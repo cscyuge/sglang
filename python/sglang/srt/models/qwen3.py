@@ -3,6 +3,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
+from sgl_kernel import turbomind_rms_norm
 from torch import nn
 
 from sglang.srt.distributed import (
@@ -143,22 +144,64 @@ class Qwen3Attention(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # overlap qk norm
+        # if self.alt_stream is not None and get_is_capture_mode():
+        #     current_stream = torch.cuda.current_stream()
+        #     self.alt_stream.wait_stream(current_stream)
+        #     q_by_head = q.reshape(-1, self.head_dim)
+        #     q_by_head = self.q_norm(q_by_head)
+        #     with torch.cuda.stream(self.alt_stream):
+        #         k_by_head = k.reshape(-1, self.head_dim)
+        #         k_by_head = self.k_norm(k_by_head)
+        #     current_stream.wait_stream(self.alt_stream)
+        # else:
+        #     q_by_head = q.reshape(-1, self.head_dim)
+        #     q_by_head = self.q_norm(q_by_head)
+        #     k_by_head = k.reshape(-1, self.head_dim)
+        #     k_by_head = self.k_norm(k_by_head)
+        # q = q_by_head.view(q.shape)
+        # k = k_by_head.view(k.shape)
         if self.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
+            turbomind_rms_norm(
+                q,
+                self.q_norm.weight.data,
+                self.q_norm.variance_epsilon,
+                token_num=q.shape[0],
+                head_num=self.num_heads,
+                head_dim=self.head_dim,
+                stride=q.stride(0),
+            )
             with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
+                turbomind_rms_norm(
+                    k,
+                    self.k_norm.weight.data,
+                    self.k_norm.variance_epsilon,
+                    token_num=k.shape[0],
+                    head_num=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    stride=k.stride(0),
+                )
             current_stream.wait_stream(self.alt_stream)
         else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
+            turbomind_rms_norm(
+                q,
+                self.q_norm.weight.data,
+                self.q_norm.variance_epsilon,
+                token_num=q.shape[0],
+                head_num=self.num_heads,
+                head_dim=self.head_dim,
+                stride=q.stride(0),
+            )
+            turbomind_rms_norm(
+                k,
+                self.k_norm.weight.data,
+                self.k_norm.variance_epsilon,
+                token_num=k.shape[0],
+                head_num=self.num_kv_heads,
+                head_dim=self.head_dim,
+                stride=k.stride(0),
+            )
         return q, k
 
     def forward(

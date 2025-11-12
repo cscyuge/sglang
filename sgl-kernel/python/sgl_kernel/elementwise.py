@@ -83,6 +83,48 @@ def fused_add_rmsnorm(
     )
 
 
+def turbomind_rms_norm(
+    data: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    token_num: int = None,
+    head_num: int = None,
+    head_dim: int = None,
+    stride: int = None,
+) -> None:
+    r"""Turbomind inplace RMS normalization.
+
+    Parameters
+    ----------
+    data: torch.Tensor
+        Input tensor to be normalized in-place, shape (token_num, head_num, head_dim).
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+    token_num: int
+        Number of tokens.
+    head_num: int
+        Number of attention heads.
+    head_dim: int
+        Dimension of each attention head.
+    stride: int
+        Stride for the data tensor.
+    """
+    if token_num is None:
+        token_num = data.size(0)
+    if head_num is None:
+        head_num = data.size(1)
+    if head_dim is None:
+        head_dim = data.size(2)
+    if stride is None:
+        stride = data.stride(0)
+
+    torch.ops.sgl_kernel.turbomind_rms_norm.default(
+        data, weight, eps, token_num, head_num, head_dim, stride
+    )
+
+
 def gemma_rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,

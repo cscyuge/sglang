@@ -190,6 +190,14 @@ void fast_topk_transform_ragged_interface(
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt = std::nullopt);
+void turbomind_rms_norm(
+    torch::Tensor& data,
+    const torch::Tensor& weight,
+    double eps,
+    int64_t token_num,
+    int64_t head_num,
+    int64_t head_dim,
+    int64_t stride);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
