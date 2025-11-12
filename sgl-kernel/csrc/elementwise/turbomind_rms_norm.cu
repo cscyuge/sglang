@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
+#include "cub/block/block_reduce.cuh"
 #include "utils.h"
 
 // Array type for vectorized operations
@@ -19,7 +20,57 @@ struct Array {
   }
 };
 
-// Efficient vectorized load
+template<typename T>
+struct plus {
+    __device__ T operator()(T a, T b)
+    {
+        return a + b;
+    }
+};
+
+template<typename T>
+struct multiplies {
+    __device__ T operator()(T a, T b)
+    {
+        return a * b;
+    }
+};
+
+template<typename T, int N, typename Op>
+inline __device__ Array<T, N> binary_op_vv(const Array<T, N>& a, const Array<T, N>& b, Op op)
+{
+    Array<T, N> c;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        c[i] = op(a[i], b[i]);
+    }
+    return c;
+}
+
+template<typename T, int N>
+inline __device__ Array<T, N> operator+(const Array<T, N>& a, const Array<T, N>& b)
+{
+    return binary_op_vv(a, b, plus<T>{});
+}
+
+template<typename T, int N>
+inline __device__ Array<T, N> operator*(const Array<T, N>& a, const Array<T, N>& b)
+{
+    return binary_op_vv(a, b, multiplies<T>{});
+}
+
+template<typename To, typename From, int N>
+inline __device__ Array<To, N> cast(const Array<From, N>& src)
+{
+    Array<To, N> dst;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        dst[i] = (To)src[i];
+    }
+    return dst;
+}
+
+// Vectorized load
 template <typename T, int N>
 inline __device__ void Load(Array<T, N>& dst, const T* src) {
   if constexpr (sizeof(Array<T, N>) == sizeof(uint4)) {
@@ -39,7 +90,7 @@ inline __device__ void Load(Array<T, N>& dst, const T* src) {
   }
 }
 
-// Efficient vectorized load with __ldg
+// Vectorized load with __ldg
 template <typename T, int N>
 inline __device__ void Ldg(Array<T, N>& dst, const T* src) {
   static_assert(sizeof(Array<T, N>) <= sizeof(uint4));
@@ -55,7 +106,7 @@ inline __device__ void Ldg(Array<T, N>& dst, const T* src) {
   }
 }
 
-// Efficient vectorized store
+// Vectorized store
 template <typename T, int N>
 inline __device__ void Store(T* __restrict__ dst, const Array<T, N>& src) {
   if constexpr (sizeof(Array<T, N>) == sizeof(uint4)) {
@@ -86,7 +137,7 @@ __global__ void RMSNorm(
     float eps,
     float inv_dim) {
   // vec_size = 16/2 = 8 for float16, 4 for float32
-  constexpr int thr_per_qk = 128 / vec_size;  // process 16 elements per thread if float16
+  constexpr int thr_per_qk = 128 / vec_size;
 
   const int bi = (threadIdx.x + blockIdx.x * blockDim.x) / thr_per_qk;
   const int di = threadIdx.x % thr_per_qk * vec_size;
@@ -99,13 +150,11 @@ __global__ void RMSNorm(
 
   data += ti * ld + hi * dim;
 
-  // Load data vector efficiently
   Array<T, vec_size> vec{};
   if (di < dim) {
     Load(vec, &data[di]);
   }
 
-  // Convert to float and compute sum of squares
   float acc[vec_size];
   float sum = 0.0f;
 #pragma unroll
@@ -119,10 +168,8 @@ __global__ void RMSNorm(
     sum += __shfl_xor_sync((uint32_t)-1, sum, mask);
   }
 
-  // Compute RMS
   float rms = rsqrtf(sum * inv_dim + eps);
 
-  // Load weight and apply normalization
   if (di < dim) {
     Array<T, vec_size> w{};
     Ldg(w, &weight[di]);
@@ -135,6 +182,71 @@ __global__ void RMSNorm(
     // Store back efficiently
     Store(&data[di], vec);
   }
+}
+
+template <class T, class Accum, int block_dim, int vec_size>
+__global__ void RMSNorm_v0(
+    T*       dst,
+    int      dst_ld,
+    const T* src,
+    int      src_ld,
+    const T* __restrict__ weights,
+    int   dims,
+    int   num,
+    float eps,
+    float inv_dims) 
+{
+    const int ti = blockIdx.x;
+    const int di = threadIdx.x * vec_size;
+
+    if (ti >= num) {
+        return;
+    }
+
+    src += src_ld * ti;
+
+    Array<Accum, vec_size> accum{};
+    Array<T, vec_size>     vec;
+
+    for (int i = di; i < dims; i += block_dim * vec_size) {
+        Load(vec, &src[i]);
+        Array<Accum, vec_size> tmp = cast<Accum>(vec);
+        accum = accum + tmp * tmp;
+    }
+
+    float sum{};
+#pragma unroll
+    for (int i = 0; i < vec_size; ++i) {
+        sum += accum[i];
+    }
+
+    using BlockReduce = cub::BlockReduce<Accum, block_dim>;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    sum = BlockReduce{temp_storage}.Sum(sum);
+
+    __shared__ float shared_sum;
+
+    if (threadIdx.x == 0) {
+        shared_sum = rsqrtf(sum * inv_dims + eps);
+    }
+
+    __syncthreads();
+
+    sum = shared_sum;
+
+    dst += dst_ld * ti;
+
+    Array<T, vec_size> sv;
+    for (int i = di; i < dims; i += block_dim * vec_size) {
+        Load(vec, &src[i]);
+        Ldg(sv, &weights[i]);
+#pragma unroll
+        for (int c = 0; c < vec_size; ++c) {
+            vec[c] = (T)((float)vec[c] * sum) * sv[c];
+        }
+        Store(&dst[i], vec);
+    }
 }
 
 void turbomind_rms_norm(
@@ -184,4 +296,39 @@ void turbomind_rms_norm(
     }
     return true;
   });
+}
+
+void turbomind_rms_norm_v0(
+    torch::Tensor& out,
+    const torch::Tensor& x,
+    const torch::Tensor& w,
+    double eps) {
+    if (x.numel() == 0) {
+        return;
+    }
+    TORCH_CHECK(x.dim() == 2);
+    TORCH_CHECK(out.size(0) == x.size(0) && out.size(1) == x.size(1));
+    TORCH_CHECK(w.size(-1) == x.size(-1));
+
+    const auto num = x.size(0);
+    const auto dim = x.size(1);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(x.scalar_type(), c_type, [&] {
+        constexpr int vec_size = 16 / sizeof(c_type);
+        constexpr int threads = 512;
+        const int blocks = num;
+
+        RMSNorm_v0<c_type, float, threads, vec_size><<<blocks, threads, 0, stream>>>(
+            static_cast<c_type*>(out.data_ptr()),
+            out.stride(0),
+            static_cast<const c_type*>(x.data_ptr()),
+            x.stride(0),
+            static_cast<const c_type*>(w.data_ptr()),
+            dim,
+            num,
+            eps,
+            1.f / dim);
+        return true;
+    });
 }

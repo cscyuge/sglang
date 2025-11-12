@@ -198,6 +198,11 @@ void turbomind_rms_norm(
     int64_t head_num,
     int64_t head_dim,
     int64_t stride);
+void turbomind_rms_norm_v0(
+    torch::Tensor& out,
+    const torch::Tensor& x,
+    const torch::Tensor& w,
+    double eps);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);

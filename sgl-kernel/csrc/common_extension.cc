@@ -123,6 +123,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "stride) -> ()");
   m.impl("turbomind_rms_norm", torch::kCUDA, &turbomind_rms_norm);
 
+  m.def(
+      "turbomind_rms_norm_v0(Tensor! out, Tensor x, Tensor w, float eps) -> ()");
+  m.impl("turbomind_rms_norm_v0", torch::kCUDA, &turbomind_rms_norm_v0);
+
   /*
    * From csrc/gemm
    */

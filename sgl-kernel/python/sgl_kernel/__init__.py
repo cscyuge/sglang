@@ -33,6 +33,7 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
     turbomind_rms_norm,
+    turbomind_rms_norm_v0,
 )
 from sgl_kernel.expert_specialization import es_fp8_blockwise_scaled_grouped_mm
 from sgl_kernel.fused_moe import fused_marlin_moe

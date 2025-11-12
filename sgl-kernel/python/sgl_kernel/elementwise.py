@@ -124,6 +124,30 @@ def turbomind_rms_norm(
         data, weight, eps, token_num, head_num, head_dim, stride
     )
 
+def turbomind_rms_norm_v0(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Turbomind RMS normalization.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (batch_size, hidden_size).
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        The output tensor, if specified, the kernel will update this tensor inplace.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    torch.ops.sgl_kernel.turbomind_rms_norm_v0.default(out, input, weight, eps)
+    return out
 
 def gemma_rmsnorm(
     input: torch.Tensor,

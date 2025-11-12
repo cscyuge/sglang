@@ -194,18 +194,32 @@ def rmsnorm_turbomind(
     orig_shape = x.shape
     x = x.view(-1, x.shape[-1])
     hidden_size = x.shape[-1]
-    head_dim = 128
-    head_num = hidden_size // head_dim
+    head_dim = hidden_size
+    head_num = 1
+    token_num = x.numel() // hidden_size
     sgl_kernel.turbomind_rms_norm(
         x,
         weight,
         eps,
-        token_num=x.shape[0],
+        token_num=token_num,
         head_num=head_num,
         head_dim=head_dim,
         stride=x.stride(0),
     )
     return x.view(orig_shape)
+
+def rmsnorm_turbomind_v0(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+):
+    assert residual is None
+    orig_shape = x.shape
+    x = x.view(-1, x.shape[-1])
+    out = torch.empty_like(x)
+    sgl_kernel.turbomind_rms_norm_v0(x, weight, eps, out=out)
+    return out.view(orig_shape)
 
 
 def calculate_diff(batch_size, seq_len, hidden_size, use_residual=True):
@@ -229,12 +243,16 @@ def calculate_diff(batch_size, seq_len, hidden_size, use_residual=True):
     output_turbomind = rmsnorm_turbomind(
         x.clone(), weight, residual.clone() if residual is not None else None
     )
+    output_turbomind_v0 = rmsnorm_turbomind_v0(
+        x.clone(), weight, residual.clone() if residual is not None else None
+    )
     if use_residual:
         output_naive = output_naive[0]
         output_flashinfer = output_flashinfer[0]
         output_vllm = output_vllm[0]
         output_sglang = output_sglang[0]
         output_turbomind = output_turbomind[0]
+        output_turbomind_v0 = output_turbomind_v0[0]
     print(f"Naive output={output_naive}")
     if FLASHINFER_AVAILABLE:
         print(f"FlashInfer output={output_flashinfer}")
@@ -246,11 +264,14 @@ def calculate_diff(batch_size, seq_len, hidden_size, use_residual=True):
         print("vLLM not available, skipped")
     print(f"SGLang output={output_sglang}")
     print(f"Turbomind output={output_turbomind}")
-
+    print(f"Turbomind_v0 output={output_turbomind_v0}")
     # Only compare available implementations
     all_match = torch.allclose(output_naive, output_sglang, atol=1e-2, rtol=1e-2)
     all_match = all_match and torch.allclose(
         output_naive, output_turbomind, atol=1e-2, rtol=1e-2
+    )
+    all_match = all_match and torch.allclose(
+        output_naive, output_turbomind_v0, atol=1e-2, rtol=1e-2
     )
     if FLASHINFER_AVAILABLE:
         all_match = all_match and torch.allclose(
@@ -283,9 +304,9 @@ def make_configs(bsizes: List[int], slens: List[int], hsizes: List[int]) -> List
 
 
 # Filter providers based on availability
-available_providers = ["huggingface", "sglang", "turbomind"]
-available_names = ["HuggingFace", "SGL Kernel", "Turbomind"]
-available_styles = [("blue", "-"), ("orange", "-"), ("purple", "-")]
+available_providers = ["huggingface", "sglang", "turbomind", "turbomind_v0"]
+available_names = ["HuggingFace", "SGL Kernel", "Turbomind", "Turbomind_v0"]
+available_styles = [("blue", "-"), ("orange", "-"), ("purple", "-"), ("yellow", "-")]
 
 if FLASHINFER_AVAILABLE:
     available_providers.insert(-1, "flashinfer")
@@ -373,7 +394,14 @@ def benchmark(batch_size, seq_len, hidden_size, provider, use_residual):
                 residual.clone() if residual is not None else None,
             )
         )
-
+    elif provider == "turbomind_v0":
+        return timed(
+            lambda: rmsnorm_turbomind_v0(
+                x.clone(),
+                weight,
+                residual.clone() if residual is not None else None,
+            )
+        )
     # provider == "speedup"
     if VLLM_AVAILABLE:
         t_ref, _, _ = timed(
@@ -433,5 +461,5 @@ if __name__ == "__main__":
         print("✅ sanity pass" if ok else "❌ mismatch")
     else:
         benchmark.run(
-            print_data=True, use_residual=args.use_residual, save_path="./results"
+            print_data=True, use_residual=args.use_residual, save_path="./results_v0"
         )
