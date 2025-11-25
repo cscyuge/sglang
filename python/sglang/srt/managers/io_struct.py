@@ -1362,6 +1362,23 @@ class ProfileReqOutput(BaseReq):
     message: str
 
 
+class KVScaleCalcReqType(Enum):
+    START_CALC = 1
+    END_CALC = 2
+
+
+@dataclass
+class KVScaleCalcReq(BaseReq):
+    type: KVScaleCalcReqType
+
+
+@dataclass
+class KVScaleCalcReqOutput(BaseReq):
+    success: bool
+    message: str
+    dump_path: Optional[str] = None
+
+
 @dataclass
 class FreezeGCReq(BaseReq):
     pass

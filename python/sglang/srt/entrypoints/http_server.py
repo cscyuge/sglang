@@ -697,6 +697,21 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     )
 
 
+@app.api_route("/start_kv_scale_calc", methods=["GET", "POST"])
+async def start_kv_scale_calc_async():
+    message = await _global_state.tokenizer_manager.start_kv_scale_calc()
+    return Response(content=f"{message}\n", status_code=200)
+
+
+@app.api_route("/end_kv_scale_calc", methods=["GET", "POST"])
+async def end_kv_scale_calc_async():
+    message = await _global_state.tokenizer_manager.end_kv_scale_calc()
+    return Response(
+        content=f"{message}\n",
+        status_code=200,
+    )
+
+
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""

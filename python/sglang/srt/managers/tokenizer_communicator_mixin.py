@@ -42,6 +42,9 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    KVScaleCalcReq,
+    KVScaleCalcReqOutput,
+    KVScaleCalcReqType,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
@@ -195,6 +198,9 @@ class TokenizerCommunicatorMixin:
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.kv_scale_calc_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -273,6 +279,10 @@ class TokenizerCommunicatorMixin:
                     self.profile_communicator.handle_recv,
                 ),
                 (
+                    KVScaleCalcReqOutput,
+                    self.kv_scale_calc_communicator.handle_recv,
+                ),
+                (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
                 ),
@@ -349,6 +359,24 @@ class TokenizerCommunicatorMixin:
         if not result.success:
             raise RuntimeError(result.message)
         return result
+
+    async def start_kv_scale_calc(self: TokenizerManager):
+        self.auto_create_handle_loop()
+        req = KVScaleCalcReq(type=KVScaleCalcReqType.START_CALC)
+        results = await self.kv_scale_calc_communicator(req)
+        success, message = _Communicator.merge_results(results)
+        if not success:
+            raise RuntimeError(message)
+        return message
+
+    async def end_kv_scale_calc(self: TokenizerManager):
+        self.auto_create_handle_loop()
+        req = KVScaleCalcReq(type=KVScaleCalcReqType.END_CALC)
+        results = await self.kv_scale_calc_communicator(req)
+        success, message = _Communicator.merge_results(results)
+        if not success:
+            raise RuntimeError(message)
+        return message
 
     async def start_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()

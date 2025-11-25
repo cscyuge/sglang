@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -24,6 +25,7 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
@@ -89,6 +91,9 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    KVScaleCalcReq,
+    KVScaleCalcReqOutput,
+    KVScaleCalcReqType,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
@@ -148,6 +153,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache import kv_scale_recorder
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -259,6 +265,9 @@ class Scheduler(
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
         )
+        self.kv_scale_calc_in_progress = False
+        self.kv_scale_calc_recorder: Optional[kv_scale_recorder.KVScaleRecorder] = None
+        self.kv_scale_calc_start_ts: Optional[float] = None
         self.enable_kv_cache_events = bool(
             server_args.kv_events_config and tp_rank == 0
         )
@@ -560,6 +569,7 @@ class Scheduler(
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
+                (KVScaleCalcReq, self.handle_kv_scale_calc),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
@@ -2455,6 +2465,95 @@ class Scheduler(
         """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
         return SendWeightsToRemoteInstanceReqOutput(success, message)
+
+    def handle_kv_scale_calc(self, recv_req: KVScaleCalcReq):
+        if recv_req.type == KVScaleCalcReqType.START_CALC:
+            return self._start_kv_scale_calc()
+        else:
+            return self._end_kv_scale_calc()
+
+    def _start_kv_scale_calc(self) -> KVScaleCalcReqOutput:
+        if self.kv_scale_calc_in_progress or kv_scale_recorder.is_active():
+            return KVScaleCalcReqOutput(
+                success=False,
+                message="KV scale calculation is already in progress. Call /end_kv_scale_calc first.",
+            )
+
+        recorder = kv_scale_recorder.KVScaleRecorder(device=self.device)
+        kv_scale_recorder.set_active_recorder(recorder)
+        self.kv_scale_calc_recorder = recorder
+        self.kv_scale_calc_in_progress = True
+        self.kv_scale_calc_start_ts = time.time()
+        logger.info("KV scale calculation started on TP rank %s", self.tp_rank)
+        return KVScaleCalcReqOutput(
+            success=True,
+            message="KV scale calculation started.",
+        )
+
+    def _end_kv_scale_calc(self) -> KVScaleCalcReqOutput:
+        if not self.kv_scale_calc_in_progress or self.kv_scale_calc_recorder is None:
+            return KVScaleCalcReqOutput(
+                success=False,
+                message="KV scale calculation is not running. Call /start_kv_scale_calc first.",
+            )
+
+        recorder = self.kv_scale_calc_recorder
+        summary = recorder.summary()
+        k_map = summary.get("k_scale", {})
+        v_map = summary.get("v_scale", {})
+        if not k_map and not v_map:
+            kv_scale_recorder.clear_active_recorder()
+            self.kv_scale_calc_in_progress = False
+            self.kv_scale_calc_recorder = None
+            self.kv_scale_calc_start_ts = None
+            return KVScaleCalcReqOutput(
+                success=False,
+                message="KV scale calculation collected no samples; no file generated.",
+            )
+
+        dump_dir = Path(os.environ.get("SGLANG_KV_SCALE_DUMP_DIR", "/tmp")).expanduser()
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        ts_value = self.kv_scale_calc_start_ts or time.time()
+        timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts_value))
+        dump_path = dump_dir / f"kv_scale_tp{self.tp_rank}_{timestamp}.json"
+
+        payload = {
+            "tp_rank": self.tp_rank,
+            "tp_size": self.tp_size,
+            "dtype": str(
+                getattr(self.token_to_kv_pool_allocator.get_kvcache(), "dtype", "")
+            ),
+            "k_scale": dict(sorted(k_map.items(), key=lambda x: int(x[0]))),
+            "v_scale": dict(sorted(v_map.items(), key=lambda x: int(x[0]))),
+            "start_ts": self.kv_scale_calc_start_ts,
+            "end_ts": time.time(),
+        }
+
+        try:
+            with dump_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as exc:  # pragma: no cover - log unexpected failure
+            logger.exception("Failed to dump KV scale data: %s", exc)
+            kv_scale_recorder.clear_active_recorder()
+            self.kv_scale_calc_in_progress = False
+            self.kv_scale_calc_recorder = None
+            self.kv_scale_calc_start_ts = None
+            return KVScaleCalcReqOutput(
+                success=False,
+                message=f"Failed to write KV scale file: {exc}",
+            )
+
+        message = f"KV scale factors saved to {dump_path}"
+        logger.info("%s", message)
+        kv_scale_recorder.clear_active_recorder()
+        self.kv_scale_calc_in_progress = False
+        self.kv_scale_calc_recorder = None
+        self.kv_scale_calc_start_ts = None
+        return KVScaleCalcReqOutput(
+            success=True,
+            message=message,
+            dump_path=str(dump_path),
+        )
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
