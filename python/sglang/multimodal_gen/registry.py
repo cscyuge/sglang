@@ -38,6 +38,9 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flashtalk import (
+    FlashTalkPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinPipelineConfig,
     Flux2PipelineConfig,
@@ -70,6 +73,7 @@ from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
     FluxSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.flashtalk import FlashTalkSamplingParams
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
@@ -657,6 +661,14 @@ def _register_configs():
         sampling_param_cls=GlmImageSamplingParams,
         pipeline_config_cls=GlmImagePipelineConfig,
         model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
+    )
+
+    # FlashTalk
+    register_configs(
+        sampling_param_cls=FlashTalkSamplingParams,
+        pipeline_config_cls=FlashTalkPipelineConfig,
+        hf_model_paths=["SoulX-FlashTalk-14B"],
+        model_detectors=[lambda hf_id: "flashtalk" in hf_id.lower()],
     )
 
 

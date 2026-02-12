@@ -88,6 +88,10 @@ def _build_sampling_params_from_request(
         sampling_kwargs["enable_teacache"] = request.enable_teacache
     if request.output_path is not None:
         sampling_kwargs["output_path"] = request.output_path
+    if request.audio_path is not None:
+        sampling_kwargs["audio_path"] = request.audio_path
+    if request.audio_encode_mode is not None:
+        sampling_kwargs["audio_encode_mode"] = request.audio_encode_mode
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,

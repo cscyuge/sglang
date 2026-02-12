@@ -231,6 +231,14 @@ def prepare_request(
             f"Height and width must be positive, got height={req.height}, width={req.width}"
         )
 
+    # Pass audio parameters to extra dict for FlashTalk pipeline
+    audio_path = getattr(sampling_params, "audio_path", None)
+    if audio_path is not None:
+        req.extra["audio_path"] = audio_path
+    audio_encode_mode = getattr(sampling_params, "audio_encode_mode", None)
+    if audio_encode_mode is not None:
+        req.extra["audio_encode_mode"] = audio_encode_mode
+
     return req
 
 

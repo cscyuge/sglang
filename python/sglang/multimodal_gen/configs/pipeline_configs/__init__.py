@@ -7,6 +7,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
     DiffusersGenericPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.flashtalk import (
+    FlashTalkPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinPipelineConfig,
     Flux2PipelineConfig,
@@ -32,6 +35,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipeline
 
 __all__ = [
     "DiffusersGenericPipelineConfig",
+    "FlashTalkPipelineConfig",
     "HunyuanConfig",
     "FastHunyuanConfig",
     "FluxPipelineConfig",

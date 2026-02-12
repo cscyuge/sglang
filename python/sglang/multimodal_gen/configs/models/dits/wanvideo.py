@@ -103,3 +103,31 @@ class WanVideoConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=WanVideoArchConfig)
 
     prefix: str = "Wan"
+
+
+@dataclass
+class FlashTalkWanVideoArchConfig(WanVideoArchConfig):
+    """Extended WanVideo arch config for FlashTalk with audio cross-attention."""
+
+    has_audio_cross_attn: bool = True
+    audio_dim: int = 768
+    audio_context_tokens: int = 32
+
+    # Weight mapping for FlashTalk audio cross-attention layers
+    # Maps FlashTalk checkpoint keys to sglang model keys
+    flashtalk_param_names_mapping: dict = field(
+        default_factory=lambda: {
+            # Audio cross-attention weights
+            r"^blocks\.(\d+)\.audio_cross_attn\.q_linear\.(.*)$": r"blocks.\1.audio_cross_attn.q_linear.\2",
+            r"^blocks\.(\d+)\.audio_cross_attn\.kv_linear\.(.*)$": r"blocks.\1.audio_cross_attn.kv_linear.\2",
+            r"^blocks\.(\d+)\.audio_cross_attn\.proj\.(.*)$": r"blocks.\1.audio_cross_attn.proj.\2",
+            r"^blocks\.(\d+)\.norm_x\.(.*)$": r"blocks.\1.norm_audio.\2",
+        }
+    )
+
+
+@dataclass
+class FlashTalkWanVideoConfig(DiTConfig):
+    arch_config: DiTArchConfig = field(default_factory=FlashTalkWanVideoArchConfig)
+
+    prefix: str = "Wan"
