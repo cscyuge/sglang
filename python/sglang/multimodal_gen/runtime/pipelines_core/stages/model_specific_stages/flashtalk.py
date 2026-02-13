@@ -67,13 +67,30 @@ class FlashTalkDenoisingStage(PipelineStage):
 
         device = get_local_torch_device()
         dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
+        sp_size = get_sp_world_size()
 
-        # Move transformer to GPU if CPU-offloaded
-        if (
+        # Enable transformer-internal sequence sharding for multi-GPU SP.
+        # This lets the transformer handle sequence split/gather internally,
+        # so FlashTalk-specific tensors (image_latent, motion_latent,
+        # audio_context) don't need external sharding.
+        use_sp = sp_size > 1
+        if use_sp:
+            batch.enable_sequence_shard = True
+
+        # Skip per-step CPU offload when using SP: moving the full 14B model
+        # between CPU and GPU at every denoising step is prohibitively slow.
+        use_cpu_offload = (
             server_args.dit_cpu_offload
             and not server_args.use_fsdp_inference
-            and next(self.transformer.parameters()).device.type == "cpu"
-        ):
+            and not use_sp
+        )
+
+        # Move transformer to GPU if CPU-offloaded
+        if use_cpu_offload and next(self.transformer.parameters()).device.type == "cpu":
+            self.transformer.to(device)
+        elif use_sp and next(self.transformer.parameters()).device.type == "cpu":
+            # For multi-GPU SP, move to GPU once and keep it there
+            logger.info("Moving transformer to GPU (SP mode, skipping per-step offload)")
             self.transformer.to(device)
 
         latents = batch.latents.to(device=device, dtype=dit_dtype)
@@ -183,7 +200,9 @@ class FlashTalkDenoisingStage(PipelineStage):
 
                     # Single forward pass (no CFG)
                     with set_forward_context(
-                        current_timestep=i, attn_metadata=None
+                        current_timestep=i,
+                        attn_metadata=None,
+                        forward_batch=batch,
                     ):
                         noise_pred = self.transformer(
                             hidden_states=latent_model_input,
@@ -234,8 +253,8 @@ class FlashTalkDenoisingStage(PipelineStage):
                 :, :, -motion_frames_num:
             ].clone()
 
-        # Offload transformer back to CPU if needed
-        if server_args.dit_cpu_offload and not server_args.use_fsdp_inference:
+        # Offload transformer back to CPU if needed (skipped for SP mode)
+        if use_cpu_offload:
             self.transformer.to("cpu")
             torch.cuda.empty_cache()
 
