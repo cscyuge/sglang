@@ -74,6 +74,25 @@ class AudioEncodingStage(PipelineStage):
             )
         return speech_array
 
+    def _loudness_norm(
+        self, audio_array: np.ndarray, sample_rate: int, target_lufs: float = -23.0
+    ) -> np.ndarray:
+        """Normalize audio loudness to target LUFS (matching original FlashTalk)."""
+        try:
+            import pyloudnorm as pyln
+
+            meter = pyln.Meter(sample_rate)
+            loudness = meter.integrated_loudness(audio_array)
+            if abs(loudness) > 100:
+                return audio_array
+            return pyln.normalize.loudness(audio_array, loudness, target_lufs)
+        except ImportError:
+            logger.warning(
+                "pyloudnorm not installed, skipping loudness normalization. "
+                "Install with: pip install pyloudnorm"
+            )
+            return audio_array
+
     @torch.no_grad()
     def forward(
         self,
@@ -104,6 +123,10 @@ class AudioEncodingStage(PipelineStage):
             speech_array = audio_tensor
         else:
             speech_array = self._load_audio(audio_path, sample_rate)
+
+        # Loudness normalization (matching original FlashTalk preprocessing)
+        if isinstance(speech_array, np.ndarray):
+            speech_array = self._loudness_norm(speech_array, sample_rate)
 
         # Compute expected video frames from audio duration
         if isinstance(speech_array, np.ndarray):

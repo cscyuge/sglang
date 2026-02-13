@@ -4,6 +4,15 @@ Wav2Vec2 audio encoder for FlashTalk.
 
 Wraps HuggingFace Wav2Vec2Model to extract multi-layer hidden states
 and aligns them to video frame rate via linear interpolation.
+
+Replicates the original FlashTalk Wav2Vec2 forward pass:
+1. CNN feature extraction at native audio framerate (~50fps for 16kHz)
+2. Linear interpolation of CNN features to video framerate (e.g. 25fps)
+3. Feature projection + encoder transformer at video framerate
+4. Collect all encoder hidden states at video framerate
+
+This ordering is critical: the encoder's self-attention operates at
+video temporal resolution, matching the original FlashTalk behavior.
 """
 
 import torch
@@ -66,28 +75,50 @@ class Wav2Vec2AudioEncoder(nn.Module):
     ) -> torch.Tensor:
         """Encode audio waveform into multi-layer features.
 
+        Replicates the original FlashTalk Wav2Vec2 forward pass:
+        1. CNN feature_extractor at native framerate
+        2. Interpolate CNN features to num_video_frames (video fps)
+        3. feature_projection + encoder at video framerate
+        4. Collect hidden_states[1:num_hidden_layers+1]
+
         Args:
             audio_waveform: (B, L) raw audio at 16kHz
-            num_video_frames: if provided, interpolate to this many frames
+            num_video_frames: if provided, interpolate CNN features to this
+                many frames BEFORE the encoder (matching original FlashTalk)
 
         Returns:
             (B, seq_len, num_layers, hidden_size) audio features
         """
-        outputs = self.wav2vec2(audio_waveform, output_hidden_states=True)
-        # hidden_states is a tuple of (num_layers + 1) tensors, each (B, T, D)
-        # Skip the embedding layer output (index 0), take layers 1..num_hidden_layers
-        hidden_states = outputs.hidden_states[1 : self.num_hidden_layers + 1]
+        wav2vec = self.wav2vec2
+
+        # Step 1: CNN feature extraction at native audio framerate
+        extract_features = wav2vec.feature_extractor(audio_waveform)
+        extract_features = extract_features.transpose(1, 2)  # (B, T_native, D)
+
+        # Step 2: Interpolate to video framerate BEFORE encoder
+        if num_video_frames is not None:
+            extract_features = self.linear_interpolation(
+                extract_features, num_video_frames
+            )
+
+        # Step 3: Feature projection (layer norm + projection + dropout)
+        hidden_states, extract_features = wav2vec.feature_projection(
+            extract_features
+        )
+        hidden_states = wav2vec._mask_hidden_states(hidden_states)
+
+        # Step 4: Encoder transformer at video framerate
+        encoder_outputs = wav2vec.encoder(
+            hidden_states,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        # Collect hidden states: skip embedding layer (index 0),
+        # take encoder layers 1..num_hidden_layers
+        all_hidden = encoder_outputs.hidden_states[1 : self.num_hidden_layers + 1]
 
         # Stack to (B, T, num_layers, D)
-        all_layer_features = torch.stack(hidden_states, dim=2)
-
-        if num_video_frames is not None:
-            B, T, L, D = all_layer_features.shape
-            # Reshape to (B, T, L*D) for interpolation, then reshape back
-            features_flat = all_layer_features.reshape(B, T, L * D)
-            features_flat = self.linear_interpolation(features_flat, num_video_frames)
-            all_layer_features = features_flat.reshape(
-                B, num_video_frames, L, D
-            )
+        all_layer_features = torch.stack(all_hidden, dim=2)
 
         return all_layer_features
