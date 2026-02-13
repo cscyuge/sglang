@@ -87,13 +87,18 @@ def _maybe_download_model(
             logger.info("Downloaded to %s", file_path)
             return os.path.dirname(file_path)
         except Exception as e_config:
-            raise ValueError(
-                (
-                    "Could not find model locally at %s and failed to download "
-                    "model_index.json/config.json from %s: %s"
-                )
-                % (model_name_or_path, source_hub, e_config)
-            ) from e_config
+            logger.debug("config.json not found or failed: %s", e_config)
+
+        # If both downloads failed, return the original path as-is
+        # so that registry detectors can still match by model name.
+        logger.warning(
+            "Could not find model locally at %s and failed to download "
+            "model_index.json/config.json from %s. "
+            "Returning original path for registry-based detection.",
+            model_name_or_path,
+            source_hub,
+        )
+        return model_name_or_path
 
 
 # Copied and adapted from hf_diffusers_utils.py
@@ -129,6 +134,20 @@ def get_is_diffusion_model(model_path: str):
     is_diffusion_model = is_diffusers_model_path(model_path)
     if is_diffusion_model:
         logger.info("Diffusion model detected")
+        return is_diffusion_model
+
+    # Also check model_detectors in the multimodal_gen registry
+    # for non-diffusers models (e.g. safetensors-only models like FlashTalk)
+    try:
+        from sglang.multimodal_gen.registry import _MODEL_NAME_DETECTORS
+
+        for _model_id, detector in _MODEL_NAME_DETECTORS:
+            if detector(model_path.lower()):
+                logger.info("Diffusion model detected via registry detector")
+                return True
+    except Exception:
+        pass
+
     return is_diffusion_model
 
 

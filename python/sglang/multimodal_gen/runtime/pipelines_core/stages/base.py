@@ -196,8 +196,8 @@ class PipelineStage(ABC):
             stage_name,
             logger=logger,
             timings=batch.timings,
-            perf_dump_path_provided=batch.perf_dump_path is not None,
-            log_stage_start_end=not batch.is_warmup
+            perf_dump_path_provided=getattr(batch, "perf_dump_path", None) is not None,
+            log_stage_start_end=not getattr(batch, "is_warmup", False)
             and not (self.server_args and self.server_args.comfyui_mode),
         ):
             result = self.forward(batch, server_args)

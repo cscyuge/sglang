@@ -485,7 +485,13 @@ class SamplingParams:
 
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
-        user_sampling_params = SamplingParams(*args, **user_kwargs)
+
+        # Use the actual subclass (e.g. FlashTalkSamplingParams) to construct
+        # user params so that subclass-specific fields are accepted.
+        actual_cls = type(sampling_params)
+        actual_field_names = {f.name for f in dataclasses.fields(actual_cls)}
+        filtered_kwargs = {k: v for k, v in user_kwargs.items() if k in actual_field_names}
+        user_sampling_params = actual_cls(*args, **filtered_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
@@ -759,6 +765,28 @@ class SamplingParams:
             default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
         )
+
+        # Audio arguments (for audio-driven models like FlashTalk)
+        parser.add_argument(
+            "--audio-path",
+            type=str,
+            default=None,
+            help="Path to an audio WAV file for audio-driven generation.",
+        )
+        parser.add_argument(
+            "--audio-encode-mode",
+            type=str,
+            default=None,
+            choices=["stream", "once"],
+            help="Audio encoding mode: 'stream' for chunk-by-chunk, 'once' for all at once.",
+        )
+        parser.add_argument(
+            "--audio-encoder-path",
+            type=str,
+            default=None,
+            help="Path to Wav2Vec2 model directory for audio-driven generation.",
+        )
+
         return parser
 
     @classmethod
@@ -782,7 +810,16 @@ class SamplingParams:
         attrs = sampling_params_fields & args_attrs
         args.height_not_provided = False
         args.width_not_provided = False
-        return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
+        result = {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
+
+        # Also forward extra CLI args that may belong to model-specific subclasses
+        # (e.g. audio_path, audio_encode_mode for FlashTalkSamplingParams).
+        _extra_forwarded_args = ["audio_path", "audio_encode_mode", "audio_encoder_path"]
+        for arg_name in _extra_forwarded_args:
+            if hasattr(args, arg_name) and getattr(args, arg_name) is not None:
+                result[arg_name] = getattr(args, arg_name)
+
+        return result
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
@@ -798,13 +835,27 @@ class SamplingParams:
 
         # global switch: if True, allow overriding protected fields
         allow_override_protected = not user_params.no_override_protected_fields
-        for field in dataclasses.fields(user_params):
-            field_name = field.name
+        for field_obj in dataclasses.fields(user_params):
+            field_name = field_obj.name
             user_value = getattr(user_params, field_name)
-            default_class_value = getattr(SamplingParams, field_name)
+
+            # Compare against base SamplingParams class attribute when available,
+            # since CLI defaults are based on the base class.  For subclass-only
+            # fields (e.g. audio_path on FlashTalkSamplingParams), fall back to
+            # the field descriptor default.
+            if hasattr(SamplingParams, field_name):
+                default_class_value = getattr(SamplingParams, field_name)
+            elif field_obj.default is not dataclasses.MISSING:
+                default_class_value = field_obj.default
+            elif field_obj.default_factory is not dataclasses.MISSING:
+                default_class_value = field_obj.default_factory()
+            else:
+                default_class_value = dataclasses.MISSING
 
             # A field is considered user-modified if its value is different from the default
-            is_user_modified = user_value != default_class_value
+            is_user_modified = (default_class_value is dataclasses.MISSING) or (
+                user_value != default_class_value
+            )
             is_protected_field = field_name in predefined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field

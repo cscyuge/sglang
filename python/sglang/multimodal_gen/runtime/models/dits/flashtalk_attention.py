@@ -283,6 +283,21 @@ class FlashTalkAudioCrossAttention(nn.Module):
         N_t = shape[0]
         encoder_hidden_states = encoder_hidden_states.squeeze(0)
 
+        # Align audio temporal dimension with latent temporal dimension
+        audio_N_t = encoder_hidden_states.shape[0]
+        if audio_N_t != N_t:
+            if audio_N_t < N_t:
+                # Pad by repeating the last frame
+                pad = encoder_hidden_states[-1:].expand(
+                    N_t - audio_N_t, -1, -1
+                )
+                encoder_hidden_states = torch.cat(
+                    [encoder_hidden_states, pad], dim=0
+                )
+            else:
+                # Truncate
+                encoder_hidden_states = encoder_hidden_states[:N_t]
+
         if human_num == 1 or x_ref_attn_map is None:
             return self._single_person_forward(x, encoder_hidden_states, N_t)
         else:

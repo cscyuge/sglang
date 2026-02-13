@@ -198,6 +198,8 @@ class ConfigInfo:
 
     sampling_param_cls: Any
     pipeline_config_cls: Type[PipelineConfig]
+    # Pipeline class name for models without model_index.json (e.g. FlashTalk)
+    pipeline_name: Optional[str] = None
 
 
 # The central registry mapping a model name to its configuration information
@@ -215,6 +217,7 @@ def register_configs(
     pipeline_config_cls: Type[PipelineConfig],
     hf_model_paths: Optional[List[str]] = None,
     model_detectors: Optional[List[Callable[[str], bool]]] = None,
+    pipeline_name: Optional[str] = None,
 ):
     """
     Registers configuration classes for a new model family.
@@ -224,6 +227,7 @@ def register_configs(
     _CONFIG_REGISTRY[model_id] = ConfigInfo(
         sampling_param_cls=sampling_param_cls,
         pipeline_config_cls=pipeline_config_cls,
+        pipeline_name=pipeline_name,
     )
     if hf_model_paths:
         for path in hf_model_paths:
@@ -269,12 +273,16 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
             return _CONFIG_REGISTRY.get(model_id)
 
     # 3. Use detectors
-    if os.path.exists(model_path):
-        config = verify_model_config_and_directory(model_path)
-    else:
-        config = maybe_download_model_index(model_path)
-
-    pipeline_name = config.get("_class_name", "").lower()
+    pipeline_name = ""
+    try:
+        if os.path.exists(model_path):
+            config = verify_model_config_and_directory(model_path)
+        else:
+            config = maybe_download_model_index(model_path)
+        pipeline_name = config.get("_class_name", "").lower()
+    except Exception:
+        # model_index.json not found; still try model path detectors below
+        pass
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
@@ -379,6 +387,26 @@ def get_model_info(
             config = maybe_download_model_index(model_path)
     except Exception as e:
         logger.error(f"Could not read model config for '{model_path}': {e}")
+        # Before falling back to diffusers, try registry detectors
+        # for non-diffusers models (e.g. safetensors-only models like FlashTalk)
+        config_info = None
+        try:
+            config_info = _get_config_info(model_path)
+        except Exception:
+            pass
+        if config_info and config_info.pipeline_name:
+            pipeline_cls = _PIPELINE_REGISTRY.get(config_info.pipeline_name)
+            if pipeline_cls:
+                logger.info(
+                    "Resolved model '%s' via registry detector (pipeline=%s)",
+                    model_path,
+                    config_info.pipeline_name,
+                )
+                return ModelInfo(
+                    pipeline_cls=pipeline_cls,
+                    sampling_param_cls=config_info.sampling_param_cls,
+                    pipeline_config_cls=config_info.pipeline_config_cls,
+                )
         if backend == Backend.AUTO:
             logger.info("Falling back to diffusers backend")
             return _get_diffusers_model_info(model_path)
@@ -669,6 +697,7 @@ def _register_configs():
         pipeline_config_cls=FlashTalkPipelineConfig,
         hf_model_paths=["SoulX-FlashTalk-14B"],
         model_detectors=[lambda hf_id: "flashtalk" in hf_id.lower()],
+        pipeline_name="FlashTalkPipeline",
     )
 
 

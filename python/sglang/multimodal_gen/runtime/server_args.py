@@ -293,6 +293,7 @@ class ServerArgs:
     dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
+    audio_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
@@ -373,6 +374,8 @@ class ServerArgs:
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = False
+            if self.audio_encoder_cpu_offload is None:
+                self.audio_encoder_cpu_offload = False
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = False
         else:
@@ -382,6 +385,8 @@ class ServerArgs:
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
+            if self.audio_encoder_cpu_offload is None:
+                self.audio_encoder_cpu_offload = True
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = True
 

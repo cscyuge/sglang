@@ -4,8 +4,37 @@ FlashTalk pipeline implementation.
 
 Audio-driven talking face video generation pipeline based on Wan 14B I2V,
 extended with Wav2Vec2 audio encoder, AudioProjModel, and audio cross-attention.
+
+Overrides load_modules to support FlashTalk's flat directory structure with
+original (non-diffusers) naming conventions.
 """
 
+import json
+import os
+from typing import Any
+
+import torch
+from safetensors.torch import safe_open
+from transformers import AutoTokenizer
+
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
+    get_param_names_mapping,
+    set_default_torch_dtype,
+    skip_init_modules,
+)
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    safetensors_weights_iterator,
+)
+from sglang.multimodal_gen.runtime.models.adapter.audio_proj import AudioProjModel
+from sglang.multimodal_gen.runtime.models.dits.flashtalk_wanvideo import (
+    FlashTalkWanTransformer3DModel,
+)
+from sglang.multimodal_gen.runtime.models.encoders.wav2vec2 import (
+    Wav2Vec2AudioEncoder,
+)
+from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
@@ -32,6 +61,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -72,6 +102,794 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         self.modules["scheduler"] = FlowUniPCMultistepScheduler(
             shift=server_args.pipeline_config.flow_shift
         )
+
+    def load_modules(
+        self,
+        server_args: ServerArgs,
+        loaded_modules: dict[str, torch.nn.Module] | None = None,
+    ) -> dict[str, Any]:
+        """Load modules from FlashTalk's flat directory structure.
+
+        FlashTalk uses original (non-diffusers) naming:
+        - config.json + diffusion_pytorch_model-*.safetensors -> Transformer + AudioProj
+        - Wan2.1_VAE.pth -> VAE
+        - models_t5_umt5-xxl-enc-bf16.pth -> T5 encoder
+        - models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth -> CLIP
+        - google/umt5-xxl/ -> T5 tokenizer
+        - xlm-roberta-large/ -> CLIP tokenizer (not used as image_processor)
+        """
+        # If pre-loaded modules are provided, use them directly
+        if loaded_modules is not None:
+            return loaded_modules
+
+        # FlashTalk uses a flat directory structure (no model_index.json),
+        # so we skip maybe_download_model which requires diffusers layout.
+        # Just validate the local path exists.
+        model_path = self.model_path
+        if not os.path.isdir(model_path):
+            raise ValueError(
+                f"FlashTalk model path does not exist: {model_path}. "
+                "FlashTalk requires a local directory with flat checkpoint files."
+            )
+        # Verify expected files exist
+        config_path = os.path.join(model_path, "config.json")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"config.json not found in {model_path}. "
+                "Expected FlashTalk flat directory structure."
+            )
+        logger.info("FlashTalk model path: %s", model_path)
+
+        pipeline_config = server_args.pipeline_config
+        device = get_local_torch_device()
+
+        loaded_components: dict[str, Any] = {}
+
+        # ---- 4a. Transformer (sharded safetensors via FSDP loader) ----
+        logger.info("Loading FlashTalk transformer...")
+        loaded_components["transformer"] = self._load_transformer(
+            model_path, server_args, device
+        )
+
+        # ---- 4b. AudioProj (from same safetensors, audio_proj.* keys) ----
+        logger.info("Loading FlashTalk AudioProjModel...")
+        loaded_components["audio_proj"] = self._load_audio_proj(
+            model_path, server_args, device
+        )
+
+        # ---- 4c. VAE (Wan2.1_VAE.pth) ----
+        logger.info("Loading FlashTalk VAE...")
+        loaded_components["vae"] = self._load_vae(model_path, server_args, device)
+
+        # ---- 4d. T5 Text Encoder ----
+        logger.info("Loading FlashTalk T5 text encoder...")
+        loaded_components["text_encoder"] = self._load_text_encoder(
+            model_path, server_args, device
+        )
+
+        # ---- 4e. CLIP Image Encoder ----
+        logger.info("Loading FlashTalk CLIP image encoder...")
+        loaded_components["image_encoder"] = self._load_image_encoder(
+            model_path, server_args, device
+        )
+
+        # ---- 4f. Tokenizer ----
+        logger.info("Loading FlashTalk tokenizer...")
+        tokenizer_path = os.path.join(model_path, "google", "umt5-xxl")
+        if os.path.isdir(tokenizer_path):
+            loaded_components["tokenizer"] = AutoTokenizer.from_pretrained(
+                tokenizer_path
+            )
+        else:
+            logger.warning(
+                "T5 tokenizer directory not found at %s, trying model_path root",
+                tokenizer_path,
+            )
+            loaded_components["tokenizer"] = AutoTokenizer.from_pretrained(model_path)
+
+        # ---- 4f. Image processor ----
+        # FlashTalk ships CLIP tokenizer in xlm-roberta-large/ but no image_processor.
+        # Create a default processor for ViT-Huge-14 (224x224, standard normalization).
+        loaded_components["image_processor"] = self._create_image_processor()
+
+        # ---- 4g. Wav2Vec2 audio encoder (optional) ----
+        audio_encoder_path = getattr(pipeline_config, "audio_encoder_path", None)
+        if audio_encoder_path:
+            logger.info("Loading Wav2Vec2 audio encoder from %s", audio_encoder_path)
+            audio_encoder = Wav2Vec2AudioEncoder(model_path=audio_encoder_path)
+            audio_encoder = audio_encoder.to(device)
+            audio_encoder.eval()
+            loaded_components["audio_encoder"] = audio_encoder
+
+            try:
+                from transformers import Wav2Vec2FeatureExtractor
+
+                loaded_components["wav2vec_feature_extractor"] = (
+                    Wav2Vec2FeatureExtractor.from_pretrained(audio_encoder_path)
+                )
+            except Exception as e:
+                logger.warning("Could not load Wav2Vec2FeatureExtractor: %s", e)
+                loaded_components["wav2vec_feature_extractor"] = None
+        else:
+            logger.info(
+                "No audio_encoder_path specified; audio encoder will not be loaded. "
+                "Pass --audio-encoder-path to enable audio-driven generation."
+            )
+            loaded_components["audio_encoder"] = None
+            loaded_components["wav2vec_feature_extractor"] = None
+
+        # Remove optional None modules from required list so the check passes
+        for name in ("audio_encoder", "image_processor"):
+            if loaded_components.get(name) is None and name in self._required_config_modules:
+                self._required_config_modules.remove(name)
+
+        logger.info(
+            "FlashTalk modules loaded: %s",
+            [k for k, v in loaded_components.items() if v is not None],
+        )
+        return loaded_components
+
+    def _load_transformer(
+        self, model_path: str, server_args: ServerArgs, device: torch.device
+    ) -> torch.nn.Module:
+        """Load the DiT transformer via FSDP, filtering out audio_proj keys.
+
+        Uses inline FSDP loading (instead of maybe_load_fsdp_model) to handle
+        computed buffers (like RoPE inv_freq) that stay on meta device after
+        checkpoint loading.
+        """
+        from torch.distributed._tensor import distribute_tensor
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
+        from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+            load_model_from_full_model_state_dict,
+        )
+        from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+        from sglang.multimodal_gen.utils import set_mixed_precision_policy
+
+        # Read config.json to update dit_config
+        config_path = os.path.join(model_path, "config.json")
+        with open(config_path) as f:
+            raw_config = json.load(f)
+
+        dit_config = server_args.pipeline_config.dit_config
+        # Update arch config from checkpoint's config.json
+        if "in_dim" in raw_config:
+            dit_config.arch_config.in_channels = raw_config["in_dim"]
+        if "out_dim" in raw_config:
+            dit_config.arch_config.out_channels = raw_config["out_dim"]
+        if "dim" in raw_config:
+            head_dim = dit_config.arch_config.attention_head_dim
+            dit_config.arch_config.num_attention_heads = raw_config["dim"] // head_dim
+        if "num_layers" in raw_config:
+            dit_config.arch_config.num_layers = raw_config["num_layers"]
+        if "ffn_dim" in raw_config:
+            dit_config.arch_config.ffn_dim = raw_config["ffn_dim"]
+        # Re-derive hidden_size and num_channels_latents
+        dit_config.arch_config.__post_init__()
+
+        safetensors_list = _list_safetensors_files(model_path)
+        if not safetensors_list:
+            raise ValueError(f"No safetensors files found in {model_path}")
+
+        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        param_dtype = torch.bfloat16
+        reduce_dtype = torch.float32
+
+        logger.info(
+            "Loading FlashTalkWanTransformer3DModel from %d safetensors files, dtype=%s",
+            len(safetensors_list),
+            default_dtype,
+        )
+
+        # Setup mixed precision policy
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype, reduce_dtype, None, cast_forward_inputs=False
+        )
+        set_mixed_precision_policy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            output_dtype=None,
+            mp_policy=mp_policy,
+        )
+
+        # Create model on meta device
+        with set_default_torch_dtype(default_dtype), torch.device("meta"):
+            model = FlashTalkWanTransformer3DModel(config=dit_config)
+
+        # Load weights
+        weight_iterator = safetensors_weights_iterator(safetensors_list)
+        param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+        load_model_from_full_model_state_dict(
+            model,
+            weight_iterator,
+            device,
+            default_dtype,
+            strict=False,
+            cpu_offload=server_args.dit_cpu_offload,
+            param_names_mapping=param_names_mapping_fn,
+        )
+
+        # Materialize any remaining meta-device buffers (e.g., RoPE inv_freq)
+        # that are computed at init time and not stored in checkpoints.
+        target = torch.device("cpu") if server_args.dit_cpu_offload else device
+        for name, buf in list(model.named_buffers()):
+            if buf.is_meta:
+                logger.info("Materializing meta buffer: %s (shape=%s)", name, buf.shape)
+                parts = name.split(".")
+                parent = model
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                attr_name = parts[-1]
+                if attr_name == "inv_freq":
+                    # RoPE inv_freq: 1 / (theta ** (arange(0, dim, 2) / dim))
+                    dim = buf.shape[0] * 2
+                    theta = 10000.0
+                    inv_freq = 1.0 / (
+                        theta
+                        ** (torch.arange(0, dim, 2, device=target).float() / dim)
+                    )
+                    parent.register_buffer(attr_name, inv_freq, persistent=False)
+                else:
+                    real_buf = torch.zeros(
+                        buf.shape, dtype=buf.dtype, device=target
+                    )
+                    parent.register_buffer(attr_name, real_buf, persistent=False)
+
+        # Verify no meta tensors remain
+        from itertools import chain as iterchain
+
+        for n, p in iterchain(model.named_parameters(), model.named_buffers()):
+            if p.is_meta:
+                raise RuntimeError(
+                    f"Unexpected param or buffer {n} on meta device."
+                )
+            if isinstance(p, torch.nn.Parameter):
+                p.requires_grad = False
+
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info("Loaded transformer with %.2fB parameters", total_params / 1e9)
+        return model
+
+    def _load_audio_proj(
+        self, model_path: str, server_args: ServerArgs, device: torch.device
+    ) -> torch.nn.Module:
+        """Extract audio_proj weights from safetensors and load into AudioProjModel."""
+        config_path = os.path.join(model_path, "config.json")
+        with open(config_path) as f:
+            raw_config = json.load(f)
+
+        # Extract audio_proj.* keys from safetensors first to derive dimensions
+        safetensors_list = _list_safetensors_files(model_path)
+        audio_proj_state_dict = {}
+        prefix = "audio_proj."
+        for st_file in safetensors_list:
+            with safe_open(st_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key.startswith(prefix):
+                        stripped_key = key[len(prefix) :]
+                        audio_proj_state_dict[stripped_key] = f.get_tensor(key)
+
+        # Derive dimensions from config and checkpoint shapes
+        num_audio_layers = raw_config.get("num_audio_layers", 12)
+        audio_feat_dim = raw_config.get("audio_feat_dim", 768)
+        audio_window_first = raw_config.get("audio_window", 5)
+
+        # Infer audio_window_vf from proj1_vf weight shape if available
+        audio_window_vf = raw_config.get("audio_window_vf", 12)
+        if "proj1_vf.weight" in audio_proj_state_dict:
+            vf_input_dim = audio_proj_state_dict["proj1_vf.weight"].shape[1]
+            audio_window_vf = vf_input_dim // (num_audio_layers * audio_feat_dim)
+            logger.info(
+                "Inferred audio_window_vf=%d from proj1_vf weight shape %s",
+                audio_window_vf,
+                audio_proj_state_dict["proj1_vf.weight"].shape,
+            )
+
+        # Build AudioProjModel from config
+        audio_proj = AudioProjModel(
+            audio_window_first=audio_window_first,
+            audio_window_vf=audio_window_vf,
+            context_tokens=raw_config.get("context_tokens", 32),
+            output_dim=raw_config.get("output_dim", 768),
+            hidden_dim=raw_config.get("intermediate_dim", 512),
+            num_audio_layers=num_audio_layers,
+            audio_feat_dim=audio_feat_dim,
+        )
+
+        if audio_proj_state_dict:
+            missing, unexpected = audio_proj.load_state_dict(
+                audio_proj_state_dict, strict=False
+            )
+            if missing:
+                logger.warning("AudioProj missing keys: %s", missing)
+            if unexpected:
+                logger.warning("AudioProj unexpected keys: %s", unexpected)
+            logger.info(
+                "Loaded AudioProjModel with %d parameters",
+                sum(p.numel() for p in audio_proj.parameters()),
+            )
+        else:
+            logger.warning(
+                "No audio_proj.* keys found in safetensors; "
+                "AudioProjModel will use random initialization."
+            )
+
+        audio_proj = audio_proj.to(device)
+        audio_proj.eval()
+        return audio_proj
+
+    def _load_vae(
+        self, model_path: str, server_args: ServerArgs, device: torch.device
+    ) -> torch.nn.Module:
+        """Load VAE from Wan2.1_VAE.pth."""
+        vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
+        if not os.path.exists(vae_path):
+            raise FileNotFoundError(f"VAE checkpoint not found: {vae_path}")
+
+        vae_config = server_args.pipeline_config.vae_config
+        vae_precision = server_args.pipeline_config.vae_precision
+        vae_dtype = PRECISION_TO_TYPE[vae_precision]
+
+        # Resolve VAE class from registry
+        vae_cls, _ = ModelRegistry.resolve_model_cls("AutoencoderKLWan")
+
+        should_offload = server_args.vae_cpu_offload
+        target_device = torch.device("cpu") if should_offload else device
+
+        with set_default_torch_dtype(vae_dtype), skip_init_modules():
+            vae = vae_cls(vae_config).to(target_device)
+
+        state_dict = torch.load(vae_path, map_location="cpu", weights_only=True)
+        mapped_sd = self._remap_wan_vae_keys(state_dict, vae_config)
+        del state_dict
+        missing, unexpected = vae.load_state_dict(mapped_sd, strict=False)
+        if missing:
+            logger.warning("VAE missing keys (%d): %s", len(missing), missing[:10])
+        if unexpected:
+            logger.warning(
+                "VAE unexpected keys (%d): %s", len(unexpected), unexpected[:10]
+            )
+        del mapped_sd
+
+        if not should_offload:
+            vae = vae.to(device)
+        vae.eval()
+        logger.info(
+            "Loaded VAE with %d parameters", sum(p.numel() for p in vae.parameters())
+        )
+        return vae
+
+    def _load_text_encoder(
+        self, model_path: str, server_args: ServerArgs, device: torch.device
+    ) -> torch.nn.Module:
+        """Load T5 encoder from models_t5_umt5-xxl-enc-bf16.pth with key remapping."""
+        t5_path = os.path.join(model_path, "models_t5_umt5-xxl-enc-bf16.pth")
+        if not os.path.exists(t5_path):
+            raise FileNotFoundError(f"T5 checkpoint not found: {t5_path}")
+
+        encoder_config = server_args.pipeline_config.text_encoder_configs[0]
+        encoder_precision = server_args.pipeline_config.text_encoder_precisions[0]
+        encoder_dtype = PRECISION_TO_TYPE[encoder_precision]
+
+        # Check if we should use FSDP-based CPU offloading (matching standard loader)
+        should_offload = server_args.text_encoder_cpu_offload
+        arch_config = getattr(encoder_config, "arch_config", encoder_config)
+        fsdp_conditions = getattr(arch_config, "_fsdp_shard_conditions", [])
+        use_fsdp_offload = should_offload and len(fsdp_conditions) > 0
+
+        # Resolve T5 encoder from registry (UMT5EncoderModel for umt5-xxl)
+        model_cls, _ = ModelRegistry.resolve_model_cls("UMT5EncoderModel")
+
+        with set_default_torch_dtype(encoder_dtype), skip_init_modules():
+            model = model_cls(encoder_config)
+
+        state_dict = torch.load(t5_path, map_location="cpu", weights_only=True)
+
+        # Remap Wan's original T5 keys to sglang UMT5EncoderModel keys
+        mapped_sd = self._remap_wan_t5_keys(state_dict)
+        # Use load_weights which handles qkv fusing
+        model.load_weights(mapped_sd.items())
+        del state_dict, mapped_sd
+
+        if use_fsdp_offload:
+            # Use FSDP sharding with CPU offload (auto-moves params to GPU during forward)
+            import torch.distributed as dist
+
+            from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
+            from sglang.multimodal_gen.runtime.platforms import current_platform
+
+            mesh = dist.init_device_mesh(
+                current_platform.device_type,
+                mesh_shape=(1, dist.get_world_size()),
+                mesh_dim_names=("offload", "replicate"),
+            )
+            shard_model(
+                model,
+                cpu_offload=True,
+                reshard_after_forward=True,
+                mesh=mesh["offload"],
+                fsdp_shard_conditions=fsdp_conditions,
+                pin_cpu_memory=server_args.pin_cpu_memory,
+            )
+        else:
+            model = model.to(device)
+
+        model.eval()
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info("Loaded T5 encoder with %.2fB parameters", total_params / 1e9)
+        return model
+
+    @staticmethod
+    def _remap_wan_t5_keys(
+        state_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Remap Wan's original T5 naming to HuggingFace-style T5 keys.
+
+        Wan naming -> HuggingFace T5 naming:
+            token_embedding.weight -> shared.weight
+            norm.weight -> encoder.final_layer_norm.weight
+            blocks.N.norm1.weight -> encoder.block.N.layer.0.layer_norm.weight
+            blocks.N.norm2.weight -> encoder.block.N.layer.1.layer_norm.weight
+            blocks.N.attn.q.weight -> encoder.block.N.layer.0.SelfAttention.q.weight
+            blocks.N.attn.k.weight -> encoder.block.N.layer.0.SelfAttention.k.weight
+            blocks.N.attn.v.weight -> encoder.block.N.layer.0.SelfAttention.v.weight
+            blocks.N.attn.o.weight -> encoder.block.N.layer.0.SelfAttention.o.weight
+            blocks.N.pos_embedding.embedding.weight -> encoder.block.N.layer.0.SelfAttention.relative_attention_bias.weight
+            blocks.N.ffn.gate.0.weight -> encoder.block.N.layer.1.DenseReluDense.wi_0.weight
+            blocks.N.ffn.fc1.weight -> encoder.block.N.layer.1.DenseReluDense.wi_1.weight
+            blocks.N.ffn.fc2.weight -> encoder.block.N.layer.1.DenseReluDense.wo.weight
+        """
+        import re
+
+        mapped = {}
+        for key, tensor in state_dict.items():
+            new_key = None
+
+            if key == "token_embedding.weight":
+                new_key = "shared.weight"
+            elif key == "norm.weight":
+                new_key = "encoder.final_layer_norm.weight"
+            else:
+                m = re.match(r"blocks\.(\d+)\.(.+)", key)
+                if m:
+                    idx = m.group(1)
+                    rest = m.group(2)
+                    block_prefix = f"encoder.block.{idx}"
+
+                    if rest == "norm1.weight":
+                        new_key = f"{block_prefix}.layer.0.layer_norm.weight"
+                    elif rest == "norm2.weight":
+                        new_key = f"{block_prefix}.layer.1.layer_norm.weight"
+                    elif rest == "attn.q.weight":
+                        new_key = f"{block_prefix}.layer.0.SelfAttention.q.weight"
+                    elif rest == "attn.k.weight":
+                        new_key = f"{block_prefix}.layer.0.SelfAttention.k.weight"
+                    elif rest == "attn.v.weight":
+                        new_key = f"{block_prefix}.layer.0.SelfAttention.v.weight"
+                    elif rest == "attn.o.weight":
+                        new_key = f"{block_prefix}.layer.0.SelfAttention.o.weight"
+                    elif rest == "pos_embedding.embedding.weight":
+                        new_key = f"{block_prefix}.layer.0.SelfAttention.relative_attention_bias.weight"
+                    elif rest == "ffn.gate.0.weight":
+                        new_key = f"{block_prefix}.layer.1.DenseReluDense.wi_0.weight"
+                    elif rest == "ffn.fc1.weight":
+                        new_key = f"{block_prefix}.layer.1.DenseReluDense.wi_1.weight"
+                    elif rest == "ffn.fc2.weight":
+                        new_key = f"{block_prefix}.layer.1.DenseReluDense.wo.weight"
+
+            if new_key is not None:
+                mapped[new_key] = tensor
+
+        return mapped
+
+    @staticmethod
+    def _remap_wan_vae_keys(
+        state_dict: dict[str, torch.Tensor],
+        vae_config,
+    ) -> dict[str, torch.Tensor]:
+        """Remap Wan original VAE keys to sglang AutoencoderKLWan keys.
+
+        Original Wan VAE uses flat lists (downsamples/upsamples) with
+        Sequential-style sub-keys (residual.0, residual.2, etc.), while sglang
+        uses hierarchical blocks with named sub-modules (norm1, conv1, etc.).
+
+        Encoder down_blocks are a flat ModuleList matching the checkpoint, so
+        the index mapping is 1:1. Decoder up_blocks are hierarchical
+        (WanUpBlock with resnets + upsamplers), requiring flat→hierarchical
+        index conversion.
+        """
+        import re
+
+        arch_config = getattr(vae_config, "arch_config", vae_config)
+        dim_mult = list(arch_config.dim_mult)
+        num_res_blocks = arch_config.num_res_blocks
+
+        # Sub-key mapping within residual blocks:
+        #   original Sequential indices → sglang named sub-modules
+        _res_sub = {
+            "residual.0.gamma": "norm1.gamma",
+            "residual.2.weight": "conv1.weight",
+            "residual.2.bias": "conv1.bias",
+            "residual.3.gamma": "norm2.gamma",
+            "residual.6.weight": "conv2.weight",
+            "residual.6.bias": "conv2.bias",
+            "shortcut.weight": "conv_shortcut.weight",
+            "shortcut.bias": "conv_shortcut.bias",
+        }
+
+        # Build decoder flat index → (block_idx, type, local_idx)
+        num_blocks = len(dim_mult)
+        resnets_per_block = num_res_blocks + 1  # WanUpBlock adds 1 extra
+        dec_flat_map: dict[int, tuple[int, str, int]] = {}
+        flat_idx = 0
+        for block_idx in range(num_blocks):
+            for resnet_idx in range(resnets_per_block):
+                dec_flat_map[flat_idx] = (block_idx, "resnet", resnet_idx)
+                flat_idx += 1
+            # All blocks except the last have an upsampler
+            if block_idx != num_blocks - 1:
+                dec_flat_map[flat_idx] = (block_idx, "upsampler", 0)
+                flat_idx += 1
+
+        mapped: dict[str, torch.Tensor] = {}
+
+        for key, tensor in state_dict.items():
+            new_key = None
+
+            # --- Top-level quant convs ---
+            if key.startswith("conv1."):
+                new_key = "quant_conv." + key[len("conv1."):]
+            elif key.startswith("conv2."):
+                new_key = "post_quant_conv." + key[len("conv2."):]
+
+            # --- Encoder ---
+            elif key.startswith("encoder.conv1."):
+                new_key = "encoder.conv_in." + key[len("encoder.conv1."):]
+
+            elif key.startswith("encoder.head."):
+                rest = key[len("encoder.head."):]
+                if rest.startswith("0."):
+                    # head.0 = RMS_norm → norm_out
+                    new_key = "encoder.norm_out." + rest[2:]
+                elif rest.startswith("2."):
+                    # head.2 = CausalConv3d → conv_out
+                    new_key = "encoder.conv_out." + rest[2:]
+
+            elif key.startswith("encoder.middle."):
+                rest = key[len("encoder.middle."):]
+                m = re.match(r"^(\d+)\.(.+)$", rest)
+                if m:
+                    mid_idx = int(m.group(1))
+                    sub = m.group(2)
+                    if mid_idx == 0:
+                        # First resnet
+                        mapped_sub = _res_sub.get(sub, sub)
+                        new_key = f"encoder.mid_block.resnets.0.{mapped_sub}"
+                    elif mid_idx == 1:
+                        # Attention block (sub-keys match directly)
+                        new_key = f"encoder.mid_block.attentions.0.{sub}"
+                    elif mid_idx == 2:
+                        # Second resnet
+                        mapped_sub = _res_sub.get(sub, sub)
+                        new_key = f"encoder.mid_block.resnets.1.{mapped_sub}"
+
+            elif key.startswith("encoder.downsamples."):
+                rest = key[len("encoder.downsamples."):]
+                m = re.match(r"^(\d+)\.(.+)$", rest)
+                if m:
+                    idx = int(m.group(1))
+                    sub = m.group(2)
+                    # Encoder down_blocks is a flat list with same indexing
+                    mapped_sub = _res_sub.get(sub, sub)
+                    new_key = f"encoder.down_blocks.{idx}.{mapped_sub}"
+
+            # --- Decoder ---
+            elif key.startswith("decoder.conv1."):
+                new_key = "decoder.conv_in." + key[len("decoder.conv1."):]
+
+            elif key.startswith("decoder.head."):
+                rest = key[len("decoder.head."):]
+                if rest.startswith("0."):
+                    new_key = "decoder.norm_out." + rest[2:]
+                elif rest.startswith("2."):
+                    new_key = "decoder.conv_out." + rest[2:]
+
+            elif key.startswith("decoder.middle."):
+                rest = key[len("decoder.middle."):]
+                m = re.match(r"^(\d+)\.(.+)$", rest)
+                if m:
+                    mid_idx = int(m.group(1))
+                    sub = m.group(2)
+                    if mid_idx == 0:
+                        mapped_sub = _res_sub.get(sub, sub)
+                        new_key = f"decoder.mid_block.resnets.0.{mapped_sub}"
+                    elif mid_idx == 1:
+                        new_key = f"decoder.mid_block.attentions.0.{sub}"
+                    elif mid_idx == 2:
+                        mapped_sub = _res_sub.get(sub, sub)
+                        new_key = f"decoder.mid_block.resnets.1.{mapped_sub}"
+
+            elif key.startswith("decoder.upsamples."):
+                rest = key[len("decoder.upsamples."):]
+                m = re.match(r"^(\d+)\.(.+)$", rest)
+                if m:
+                    idx = int(m.group(1))
+                    sub = m.group(2)
+                    if idx in dec_flat_map:
+                        block_idx, typ, local_idx = dec_flat_map[idx]
+                        if typ == "resnet":
+                            mapped_sub = _res_sub.get(sub, sub)
+                            new_key = (
+                                f"decoder.up_blocks.{block_idx}"
+                                f".resnets.{local_idx}.{mapped_sub}"
+                            )
+                        elif typ == "upsampler":
+                            # Resample sub-keys (resample.1.*, time_conv.*)
+                            # match directly between original and sglang
+                            new_key = (
+                                f"decoder.up_blocks.{block_idx}"
+                                f".upsamplers.0.{sub}"
+                            )
+
+            if new_key is not None:
+                mapped[new_key] = tensor
+            else:
+                logger.warning("VAE key not mapped: %s", key)
+                mapped[key] = tensor
+
+        return mapped
+
+    def _load_image_encoder(
+        self, model_path: str, server_args: ServerArgs, device: torch.device
+    ) -> torch.nn.Module:
+        """Load CLIP image encoder from .pth file with OpenCLIP->sglang key mapping."""
+        clip_pattern = "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+        clip_path = os.path.join(model_path, clip_pattern)
+        if not os.path.exists(clip_path):
+            logger.warning(
+                "CLIP checkpoint not found at %s; image encoder will not be loaded.",
+                clip_path,
+            )
+            return None
+
+        encoder_config = server_args.pipeline_config.image_encoder_config
+        encoder_precision = server_args.pipeline_config.image_encoder_precision
+        encoder_dtype = PRECISION_TO_TYPE[encoder_precision]
+
+        should_offload = server_args.image_encoder_cpu_offload
+        target_device = torch.device("cpu") if should_offload else device
+
+        model_cls, _ = ModelRegistry.resolve_model_cls("CLIPVisionModel")
+
+        with set_default_torch_dtype(encoder_dtype), skip_init_modules():
+            model = model_cls(encoder_config)
+
+        state_dict = torch.load(clip_path, map_location="cpu", weights_only=True)
+
+        # Remap OpenCLIP visual keys to sglang CLIPVisionModel keys
+        mapped_sd = self._remap_openclip_visual_keys(state_dict, model)
+        missing, unexpected = model.load_state_dict(mapped_sd, strict=False)
+        if missing:
+            logger.warning(
+                "CLIP missing keys (%d): %s", len(missing), missing[:10]
+            )
+        if unexpected:
+            logger.warning(
+                "CLIP unexpected keys (%d): %s", len(unexpected), unexpected[:10]
+            )
+        del state_dict, mapped_sd
+
+        model = model.to(target_device)
+        model.eval()
+        logger.info(
+            "Loaded CLIP image encoder with %d parameters",
+            sum(p.numel() for p in model.parameters()),
+        )
+        return model
+
+    @staticmethod
+    def _remap_openclip_visual_keys(
+        state_dict: dict[str, torch.Tensor],
+        model: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        """Remap OpenCLIP visual.* keys to sglang CLIPVisionModel keys.
+
+        OpenCLIP naming:
+            visual.cls_embedding -> vision_model.embeddings.class_embedding
+            visual.patch_embedding.weight -> vision_model.embeddings.patch_embedding.weight
+            visual.pos_embedding -> vision_model.embeddings.position_embedding.weight
+            visual.pre_norm.* -> vision_model.pre_layrnorm.*
+            visual.post_norm.* -> vision_model.post_layernorm.*
+            visual.transformer.N.norm1.* -> vision_model.encoder.layers.N.layer_norm1.*
+            visual.transformer.N.norm2.* -> vision_model.encoder.layers.N.layer_norm2.*
+            visual.transformer.N.attn.to_qkv.* -> vision_model.encoder.layers.N.self_attn.qkv_proj.*
+            visual.transformer.N.attn.proj.* -> vision_model.encoder.layers.N.self_attn.out_proj.*
+            visual.transformer.N.mlp.0.* -> vision_model.encoder.layers.N.mlp.fc1.*
+            visual.transformer.N.mlp.2.* -> vision_model.encoder.layers.N.mlp.fc2.*
+            visual.head -> visual_projection.weight (if present)
+        """
+        import re
+
+        mapped = {}
+        prefix = "visual."
+
+        for key, tensor in state_dict.items():
+            if not key.startswith(prefix):
+                continue
+            vkey = key[len(prefix) :]
+
+            new_key = None
+            if vkey == "cls_embedding":
+                # Shape (1,1,D) -> (D,) for class_embedding
+                new_key = "vision_model.embeddings.class_embedding"
+                tensor = tensor.squeeze()
+            elif vkey == "patch_embedding.weight":
+                new_key = "vision_model.embeddings.patch_embedding.weight"
+            elif vkey == "pos_embedding":
+                new_key = "vision_model.embeddings.position_embedding.weight"
+                # Shape (1, S, D) -> (S, D)
+                tensor = tensor.squeeze(0)
+            elif vkey.startswith("pre_norm."):
+                suffix = vkey[len("pre_norm.") :]
+                new_key = f"vision_model.pre_layrnorm.{suffix}"
+            elif vkey.startswith("post_norm."):
+                suffix = vkey[len("post_norm.") :]
+                new_key = f"vision_model.post_layernorm.{suffix}"
+            else:
+                # Transformer layers
+                m = re.match(r"transformer\.(\d+)\.(.+)", vkey)
+                if m:
+                    layer_idx = m.group(1)
+                    rest = m.group(2)
+                    layer_prefix = f"vision_model.encoder.layers.{layer_idx}"
+
+                    if rest.startswith("attn.to_qkv."):
+                        suffix = rest[len("attn.to_qkv.") :]
+                        new_key = f"{layer_prefix}.self_attn.qkv_proj.{suffix}"
+                    elif rest.startswith("attn.proj."):
+                        suffix = rest[len("attn.proj.") :]
+                        new_key = f"{layer_prefix}.self_attn.out_proj.{suffix}"
+                    elif rest.startswith("norm1."):
+                        suffix = rest[len("norm1.") :]
+                        new_key = f"{layer_prefix}.layer_norm1.{suffix}"
+                    elif rest.startswith("norm2."):
+                        suffix = rest[len("norm2.") :]
+                        new_key = f"{layer_prefix}.layer_norm2.{suffix}"
+                    elif rest.startswith("mlp.0."):
+                        suffix = rest[len("mlp.0.") :]
+                        new_key = f"{layer_prefix}.mlp.fc1.{suffix}"
+                    elif rest.startswith("mlp.2."):
+                        suffix = rest[len("mlp.2.") :]
+                        new_key = f"{layer_prefix}.mlp.fc2.{suffix}"
+
+            if new_key is not None:
+                mapped[new_key] = tensor
+
+        # Also check if visual.head should map to visual_projection
+        if "visual.head" in state_dict:
+            mapped["visual_projection.weight"] = state_dict["visual.head"]
+
+        return mapped
+
+    @staticmethod
+    def _create_image_processor():
+        """Create a default CLIPImageProcessor for ViT-Huge-14 (224x224)."""
+        try:
+            from transformers import CLIPImageProcessor
+
+            return CLIPImageProcessor(
+                size={"shortest_edge": 224},
+                crop_size={"height": 224, "width": 224},
+                do_resize=True,
+                do_center_crop=True,
+                do_normalize=True,
+                image_mean=[0.48145466, 0.4578275, 0.40821073],
+                image_std=[0.26862954, 0.26130258, 0.27577711],
+            )
+        except Exception as e:
+            logger.warning("Could not create CLIPImageProcessor: %s", e)
+            return None
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Set up pipeline stages with proper dependency injection."""

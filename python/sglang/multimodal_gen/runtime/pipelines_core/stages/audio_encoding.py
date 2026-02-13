@@ -165,7 +165,7 @@ class AudioEncodingStage(PipelineStage):
             batch.extra.get("audio_path") is not None
             or batch.extra.get("audio_tensor") is not None
         )
-        result.add_check("audio_input", has_audio, V.is_true)
+        result.add_check("audio_input", has_audio, lambda x: x is True)
         return result
 
     def verify_output(

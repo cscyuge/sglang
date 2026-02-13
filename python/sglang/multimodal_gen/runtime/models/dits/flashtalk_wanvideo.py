@@ -13,6 +13,9 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.models.dits.wanvideo import (
+    FlashTalkWanVideoArchConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -245,10 +248,13 @@ class FlashTalkWanTransformer3DModel(WanTransformer3DModel):
     passes audio_context through to each block.
     """
 
-    def __init__(self, config: WanVideoConfig) -> None:
+    # Override with FlashTalk original->sglang mapping (instead of diffusers->sglang)
+    param_names_mapping = FlashTalkWanVideoArchConfig().param_names_mapping
+
+    def __init__(self, config: WanVideoConfig, hf_config: dict | None = None) -> None:
         # We override __init__ to use FlashTalkWanTransformerBlock
         # Call grandparent init to skip WanTransformer3DModel's block creation
-        CachableDiT.__init__(self, config)
+        CachableDiT.__init__(self, config, hf_config=hf_config or {})
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
         self.inner_dim = inner_dim

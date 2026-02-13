@@ -68,6 +68,14 @@ class FlashTalkDenoisingStage(PipelineStage):
         device = get_local_torch_device()
         dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
 
+        # Move transformer to GPU if CPU-offloaded
+        if (
+            server_args.dit_cpu_offload
+            and not server_args.use_fsdp_inference
+            and next(self.transformer.parameters()).device.type == "cpu"
+        ):
+            self.transformer.to(device)
+
         latents = batch.latents.to(device=device, dtype=dit_dtype)
         timesteps = batch.timesteps
         audio_context = batch.extra.get("audio_context")
@@ -136,6 +144,8 @@ class FlashTalkDenoisingStage(PipelineStage):
                 latents[:, :n_motion] = motion_latent
 
         generator = batch.generator
+        if isinstance(generator, list):
+            generator = generator[0] if generator else None
 
         autocast_enabled = dit_dtype != torch.float32 and not getattr(
             server_args, "disable_autocast", False
@@ -161,6 +171,8 @@ class FlashTalkDenoisingStage(PipelineStage):
                     ),
                 ):
                     t_i = timesteps[i]
+                    if t_i.dim() == 0:
+                        t_i = t_i.unsqueeze(0)
 
                     # Prepare model input
                     latent_model_input = latents.to(dit_dtype)
@@ -187,7 +199,10 @@ class FlashTalkDenoisingStage(PipelineStage):
 
                     # Flow matching update step
                     t_cur = t_i[:, None, None, None] / num_timesteps
-                    t_next = timesteps[i + 1][:, None, None, None] / num_timesteps
+                    t_next_val = timesteps[i + 1]
+                    if t_next_val.dim() == 0:
+                        t_next_val = t_next_val.unsqueeze(0)
+                    t_next = t_next_val[:, None, None, None] / num_timesteps
                     x_0 = latents + noise_pred * t_cur
                     latents = (1 - t_next) * x_0 + t_next * torch.randn(
                         x_0.size(),
@@ -218,6 +233,11 @@ class FlashTalkDenoisingStage(PipelineStage):
             batch.extra["motion_latent_output"] = latents[
                 :, :, -motion_frames_num:
             ].clone()
+
+        # Offload transformer back to CPU if needed
+        if server_args.dit_cpu_offload and not server_args.use_fsdp_inference:
+            self.transformer.to("cpu")
+            torch.cuda.empty_cache()
 
         return batch
 
@@ -396,13 +416,14 @@ class FlashTalkColorCorrectionStage(PipelineStage):
         enable = getattr(
             server_args.pipeline_config, "enable_lab_color_correction", False
         )
-        strength = batch.extra.get("color_correction_strength", 1.0)
+        extra = getattr(batch, "extra", {}) or {}
+        strength = extra.get("color_correction_strength", 1.0)
 
         if not enable or strength <= 0.0 or batch.output is None:
             return batch
 
         # Get reference image (the condition image)
-        reference = batch.extra.get("color_reference")
+        reference = extra.get("color_reference")
         if reference is None:
             return batch
 
