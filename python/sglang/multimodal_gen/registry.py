@@ -379,34 +379,33 @@ def get_model_info(
     # 1. Discover all available pipeline classes and cache them
     _discover_and_register_pipelines()
 
-    # 2. Get pipeline class from model's model_index.json
+    # 2. Try registry detectors first (for non-diffusers models like FlashTalk)
+    try:
+        config_info = _get_config_info(model_path)
+    except Exception:
+        config_info = None
+    if config_info and config_info.pipeline_name:
+        pipeline_cls = _PIPELINE_REGISTRY.get(config_info.pipeline_name)
+        if pipeline_cls:
+            logger.info(
+                "Resolved model '%s' via registry detector (pipeline=%s)",
+                model_path,
+                config_info.pipeline_name,
+            )
+            return ModelInfo(
+                pipeline_cls=pipeline_cls,
+                sampling_param_cls=config_info.sampling_param_cls,
+                pipeline_config_cls=config_info.pipeline_config_cls,
+            )
+
+    # 3. Get pipeline class from model's model_index.json
     try:
         if os.path.exists(model_path):
             config = verify_model_config_and_directory(model_path)
         else:
             config = maybe_download_model_index(model_path)
     except Exception as e:
-        logger.error(f"Could not read model config for '{model_path}': {e}")
-        # Before falling back to diffusers, try registry detectors
-        # for non-diffusers models (e.g. safetensors-only models like FlashTalk)
-        config_info = None
-        try:
-            config_info = _get_config_info(model_path)
-        except Exception:
-            pass
-        if config_info and config_info.pipeline_name:
-            pipeline_cls = _PIPELINE_REGISTRY.get(config_info.pipeline_name)
-            if pipeline_cls:
-                logger.info(
-                    "Resolved model '%s' via registry detector (pipeline=%s)",
-                    model_path,
-                    config_info.pipeline_name,
-                )
-                return ModelInfo(
-                    pipeline_cls=pipeline_cls,
-                    sampling_param_cls=config_info.sampling_param_cls,
-                    pipeline_config_cls=config_info.pipeline_config_cls,
-                )
+        logger.warning(f"Could not read model config for '{model_path}': {e}")
         if backend == Backend.AUTO:
             logger.info("Falling back to diffusers backend")
             return _get_diffusers_model_info(model_path)
