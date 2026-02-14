@@ -233,6 +233,18 @@ class FlashTalkWanTransformerBlock(WanTransformerBlock):
             )
             hidden_states = hidden_states + audio_output
 
+            # Recompute FFN input norm to include audio contribution.
+            # Original FlashTalk: ffn(norm2(x) * (1 + scale) + shift) where x
+            # includes audio output. Without this, the FFN misses the audio
+            # signal, causing progressive quality degradation in multi-chunk
+            # generation.
+            norm_hidden_states = self.cross_attn_residual_norm.norm(
+                hidden_states
+            )
+            norm_hidden_states = (
+                norm_hidden_states.float() * (1 + c_scale_msa) + c_shift_msa
+            ).to(orig_dtype)
+
         # 4. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
         hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
@@ -367,12 +379,13 @@ class FlashTalkWanTransformer3DModel(WanTransformer3DModel):
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
-        if (
-            isinstance(encoder_hidden_states_image, list)
-            and len(encoder_hidden_states_image) > 0
-        ):
-            encoder_hidden_states_image = encoder_hidden_states_image[0]
-        else:
+        if isinstance(encoder_hidden_states_image, list):
+            encoder_hidden_states_image = (
+                encoder_hidden_states_image[0]
+                if len(encoder_hidden_states_image) > 0
+                else None
+            )
+        elif not isinstance(encoder_hidden_states_image, torch.Tensor):
             encoder_hidden_states_image = None
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape

@@ -93,8 +93,20 @@ class FlashTalkPipelineConfig(WanI2V720PConfig):
     # Motion frame caching for streaming
     motion_frames_num: int = 5
 
+    # Per-chunk frame count for multi-chunk generation (model training value).
+    # SP may pad batch.num_frames for GPU divisibility (e.g. 33→61 with 8 GPUs),
+    # but the model was trained on 33-frame chunks. This value overrides
+    # batch.num_frames inside the multi-chunk loop.
+    chunk_frame_num: int = 33
+
     # Lab color correction
     enable_lab_color_correction: bool = True
+
+    # Cached audio duration for per-chunk sliding window (seconds).
+    # Matches original FlashTalk's ``cached_audio_duration`` in infer_params.
+    # Each chunk's audio is processed with an 8-second sliding deque padded
+    # with silence at the beginning, matching the original streaming behavior.
+    cached_audio_duration: int = 8
 
     # Default FlashTalk resolution
     max_area: int = 768 * 448

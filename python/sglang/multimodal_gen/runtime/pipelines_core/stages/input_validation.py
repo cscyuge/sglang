@@ -182,15 +182,32 @@ class InputValidationStage(PipelineStage):
                     0
                 ]  # not support multi image input yet.
 
-            max_area = server_args.pipeline_config.max_area
-            aspect_ratio = condition_image_height / condition_image_width
             mod_value = (
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
-            width, height = self._calculate_dimensions_from_area(
-                max_area, aspect_ratio, mod_value
+
+            # Use user-specified dimensions if provided and valid,
+            # otherwise calculate from image aspect ratio and max_area.
+            sp = batch.sampling_params
+            user_w = getattr(sp, "width", None) if sp else None
+            user_h = getattr(sp, "height", None) if sp else None
+            user_provided = (
+                user_w is not None
+                and user_h is not None
+                and not getattr(sp, "width_not_provided", True)
+                and not getattr(sp, "height_not_provided", True)
+                and user_w % mod_value == 0
+                and user_h % mod_value == 0
             )
+            if user_provided:
+                width, height = user_w, user_h
+            else:
+                max_area = server_args.pipeline_config.max_area
+                aspect_ratio = condition_image_height / condition_image_width
+                width, height = self._calculate_dimensions_from_area(
+                    max_area, aspect_ratio, mod_value
+                )
 
             batch.condition_image = batch.condition_image.resize((width, height))
             batch.height = height

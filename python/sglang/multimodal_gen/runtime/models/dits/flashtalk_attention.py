@@ -18,7 +18,12 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
+    get_sp_group,
+    get_sp_world_size,
     get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 
@@ -163,11 +168,12 @@ class FlashTalkAudioCrossAttention(nn.Module):
             q_flat = self.q_norm(q_flat)
             q = q_flat.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        # KV from audio
+        # KV from audio — use "split" layout (all K first, all V second)
+        # matching the original checkpoint's view(B, N_a, 2, H, D) convention.
         _, N_a, _ = encoder_hidden_states.shape
         kv, _ = self.kv_linear(encoder_hidden_states)
-        kv = kv.unflatten(2, (self.local_num_heads, self.head_dim * 2))
-        k, v = kv.chunk(2, dim=-1)
+        kv = kv.unflatten(2, (2, self.local_num_heads, self.head_dim))
+        k, v = kv[:, :, 0], kv[:, :, 1]
         if self.qk_norm:
             k_flat = k.flatten(2)
             k_flat = self.k_norm(k_flat)
@@ -232,11 +238,12 @@ class FlashTalkAudioCrossAttention(nn.Module):
         q = self.rope_1d(q, normalized_pos)
         q = rearrange(q, "B H (N_t S) D -> (B N_t) S H D", N_t=N_t)
 
-        # KV from audio
+        # KV from audio — use "split" layout (all K first, all V second)
+        # matching the original checkpoint's view(B, N_a, 2, H, D) convention.
         _, N_a, _ = encoder_hidden_states.shape
         kv, _ = self.kv_linear(encoder_hidden_states)
-        kv = kv.unflatten(2, (self.local_num_heads, self.head_dim * 2))
-        k, v = kv.chunk(2, dim=-1)
+        kv = kv.unflatten(2, (2, self.local_num_heads, self.head_dim))
+        k, v = kv[:, :, 0], kv[:, :, 1]
         if self.qk_norm:
             k_flat = k.flatten(2)
             k_flat = self.k_norm(k_flat)
@@ -271,14 +278,14 @@ class FlashTalkAudioCrossAttention(nn.Module):
         """Forward pass for audio cross-attention.
 
         Args:
-            x: (B, N_t * S, C) video latent tokens
+            x: (B, N_t * S, C) or (B, local_seq, C) when SP-sharded
             encoder_hidden_states: (B_t, context_tokens, audio_dim) audio context
-            shape: (N_t, N_h, N_w) temporal and spatial dimensions
+            shape: (N_t, N_h, N_w) temporal and spatial dimensions (full, pre-SP)
             x_ref_attn_map: optional attention map for multi-person separation
             human_num: number of people in the video
 
         Returns:
-            (B, N_t * S, C) output after audio cross-attention
+            (B, seq, C) output after audio cross-attention, same shape as input
         """
         N_t = shape[0]
         encoder_hidden_states = encoder_hidden_states.squeeze(0)
@@ -297,6 +304,35 @@ class FlashTalkAudioCrossAttention(nn.Module):
             else:
                 # Truncate
                 encoder_hidden_states = encoder_hidden_states[:N_t]
+
+        sp_size = get_sp_world_size()
+
+        if sp_size > 1:
+            # When SP is active, x is a shard of the flattened sequence. The
+            # audio cross-attention groups tokens by temporal step (each step
+            # attends to its own audio context). With SP sharding by flat index,
+            # each GPU's shard spans partial temporal steps, so the naive
+            # rearrange(x, "B (N_t S) C -> ...") would assign the wrong audio
+            # context to tokens.
+            #
+            # Fix: all-gather the full sequence, perform audio cross-attention
+            # on the full (correctly-grouped) sequence, then take back our shard.
+            sp_rank = get_sp_group().rank_in_group
+            local_seq = x.shape[1]
+            x_full = sequence_model_parallel_all_gather(x, dim=1)
+
+            if human_num == 1 or x_ref_attn_map is None:
+                out_full = self._single_person_forward(
+                    x_full, encoder_hidden_states, N_t
+                )
+            else:
+                out_full = self._multi_person_forward(
+                    x_full, encoder_hidden_states, N_t, x_ref_attn_map
+                )
+
+            # Take this rank's shard back
+            start = sp_rank * local_seq
+            return out_full[:, start : start + local_seq, :].contiguous()
 
         if human_num == 1 or x_ref_attn_map is None:
             return self._single_person_forward(x, encoder_hidden_states, N_t)

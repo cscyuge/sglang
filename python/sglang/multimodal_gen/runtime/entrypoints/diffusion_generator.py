@@ -274,6 +274,7 @@ class DiffGenerator:
                         lambda idx: req.output_file_path(len(output_batch.output), idx),
                         audio=output_batch.audio,
                         audio_sample_rate=audio_sample_rate,
+                        audio_path=output_batch.audio_path,
                         samples_out=samples_out,
                         audios_out=audios_out,
                         frames_out=frames_out,

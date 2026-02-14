@@ -189,3 +189,84 @@ class AudioProjModel(nn.Module):
             B, N_t, self.context_tokens, self.output_dim
         )
         return context_tokens
+
+    def forward_prewindowed(
+        self,
+        windowed_features: torch.Tensor,
+        vae_temporal_factor: int = 4,
+    ) -> torch.Tensor:
+        """Project pre-windowed audio features into context tokens.
+
+        Accepts features that have already been windowed externally (matching
+        the original FlashTalk's ``get_audio_embedding`` which windows on the
+        full wav2vec2 output before slicing per chunk).
+
+        Args:
+            windowed_features: (B, num_video_frames, window_size, num_layers, feat_dim)
+                Pre-windowed audio features for this chunk.
+            vae_temporal_factor: VAE temporal compression factor (default 4).
+
+        Returns:
+            (B, N_t, context_tokens, output_dim) audio context for DiT.
+        """
+        B, num_video_frames, window_size, num_layers, feat_dim = (
+            windowed_features.shape
+        )
+        N_t = 1 + (num_video_frames - 1) // vae_temporal_factor
+
+        # --- First latent temporal step (t=0) ---
+        # (B, 1, window, layers, dim) → flatten → proj1
+        first_frame = windowed_features[:, :1]  # (B, 1, 5, L, D)
+        first_flat = first_frame.reshape(B, -1)  # (B, 5*L*D)
+        first_out = torch.relu(self.proj1(first_flat))  # (B, hidden)
+        first_out = first_out.unsqueeze(1)  # (B, 1, hidden)
+
+        # --- Subsequent latent temporal steps (t=1..N_t-1) ---
+        n_subsequent_steps = N_t - 1
+
+        if n_subsequent_steps > 0:
+            subsequent = windowed_features[:, 1:]  # (B, 32, 5, L, D)
+            # Group by vae_temporal_factor: (B, N_t-1, vae_scale, window, L, D)
+            grouped = subsequent.reshape(
+                B,
+                n_subsequent_steps,
+                vae_temporal_factor,
+                window_size,
+                num_layers,
+                feat_dim,
+            )
+            mid = window_size // 2  # 2
+
+            # Sub-sample matching the original FlashTalk pattern:
+            # first sub-frame: window[:mid+1], middle sub-frames: center,
+            # last sub-frame: window[mid:]
+            first_sub = grouped[:, :, :1, : mid + 1].reshape(
+                B, n_subsequent_steps, mid + 1, num_layers, feat_dim
+            )
+            middle_sub = grouped[:, :, 1:-1, mid : mid + 1].reshape(
+                B, n_subsequent_steps, vae_temporal_factor - 2, num_layers, feat_dim
+            )
+            last_sub = grouped[:, :, -1:, mid:].reshape(
+                B, n_subsequent_steps, window_size - mid, num_layers, feat_dim
+            )
+
+            combined = torch.cat([first_sub, middle_sub, last_sub], dim=2)
+            combined_flat = combined.reshape(B * n_subsequent_steps, -1)
+            subsequent_out = torch.relu(self.proj1_vf(combined_flat))
+            subsequent_out = subsequent_out.reshape(B, n_subsequent_steps, -1)
+        else:
+            subsequent_out = first_out[:, :0]
+
+        # --- Shared projection ---
+        all_out = torch.cat([first_out, subsequent_out], dim=1)  # (B, N_t, hidden)
+        BN = B * N_t
+        all_out = all_out.reshape(BN, -1)
+
+        all_out = torch.relu(self.proj2(all_out))
+        context_tokens = self.proj3(all_out)
+        context_tokens = context_tokens.reshape(BN, self.context_tokens, self.output_dim)
+
+        with autocast(enabled=False):
+            context_tokens = self.norm(context_tokens.float())
+
+        return context_tokens.reshape(B, N_t, self.context_tokens, self.output_dim)

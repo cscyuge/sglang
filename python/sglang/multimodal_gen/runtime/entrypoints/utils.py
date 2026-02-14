@@ -166,6 +166,49 @@ def _mux_audio_np_into_mp4(
                 pass
 
 
+def _mux_audio_file_into_mp4(
+    *,
+    save_file_path: str,
+    audio_file_path: str,
+    ffmpeg_exe: str,
+) -> None:
+    """Mux audio from an existing file into an mp4 using -shortest."""
+    import tempfile
+
+    dir_name = os.path.dirname(save_file_path)
+    merged_fd, merged_path = tempfile.mkstemp(suffix=".mp4", dir=dir_name or ".")
+    os.close(merged_fd)
+    try:
+        subprocess.run(
+            [
+                ffmpeg_exe,
+                "-y",
+                "-i",
+                save_file_path,
+                "-i",
+                audio_file_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-strict",
+                "experimental",
+                "-shortest",
+                merged_path,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.replace(merged_path, save_file_path)
+    finally:
+        if os.path.exists(merged_path):
+            try:
+                os.remove(merged_path)
+            except OSError:
+                pass
+
+
 def _maybe_mux_audio_into_mp4(
     *,
     save_file_path: str,
@@ -173,11 +216,29 @@ def _maybe_mux_audio_into_mp4(
     frames: list,
     fps: int,
     audio_sample_rate: Optional[int],
+    audio_path: Optional[str] = None,
 ) -> None:
     """Best-effort mux audio into an already-written mp4 at save_file_path.
 
     Any failure should keep the silent video and only log a warning.
     """
+    # If an audio file path is provided, mux directly from it
+    if audio_path is not None and os.path.isfile(audio_path):
+        try:
+            ffmpeg_exe = _resolve_ffmpeg_exe()
+            _mux_audio_file_into_mp4(
+                save_file_path=save_file_path,
+                audio_file_path=audio_path,
+                ffmpeg_exe=ffmpeg_exe,
+            )
+            logger.info(f"Merged video saved to {CYAN}{save_file_path}{RESET}")
+        except Exception as e:
+            logger.warning(
+                "Failed to mux audio file into mp4 (saved silent video): %s",
+                str(e),
+            )
+        return
+
     audio_np = _normalize_audio_to_numpy(audio)
     if audio_np is None:
         return
@@ -271,6 +332,7 @@ def save_outputs(
     *,
     audio: Any = None,
     audio_sample_rate: Optional[int] = None,
+    audio_path: Optional[str] = None,
     samples_out: Optional[list[Any]] = None,
     audios_out: Optional[list[Any]] = None,
     frames_out: Optional[list[Any]] = None,
@@ -289,6 +351,7 @@ def save_outputs(
             save_output,
             save_file_path,
             audio_sample_rate=audio_sample_rate,
+            audio_path=audio_path,
         )
         if samples_out is not None:
             samples_out.append(sample)
@@ -315,6 +378,7 @@ def post_process_sample(
     save_output: bool = True,
     save_file_path: Optional[str] = None,
     audio_sample_rate: Optional[int] = None,
+    audio_path: Optional[str] = None,
 ):
     """
     Process sample output and save video if necessary
@@ -377,6 +441,7 @@ def post_process_sample(
                     frames=frames,
                     fps=fps,
                     audio_sample_rate=audio_sample_rate,
+                    audio_path=audio_path,
                 )
 
             else:

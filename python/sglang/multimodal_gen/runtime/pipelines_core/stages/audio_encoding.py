@@ -163,7 +163,11 @@ class AudioEncodingStage(PipelineStage):
             )
         # audio_features: (B, num_video_frames, num_layers, feat_dim)
 
-        # Project through AudioProjModel
+        # Store raw wav2vec features for multi-chunk slicing
+        batch.extra["audio_features_all"] = audio_features
+        batch.extra["total_audio_video_frames"] = num_video_frames
+
+        # Project through AudioProjModel (for single-chunk backward compat)
         vae_temporal_factor = (
             server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
             if hasattr(server_args.pipeline_config, "vae_config")
@@ -175,6 +179,14 @@ class AudioEncodingStage(PipelineStage):
         # audio_context: (B, N_t, context_tokens, output_dim)
 
         batch.extra["audio_context"] = audio_context
+
+        # Store raw audio info for multi-chunk per-chunk processing
+        if isinstance(speech_array, np.ndarray):
+            batch.extra["raw_audio_array"] = speech_array
+        else:
+            batch.extra["raw_audio_array"] = speech_array.cpu().numpy()
+        batch.extra["audio_sample_rate"] = sample_rate
+        batch.extra["audio_fps"] = fps
 
         self.offload_model()
         return batch

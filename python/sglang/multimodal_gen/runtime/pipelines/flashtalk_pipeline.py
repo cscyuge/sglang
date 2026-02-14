@@ -38,10 +38,17 @@ from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    DiagonalGaussianDistribution,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     ConditioningStage,
     DecodingStage,
@@ -984,6 +991,426 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             stage_name="color_correction_stage",
             stage=FlashTalkColorCorrectionStage(),
+        )
+
+    # ------------------------------------------------------------------
+    # Multi-chunk generation
+    # ------------------------------------------------------------------
+
+    def _find_denoising_stage_index(self) -> int:
+        """Return the index of the FlashTalkDenoisingStage in self.stages."""
+        for i, stage in enumerate(self.stages):
+            if isinstance(stage, FlashTalkDenoisingStage):
+                return i
+        raise RuntimeError("FlashTalkDenoisingStage not found in pipeline stages")
+
+    @torch.no_grad()
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+        """Multi-chunk FlashTalk generation.
+
+        Runs one-time stages (input validation through image VAE encoding),
+        then loops over audio chunks: for each chunk, slices audio features,
+        re-creates noise latents, denoises, decodes, applies color correction,
+        and re-encodes the last ``motion_frames_num`` decoded frames as the
+        motion latent for the next chunk.
+        """
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang.multimodal_gen.utils import PRECISION_TO_TYPE as _P2T
+
+        if not batch.is_warmup and not batch.suppress_logs:
+            logger.info(
+                "Running FlashTalk pipeline stages: %s",
+                list(self._stage_name_mapping.keys()),
+                main_process_only=True,
+            )
+
+        denoising_idx = self._find_denoising_stage_index()
+
+        # --- Run one-time stages (0 .. denoising_idx-1) ---
+        for stage in self.stages[:denoising_idx]:
+            batch = stage.forward(batch, server_args)
+
+        # --- Check if multi-chunk is needed ---
+        pipeline_config = server_args.pipeline_config
+
+        vae_temporal_factor = (
+            pipeline_config.vae_config.arch_config.scale_factor_temporal
+            if hasattr(pipeline_config, "vae_config")
+            else 4
+        )
+
+        # Use the training-expected chunk size (33 frames), NOT the SP-padded
+        # batch.num_frames (which may be 61 for 8-GPU divisibility).
+        # FlashTalk was trained on 33-frame chunks and the model architecture
+        # (AudioProj, motion latent, denoising) all expect this frame count.
+        chunk_frame_num = getattr(pipeline_config, "chunk_frame_num", 33)
+        motion_frames_num = pipeline_config.motion_frames_num  # 5
+
+        audio_features_all = batch.extra.get("audio_features_all")
+        total_audio_video_frames = batch.extra.get("total_audio_video_frames", 0)
+
+        # If no audio features or audio is short enough for a single chunk,
+        # fall back to default single-chunk pipeline
+        if audio_features_all is None or total_audio_video_frames <= chunk_frame_num:
+            for stage in self.stages[denoising_idx:]:
+                result = stage.forward(batch, server_args)
+                if isinstance(result, OutputBatch):
+                    return result
+                batch = result
+            return OutputBatch(output=batch.output, timings=batch.timings)
+
+        # --- Multi-chunk mode: override SP-padded frame count ---
+        frame_num = chunk_frame_num  # 33
+        slice_len = frame_num - motion_frames_num  # 28
+
+        # Override batch.num_frames so latent_prep_stage creates correctly-sized
+        # noise latents (9 temporal steps instead of 16).
+        batch.num_frames = frame_num
+
+        # Slice image_latent to match chunk temporal dimensions.
+        # SP padding produced extra zero temporal steps that we don't need.
+        chunk_latent_num_frames = (frame_num - 1) // vae_temporal_factor + 1  # 9
+        if (
+            batch.image_latent is not None
+            and batch.image_latent.shape[2] > chunk_latent_num_frames
+        ):
+            logger.info(
+                "Slicing image_latent temporal dim from %d to %d for %d-frame chunks",
+                batch.image_latent.shape[2],
+                chunk_latent_num_frames,
+                frame_num,
+            )
+            batch.image_latent = batch.image_latent[
+                :, :, :chunk_latent_num_frames, :, :
+            ]
+
+        # Match the original FlashTalk chunk count formula.
+        # The original runs chunk_count+1 iterations: first chunk (from image) plus
+        # chunk_count subsequent chunks with motion frame carry-over.
+        num_chunks = (total_audio_video_frames - frame_num) // slice_len + 1
+
+        # Debug: limit chunks for faster testing
+        _debug_max_chunks = int(
+            os.environ.get("FLASHTALK_MAX_CHUNKS", "0")
+        )
+        if _debug_max_chunks > 0:
+            num_chunks = min(num_chunks, _debug_max_chunks)
+
+        logger.info(
+            "Multi-chunk generation: %d chunks (total_frames=%d, frame_num=%d, "
+            "slice_len=%d, motion_frames=%d)",
+            num_chunks,
+            total_audio_video_frames,
+            frame_num,
+            slice_len,
+            motion_frames_num,
+        )
+
+        # --- Stage references ---
+        latent_prep_stage = None
+        for stage in self.stages:
+            if isinstance(stage, LatentPreparationStage):
+                latent_prep_stage = stage
+                break
+        if latent_prep_stage is None:
+            raise RuntimeError("LatentPreparationStage not found in pipeline stages")
+        denoising_stage = self.stages[denoising_idx]
+        decoding_stage = self.stages[denoising_idx + 1]
+        color_correction_stage = self.stages[denoising_idx + 2]
+
+        # --- Audio proj + VAE references ---
+        audio_proj = self.get_module("audio_proj")
+        audio_encoder = self.get_module("audio_encoder")
+        wav2vec_feature_extractor = self.get_module("wav2vec_feature_extractor")
+        vae = self.get_module("vae")
+        device = get_local_torch_device()
+
+        # --- Per-chunk sliding window audio setup ---
+        # Match original FlashTalk's streaming audio processing:
+        # - 8-second sliding deque (silence-padded)
+        # - Per-chunk loudness normalization + wav2vec2 processing
+        # - Extract last frame_num frames from the wav2vec2 output
+        import numpy as np
+        from collections import deque
+
+        raw_audio_array = batch.extra.get("raw_audio_array")
+        sample_rate = batch.extra.get("audio_sample_rate", 16000)
+        fps = batch.extra.get("audio_fps", 25)
+        cached_audio_duration = getattr(
+            pipeline_config, "cached_audio_duration", 8
+        )
+
+        use_streaming_audio = raw_audio_array is not None and audio_encoder is not None
+
+        if use_streaming_audio:
+            cached_audio_length = sample_rate * cached_audio_duration  # 128000
+            audio_end_idx = cached_audio_duration * fps  # 200
+            audio_start_idx = audio_end_idx - frame_num  # 167
+
+            # Initialize sliding audio deque with silence (matching original)
+            audio_dq: deque = deque(
+                [0.0] * cached_audio_length, maxlen=cached_audio_length
+            )
+
+            # Split raw audio into per-chunk sample slices
+            slice_samples = slice_len * sample_rate // fps  # 17920
+            total_samples = len(raw_audio_array)
+            n_full_slices = total_samples // slice_samples
+            if n_full_slices > 0:
+                speech_slices = raw_audio_array[
+                    : n_full_slices * slice_samples
+                ].reshape(n_full_slices, slice_samples)
+            else:
+                speech_slices = raw_audio_array[:slice_samples].reshape(1, -1)
+
+            logger.info(
+                "Per-chunk streaming audio: cached_duration=%ds, "
+                "deque_len=%d, slice_samples=%d, num_slices=%d",
+                cached_audio_duration,
+                cached_audio_length,
+                slice_samples,
+                len(speech_slices),
+            )
+
+        # VAE normalization factors (same as ImageVAEEncodingStage uses)
+        scaling_factor, shift_factor = (
+            pipeline_config.get_decode_scale_and_shift(device, torch.float32, vae)
+        )
+
+        # --- Initial motion latent from image_latent ---
+        # image_latent shape: (B, mask_ch + 16, N_t, H_lat, W_lat)
+        # mask_ch = temporal_compression_ratio (typically 4)
+        # Extract first temporal step of the VAE latent channels (skip mask)
+        mask_channels = vae_temporal_factor  # temporal_compression_ratio
+        initial_motion_latent = batch.image_latent[:, mask_channels:, :1, :, :]
+        batch.extra["motion_latent"] = initial_motion_latent
+
+        # Set up color reference from condition image for color correction
+        if batch.condition_image is not None:
+            import PIL.Image
+
+            if isinstance(batch.condition_image, torch.Tensor):
+                cond_img = batch.condition_image
+                if cond_img.dim() == 4:
+                    cond_img = cond_img.unsqueeze(2)  # (B,C,H,W) -> (B,C,1,H,W)
+                # Normalize to [-1, 1] if needed
+                if cond_img.min() >= 0 and cond_img.max() <= 1:
+                    cond_img = cond_img * 2 - 1
+                batch.extra["color_reference"] = cond_img.to(device)
+            elif isinstance(batch.condition_image, PIL.Image.Image):
+                import numpy as np
+
+                arr = np.array(batch.condition_image).astype(np.float32) / 255.0
+                cond_tensor = (
+                    torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+                )  # (1, C, 1, H, W)
+                cond_tensor = cond_tensor * 2 - 1  # [0,1] -> [-1,1]
+                batch.extra["color_reference"] = cond_tensor.to(device)
+
+        # --- Multi-chunk loop ---
+        all_chunk_frames = []
+
+        # Optional debug: save per-chunk outputs (set FLASHTALK_DEBUG_CHUNKS=1)
+        _debug_save_chunks = os.environ.get("FLASHTALK_DEBUG_CHUNKS", "0") == "1"
+        _debug_out_dir = os.environ.get(
+            "FLASHTALK_DEBUG_DIR", "/sgl-workspace/outputs/debug_chunks"
+        )
+
+        for chunk_idx in range(num_chunks):
+            logger.info("Generating chunk %d/%d", chunk_idx + 1, num_chunks)
+
+            # a. Per-chunk audio: sliding window wav2vec2 processing
+            #    (matches original FlashTalk's "stream" mode exactly)
+            if use_streaming_audio:
+                # Add this chunk's audio samples to the sliding deque
+                if chunk_idx < len(speech_slices):
+                    audio_dq.extend(speech_slices[chunk_idx].tolist())
+                audio_array = np.array(audio_dq)
+
+                # Per-chunk loudness normalization (matching original)
+                try:
+                    import pyloudnorm as pyln
+
+                    meter = pyln.Meter(sample_rate)
+                    loudness = meter.integrated_loudness(audio_array)
+                    if abs(loudness) <= 100:
+                        audio_array = pyln.normalize.loudness(
+                            audio_array, loudness, -23.0
+                        )
+                except ImportError:
+                    pass
+
+                # Process through wav2vec2 feature extractor + encoder
+                audio_feature_np = np.squeeze(
+                    wav2vec_feature_extractor(
+                        audio_array, sampling_rate=sample_rate
+                    ).input_values
+                )
+                audio_feature_t = (
+                    torch.from_numpy(audio_feature_np)
+                    .float()
+                    .to(device=device)
+                    .unsqueeze(0)
+                )
+                audio_encoder.to(device)
+                chunk_wav2vec = audio_encoder(
+                    audio_feature_t, num_video_frames=audio_end_idx
+                )
+                # chunk_wav2vec: (1, audio_end_idx, num_layers, feat_dim)
+                #              = (1, 200, 12, 768)
+
+                # Window on the FULL wav2vec output (matching original's
+                # get_audio_embedding), then slice the last frame_num frames.
+                half_w = audio_proj.audio_window_first // 2  # 2
+                window_offsets = torch.arange(-half_w, half_w + 1, device=device)
+                frame_indices = torch.arange(
+                    audio_start_idx, audio_end_idx, device=device
+                )
+                windowed_idx = (
+                    frame_indices.unsqueeze(1) + window_offsets.unsqueeze(0)
+                )
+                windowed_idx = windowed_idx.clamp(0, audio_end_idx - 1)
+                # (frame_num, window_size) indices into (1, 200, ...)
+                windowed_features = chunk_wav2vec[:, windowed_idx]
+                # (1, frame_num, window_size, num_layers, feat_dim)
+
+                # Project through AudioProjModel with pre-windowed features
+                audio_proj.to(device)
+                batch.extra["audio_context"] = audio_proj.forward_prewindowed(
+                    windowed_features, vae_temporal_factor=vae_temporal_factor
+                )
+
+                if server_args.audio_encoder_cpu_offload:
+                    audio_encoder.to("cpu", non_blocking=True)
+            else:
+                # Fallback: slice pre-computed features (legacy path)
+                start = chunk_idx * slice_len
+                chunk_audio = audio_features_all[:, start : start + frame_num]
+                if chunk_audio.shape[1] < frame_num:
+                    pad_len = frame_num - chunk_audio.shape[1]
+                    chunk_audio = torch.nn.functional.pad(
+                        chunk_audio, (0, 0, 0, 0, 0, pad_len), mode="replicate"
+                    )
+                chunk_audio = chunk_audio.to(device)
+                audio_proj.to(device)
+                batch.extra["audio_context"] = audio_proj(
+                    chunk_audio, vae_temporal_factor=vae_temporal_factor
+                )
+
+            # b. Create fresh noise latents (matching original FlashTalk dtype/shape)
+            dit_dtype = _P2T[pipeline_config.precision]
+            gen = batch.generator[0] if isinstance(batch.generator, list) else batch.generator
+            z_dim = pipeline_config.vae_config.arch_config.z_dim
+            vae_spatial_stride = 8  # WanVAE spatial stride
+            latent_shape = (
+                1,
+                z_dim,
+                chunk_latent_num_frames,
+                batch.height // vae_spatial_stride,
+                batch.width // vae_spatial_stride,
+            )
+            batch.latents = torch.randn(
+                latent_shape, dtype=dit_dtype, device=device, generator=gen
+            )
+
+            # c. Denoise — force FlashTalk-specific timesteps (with shift)
+            batch.timesteps = None
+            batch = denoising_stage.forward(batch, server_args)
+
+            # d+e+f. Decode → color correct → motion carry
+            # Match the original FlashTalk flow:
+            # 1. Denormalize latents  2. VAE decode → [-1, 1]
+            # 3. Color correct in [-1, 1]  4. Motion carry → VAE encode → normalize
+            vae.to(device)
+            vae_dtype = _P2T[pipeline_config.vae_precision]
+            vae_autocast_enabled = (
+                vae_dtype != torch.float32
+                and not server_args.disable_autocast
+            )
+
+            # Denormalize latents (like DecodingStage.scale_and_shift)
+            denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
+            sf_dev = shift_factor.to(device=device)
+            sc_dev = scaling_factor.to(device=device)
+            denorm_latents = denoised_latents / sc_dev + sf_dev
+
+            # VAE decode
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast_enabled,
+            ):
+                if not vae_autocast_enabled:
+                    denorm_latents = denorm_latents.to(vae_dtype)
+                videos = vae.decode(denorm_latents)  # [-1, 1]
+
+            # Color correction (operates on [-1, 1])
+            batch.output = videos
+            batch = color_correction_stage.forward(batch, server_args)
+            videos_corrected = batch.output  # [-1, 1]
+
+            # Convert to [0, 1] for chunk frame collection
+            corrected = (videos_corrected + 1) / 2  # [0, 1]
+            corrected = corrected.clamp(0, 1)
+
+            # Motion carry: last 5 frames in [-1, 1] → VAE encode
+            cond_frame = videos_corrected[:, :, -motion_frames_num:].to(device)
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast_enabled,
+            ):
+                if not vae_autocast_enabled:
+                    cond_frame = cond_frame.to(vae_dtype)
+                latent_dist = vae.encode(cond_frame)
+                if isinstance(latent_dist, DiagonalGaussianDistribution):
+                    motion_latent_raw = latent_dist.mode()
+                elif hasattr(latent_dist, "latent_dist"):
+                    motion_latent_raw = latent_dist.latent_dist.mode()
+                else:
+                    motion_latent_raw = latent_dist
+
+            # Normalize the motion latent in float32
+            motion_latent_f32 = motion_latent_raw.float()
+            motion_latent_normalized = (motion_latent_f32 - sf_dev) * sc_dev
+            batch.extra["motion_latent"] = motion_latent_normalized
+
+            # Offload VAE if configured
+            if server_args.vae_cpu_offload:
+                vae.to("cpu", non_blocking=True)
+
+            # g. Collect non-overlapping frames (skip first motion_frames_num)
+            chunk_frames = corrected[:, :, motion_frames_num:]
+            all_chunk_frames.append(chunk_frames)
+
+            # Optional: save per-chunk video for debugging
+            if _debug_save_chunks and chunk_idx < 10:
+                try:
+                    import imageio
+
+                    os.makedirs(_debug_out_dir, exist_ok=True)
+                    _dbg = (chunk_frames[0] * 255).clamp(0, 255).to(torch.uint8)
+                    _dbg = _dbg.permute(1, 2, 3, 0).cpu().numpy()
+                    _dbg_path = os.path.join(
+                        _debug_out_dir, f"chunk_{chunk_idx:03d}.mp4"
+                    )
+                    imageio.mimsave(_dbg_path, list(_dbg), fps=25)
+                except Exception as e:
+                    logger.warning("Debug chunk save failed: %s", e)
+
+        # --- Concatenate all chunks & return ---
+        final_video = torch.cat(all_chunk_frames, dim=2)
+
+        audio_path = batch.extra.get("audio_path")
+
+        return OutputBatch(
+            output=final_video,
+            timings=batch.timings,
+            audio_path=audio_path,
         )
 
 

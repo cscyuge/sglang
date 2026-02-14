@@ -10,7 +10,6 @@ Contains:
 import time
 
 import torch
-from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -120,18 +119,20 @@ class FlashTalkDenoisingStage(PipelineStage):
         flow_shift = server_args.pipeline_config.flow_shift or 5.0
         num_timesteps = 1000
 
-        # Build timesteps with shift
+        # Build timesteps with shift — match original FlashTalk schedule exactly.
+        # Original uses DESCENDING timesteps [1000, 750, 500, 250] + [0],
+        # then applies timestep_transform(shift=5) to each.
         if timesteps is None:
-            num_steps = batch.num_inference_steps or 2
+            num_steps = batch.num_inference_steps or 4
             if num_steps == 2:
-                ts_list = [1000.0, 500.0]
+                ts_list = [1000, 500]
             elif num_steps == 4:
-                ts_list = [1000.0, 750.0, 500.0, 250.0]
+                ts_list = [1000, 750, 500, 250]
             else:
                 import numpy as np
 
                 ts_list = list(
-                    np.linspace(num_timesteps, 1, num_steps, dtype=float)
+                    np.linspace(num_timesteps, 1, num_steps, dtype=np.float32)
                 )
             ts_list.append(0.0)
             timesteps = [

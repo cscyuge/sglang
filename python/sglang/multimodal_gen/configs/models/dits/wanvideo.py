@@ -122,6 +122,8 @@ class FlashTalkWanVideoArchConfig(WanVideoArchConfig):
     in_channels: int = 36
     # CLIP ViT-Huge output dimension for WanImageEmbedding
     image_dim: int = 1280
+    # Enable I2V cross-attention (k_img/v_img projections for CLIP features)
+    added_kv_proj_dim: int = 5120
 
     # Complete mapping from FlashTalk original checkpoint keys to sglang model keys
     param_names_mapping: dict = field(
@@ -152,11 +154,11 @@ class FlashTalkWanVideoArchConfig(WanVideoArchConfig):
             r"^blocks\.(\d+)\.cross_attn\.k\.(.*)$": r"blocks.\1.attn2.to_k.\2",
             r"^blocks\.(\d+)\.cross_attn\.v\.(.*)$": r"blocks.\1.attn2.to_v.\2",
             r"^blocks\.(\d+)\.cross_attn\.o\.(.*)$": r"blocks.\1.attn2.to_out.\2",
-            r"^blocks\.(\d+)\.cross_attn\.k_img\.(.*)$": r"blocks.\1.attn2.to_k_img.\2",
-            r"^blocks\.(\d+)\.cross_attn\.v_img\.(.*)$": r"blocks.\1.attn2.to_v_img.\2",
+            r"^blocks\.(\d+)\.cross_attn\.k_img\.(.*)$": r"blocks.\1.attn2.add_k_proj.\2",
+            r"^blocks\.(\d+)\.cross_attn\.v_img\.(.*)$": r"blocks.\1.attn2.add_v_proj.\2",
             r"^blocks\.(\d+)\.cross_attn\.norm_q\.(.*)$": r"blocks.\1.attn2.norm_q.\2",
             r"^blocks\.(\d+)\.cross_attn\.norm_k\.(.*)$": r"blocks.\1.attn2.norm_k.\2",
-            r"^blocks\.(\d+)\.cross_attn\.norm_k_img\.(.*)$": r"blocks.\1.attn2.norm_k_img.\2",
+            r"^blocks\.(\d+)\.cross_attn\.norm_k_img\.(.*)$": r"blocks.\1.attn2.norm_added_k.\2",
             # FFN: original ffn.{0,2} -> sglang ffn.{fc_in,fc_out}
             r"^blocks\.(\d+)\.ffn\.0\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
             r"^blocks\.(\d+)\.ffn\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",
