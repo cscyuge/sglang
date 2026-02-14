@@ -7,9 +7,11 @@ Contains:
 - FlashTalkColorCorrectionStage: Lab color space correction
 """
 
+import os
 import time
 
 import torch
+import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -47,6 +49,29 @@ class FlashTalkDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        self._maybe_enable_torch_compile(self.transformer)
+
+    def _maybe_enable_torch_compile(self, module: object) -> None:
+        """Compile a module with torch.compile if enabled.
+
+        Mirrors the pattern from DenoisingStage. No-op if torch compile is
+        disabled or the object is not an nn.Module.
+        """
+        if not self.server_args.enable_torch_compile or not isinstance(
+            module, nn.Module
+        ):
+            return
+        try:
+            import torch._inductor.config as _inductor_cfg
+
+            _inductor_cfg.reorder_for_compute_comm_overlap = True
+        except ImportError:
+            pass
+        mode = os.environ.get(
+            "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+        )
+        logger.info("Compiling FlashTalk transformer with mode: %s", mode)
+        module.compile(mode=mode, fullgraph=False, dynamic=None)
 
     def _timestep_transform(
         self, t: torch.Tensor, shift: float = 5.0, num_timesteps: int = 1000

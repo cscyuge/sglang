@@ -1214,6 +1214,25 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         # --- Multi-chunk loop ---
         all_chunk_frames = []
 
+        # Compile VAE encode/decode if torch.compile is enabled.
+        # This must happen before the chunk loop so compilation is amortized.
+        # Matches the original FlashTalk which compiles both vae.encode and
+        # vae.decode at init time (COMPILE_VAE=True).
+        if (
+            server_args.enable_torch_compile
+            and not server_args.vae_cpu_offload
+        ):
+            compile_mode = os.environ.get(
+                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            )
+            if not getattr(vae, "_flashtalk_vae_compiled", False):
+                logger.info(
+                    "Compiling VAE encode/decode with mode: %s", compile_mode
+                )
+                vae.encode = torch.compile(vae.encode, mode=compile_mode)
+                vae.decode = torch.compile(vae.decode, mode=compile_mode)
+                vae._flashtalk_vae_compiled = True
+
         # Optional debug: save per-chunk outputs (set FLASHTALK_DEBUG_CHUNKS=1)
         _debug_save_chunks = os.environ.get("FLASHTALK_DEBUG_CHUNKS", "0") == "1"
         _debug_out_dir = os.environ.get(
