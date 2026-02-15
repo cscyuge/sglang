@@ -125,12 +125,15 @@ class FlashTalkWanTransformerBlock(WanTransformerBlock):
         # LayerNorm before audio cross-attention
         self.norm_audio = FP32LayerNorm(dim, elementwise_affine=True)
 
+        # Pre-allocate null tensor for residual norm (avoids per-forward allocation)
+        self.register_buffer("_null_param", torch.zeros(1), persistent=False)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        freqs_cis: tuple[torch.Tensor, ...],
         audio_context: torch.Tensor | None = None,
         grid_shape: tuple[int, int, int] | None = None,
         human_num: int = 1,
@@ -178,9 +181,18 @@ class FlashTalkWanTransformerBlock(WanTransformerBlock):
         key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
-        # Apply rotary embeddings
-        cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
+        # Apply rotary embeddings (cos_sin_cache pre-computed at model level)
+        if len(freqs_cis) == 3:
+            cos, sin, cos_sin_cache = freqs_cis
+        else:
+            cos, sin = freqs_cis
+            cos_sin_cache = None
+
+        if cos_sin_cache is not None and _is_cuda and query.shape == key.shape:
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
+            )
+        elif _is_cuda and query.shape == key.shape:
             cos_sin_cache = torch.cat(
                 [
                     cos.to(dtype=torch.float32).contiguous(),
@@ -201,9 +213,7 @@ class FlashTalkWanTransformerBlock(WanTransformerBlock):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
+        null_shift = null_scale = self._null_param.to(dtype=hidden_states.dtype)
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
@@ -408,7 +418,10 @@ class FlashTalkWanTransformer3DModel(WanTransformer3DModel):
             )
             assert freqs_cos.dtype == torch.float32
             assert freqs_cos.device == hidden_states.device
-            freqs_cis = (freqs_cos.float(), freqs_sin.float())
+            cos_sin_cache = torch.cat(
+                [freqs_cos.contiguous(), freqs_sin.contiguous()], dim=-1
+            )
+            freqs_cis = (freqs_cos.float(), freqs_sin.float(), cos_sin_cache)
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
@@ -439,7 +452,11 @@ class FlashTalkWanTransformer3DModel(WanTransformer3DModel):
                 post_patch_width,
                 hidden_states.device,
             )
-            freqs_cis = (freqs_cos.float(), freqs_sin.float())
+            cos_sin_cache = torch.cat(
+                [freqs_cos.float().contiguous(), freqs_sin.float().contiguous()],
+                dim=-1,
+            )
+            freqs_cis = (freqs_cos.float(), freqs_sin.float(), cos_sin_cache)
 
         # Timestep embedding
         if timestep.dim() == 2:

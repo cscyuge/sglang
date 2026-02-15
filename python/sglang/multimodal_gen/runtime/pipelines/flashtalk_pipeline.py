@@ -9,15 +9,20 @@ Overrides load_modules to support FlashTalk's flat directory structure with
 original (non-diffusers) naming conventions.
 """
 
+import gc
 import json
 import os
+import time
 from typing import Any
 
 import torch
 from safetensors.torch import safe_open
 from transformers import AutoTokenizer
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     get_param_names_mapping,
@@ -1214,23 +1219,31 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         # --- Multi-chunk loop ---
         all_chunk_frames = []
 
-        # Compile VAE encode/decode if torch.compile is enabled.
-        # This must happen before the chunk loop so compilation is amortized.
-        # Matches the original FlashTalk which compiles both vae.encode and
-        # vae.decode at init time (COMPILE_VAE=True).
-        if (
-            server_args.enable_torch_compile
-            and not server_args.vae_cpu_offload
-        ):
-            compile_mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-            )
+        # When using multi-GPU SP, skip VAE and audio_encoder CPU offload
+        # during the chunk loop. The original FlashTalk keeps everything on
+        # GPU permanently. With 8x H20 (95 GB each) and VAE ~250 MB + audio
+        # encoder ~190 MB, this is negligible memory but avoids ~100-200ms
+        # of CPU<->GPU roundtrip per chunk.
+        sp_size = get_sp_world_size()
+        skip_vae_offload = sp_size > 1
+        skip_audio_offload = sp_size > 1
+
+        if skip_vae_offload:
+            vae.to(device)
+
+        # Compile VAE encode/decode if torch.compile is enabled AND warmup is
+        # requested.  VAE compile saves ~0.2s per chunk but adds 40-50s to the
+        # first chunk (compilation overhead), so it's only worth it for long
+        # runs (100+ chunks) or when warmup pre-compiles everything.
+        if server_args.enable_torch_compile and server_args.warmup:
+            vae_compile_mode = "default"
             if not getattr(vae, "_flashtalk_vae_compiled", False):
                 logger.info(
-                    "Compiling VAE encode/decode with mode: %s", compile_mode
+                    "Compiling VAE encode/decode with mode: %s", vae_compile_mode
                 )
-                vae.encode = torch.compile(vae.encode, mode=compile_mode)
-                vae.decode = torch.compile(vae.decode, mode=compile_mode)
+                vae.to(device)
+                vae.encode = torch.compile(vae.encode, mode=vae_compile_mode)
+                vae.decode = torch.compile(vae.decode, mode=vae_compile_mode)
                 vae._flashtalk_vae_compiled = True
 
         # Optional debug: save per-chunk outputs (set FLASHTALK_DEBUG_CHUNKS=1)
@@ -1239,7 +1252,15 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             "FLASHTALK_DEBUG_DIR", "/sgl-workspace/outputs/debug_chunks"
         )
 
+        # Disable Python's cyclic garbage collector during the chunk loop.
+        # Reference-counting still frees objects immediately via `del`, but
+        # the periodic GC sweep (which traverses all objects and can trigger
+        # CUDA synchronisation points) is deferred until after the loop.
+        _gc_was_enabled = gc.isenabled()
+        gc.disable()
+
         for chunk_idx in range(num_chunks):
+            chunk_start = time.time()
             logger.info("Generating chunk %d/%d", chunk_idx + 1, num_chunks)
 
             # a. Per-chunk audio: sliding window wav2vec2 processing
@@ -1303,7 +1324,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     windowed_features, vae_temporal_factor=vae_temporal_factor
                 )
 
-                if server_args.audio_encoder_cpu_offload:
+                if server_args.audio_encoder_cpu_offload and not skip_audio_offload:
                     audio_encoder.to("cpu", non_blocking=True)
             else:
                 # Fallback: slice pre-computed features (legacy path)
@@ -1358,6 +1379,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             denorm_latents = denoised_latents / sc_dev + sf_dev
 
             # VAE decode
+            torch.cuda.synchronize()
+            _t_vae_dec = time.time()
             with torch.autocast(
                 device_type=current_platform.device_type,
                 dtype=vae_dtype,
@@ -1366,18 +1389,22 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 if not vae_autocast_enabled:
                     denorm_latents = denorm_latents.to(vae_dtype)
                 videos = vae.decode(denorm_latents)  # [-1, 1]
+            torch.cuda.synchronize()
+            _t_vae_dec = time.time() - _t_vae_dec
+            del denorm_latents
 
             # Color correction (operates on [-1, 1])
             batch.output = videos
             batch = color_correction_stage.forward(batch, server_args)
             videos_corrected = batch.output  # [-1, 1]
-
-            # Convert to [0, 1] for chunk frame collection
-            corrected = (videos_corrected + 1) / 2  # [0, 1]
-            corrected = corrected.clamp(0, 1)
+            del videos
 
             # Motion carry: last 5 frames in [-1, 1] → VAE encode
-            cond_frame = videos_corrected[:, :, -motion_frames_num:].to(device)
+            # .clone() ensures contiguous memory for VAE encode and
+            # releases the reference to the full decoded video tensor.
+            cond_frame = videos_corrected[:, :, -motion_frames_num:].clone()
+            torch.cuda.synchronize()
+            _t_vae_enc = time.time()
             with torch.autocast(
                 device_type=current_platform.device_type,
                 dtype=vae_dtype,
@@ -1392,19 +1419,42 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     motion_latent_raw = latent_dist.latent_dist.mode()
                 else:
                     motion_latent_raw = latent_dist
+            torch.cuda.synchronize()
+            _t_vae_enc = time.time() - _t_vae_enc
+            del cond_frame
+
+            # Convert to [0, 1] for chunk frame collection
+            corrected = (videos_corrected + 1) / 2  # [0, 1]
+            corrected = corrected.clamp(0, 1)
+            del videos_corrected
 
             # Normalize the motion latent in float32
             motion_latent_f32 = motion_latent_raw.float()
             motion_latent_normalized = (motion_latent_f32 - sf_dev) * sc_dev
             batch.extra["motion_latent"] = motion_latent_normalized
 
-            # Offload VAE if configured
-            if server_args.vae_cpu_offload:
+            # Offload VAE if configured (skip when keeping on GPU for SP)
+            if server_args.vae_cpu_offload and not skip_vae_offload:
                 vae.to("cpu", non_blocking=True)
 
             # g. Collect non-overlapping frames (skip first motion_frames_num)
-            chunk_frames = corrected[:, :, motion_frames_num:]
+            # .clone() releases the full corrected tensor (33 frames) and
+            # keeps only the 28 new frames, reducing memory pressure.
+            chunk_frames = corrected[:, :, motion_frames_num:].clone()
+            del corrected
             all_chunk_frames.append(chunk_frames)
+
+            # Per-chunk timing summary (skip chunk 1 which includes compile)
+            _t_chunk = time.time() - chunk_start
+            if chunk_idx > 0:
+                logger.info(
+                    "Chunk %d/%d: total=%.3fs vae_dec=%.3fs vae_enc=%.3fs",
+                    chunk_idx + 1,
+                    num_chunks,
+                    _t_chunk,
+                    _t_vae_dec,
+                    _t_vae_enc,
+                )
 
             # Optional: save per-chunk video for debugging
             if _debug_save_chunks and chunk_idx < 10:
@@ -1422,6 +1472,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     logger.warning("Debug chunk save failed: %s", e)
 
         # --- Concatenate all chunks & return ---
+        if _gc_was_enabled:
+            gc.enable()
+            gc.collect()
+
         final_video = torch.cat(all_chunk_frames, dim=2)
 
         audio_path = batch.extra.get("audio_path")
