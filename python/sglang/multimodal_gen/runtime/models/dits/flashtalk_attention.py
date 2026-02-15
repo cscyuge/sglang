@@ -9,6 +9,7 @@ for multi-person spatial separation.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
@@ -188,6 +189,99 @@ class FlashTalkAudioCrossAttention(nn.Module):
         out = rearrange(out, "(B N_t) S C -> B (N_t S) C", N_t=N_t)
         return out
 
+    def _local_sp_single_person_forward(
+        self,
+        x: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        shape: tuple[int, int, int],
+    ) -> torch.Tensor:
+        """SP-local single-person audio cross-attention without all-gather.
+
+        Computes per-frame cross-attention locally on each rank's shard,
+        avoiding the all-gather + full-sequence-compute + slice-back pattern.
+        Each rank determines which temporal frames its tokens belong to and
+        cross-attends only to the corresponding audio context frames.
+        """
+        N_t, N_h, N_w = shape
+        S = N_h * N_w  # spatial tokens per temporal frame
+        sp_rank = get_sp_group().rank_in_group
+        B = x.shape[0]
+        local_seq = x.shape[1]
+
+        # Global flat index range for this rank's shard
+        global_start = sp_rank * local_seq
+        global_end = global_start + local_seq
+
+        # Which temporal frames overlap with this rank's shard
+        start_frame = global_start // S
+        end_frame = min((global_end - 1) // S, N_t - 1)
+
+        # Q projection on local shard
+        q, _ = self.q_linear(x)
+        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
+        if self.qk_norm:
+            q_flat = q.flatten(2)
+            q_flat = self.q_norm(q_flat)
+            q = q_flat.unflatten(2, (self.local_num_heads, self.head_dim))
+
+        # KV projection for relevant audio frames only
+        audio_frames = encoder_hidden_states[start_frame : end_frame + 1]
+        kv, _ = self.kv_linear(audio_frames)
+        kv = kv.unflatten(2, (2, self.local_num_heads, self.head_dim))
+        k_all, v_all = kv[:, :, 0], kv[:, :, 1]
+        if self.qk_norm:
+            k_flat = k_all.flatten(2)
+            k_flat = self.k_norm(k_flat)
+            k_all = k_flat.unflatten(2, (self.local_num_heads, self.head_dim))
+
+        # Per-frame cross-attention using SDPA (no USP all-to-all needed)
+        out_parts = []
+        pos = 0
+        for f_idx, f in enumerate(range(start_frame, end_frame + 1)):
+            frame_start = f * S
+            frame_end = (f + 1) * S
+
+            # Token count from this frame on this rank
+            overlap_start = max(frame_start, global_start)
+            overlap_end = min(frame_end, global_end)
+            n_tokens = overlap_end - overlap_start
+
+            q_frame = q[:, pos : pos + n_tokens]  # (B, n, H, D)
+            k_frame = k_all[f_idx : f_idx + 1]  # (1, N_a, H, D)
+            v_frame = v_all[f_idx : f_idx + 1]  # (1, N_a, H, D)
+
+            if B > 1:
+                k_frame = k_frame.expand(B, -1, -1, -1)
+                v_frame = v_frame.expand(B, -1, -1, -1)
+
+            # SDPA expects (B, H, N, D)
+            attn_out = F.scaled_dot_product_attention(
+                q_frame.transpose(1, 2),
+                k_frame.transpose(1, 2),
+                v_frame.transpose(1, 2),
+                is_causal=False,
+            )
+            out_parts.append(attn_out.transpose(1, 2))  # (B, n, H, D)
+            pos += n_tokens
+
+        # Handle padding tokens beyond last real frame (when seq not divisible by sp_size)
+        if pos < local_seq:
+            out_parts.append(
+                torch.zeros(
+                    B,
+                    local_seq - pos,
+                    self.local_num_heads,
+                    self.head_dim,
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+            )
+
+        out = torch.cat(out_parts, dim=1)  # (B, local_seq, H, D)
+        out = out.flatten(2)  # (B, local_seq, C)
+        out, _ = self.proj(out)
+        return out
+
     def _multi_person_forward(
         self,
         x: torch.Tensor,
@@ -308,31 +402,21 @@ class FlashTalkAudioCrossAttention(nn.Module):
         sp_size = get_sp_world_size()
 
         if sp_size > 1:
-            # When SP is active, x is a shard of the flattened sequence. The
-            # audio cross-attention groups tokens by temporal step (each step
-            # attends to its own audio context). With SP sharding by flat index,
-            # each GPU's shard spans partial temporal steps, so the naive
-            # rearrange(x, "B (N_t S) C -> ...") would assign the wrong audio
-            # context to tokens.
-            #
-            # Fix: all-gather the full sequence, perform audio cross-attention
-            # on the full (correctly-grouped) sequence, then take back our shard.
-            sp_rank = get_sp_group().rank_in_group
-            local_seq = x.shape[1]
-            x_full = sequence_model_parallel_all_gather(x, dim=1)
-
             if human_num == 1 or x_ref_attn_map is None:
-                out_full = self._single_person_forward(
-                    x_full, encoder_hidden_states, N_t
+                # Optimized: local per-frame attention without all-gather
+                return self._local_sp_single_person_forward(
+                    x, encoder_hidden_states, shape
                 )
             else:
+                # Multi-person: fall back to all-gather (not yet optimized)
+                sp_rank = get_sp_group().rank_in_group
+                local_seq = x.shape[1]
+                x_full = sequence_model_parallel_all_gather(x, dim=1)
                 out_full = self._multi_person_forward(
                     x_full, encoder_hidden_states, N_t, x_ref_attn_map
                 )
-
-            # Take this rank's shard back
-            start = sp_rank * local_seq
-            return out_full[:, start : start + local_seq, :].contiguous()
+                start = sp_rank * local_seq
+                return out_full[:, start : start + local_seq, :].contiguous()
 
         if human_num == 1 or x_ref_attn_map is None:
             return self._single_person_forward(x, encoder_hidden_states, N_t)
