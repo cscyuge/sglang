@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.layer import LocalAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
@@ -124,6 +125,17 @@ class FlashTalkWanTransformerBlock(WanTransformerBlock):
         )
         # LayerNorm before audio cross-attention
         self.norm_audio = FP32LayerNorm(dim, elementwise_affine=True)
+
+        # Text/image cross-attention context is replicated on all SP ranks.
+        # USP all-to-all is wasteful here (creates sp_size-x KV expansion).
+        # Replace with local attention that skips all-to-all entirely.
+        if get_sp_world_size() > 1:
+            self.attn2.attn = LocalAttention(
+                num_heads=self.attn2.local_num_heads,
+                head_size=self.attn2.head_dim,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+            )
 
         # Pre-allocate null tensor for residual norm (avoids per-forward allocation)
         self.register_buffer("_null_param", torch.zeros(1), persistent=False)
