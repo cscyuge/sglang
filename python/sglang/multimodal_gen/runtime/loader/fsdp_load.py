@@ -27,6 +27,16 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     hf_to_custom_state_dict,
     set_default_torch_dtype,
 )
+
+# FP8 dtypes that should not be cast to param_dtype during loading
+_FP8_DTYPES = frozenset(
+    {
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+    }
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
@@ -254,7 +264,13 @@ def load_model_from_full_model_state_dict(
                 )
                 continue
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            # Respect FP8 parameter dtypes — don't cast fp8 weights to param_dtype
+            load_dtype = (
+                meta_sharded_param.dtype
+                if meta_sharded_param.dtype in _FP8_DTYPES
+                else param_dtype
+            )
+            full_tensor = full_tensor.to(device=device, dtype=load_dtype)
             actual_param = param_dict.get(target_param_name)
             weight_loader = (
                 getattr(actual_param, "weight_loader", None)
@@ -264,7 +280,7 @@ def load_model_from_full_model_state_dict(
             if weight_loader is not None:
                 assert actual_param is not None
                 sharded_tensor = torch.empty_like(
-                    meta_sharded_param, device=device, dtype=param_dtype
+                    meta_sharded_param, device=device, dtype=load_dtype
                 )
                 temp_param = _make_param_like(actual_param, sharded_tensor)
                 weight_loader(temp_param, full_tensor)
@@ -275,7 +291,12 @@ def load_model_from_full_model_state_dict(
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()
         else:
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            load_dtype = (
+                meta_sharded_param.dtype
+                if meta_sharded_param.dtype in _FP8_DTYPES
+                else param_dtype
+            )
+            full_tensor = full_tensor.to(device=device, dtype=load_dtype)
             sharded_tensor = distribute_tensor(
                 full_tensor,
                 meta_sharded_param.device_mesh,

@@ -309,6 +309,23 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         with set_default_torch_dtype(default_dtype), torch.device("meta"):
             model = FlashTalkWanTransformer3DModel(config=dit_config)
 
+        # Apply FP8 block quantization if checkpoint has quantization_config
+        fp8_quant_config = None
+        quant_config_dict = raw_config.get("quantization_config")
+        if quant_config_dict and quant_config_dict.get("quant_method") == "fp8":
+            from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
+                Fp8BlockQuantConfig,
+                apply_fp8_quant_to_model,
+            )
+
+            weight_block_size = quant_config_dict.get(
+                "weight_block_size", [128, 128]
+            )
+            fp8_quant_config = Fp8BlockQuantConfig(
+                weight_block_size=weight_block_size
+            )
+            apply_fp8_quant_to_model(model, fp8_quant_config)
+
         # Load weights
         weight_iterator = safetensors_weights_iterator(safetensors_list)
         param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
@@ -321,6 +338,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             cpu_offload=server_args.dit_cpu_offload,
             param_names_mapping=param_names_mapping_fn,
         )
+
+        # Post-process FP8 weights (convert scale_inv bf16 -> float32)
+        if fp8_quant_config is not None:
+            from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
+                process_fp8_weights_after_loading,
+            )
+
+            process_fp8_weights_after_loading(model)
 
         # Materialize any remaining meta-device buffers (e.g., RoPE inv_freq)
         # that are computed at init time and not stored in checkpoints.
