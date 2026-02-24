@@ -12,9 +12,12 @@ original (non-diffusers) naming conventions.
 import gc
 import json
 import os
+import re
 import time
+from collections import deque
 from typing import Any
 
+import numpy as np
 import torch
 from safetensors.torch import safe_open
 from transformers import AutoTokenizer
@@ -46,6 +49,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multi
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -151,13 +155,12 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
     2. TextEncoding - T5 encode text prompt
     3. ImageEncoding - CLIP encode condition face image
     4. AudioEncoding - Wav2Vec2 + AudioProj encode audio
-    5. Conditioning - combine text + image conditions
-    6. TimestepPreparation - prepare timesteps
-    7. LatentPreparation - initialize noise latents
-    8. ImageVAEEncoding - VAE encode condition image to latent
-    9. FlashTalkDenoising - no-CFG denoising with audio context
-    10. Decoding - VAE decode to pixel space
-    11. FlashTalkColorCorrection - Lab color correction
+    5. TimestepPreparation - prepare timesteps
+    6. LatentPreparation - initialize noise latents
+    7. ImageVAEEncoding - VAE encode condition image to latent
+    8. FlashTalkDenoising - no-CFG denoising with audio context
+    9. Decoding - VAE decode to pixel space
+    10. FlashTalkColorCorrection - Lab color correction
     """
 
     pipeline_name = "FlashTalkPipeline"
@@ -295,10 +298,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             loaded_components["audio_encoder"] = None
             loaded_components["wav2vec_feature_extractor"] = None
 
-        # Remove optional None modules from required list so the check passes
+        # Remove optional None modules from required list so the check passes.
+        # Work on a copy to avoid mutating the class-level list.
+        required = list(self._required_config_modules)
         for name in ("audio_encoder", "image_processor"):
-            if loaded_components.get(name) is None and name in self._required_config_modules:
-                self._required_config_modules.remove(name)
+            if loaded_components.get(name) is None and name in required:
+                required.remove(name)
+        self._required_config_modules = required
 
         logger.info(
             "FlashTalk modules loaded: %s",
@@ -315,13 +321,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         computed buffers (like RoPE inv_freq) that stay on meta device after
         checkpoint loading.
         """
-        from torch.distributed._tensor import distribute_tensor
         from torch.distributed.fsdp import MixedPrecisionPolicy
 
         from sglang.multimodal_gen.runtime.loader.fsdp_load import (
             load_model_from_full_model_state_dict,
         )
-        from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
         from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
         # Read config.json to update dit_config
@@ -350,7 +354,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             raise ValueError(f"No safetensors files found in {model_path}")
 
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-        param_dtype = torch.bfloat16
+        param_dtype = default_dtype
         reduce_dtype = torch.float32
 
         logger.info(
@@ -379,7 +383,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         if quant_config_dict and quant_config_dict.get("quant_method") == "fp8":
             from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
                 Fp8Config,
-                Fp8LinearMethod,
             )
 
             weight_block_size = quant_config_dict.get(
@@ -592,7 +595,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             import torch.distributed as dist
 
             from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
-            from sglang.multimodal_gen.runtime.platforms import current_platform
 
             mesh = dist.init_device_mesh(
                 current_platform.device_type,
@@ -635,7 +637,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             blocks.N.ffn.fc1.weight -> encoder.block.N.layer.1.DenseReluDense.wi_1.weight
             blocks.N.ffn.fc2.weight -> encoder.block.N.layer.1.DenseReluDense.wo.weight
         """
-        import re
 
         mapped = {}
         for key, tensor in state_dict.items():
@@ -694,7 +695,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         (WanUpBlock with resnets + upsamplers), requiring flat→hierarchical
         index conversion.
         """
-        import re
 
         arch_config = getattr(vae_config, "arch_config", vae_config)
         dim_mult = list(arch_config.dim_mult)
@@ -904,7 +904,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             visual.transformer.N.mlp.2.* -> vision_model.encoder.layers.N.mlp.fc2.*
             visual.head -> visual_projection.weight (if present)
         """
-        import re
 
         mapped = {}
         prefix = "visual."
@@ -1039,7 +1038,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        # 7. Latent preparation
+        # 6. Latent preparation
         self.add_stage(
             stage_name="latent_preparation_stage",
             stage=LatentPreparationStage(
@@ -1048,13 +1047,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        # 8. Image VAE encoding
+        # 7. Image VAE encoding
         self.add_stage(
             stage_name="image_latent_preparation_stage",
             stage=ImageVAEEncodingStage(vae=self.get_module("vae")),
         )
 
-        # 9. FlashTalk denoising (no CFG, with audio context)
+        # 8. FlashTalk denoising (no CFG, with audio context)
         self.add_stage(
             stage_name="denoising_stage",
             stage=FlashTalkDenoisingStage(
@@ -1063,13 +1062,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        # 10. Decoding
+        # 9. Decoding
         self.add_stage(
             stage_name="decoding_stage",
             stage=DecodingStage(vae=self.get_module("vae")),
         )
 
-        # 11. Color correction
+        # 10. Color correction
         self.add_stage(
             stage_name="color_correction_stage",
             stage=FlashTalkColorCorrectionStage(),
@@ -1100,8 +1099,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         and re-encodes the last ``motion_frames_num`` decoded frames as the
         motion latent for the next chunk.
         """
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-        from sglang.multimodal_gen.utils import PRECISION_TO_TYPE as _P2T
 
         if not batch.is_warmup and not batch.suppress_logs:
             logger.info(
@@ -1192,17 +1189,19 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             motion_frames_num,
         )
 
-        # --- Stage references ---
-        latent_prep_stage = None
-        for stage in self.stages:
-            if isinstance(stage, LatentPreparationStage):
-                latent_prep_stage = stage
-                break
-        if latent_prep_stage is None:
-            raise RuntimeError("LatentPreparationStage not found in pipeline stages")
+        # --- Stage references (look up by type to avoid fragile index assumptions) ---
         denoising_stage = self.stages[denoising_idx]
-        decoding_stage = self.stages[denoising_idx + 1]
-        color_correction_stage = self.stages[denoising_idx + 2]
+        color_correction_stage = None
+        decoding_stage = None
+        for stage in self.stages[denoising_idx + 1:]:
+            if isinstance(stage, FlashTalkColorCorrectionStage):
+                color_correction_stage = stage
+            elif isinstance(stage, DecodingStage):
+                decoding_stage = stage
+        if decoding_stage is None:
+            raise RuntimeError("DecodingStage not found in pipeline stages")
+        if color_correction_stage is None:
+            raise RuntimeError("FlashTalkColorCorrectionStage not found in pipeline stages")
 
         # --- Audio proj + VAE references ---
         audio_proj = self.get_module("audio_proj")
@@ -1216,9 +1215,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         # - 8-second sliding deque (silence-padded)
         # - Per-chunk loudness normalization + wav2vec2 processing
         # - Extract last frame_num frames from the wav2vec2 output
-        import numpy as np
-        from collections import deque
-
         raw_audio_array = batch.extra.get("raw_audio_array")
         sample_rate = batch.extra.get("audio_sample_rate", 16000)
         fps = batch.extra.get("audio_fps", 25)
@@ -1258,6 +1254,17 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 len(speech_slices),
             )
 
+        # Pre-import pyloudnorm for per-chunk loudness normalization
+        _pyln = None
+        _pyln_meter = None
+        if use_streaming_audio:
+            try:
+                import pyloudnorm as _pyln
+
+                _pyln_meter = _pyln.Meter(sample_rate)
+            except ImportError:
+                pass
+
         # VAE normalization factors (same as ImageVAEEncodingStage uses)
         scaling_factor, shift_factor = (
             pipeline_config.get_decode_scale_and_shift(device, torch.float32, vae)
@@ -1284,8 +1291,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     cond_img = cond_img * 2 - 1
                 batch.extra["color_reference"] = cond_img.to(device)
             elif isinstance(batch.condition_image, PIL.Image.Image):
-                import numpy as np
-
                 arr = np.array(batch.condition_image).astype(np.float32) / 255.0
                 cond_tensor = (
                     torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
@@ -1349,17 +1354,12 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 audio_array = np.array(audio_dq)
 
                 # Per-chunk loudness normalization (matching original)
-                try:
-                    import pyloudnorm as pyln
-
-                    meter = pyln.Meter(sample_rate)
-                    loudness = meter.integrated_loudness(audio_array)
+                if _pyln is not None and _pyln_meter is not None:
+                    loudness = _pyln_meter.integrated_loudness(audio_array)
                     if abs(loudness) <= 100:
-                        audio_array = pyln.normalize.loudness(
+                        audio_array = _pyln.normalize.loudness(
                             audio_array, loudness, -23.0
                         )
-                except ImportError:
-                    pass
 
                 # Process through wav2vec2 feature extractor + encoder
                 audio_feature_np = np.squeeze(
@@ -1419,7 +1419,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 )
 
             # b. Create fresh noise latents (matching original FlashTalk dtype/shape)
-            dit_dtype = _P2T[pipeline_config.precision]
+            dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
             gen = batch.generator[0] if isinstance(batch.generator, list) else batch.generator
             z_dim = pipeline_config.vae_config.arch_config.z_dim
             vae_spatial_stride = 8  # WanVAE spatial stride
@@ -1443,7 +1443,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # 1. Denormalize latents  2. VAE decode → [-1, 1]
             # 3. Color correct in [-1, 1]  4. Motion carry → VAE encode → normalize
             vae.to(device)
-            vae_dtype = _P2T[pipeline_config.vae_precision]
+            vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
             vae_autocast_enabled = (
                 vae_dtype != torch.float32
                 and not server_args.disable_autocast
@@ -1549,6 +1549,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     logger.warning("Debug chunk save failed: %s", e)
 
         # --- Concatenate all chunks & return ---
+        # Re-enable garbage collection (was disabled during chunk loop)
         if _gc_was_enabled:
             gc.enable()
             gc.collect()

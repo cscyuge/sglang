@@ -56,7 +56,7 @@ class FlashTalkSamplingParams(SamplingParams):
     # Supported resolutions
     supported_resolutions: list[tuple[int, int]] | None = field(
         default_factory=lambda: [
-            (768, 448),  # portrait
-            (448, 768),  # landscape
+            (768, 448),  # portrait (height > width)
+            (448, 768),  # landscape (width > height)
         ]
     )

@@ -112,5 +112,6 @@ class FlashTalkPipelineConfig(WanI2V720PConfig):
     max_area: int = 768 * 448
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True

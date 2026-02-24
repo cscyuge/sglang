@@ -150,6 +150,29 @@ class FlashTalkAudioCrossAttention(nn.Module):
             causal=False,
         )
 
+    def _project_q(self, x: torch.Tensor) -> torch.Tensor:
+        """Project and optionally normalize Q from video tokens."""
+        q, _ = self.q_linear(x)
+        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
+        if self.qk_norm:
+            q = self.q_norm(q.flatten(2)).unflatten(
+                2, (self.local_num_heads, self.head_dim)
+            )
+        return q
+
+    def _project_kv(
+        self, encoder_hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project and optionally normalize KV from audio context tokens."""
+        kv, _ = self.kv_linear(encoder_hidden_states)
+        kv = kv.unflatten(2, (2, self.local_num_heads, self.head_dim))
+        k, v = kv[:, :, 0], kv[:, :, 1]
+        if self.qk_norm:
+            k = self.k_norm(k.flatten(2)).unflatten(
+                2, (self.local_num_heads, self.head_dim)
+            )
+        return k, v
+
     def _single_person_forward(
         self,
         x: torch.Tensor,
@@ -159,26 +182,10 @@ class FlashTalkAudioCrossAttention(nn.Module):
         """Simple cross-attention without multi-person RoPE."""
         # Reshape to per-temporal-step
         x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
-        B, N, C = x.shape
 
-        # Q from video
-        q, _ = self.q_linear(x)
-        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
-        if self.qk_norm:
-            q_flat = q.flatten(2)
-            q_flat = self.q_norm(q_flat)
-            q = q_flat.unflatten(2, (self.local_num_heads, self.head_dim))
-
-        # KV from audio — use "split" layout (all K first, all V second)
-        # matching the original checkpoint's view(B, N_a, 2, H, D) convention.
-        _, N_a, _ = encoder_hidden_states.shape
-        kv, _ = self.kv_linear(encoder_hidden_states)
-        kv = kv.unflatten(2, (2, self.local_num_heads, self.head_dim))
-        k, v = kv[:, :, 0], kv[:, :, 1]
-        if self.qk_norm:
-            k_flat = k.flatten(2)
-            k_flat = self.k_norm(k_flat)
-            k = k_flat.unflatten(2, (self.local_num_heads, self.head_dim))
+        # Q from video, KV from audio
+        q = self._project_q(x)
+        k, v = self._project_kv(encoder_hidden_states)
 
         # Attention
         out = self.attn(q, k, v)
@@ -217,22 +224,11 @@ class FlashTalkAudioCrossAttention(nn.Module):
         end_frame = min((global_end - 1) // S, N_t - 1)
 
         # Q projection on local shard
-        q, _ = self.q_linear(x)
-        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
-        if self.qk_norm:
-            q_flat = q.flatten(2)
-            q_flat = self.q_norm(q_flat)
-            q = q_flat.unflatten(2, (self.local_num_heads, self.head_dim))
+        q = self._project_q(x)
 
         # KV projection for relevant audio frames only
         audio_frames = encoder_hidden_states[start_frame : end_frame + 1]
-        kv, _ = self.kv_linear(audio_frames)
-        kv = kv.unflatten(2, (2, self.local_num_heads, self.head_dim))
-        k_all, v_all = kv[:, :, 0], kv[:, :, 1]
-        if self.qk_norm:
-            k_flat = k_all.flatten(2)
-            k_flat = self.k_norm(k_flat)
-            k_all = k_flat.unflatten(2, (self.local_num_heads, self.head_dim))
+        k_all, v_all = self._project_kv(audio_frames)
 
         # Per-frame cross-attention using SDPA (no USP all-to-all needed)
         out_parts = []
@@ -291,15 +287,9 @@ class FlashTalkAudioCrossAttention(nn.Module):
     ) -> torch.Tensor:
         """Cross-attention with multi-person 1D RoPE spatial separation."""
         x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
-        B, N, C = x.shape
 
         # Q projection
-        q, _ = self.q_linear(x)
-        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
-        if self.qk_norm:
-            q_flat = q.flatten(2)
-            q_flat = self.q_norm(q_flat)
-            q = q_flat.unflatten(2, (self.local_num_heads, self.head_dim))
+        q = self._project_q(x)
 
         # Compute position encoding from attention map
         max_values = x_ref_attn_map.max(1).values[:, None, None]
@@ -332,16 +322,9 @@ class FlashTalkAudioCrossAttention(nn.Module):
         q = self.rope_1d(q, normalized_pos)
         q = rearrange(q, "B H (N_t S) D -> (B N_t) S H D", N_t=N_t)
 
-        # KV from audio — use "split" layout (all K first, all V second)
-        # matching the original checkpoint's view(B, N_a, 2, H, D) convention.
-        _, N_a, _ = encoder_hidden_states.shape
-        kv, _ = self.kv_linear(encoder_hidden_states)
-        kv = kv.unflatten(2, (2, self.local_num_heads, self.head_dim))
-        k, v = kv[:, :, 0], kv[:, :, 1]
-        if self.qk_norm:
-            k_flat = k.flatten(2)
-            k_flat = self.k_norm(k_flat)
-            k = k_flat.unflatten(2, (self.local_num_heads, self.head_dim))
+        # KV from audio
+        k, v = self._project_kv(encoder_hidden_states)
+        N_a = k.shape[1]
 
         # Apply 1D RoPE to K
         per_frame = torch.zeros(N_a, dtype=k.dtype, device=k.device)

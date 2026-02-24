@@ -18,7 +18,7 @@ Both paths share proj2 and proj3 layers to produce (B, N_t, context_tokens, outp
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 
 class AudioProjModel(nn.Module):
@@ -125,7 +125,6 @@ class AudioProjModel(nn.Module):
         # then sub-sample the pre-windowed features.
         # -----------------------------------------------------------
         subsequent_windowed = windowed[:, 1:]  # (B, num_frames-1, 5, L, D)
-        num_subsequent = num_video_frames - 1
         n_subsequent_steps = N_t - 1
 
         if n_subsequent_steps > 0:
@@ -182,7 +181,7 @@ class AudioProjModel(nn.Module):
         )
 
         # Normalize in fp32 (matching original's amp.autocast(dtype=float32))
-        with autocast(enabled=False):
+        with autocast("cuda", enabled=False):
             context_tokens = self.norm(context_tokens.float())
 
         context_tokens = context_tokens.reshape(
@@ -266,7 +265,7 @@ class AudioProjModel(nn.Module):
         context_tokens = self.proj3(all_out)
         context_tokens = context_tokens.reshape(BN, self.context_tokens, self.output_dim)
 
-        with autocast(enabled=False):
+        with autocast("cuda", enabled=False):
             context_tokens = self.norm(context_tokens.float())
 
         return context_tokens.reshape(B, N_t, self.context_tokens, self.output_dim)

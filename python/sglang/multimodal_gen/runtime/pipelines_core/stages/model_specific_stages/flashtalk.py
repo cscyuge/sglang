@@ -10,6 +10,7 @@ Contains:
 import os
 import time
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -49,6 +50,10 @@ class FlashTalkDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        # TeaCache adaptive step reduction state
+        self._prev_audio_context: torch.Tensor | None = None
+        self._teacache_reduced: int = 0
+        self._teacache_total_chunks: int = 0
         self._maybe_enable_torch_compile(self.transformer)
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
@@ -143,11 +148,6 @@ class FlashTalkDenoisingStage(PipelineStage):
             and batch.teacache_params is not None
             and audio_context is not None
         ):
-            if not hasattr(self, "_prev_audio_context"):
-                self._prev_audio_context = None
-                self._teacache_reduced = 0
-                self._teacache_total_chunks = 0
-
             self._teacache_total_chunks += 1
 
             if self._prev_audio_context is not None:
@@ -195,8 +195,6 @@ class FlashTalkDenoisingStage(PipelineStage):
             elif num_steps == 4:
                 ts_list = [1000, 750, 500, 250]
             else:
-                import numpy as np
-
                 ts_list = list(
                     np.linspace(num_timesteps, 1, num_steps, dtype=np.float32)
                 )
@@ -315,16 +313,15 @@ class FlashTalkDenoisingStage(PipelineStage):
             )
 
         # Log adaptive step reduction stats
-        if batch.enable_teacache and hasattr(self, "_teacache_total_chunks"):
+        if batch.enable_teacache and self._teacache_total_chunks > 0:
             total = self._teacache_total_chunks
             reduced = self._teacache_reduced
-            if total > 0:
-                logger.info(
-                    "FlashTalk TeaCache: %d/%d chunks reduced (%.1f%%)",
-                    reduced,
-                    total,
-                    100.0 * reduced / total,
-                )
+            logger.info(
+                "FlashTalk TeaCache: %d/%d chunks reduced (%.1f%%)",
+                reduced,
+                total,
+                100.0 * reduced / total,
+            )
 
         batch.latents = latents
 

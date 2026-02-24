@@ -7,7 +7,6 @@ layers for audio-driven talking face video generation.
 """
 
 import math
-from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -17,36 +16,28 @@ from sglang.multimodal_gen.configs.models.dits.wanvideo import (
     FlashTalkWanVideoArchConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
-    divide,
     get_sp_group,
     get_sp_world_size,
-    get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.attention.layer import LocalAttention
-from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
-    RMSNorm,
     ScaleResidualLayerNormScaleShift,
     tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
-    RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
-    ModulateProjection,
     PatchEmbed,
-    TimestepEmbedder,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
@@ -54,10 +45,6 @@ from sglang.multimodal_gen.runtime.models.dits.flashtalk_attention import (
     FlashTalkAudioCrossAttention,
 )
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
-    WanI2VCrossAttention,
-    WanImageEmbedding,
-    WanSelfAttention,
-    WanT2VCrossAttention,
     WanTimeTextImageEmbedding,
     WanTransformer3DModel,
     WanTransformerBlock,
@@ -66,7 +53,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -94,7 +80,6 @@ class FlashTalkWanTransformerBlock(WanTransformerBlock):
         sla_topk: float = 0.1,
         # FlashTalk audio params
         audio_dim: int = 768,
-        audio_context_tokens: int = 32,
         audio_qk_norm: bool = False,
         class_range: int = 24,
         class_interval: int = 4,
@@ -152,7 +137,6 @@ class FlashTalkWanTransformerBlock(WanTransformerBlock):
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
-        bs, seq_length, _ = hidden_states.shape
         orig_dtype = hidden_states.dtype
 
         if temb.dim() == 4:
@@ -317,7 +301,6 @@ class FlashTalkWanTransformer3DModel(WanTransformer3DModel):
 
         # 3. FlashTalk Transformer blocks (with audio cross-attention)
         audio_dim = getattr(config, "audio_dim", 768)
-        audio_context_tokens = getattr(config, "audio_context_tokens", 32)
 
         self.blocks = nn.ModuleList(
             [
@@ -334,7 +317,6 @@ class FlashTalkWanTransformer3DModel(WanTransformer3DModel):
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,
                     audio_dim=audio_dim,
-                    audio_context_tokens=audio_context_tokens,
                 )
                 for i in range(config.num_layers)
             ]
@@ -518,10 +500,10 @@ class FlashTalkWanTransformer3DModel(WanTransformer3DModel):
         # Grid shape for audio cross-attention
         grid_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
 
-        # Ensure consistent bf16 dtype for FP8 GEMM — inputs from different
+        # Ensure consistent dtype for GEMM — inputs from different
         # encoders (text fp32, image fp16) may differ, but attention requires
-        # q/k/v to match dtype.
-        param_dtype = torch.bfloat16
+        # q/k/v to match dtype. Use the model's compute dtype (from patch_embedding).
+        param_dtype = orig_dtype
         hidden_states = hidden_states.to(param_dtype)
         encoder_hidden_states = encoder_hidden_states.to(param_dtype)
         if audio_context is not None:
