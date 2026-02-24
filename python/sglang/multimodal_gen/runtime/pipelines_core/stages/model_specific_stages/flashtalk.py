@@ -117,10 +117,50 @@ class FlashTalkDenoisingStage(PipelineStage):
             logger.info("Moving transformer to GPU (SP mode, skipping per-step offload)")
             self.transformer.to(device)
 
+        # Wire TeaCache params from sampling_params to batch.
+        # Req.teacache_params defaults to None and __getattr__ delegation
+        # doesn't work for Req-level fields, so copy explicitly.
+        if (
+            batch.enable_teacache
+            and batch.sampling_params is not None
+            and hasattr(batch.sampling_params, "teacache_params")
+            and batch.sampling_params.teacache_params is not None
+        ):
+            batch.teacache_params = batch.sampling_params.teacache_params
+
         latents = batch.latents.to(device=device, dtype=dit_dtype)
         timesteps = batch.timesteps
         audio_context = batch.extra.get("audio_context")
         human_num = batch.extra.get("human_num", 1)
+
+        # Adaptive step reduction: use fewer denoising steps for chunks
+        # with similar audio context.  This avoids the mosaic artifacts
+        # of residual-level cross-chunk caching while still cutting DiT work.
+        base_num_steps = batch.num_inference_steps or 4
+        reduced_steps = False
+        if (
+            batch.enable_teacache
+            and batch.teacache_params is not None
+            and audio_context is not None
+        ):
+            if not hasattr(self, "_prev_audio_context"):
+                self._prev_audio_context = None
+                self._teacache_reduced = 0
+                self._teacache_total_chunks = 0
+
+            self._teacache_total_chunks += 1
+
+            if self._prev_audio_context is not None:
+                diff = audio_context - self._prev_audio_context
+                rel_l1 = (
+                    diff.abs().mean() / self._prev_audio_context.abs().mean()
+                ).cpu().item()
+                if rel_l1 < batch.teacache_params.teacache_thresh:
+                    base_num_steps = max(2, base_num_steps // 2)
+                    reduced_steps = True
+                    self._teacache_reduced += 1
+
+            self._prev_audio_context = audio_context.detach().clone()
 
         # Get conditioning
         encoder_hidden_states = batch.prompt_embeds
@@ -147,8 +187,9 @@ class FlashTalkDenoisingStage(PipelineStage):
         # Build timesteps with shift — match original FlashTalk schedule exactly.
         # Original uses DESCENDING timesteps [1000, 750, 500, 250] + [0],
         # then applies timestep_transform(shift=5) to each.
+        # base_num_steps may be reduced by adaptive step reduction above.
         if timesteps is None:
-            num_steps = batch.num_inference_steps or 4
+            num_steps = base_num_steps
             if num_steps == 2:
                 ts_list = [1000, 500]
             elif num_steps == 4:
@@ -265,10 +306,25 @@ class FlashTalkDenoisingStage(PipelineStage):
 
         denoising_end_time = time.time()
         if num_steps > 0:
+            step_suffix = " (reduced)" if reduced_steps else ""
             logger.info(
-                "FlashTalk denoising: avg %.4f s/step",
+                "FlashTalk denoising: avg %.4f s/step (%d steps%s)",
                 (denoising_end_time - denoising_start_time) / num_steps,
+                num_steps,
+                step_suffix,
             )
+
+        # Log adaptive step reduction stats
+        if batch.enable_teacache and hasattr(self, "_teacache_total_chunks"):
+            total = self._teacache_total_chunks
+            reduced = self._teacache_reduced
+            if total > 0:
+                logger.info(
+                    "FlashTalk TeaCache: %d/%d chunks reduced (%.1f%%)",
+                    reduced,
+                    total,
+                    100.0 * reduced / total,
+                )
 
         batch.latents = latents
 

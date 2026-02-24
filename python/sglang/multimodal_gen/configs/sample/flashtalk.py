@@ -4,6 +4,7 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 
 @dataclass
@@ -38,6 +39,19 @@ class FlashTalkSamplingParams(SamplingParams):
 
     # FlashTalk does not use negative prompts
     negative_prompt: str | None = None
+
+    # TeaCache: cross-chunk caching for FlashTalk.
+    # With only 4 denoising steps per chunk, within-chunk caching is
+    # ineffective (large timestep jumps). Instead, FlashTalk caches
+    # per-timestep residuals and compares the same timestep across
+    # consecutive chunks where content changes gradually.
+    # Threshold controls sensitivity: lower = more caching (faster, lower quality).
+    teacache_params: TeaCacheParams = field(
+        default_factory=lambda: TeaCacheParams(
+            teacache_thresh=0.15,
+            coefficients=[1.0, 0.0],  # identity polynomial (no rescaling)
+        )
+    )
 
     # Supported resolutions
     supported_resolutions: list[tuple[int, int]] | None = field(

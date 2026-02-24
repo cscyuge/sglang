@@ -376,6 +376,20 @@ class FlashTalkWanTransformer3DModel(WanTransformer3DModel):
 
         self.layer_names = ["blocks"]
 
+    def _init_teacache_state(self) -> None:
+        """FlashTalk disables model-level TeaCache.
+
+        Cross-chunk caching at the transformer residual level doesn't work
+        because hidden_states differ completely across chunks (different noise
+        and motion latent). Instead, FlashTalk uses adaptive step reduction
+        at the denoising stage level — see FlashTalkDenoisingStage.
+        """
+        super()._init_teacache_state()
+
+    def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
+        """Always compute — FlashTalk handles caching at the pipeline level."""
+        return False
+
     def forward(
         self,
         hidden_states: torch.Tensor,
