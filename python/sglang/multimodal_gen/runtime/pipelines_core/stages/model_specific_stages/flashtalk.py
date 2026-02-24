@@ -247,7 +247,7 @@ class FlashTalkDenoisingStage(PipelineStage):
                 with StageProfiler(
                     f"flashtalk_denoising_step_{i}",
                     logger=logger,
-                    timings=batch.timings,
+                    metrics=batch.metrics,
                     perf_dump_path_provided=(
                         batch.perf_dump_path is not None
                         if hasattr(batch, "perf_dump_path")

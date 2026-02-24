@@ -55,7 +55,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     Req,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ConditioningStage,
     DecodingStage,
     ImageEncodingStage,
     ImageVAEEncodingStage,
@@ -76,6 +75,72 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+
+def _apply_fp8_quant_to_model(model: torch.nn.Module, fp8_config) -> int:
+    """Patch block-level linear layers for FP8 quantization on meta device.
+
+    Must be called after model creation on meta device, before weight loading.
+    For each ColumnParallelLinear/RowParallelLinear inside transformer blocks:
+      - Replaces weight parameter with float8_e4m3fn dtype
+      - Adds weight_scale_inv parameter (float32)
+      - Sets quant_method to Fp8LinearMethod
+
+    Returns:
+        Number of layers patched.
+    """
+    from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
+
+    block_size = fp8_config.weight_block_size
+    fp8_method = Fp8LinearMethod(fp8_config)
+    patched = 0
+
+    for name, module in model.named_modules():
+        if not isinstance(module, LinearBase):
+            continue
+        if not name.startswith("blocks."):
+            continue
+
+        old_weight = module.weight
+        out_features, in_features = old_weight.shape
+
+        if out_features % block_size[0] != 0 or in_features % block_size[1] != 0:
+            logger.warning(
+                "Skipping FP8 for %s: shape (%d, %d) not divisible by %s",
+                name, out_features, in_features, block_size,
+            )
+            continue
+
+        # Replace weight with fp8 dtype
+        new_weight = torch.nn.Parameter(
+            torch.empty(out_features, in_features,
+                        dtype=torch.float8_e4m3fn, device=old_weight.device),
+            requires_grad=False,
+        )
+        for attr in ("output_dim", "input_dim"):
+            val = getattr(old_weight, attr, None)
+            if val is not None:
+                setattr(new_weight, attr, val)
+        module.weight = new_weight
+
+        # Add weight_scale_inv parameter
+        scale_shape = (out_features // block_size[0], in_features // block_size[1])
+        scale = torch.nn.Parameter(
+            torch.empty(*scale_shape, dtype=torch.float32, device=old_weight.device),
+            requires_grad=False,
+        )
+        for attr in ("output_dim", "input_dim"):
+            val = getattr(old_weight, attr, None)
+            if val is not None:
+                setattr(scale, attr, val)
+        module.register_parameter("weight_scale_inv", scale)
+
+        module.quant_method = fp8_method
+        patched += 1
+
+    logger.info("Applied FP8 block quantization to %d linear layers", patched)
+    return patched
 
 
 class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
@@ -310,23 +375,24 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             model = FlashTalkWanTransformer3DModel(config=dit_config)
 
         # Apply FP8 block quantization if checkpoint has quantization_config
-        fp8_quant_config = None
         quant_config_dict = raw_config.get("quantization_config")
         if quant_config_dict and quant_config_dict.get("quant_method") == "fp8":
             from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
-                Fp8BlockQuantConfig,
-                apply_fp8_quant_to_model,
+                Fp8Config,
+                Fp8LinearMethod,
             )
 
             weight_block_size = quant_config_dict.get(
                 "weight_block_size", [128, 128]
             )
-            fp8_quant_config = Fp8BlockQuantConfig(
-                weight_block_size=weight_block_size
+            fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=weight_block_size,
             )
-            apply_fp8_quant_to_model(model, fp8_quant_config)
+            _apply_fp8_quant_to_model(model, fp8_config)
 
-        # Load weights
+        # Load weights (also auto-calls process_weights_after_loading for FP8)
         weight_iterator = safetensors_weights_iterator(safetensors_list)
         param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
         load_model_from_full_model_state_dict(
@@ -338,14 +404,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             cpu_offload=server_args.dit_cpu_offload,
             param_names_mapping=param_names_mapping_fn,
         )
-
-        # Post-process FP8 weights (convert scale_inv bf16 -> float32)
-        if fp8_quant_config is not None:
-            from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
-                process_fp8_weights_after_loading,
-            )
-
-            process_fp8_weights_after_loading(model)
 
         # Materialize any remaining meta-device buffers (e.g., RoPE inv_freq)
         # that are computed at init time and not stored in checkpoints.
@@ -973,13 +1031,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 ),
             )
 
-        # 5. Conditioning
-        self.add_stage(
-            stage_name="conditioning_stage",
-            stage=ConditioningStage(),
-        )
-
-        # 6. Timestep preparation
+        # 5. Timestep preparation
         self.add_stage(
             stage_name="timestep_preparation_stage",
             stage=TimestepPreparationStage(
@@ -1091,7 +1143,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 if isinstance(result, OutputBatch):
                     return result
                 batch = result
-            return OutputBatch(output=batch.output, timings=batch.timings)
+            return OutputBatch(output=batch.output, metrics=batch.metrics)
 
         # --- Multi-chunk mode: override SP-padded frame count ---
         frame_num = chunk_frame_num  # 33
@@ -1507,7 +1559,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
         return OutputBatch(
             output=final_video,
-            timings=batch.timings,
+            metrics=batch.metrics,
             audio_path=audio_path,
         )
 

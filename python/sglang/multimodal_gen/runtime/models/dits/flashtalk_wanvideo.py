@@ -518,6 +518,15 @@ class FlashTalkWanTransformer3DModel(WanTransformer3DModel):
         # Grid shape for audio cross-attention
         grid_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
 
+        # Ensure consistent bf16 dtype for FP8 GEMM — inputs from different
+        # encoders (text fp32, image fp16) may differ, but attention requires
+        # q/k/v to match dtype.
+        param_dtype = torch.bfloat16
+        hidden_states = hidden_states.to(param_dtype)
+        encoder_hidden_states = encoder_hidden_states.to(param_dtype)
+        if audio_context is not None:
+            audio_context = audio_context.to(param_dtype)
+
         # 4. Transformer blocks with audio context
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
