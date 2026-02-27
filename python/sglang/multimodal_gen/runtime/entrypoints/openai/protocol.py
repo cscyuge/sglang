@@ -54,7 +54,7 @@ class VideoResponse(BaseModel):
     id: str
     object: str = "video"
     model: str = "sora-2"
-    status: str = "queued"
+    status: str = "queued"  # queued | processing | completed | failed | cancelling | cancelled
     progress: int = 0
     created_at: int = Field(default_factory=lambda: int(time.time()))
     size: str = ""
@@ -66,8 +66,12 @@ class VideoResponse(BaseModel):
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
     file_path: Optional[str] = None
+    stream_url: Optional[str] = None
+    events_url: Optional[str] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    num_chunks: Optional[int] = None
+    chunks_completed: Optional[int] = None
 
 
 class VideoGenerationsRequest(BaseModel):
@@ -96,6 +100,7 @@ class VideoGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # FlashTalk audio input
     audio_path: Optional[str] = None
+    audio_url: Optional[str] = None
     audio_encode_mode: Optional[str] = None  # "stream" or "batch"
 
 
@@ -106,6 +111,19 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+# Session API protocol models (live-streaming FlashTalk)
+class SessionResponse(BaseModel):
+    session_id: str
+    object: str = "video.session"
+    status: str = "created"  # created | running | ended | failed
+    stream_url: Optional[str] = None
+    events_url: Optional[str] = None
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    chunks_received: int = 0
+    chunks_processed: int = 0
+    error: Optional[Dict[str, Any]] = None
 
 
 @dataclass

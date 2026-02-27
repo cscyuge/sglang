@@ -81,6 +81,74 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
+def _save_chunk_frames_for_streaming(
+    chunk_frames: torch.Tensor,
+    frame_dir: str,
+    chunk_idx: int,
+    frames_per_chunk: int,
+) -> None:
+    """Save per-chunk frames as individual JPEGs for real-time MJPEG streaming.
+
+    Args:
+        chunk_frames: Tensor of shape (1, 3, T, H, W) in [0, 1] float range.
+        frame_dir: Directory to write frame_NNNNN.jpg files into.
+        chunk_idx: Zero-based chunk index (used to compute global frame offset).
+        frames_per_chunk: Number of frames per chunk (typically 28).
+    """
+    import imageio
+
+    base_idx = chunk_idx * frames_per_chunk
+    # (1, 3, T, H, W) → (T, H, W, 3) uint8
+    frames_np = (
+        (chunk_frames[0] * 255)
+        .clamp(0, 255)
+        .to(torch.uint8)
+        .permute(1, 2, 3, 0)
+        .cpu()
+        .numpy()
+    )
+    for i in range(frames_np.shape[0]):
+        path = os.path.join(frame_dir, f"frame_{base_idx + i:05d}.jpg")
+        imageio.imwrite(path, frames_np[i])
+
+
+def _wait_for_session_audio_chunk(
+    session_dir: str,
+    chunk_idx: int,
+    cancel_file: str | None = None,
+    timeout: float = 300.0,
+    poll_interval: float = 0.05,
+) -> np.ndarray | None:
+    """Wait for a session audio chunk file to appear.
+
+    Returns the audio samples as a float32 numpy array, or None if the
+    session ended (``end`` sentinel), was cancelled, or timed out.
+    """
+    chunk_path = os.path.join(
+        session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy"
+    )
+    end_path = os.path.join(session_dir, "end")
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(end_path):
+            return None
+        if cancel_file and os.path.exists(cancel_file):
+            return None
+        if os.path.exists(chunk_path):
+            try:
+                return np.load(chunk_path)
+            except Exception:
+                # File may be mid-write; retry after a short wait
+                time.sleep(0.01)
+                try:
+                    return np.load(chunk_path)
+                except Exception:
+                    return None
+        time.sleep(poll_interval)
+    return None
+
+
 def _apply_fp8_quant_to_model(model: torch.nn.Module, fp8_config) -> int:
     """Patch block-level linear layers for FP8 quantization on meta device.
 
@@ -1132,9 +1200,15 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         audio_features_all = batch.extra.get("audio_features_all")
         total_audio_video_frames = batch.extra.get("total_audio_video_frames", 0)
 
+        # Session mode: open-ended live streaming (audio arrives incrementally)
+        is_session = batch.extra.get("session_mode", False)
+        session_dir = batch.extra.get("session_dir")
+
         # If no audio features or audio is short enough for a single chunk,
-        # fall back to default single-chunk pipeline
-        if audio_features_all is None or total_audio_video_frames <= chunk_frame_num:
+        # fall back to default single-chunk pipeline (unless session mode)
+        if not is_session and (
+            audio_features_all is None or total_audio_video_frames <= chunk_frame_num
+        ):
             for stage in self.stages[denoising_idx:]:
                 result = stage.forward(batch, server_args)
                 if isinstance(result, OutputBatch):
@@ -1167,27 +1241,33 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 :, :, :chunk_latent_num_frames, :, :
             ]
 
-        # Match the original FlashTalk chunk count formula.
-        # The original runs chunk_count+1 iterations: first chunk (from image) plus
-        # chunk_count subsequent chunks with motion frame carry-over.
-        num_chunks = (total_audio_video_frames - frame_num) // slice_len + 1
+        if is_session:
+            num_chunks = 0  # open-ended; logged differently
+            logger.info(
+                "Session mode: open-ended generation (frame_num=%d, slice_len=%d, "
+                "motion_frames=%d)",
+                frame_num, slice_len, motion_frames_num,
+            )
+        else:
+            # Match the original FlashTalk chunk count formula.
+            num_chunks = (total_audio_video_frames - frame_num) // slice_len + 1
 
-        # Debug: limit chunks for faster testing
-        _debug_max_chunks = int(
-            os.environ.get("FLASHTALK_MAX_CHUNKS", "0")
-        )
-        if _debug_max_chunks > 0:
-            num_chunks = min(num_chunks, _debug_max_chunks)
+            # Debug: limit chunks for faster testing
+            _debug_max_chunks = int(
+                os.environ.get("FLASHTALK_MAX_CHUNKS", "0")
+            )
+            if _debug_max_chunks > 0:
+                num_chunks = min(num_chunks, _debug_max_chunks)
 
-        logger.info(
-            "Multi-chunk generation: %d chunks (total_frames=%d, frame_num=%d, "
-            "slice_len=%d, motion_frames=%d)",
-            num_chunks,
-            total_audio_video_frames,
-            frame_num,
-            slice_len,
-            motion_frames_num,
-        )
+            logger.info(
+                "Multi-chunk generation: %d chunks (total_frames=%d, frame_num=%d, "
+                "slice_len=%d, motion_frames=%d)",
+                num_chunks,
+                total_audio_video_frames,
+                frame_num,
+                slice_len,
+                motion_frames_num,
+            )
 
         # --- Stage references (look up by type to avoid fragile index assumptions) ---
         denoising_stage = self.stages[denoising_idx]
@@ -1222,7 +1302,12 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             pipeline_config, "cached_audio_duration", 8
         )
 
-        use_streaming_audio = raw_audio_array is not None and audio_encoder is not None
+        # Session mode always uses streaming audio (chunks arrive via files)
+        use_streaming_audio = (
+            (raw_audio_array is not None or is_session) and audio_encoder is not None
+        )
+
+        speech_slices = None  # only set for non-session streaming audio
 
         if use_streaming_audio:
             cached_audio_length = sample_rate * cached_audio_duration  # 128000
@@ -1234,25 +1319,33 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 [0.0] * cached_audio_length, maxlen=cached_audio_length
             )
 
-            # Split raw audio into per-chunk sample slices
-            slice_samples = slice_len * sample_rate // fps  # 17920
-            total_samples = len(raw_audio_array)
-            n_full_slices = total_samples // slice_samples
-            if n_full_slices > 0:
-                speech_slices = raw_audio_array[
-                    : n_full_slices * slice_samples
-                ].reshape(n_full_slices, slice_samples)
-            else:
-                speech_slices = raw_audio_array[:slice_samples].reshape(1, -1)
+            if raw_audio_array is not None:
+                # Normal multi-chunk: split raw audio into per-chunk sample slices
+                slice_samples = slice_len * sample_rate // fps  # 17920
+                total_samples = len(raw_audio_array)
+                n_full_slices = total_samples // slice_samples
+                if n_full_slices > 0:
+                    speech_slices = raw_audio_array[
+                        : n_full_slices * slice_samples
+                    ].reshape(n_full_slices, slice_samples)
+                else:
+                    speech_slices = raw_audio_array[:slice_samples].reshape(1, -1)
 
-            logger.info(
-                "Per-chunk streaming audio: cached_duration=%ds, "
-                "deque_len=%d, slice_samples=%d, num_slices=%d",
-                cached_audio_duration,
-                cached_audio_length,
-                slice_samples,
-                len(speech_slices),
-            )
+                logger.info(
+                    "Per-chunk streaming audio: cached_duration=%ds, "
+                    "deque_len=%d, slice_samples=%d, num_slices=%d",
+                    cached_audio_duration,
+                    cached_audio_length,
+                    slice_samples,
+                    len(speech_slices),
+                )
+            else:
+                # Session mode: audio arrives per-chunk via .npy files
+                logger.info(
+                    "Session streaming audio: cached_duration=%ds, deque_len=%d",
+                    cached_audio_duration,
+                    cached_audio_length,
+                )
 
         # Pre-import pyloudnorm for per-chunk loudness normalization
         _pyln = None
@@ -1341,7 +1434,243 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         _gc_was_enabled = gc.isenabled()
         gc.disable()
 
+        # File-based progress / cancellation IPC
+        _request_id = batch.request_id
+        _progress_dir = os.path.join(server_args.output_path, ".progress")
+        os.makedirs(_progress_dir, exist_ok=True)
+        _progress_file = os.path.join(_progress_dir, _request_id) if _request_id else None
+        _cancel_file = os.path.join(_progress_dir, f"{_request_id}.cancel") if _request_id else None
+        _cancelled = False
+
+        # Streaming frame IPC: write per-chunk JPEG frames for MJPEG streaming
+        _frame_dir = None
+        _frames_per_chunk = slice_len  # typically 28
+        if _request_id:
+            _frame_dir = os.path.join(
+                server_args.output_path, ".frames", _request_id
+            )
+            try:
+                os.makedirs(_frame_dir, exist_ok=True)
+                _meta = {
+                    "num_chunks": num_chunks if not is_session else None,
+                    "fps": batch.fps or 25,
+                    "frames_per_chunk": _frames_per_chunk,
+                    "width": batch.width,
+                    "height": batch.height,
+                    "session": is_session,
+                }
+                with open(os.path.join(_frame_dir, "meta.json"), "w") as _mf:
+                    json.dump(_meta, _mf)
+            except Exception as e:
+                logger.warning("Failed to set up streaming frame dir: %s", e)
+                _frame_dir = None
+
+        # ================================================================
+        # SESSION MODE: open-ended chunk loop with audio from files
+        # ================================================================
+        if is_session:
+            all_chunk_frames = []
+            chunk_idx = 0
+            _session_ended = False
+
+            while True:
+                # Wait for audio chunk or end sentinel
+                logger.info("Session: waiting for audio chunk %d...", chunk_idx)
+                chunk_audio_data = _wait_for_session_audio_chunk(
+                    session_dir, chunk_idx, cancel_file=_cancel_file,
+                )
+                if chunk_audio_data is None:
+                    if _cancel_file and os.path.exists(_cancel_file):
+                        logger.info("Session cancelled at chunk %d", chunk_idx)
+                        _cancelled = True
+                    else:
+                        logger.info("Session ended at chunk %d", chunk_idx)
+                        _session_ended = True
+                    break
+
+                chunk_start = time.time()
+                logger.info("Session: generating chunk %d", chunk_idx)
+
+                # a. Per-chunk audio processing (same as streaming mode)
+                if use_streaming_audio:
+                    audio_dq.extend(chunk_audio_data.tolist())
+                    audio_array = np.array(audio_dq)
+
+                    if _pyln is not None and _pyln_meter is not None:
+                        loudness = _pyln_meter.integrated_loudness(audio_array)
+                        if abs(loudness) <= 100:
+                            audio_array = _pyln.normalize.loudness(
+                                audio_array, loudness, -23.0
+                            )
+
+                    audio_feature_np = np.squeeze(
+                        wav2vec_feature_extractor(
+                            audio_array, sampling_rate=sample_rate
+                        ).input_values
+                    )
+                    audio_feature_t = (
+                        torch.from_numpy(audio_feature_np)
+                        .float()
+                        .to(device=device)
+                        .unsqueeze(0)
+                    )
+                    audio_encoder.to(device)
+                    chunk_wav2vec = audio_encoder(
+                        audio_feature_t, num_video_frames=audio_end_idx
+                    )
+
+                    half_w = audio_proj.audio_window_first // 2
+                    window_offsets = torch.arange(-half_w, half_w + 1, device=device)
+                    frame_indices = torch.arange(
+                        audio_start_idx, audio_end_idx, device=device
+                    )
+                    windowed_idx = (
+                        frame_indices.unsqueeze(1) + window_offsets.unsqueeze(0)
+                    )
+                    windowed_idx = windowed_idx.clamp(0, audio_end_idx - 1)
+                    windowed_features = chunk_wav2vec[:, windowed_idx]
+
+                    audio_proj.to(device)
+                    batch.extra["audio_context"] = audio_proj.forward_prewindowed(
+                        windowed_features, vae_temporal_factor=vae_temporal_factor
+                    )
+
+                    if server_args.audio_encoder_cpu_offload and not skip_audio_offload:
+                        audio_encoder.to("cpu", non_blocking=True)
+
+                # b. Fresh noise latents
+                dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
+                gen = batch.generator[0] if isinstance(batch.generator, list) else batch.generator
+                z_dim = pipeline_config.vae_config.arch_config.z_dim
+                vae_spatial_stride = 8
+                latent_shape = (
+                    1, z_dim, chunk_latent_num_frames,
+                    batch.height // vae_spatial_stride,
+                    batch.width // vae_spatial_stride,
+                )
+                batch.latents = torch.randn(
+                    latent_shape, dtype=dit_dtype, device=device, generator=gen
+                )
+
+                # c. Denoise
+                batch.timesteps = None
+                batch = denoising_stage.forward(batch, server_args)
+
+                # d. VAE decode + color correct + motion carry
+                vae.to(device)
+                vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
+                vae_autocast_enabled = (
+                    vae_dtype != torch.float32
+                    and not server_args.disable_autocast
+                )
+
+                denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
+                sf_dev = shift_factor.to(device=device)
+                sc_dev = scaling_factor.to(device=device)
+                denorm_latents = denoised_latents / sc_dev + sf_dev
+
+                torch.cuda.synchronize()
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=vae_dtype, enabled=vae_autocast_enabled,
+                ):
+                    if not vae_autocast_enabled:
+                        denorm_latents = denorm_latents.to(vae_dtype)
+                    videos = vae.decode(denorm_latents)
+                torch.cuda.synchronize()
+                del denorm_latents
+
+                batch.output = videos
+                batch = color_correction_stage.forward(batch, server_args)
+                videos_corrected = batch.output
+                del videos
+
+                cond_frame = videos_corrected[:, :, -motion_frames_num:].clone()
+                torch.cuda.synchronize()
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=vae_dtype, enabled=vae_autocast_enabled,
+                ):
+                    if not vae_autocast_enabled:
+                        cond_frame = cond_frame.to(vae_dtype)
+                    latent_dist = vae.encode(cond_frame)
+                    if isinstance(latent_dist, DiagonalGaussianDistribution):
+                        motion_latent_raw = latent_dist.mode()
+                    elif hasattr(latent_dist, "latent_dist"):
+                        motion_latent_raw = latent_dist.latent_dist.mode()
+                    else:
+                        motion_latent_raw = latent_dist
+                torch.cuda.synchronize()
+                del cond_frame
+
+                corrected = (videos_corrected + 1) / 2
+                corrected = corrected.clamp(0, 1)
+                del videos_corrected
+
+                motion_latent_f32 = motion_latent_raw.float()
+                motion_latent_normalized = (motion_latent_f32 - sf_dev) * sc_dev
+                batch.extra["motion_latent"] = motion_latent_normalized
+
+                if server_args.vae_cpu_offload and not skip_vae_offload:
+                    vae.to("cpu", non_blocking=True)
+
+                # e. Collect frames
+                chunk_frames = corrected[:, :, motion_frames_num:].clone()
+                del corrected
+                all_chunk_frames.append(chunk_frames)
+
+                # f. Progress + streaming frames
+                if _progress_file:
+                    try:
+                        with open(_progress_file, "w") as _pf:
+                            _pf.write(f"{chunk_idx + 1} -1")
+                    except Exception:
+                        pass
+                if _frame_dir:
+                    try:
+                        _save_chunk_frames_for_streaming(
+                            chunk_frames, _frame_dir, chunk_idx, _frames_per_chunk
+                        )
+                    except Exception as e:
+                        logger.warning("Session frame save failed for chunk %d: %s", chunk_idx, e)
+
+                _t_chunk = time.time() - chunk_start
+                logger.info("Session chunk %d: %.3fs", chunk_idx, _t_chunk)
+                chunk_idx += 1
+
+            # --- Session post-loop ---
+            if _gc_was_enabled:
+                gc.enable()
+                gc.collect()
+
+            if _frame_dir:
+                try:
+                    with open(os.path.join(_frame_dir, "done"), "w") as _df:
+                        pass
+                except Exception:
+                    pass
+
+            if not all_chunk_frames:
+                return OutputBatch(output=None, metrics=batch.metrics)
+
+            final_video = torch.cat(all_chunk_frames, dim=2)
+            audio_path = batch.extra.get("audio_path")
+            return OutputBatch(
+                output=final_video,
+                metrics=batch.metrics,
+                audio_path=audio_path,
+            )
+
+        # ================================================================
+        # NORMAL MULTI-CHUNK MODE (existing code)
+        # ================================================================
         for chunk_idx in range(num_chunks):
+            # Check for cancellation at the start of each chunk
+            if _cancel_file and os.path.exists(_cancel_file):
+                logger.info("Cancelled at chunk %d/%d", chunk_idx + 1, num_chunks)
+                _cancelled = True
+                break
+
             chunk_start = time.time()
             logger.info("Generating chunk %d/%d", chunk_idx + 1, num_chunks)
 
@@ -1521,6 +1850,23 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             del corrected
             all_chunk_frames.append(chunk_frames)
 
+            # Write progress file for HTTP polling
+            if _progress_file:
+                try:
+                    with open(_progress_file, "w") as _pf:
+                        _pf.write(f"{chunk_idx + 1} {num_chunks}")
+                except Exception:
+                    pass
+
+            # Save per-chunk JPEG frames for real-time MJPEG streaming
+            if _frame_dir:
+                try:
+                    _save_chunk_frames_for_streaming(
+                        chunk_frames, _frame_dir, chunk_idx, _frames_per_chunk
+                    )
+                except Exception as e:
+                    logger.warning("Streaming frame save failed for chunk %d: %s", chunk_idx, e)
+
             # Per-chunk timing summary (skip chunk 1 which includes compile)
             _t_chunk = time.time() - chunk_start
             if chunk_idx > 0:
@@ -1553,6 +1899,26 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         if _gc_was_enabled:
             gc.enable()
             gc.collect()
+
+        # Write done sentinel for streaming clients
+        if _frame_dir:
+            try:
+                with open(os.path.join(_frame_dir, "done"), "w") as _df:
+                    pass
+            except Exception:
+                pass
+
+        if _cancelled and not all_chunk_frames:
+            logger.info("Cancelled before any chunk completed — returning empty output")
+            return OutputBatch(
+                output=None,
+                metrics=batch.metrics,
+            )
+
+        if _cancelled:
+            logger.info(
+                "Returning partial result: %d/%d chunks", len(all_chunk_frames), num_chunks
+            )
 
         final_video = torch.cat(all_chunk_frames, dim=2)
 

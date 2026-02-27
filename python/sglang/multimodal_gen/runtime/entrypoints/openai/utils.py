@@ -121,6 +121,100 @@ async def save_image_to_path(image: Union[UploadFile, str], target_path: str) ->
     return input_path
 
 
+_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
+
+async def save_audio_to_path(audio: Union[UploadFile, str], target_path: str) -> str:
+    """Save audio from an UploadFile, URL, or base64 data-URI to *target_path*.
+
+    Mirrors :func:`save_image_to_path` but for audio content.
+    """
+    if isinstance(audio, str):
+        if audio.lower().startswith(("http://", "https://")):
+            return await _save_url_audio_to_path(audio, target_path)
+        elif audio.startswith("data:audio"):
+            return await _save_base64_audio_to_path(audio, target_path)
+        else:
+            raise ValueError("Unsupported audio input format")
+    # UploadFile
+    return await _save_upload_to_path(audio, target_path)
+
+
+async def _save_url_audio_to_path(audio_url: str, target_path: str) -> str:
+    """Download audio from *audio_url* and save to *target_path*."""
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(audio_url, timeout=30.0)
+            response.raise_for_status()
+
+            if not os.path.splitext(target_path)[1]:
+                content_type = response.headers.get("content-type", "").lower()
+                url_path = audio_url.split("?")[0]
+                _, url_ext = os.path.splitext(url_path)
+                url_ext = url_ext.lower()
+
+                if url_ext in _AUDIO_EXTENSIONS:
+                    ext = url_ext
+                elif "wav" in content_type:
+                    ext = ".wav"
+                elif "mp3" in content_type or "mpeg" in content_type:
+                    ext = ".mp3"
+                elif "flac" in content_type:
+                    ext = ".flac"
+                elif "ogg" in content_type:
+                    ext = ".ogg"
+                elif "m4a" in content_type or "mp4" in content_type:
+                    ext = ".m4a"
+                else:
+                    ext = ".wav"
+                target_path = f"{target_path}{ext}"
+
+            with open(target_path, "wb") as f:
+                f.write(response.content)
+            return target_path
+    except Exception as e:
+        raise Exception(f"Failed to download audio from URL: {str(e)}")
+
+
+async def _save_base64_audio_to_path(base64_data: str, target_path: str) -> str:
+    """Decode base64 audio data and save to *target_path*."""
+    _B64_FMT_HINT = (
+        "Failed to decode base64 audio. "
+        "Expected format: `data:[<media-type>];base64,<data>`"
+    )
+    pattern = r"data:(.*?)(;base64)?,(.*)"
+    match = re.match(pattern, base64_data)
+    if not match:
+        raise ValueError(_B64_FMT_HINT)
+    media_type = match.group(1)
+    is_base64 = match.group(2)
+    if not is_base64:
+        raise ValueError(f"{_B64_FMT_HINT} (missing ;base64 marker)")
+    data = match.group(3)
+    if not data:
+        raise ValueError(f"{_B64_FMT_HINT} (empty data payload)")
+
+    if media_type.startswith("audio/"):
+        ext = media_type.split("/")[-1].lower()
+        if ext == "mpeg":
+            ext = "mp3"
+        elif ext == "x-wav":
+            ext = "wav"
+    else:
+        ext = "wav"
+    target_path = f"{target_path}.{ext}"
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    try:
+        audio_data = base64.b64decode(data)
+        with open(target_path, "wb") as f:
+            f.write(audio_data)
+        return target_path
+    except Exception as e:
+        raise Exception(f"Failed to decode base64 audio: {str(e)}")
+
+
 # Helpers
 async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
