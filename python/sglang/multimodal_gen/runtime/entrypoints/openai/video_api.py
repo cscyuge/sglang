@@ -54,10 +54,24 @@ router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
     """Resolve video-specific defaults (fps, seconds → num_frames) then
-    delegate to the shared build_sampling_params."""
-    seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
-    fps = request.fps if request.fps is not None else DEFAULT_FPS
-    num_frames = request.num_frames if request.num_frames is not None else fps * seconds
+    delegate to the shared build_sampling_params.
+
+    When neither ``num_frames`` nor ``fps`` is explicitly provided by the
+    caller, we pass *None* so that model-specific SamplingParams defaults
+    take precedence (e.g. FlashTalkSamplingParams uses num_frames=33,
+    fps=25 instead of the generic 24 fps × 4 s = 96 frames).
+    """
+    if request.num_frames is not None:
+        num_frames = request.num_frames
+        fps = request.fps if request.fps is not None else DEFAULT_FPS
+    elif request.fps is not None:
+        fps = request.fps
+        seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
+        num_frames = fps * seconds
+    else:
+        # Neither num_frames nor fps specified – let model defaults apply
+        num_frames = None
+        fps = None
 
     return build_sampling_params(
         request_id,
@@ -736,6 +750,13 @@ async def stream_video_mjpeg(
     video_id: str = Path(...),
     fps: int = Query(25, ge=1, le=60),
     jpeg_quality: int = Query(85, ge=1, le=100),
+    buffer_frames: int = Query(
+        0, ge=0, le=500,
+        description="Number of frames to pre-buffer before starting playback. "
+        "When generation is faster than real-time, buffering absorbs timing "
+        "jitter and ensures video duration matches audio exactly. "
+        "Recommended: 5*fps (e.g. 125 for 25fps = 5 second buffer).",
+    ),
 ):
     """Stream video frames as MJPEG multipart response.
 
@@ -755,6 +776,27 @@ async def stream_video_mjpeg(
         frame_interval = 1.0 / fps
         stall_count = 0
         max_stall = 600  # 600 × 0.1s = 60s timeout for first chunk / compile
+        playback_epoch = None  # wall-clock ref for drift-free pacing
+
+        # ── Pre-buffer: wait until enough frames exist before streaming ──
+        # This absorbs timing jitter and prevents the video from running
+        # longer than the audio when generation is faster than real-time.
+        if buffer_frames > 0:
+            while True:
+                # Count available frames
+                ready = 0
+                while os.path.exists(
+                    os.path.join(frame_dir, f"frame_{ready:05d}.jpg")
+                ):
+                    ready += 1
+                done_path = os.path.join(frame_dir, "done")
+                if ready >= buffer_frames or os.path.exists(done_path):
+                    break
+                stall_count += 1
+                if stall_count >= max_stall:
+                    return  # timeout
+                await asyncio.sleep(0.1)
+            stall_count = 0
 
         while True:
             frame_path = os.path.join(frame_dir, f"frame_{frame_idx:05d}.jpg")
@@ -773,12 +815,21 @@ async def stream_video_mjpeg(
                     pass  # file may be mid-write; retry next iteration
                     continue
                 frame_idx += 1
-                await asyncio.sleep(frame_interval)
+                # Wall-clock pacing: sleep until the target time for the
+                # next frame so per-frame I/O overhead doesn't accumulate.
+                now = asyncio.get_event_loop().time()
+                if playback_epoch is None:
+                    playback_epoch = now
+                target = playback_epoch + frame_idx * frame_interval
+                delay = target - now
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                # else: behind schedule (after stall), serve next immediately
             else:
                 # Check if generation is done
                 done_path = os.path.join(frame_dir, "done")
                 if os.path.exists(done_path):
-                    # Drain any remaining frames
+                    # Drain any remaining frames with the same wall-clock pacing
                     while True:
                         frame_path = os.path.join(
                             frame_dir, f"frame_{frame_idx:05d}.jpg"
@@ -799,7 +850,11 @@ async def stream_video_mjpeg(
                         except Exception:
                             break
                         frame_idx += 1
-                        await asyncio.sleep(frame_interval)
+                        if playback_epoch is not None:
+                            target = playback_epoch + frame_idx * frame_interval
+                            delay = target - asyncio.get_event_loop().time()
+                            if delay > 0:
+                                await asyncio.sleep(delay)
                     break
                 stall_count += 1
                 if stall_count >= max_stall:

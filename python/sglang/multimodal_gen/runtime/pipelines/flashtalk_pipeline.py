@@ -341,7 +341,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         loaded_components["image_processor"] = self._create_image_processor()
 
         # ---- 4g. Wav2Vec2 audio encoder (optional) ----
+        # Check pipeline_config first, then fall back to component_paths
+        # (--audio-encoder-path is parsed into component_paths["audio_encoder"])
         audio_encoder_path = getattr(pipeline_config, "audio_encoder_path", None)
+        if not audio_encoder_path:
+            audio_encoder_path = server_args.component_paths.get("audio_encoder")
         if audio_encoder_path:
             logger.info("Loading Wav2Vec2 audio encoder from %s", audio_encoder_path)
             audio_encoder = Wav2Vec2AudioEncoder(model_path=audio_encoder_path)
