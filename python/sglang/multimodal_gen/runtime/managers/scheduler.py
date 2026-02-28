@@ -233,6 +233,30 @@ class Scheduler:
                         height=height,
                         prompt="",
                     )
+
+                # FlashTalk-specific warmup: set correct frame count and
+                # provide dummy audio so the audio encoder, audio cross-
+                # attention, and DeepGEMM kernels are all exercised.
+                pipeline_config = self.server_args.pipeline_config
+                audio_encoder_path = getattr(
+                    pipeline_config, "audio_encoder_path", None
+                ) or self.server_args.component_paths.get("audio_encoder")
+                if audio_encoder_path is not None:
+                    import numpy as np
+
+                    chunk_frame_num = getattr(pipeline_config, "chunk_frame_num", 33)
+                    fps = 25
+                    req.num_frames = chunk_frame_num
+                    req.fps = fps
+                    req.adjust_frames = False
+                    # Audio must produce exactly chunk_frame_num video frames
+                    # so AudioProjModel's reshape (requires (nframes-1) % 4 == 0)
+                    # works correctly. chunk_frame_num / fps seconds of silence.
+                    n_audio_samples = int(chunk_frame_num / fps * 16000)
+                    req.extra["audio_tensor"] = np.zeros(
+                        n_audio_samples, dtype=np.float32
+                    )
+
                 req.set_as_warmup()
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
