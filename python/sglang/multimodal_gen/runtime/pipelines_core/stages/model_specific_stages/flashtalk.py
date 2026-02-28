@@ -36,6 +36,101 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
+class FlashTalkCudaGraphRunner:
+    """CUDA Graph runner for FlashTalk DiT forward pass.
+
+    Captures the entire transformer forward as a single CUDA graph.
+    Static buffers are used for all inputs; .copy_() before each replay.
+    """
+
+    def __init__(self, num_warmups: int = 2):
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.num_warmups = num_warmups
+        # Static input buffers (allocated during capture)
+        self.static_hidden_states: torch.Tensor | None = None
+        self.static_timestep: torch.Tensor | None = None
+        self.static_audio_context: torch.Tensor | None = None
+        self.static_encoder_hidden_states: torch.Tensor | None = None
+        self.static_encoder_hidden_states_image: torch.Tensor | None = None
+        # Static output buffer
+        self.static_output: torch.Tensor | None = None
+        self._captured = False
+        self._captured_shapes: tuple | None = None
+
+    @property
+    def is_captured(self) -> bool:
+        return self._captured
+
+    def needs_recapture(self, hidden_states, audio_context) -> bool:
+        """Check if shapes changed and graph needs to be re-captured."""
+        if not self._captured:
+            return True
+        hs_shape = hidden_states.shape
+        ac_shape = audio_context.shape if audio_context is not None else None
+        return (hs_shape, ac_shape) != self._captured_shapes
+
+    def capture(
+        self,
+        transformer,
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        encoder_hidden_states_image,
+        audio_context,
+        human_num,
+        forward_context_fn,
+    ):
+        """Allocate static buffers, warmup, and capture the graph."""
+        # 1. Allocate static buffers
+        self.static_hidden_states = hidden_states.clone()
+        self.static_timestep = timestep.clone()
+        self.static_encoder_hidden_states = encoder_hidden_states.clone()
+        self.static_encoder_hidden_states_image = (
+            encoder_hidden_states_image.clone()
+            if encoder_hidden_states_image is not None
+            else None
+        )
+        if audio_context is not None:
+            self.static_audio_context = audio_context.clone()
+
+        def run_once():
+            with forward_context_fn():
+                return transformer(
+                    hidden_states=self.static_hidden_states,
+                    encoder_hidden_states=self.static_encoder_hidden_states,
+                    timestep=self.static_timestep,
+                    encoder_hidden_states_image=self.static_encoder_hidden_states_image,
+                    audio_context=self.static_audio_context,
+                    human_num=human_num,
+                )
+
+        # 2. Warmup on side stream (triggers JIT compilation, FA planning)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(self.num_warmups):
+                run_once()
+        torch.cuda.current_stream().wait_stream(s)
+
+        # 3. Capture
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=s):
+            self.static_output = run_once()
+
+        self._captured = True
+        ac_shape = audio_context.shape if audio_context is not None else None
+        self._captured_shapes = (hidden_states.shape, ac_shape)
+
+    def replay(self, hidden_states, timestep, audio_context=None):
+        """Copy dynamic inputs to static buffers and replay."""
+        self.static_hidden_states.copy_(hidden_states)
+        self.static_timestep.copy_(timestep)
+        if audio_context is not None and self.static_audio_context is not None:
+            self.static_audio_context.copy_(audio_context)
+        self.graph.replay()
+        return self.static_output
+
+
 class FlashTalkDenoisingStage(PipelineStage):
     """Denoising stage for FlashTalk.
 
@@ -50,6 +145,8 @@ class FlashTalkDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        # CUDA graph runner for DiT forward (enabled via env var)
+        self._cuda_graph_runner: FlashTalkCudaGraphRunner | None = None
         # TeaCache adaptive step reduction state
         self._prev_audio_context: torch.Tensor | None = None
         self._teacache_reduced: int = 0
@@ -233,6 +330,52 @@ class FlashTalkDenoisingStage(PipelineStage):
             server_args, "disable_autocast", False
         )
 
+        # CUDA Graph setup — capture DiT forward once, replay for all steps
+        use_cuda_graph = os.environ.get("SGLANG_FLASHTALK_CUDA_GRAPH", "0") == "1"
+        if use_cuda_graph:
+            runner = self._cuda_graph_runner
+            # Build a sample input matching what the loop will produce
+            sample_latent_input = latents.to(dit_dtype)
+            if latent_model_input_extra is not None:
+                sample_latent_input = torch.cat(
+                    [sample_latent_input, latent_model_input_extra], dim=1
+                ).to(dit_dtype)
+            sample_timestep = timesteps[0]
+            if sample_timestep.dim() == 0:
+                sample_timestep = sample_timestep.unsqueeze(0)
+
+            if runner is None or runner.needs_recapture(
+                sample_latent_input, audio_context
+            ):
+                runner = FlashTalkCudaGraphRunner()
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=dit_dtype,
+                    enabled=autocast_enabled,
+                ):
+                    runner.capture(
+                        self.transformer,
+                        sample_latent_input,
+                        sample_timestep,
+                        encoder_hidden_states,
+                        encoder_hidden_states_image,
+                        audio_context,
+                        human_num,
+                        forward_context_fn=lambda: set_forward_context(
+                            current_timestep=0,
+                            attn_metadata=None,
+                            forward_batch=batch,
+                        ),
+                    )
+                self._cuda_graph_runner = runner
+                logger.info(
+                    "CUDA Graph captured for DiT forward (%d warmups)",
+                    runner.num_warmups,
+                )
+            elif audio_context is not None and runner.static_audio_context is not None:
+                # Same shapes — just update audio context for new chunk
+                runner.static_audio_context.copy_(audio_context)
+
         denoising_start_time = time.time()
         num_steps = len(timesteps) - 1
 
@@ -264,19 +407,24 @@ class FlashTalkDenoisingStage(PipelineStage):
                         ).to(dit_dtype)
 
                     # Single forward pass (no CFG)
-                    with set_forward_context(
-                        current_timestep=i,
-                        attn_metadata=None,
-                        forward_batch=batch,
-                    ):
-                        noise_pred = self.transformer(
-                            hidden_states=latent_model_input,
-                            encoder_hidden_states=encoder_hidden_states,
-                            timestep=t_i,
-                            encoder_hidden_states_image=encoder_hidden_states_image,
-                            audio_context=audio_context,
-                            human_num=human_num,
+                    if use_cuda_graph:
+                        noise_pred = runner.replay(
+                            latent_model_input, t_i, audio_context
                         )
+                    else:
+                        with set_forward_context(
+                            current_timestep=i,
+                            attn_metadata=None,
+                            forward_batch=batch,
+                        ):
+                            noise_pred = self.transformer(
+                                hidden_states=latent_model_input,
+                                encoder_hidden_states=encoder_hidden_states,
+                                timestep=t_i,
+                                encoder_hidden_states_image=encoder_hidden_states_image,
+                                audio_context=audio_context,
+                                human_num=human_num,
+                            )
 
                     # FlashTalk uses negative noise prediction
                     noise_pred = -noise_pred
