@@ -1,10 +1,12 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
+import fractions
 import json
 import os
 import shutil
 import time
+from io import BytesIO
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -114,6 +116,7 @@ def _video_job_from_sampling(
         "file_path": os.path.abspath(sampling.output_file_path()),
         "stream_url": f"/v1/videos/{request_id}/stream",
         "events_url": f"/v1/videos/{request_id}/events",
+        "audio_path": getattr(req, "audio_path", None),
     }
 
 
@@ -745,9 +748,298 @@ async def download_video_content(
     )
 
 
+def _read_jpeg_as_rgb(path: str) -> np.ndarray:
+    """Read a JPEG file and return an RGB uint8 numpy array (H, W, 3)."""
+    from PIL import Image
+
+    with Image.open(path) as img:
+        return np.array(img.convert("RGB"))
+
+
+def _load_audio_for_fmp4(
+    audio_path: str, target_sample_rate: int = 48000
+) -> Optional[np.ndarray]:
+    """Decode audio file to int16 mono numpy at *target_sample_rate* via PyAV.
+
+    Returns None if the file cannot be decoded.
+    """
+    try:
+        import av
+
+        container = av.open(audio_path)
+        resampler = av.AudioResampler(
+            format="s16", layout="mono", rate=target_sample_rate
+        )
+        frames = []
+        for frame in container.decode(audio=0):
+            for resampled in resampler.resample(frame):
+                arr = resampled.to_ndarray().flatten()
+                frames.append(arr)
+        container.close()
+        if not frames:
+            return None
+        return np.concatenate(frames).astype(np.int16)
+    except Exception as e:
+        logger.warning("Failed to load audio for fMP4 from %s: %s", audio_path, e)
+        return None
+
+
+async def _wait_for_meta(frame_dir: str, timeout: float = 60.0) -> Optional[dict]:
+    """Poll for meta.json in *frame_dir*, return parsed dict or None on timeout."""
+    meta_path = os.path.join(frame_dir, "meta.json")
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass  # file may be mid-write
+        await asyncio.sleep(0.1)
+    return None
+
+
+async def _fmp4_generator(
+    frame_dir: str,
+    fps: int,
+    buffer_frames: int,
+    audio_path: Optional[str],
+):
+    """Async generator that yields fragmented MP4 bytes (H.264 + optional AAC).
+
+    Mirrors the MJPEG generator pattern: polls for frame_NNNNN.jpg files in
+    *frame_dir*, encodes them into an fMP4 container, and yields bytes
+    incrementally so browsers can play via Media Source Extensions (MSE).
+    """
+    import av
+
+    AUDIO_SAMPLE_RATE = 48000
+
+    # ── Load audio (if provided) ──
+    audio_samples: Optional[np.ndarray] = None
+    if audio_path and os.path.exists(audio_path):
+        audio_samples = await asyncio.to_thread(
+            _load_audio_for_fmp4, audio_path, AUDIO_SAMPLE_RATE
+        )
+
+    # ── Wait for meta.json to get resolution ──
+    meta = await _wait_for_meta(frame_dir)
+    if meta is None:
+        logger.warning("fMP4 stream: timed out waiting for meta.json in %s", frame_dir)
+        return
+
+    width = meta.get("width", 512)
+    height = meta.get("height", 512)
+
+    # ── Open PyAV fMP4 container writing to BytesIO ──
+    buf = BytesIO()
+    container = av.open(
+        buf,
+        mode="w",
+        format="mp4",
+        options={
+            "movflags": "frag_keyframe+empty_moov+default_base_moof",
+        },
+    )
+
+    # Video stream
+    video_stream = container.add_stream("libx264", rate=fps)
+    video_stream.width = width
+    video_stream.height = height
+    video_stream.pix_fmt = "yuv420p"
+    video_stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
+    video_stream.time_base = fractions.Fraction(1, fps)
+
+    # Audio stream (optional)
+    audio_stream = None
+    audio_samples_per_frame = 0
+    if audio_samples is not None and len(audio_samples) > 0:
+        audio_stream = container.add_stream("aac", rate=AUDIO_SAMPLE_RATE)
+        audio_stream.layout = "mono"
+        audio_stream.time_base = fractions.Fraction(1, AUDIO_SAMPLE_RATE)
+        audio_samples_per_frame = AUDIO_SAMPLE_RATE // fps
+
+    def _flush_buf() -> bytes:
+        """Read new bytes from the BytesIO buffer and reset it."""
+        data = buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+        return data
+
+    # ── Pre-buffer phase ──
+    stall_count = 0
+    max_stall = 600  # 60s timeout
+
+    if buffer_frames > 0:
+        while True:
+            ready = 0
+            while os.path.exists(
+                os.path.join(frame_dir, f"frame_{ready:05d}.jpg")
+            ):
+                ready += 1
+            done_path = os.path.join(frame_dir, "done")
+            if ready >= buffer_frames or os.path.exists(done_path):
+                break
+            stall_count += 1
+            if stall_count >= max_stall:
+                container.close()
+                return
+            await asyncio.sleep(0.1)
+        stall_count = 0
+
+    # ── Streaming loop ──
+    frame_idx = 0
+    frame_interval = 1.0 / fps
+    playback_epoch = None
+    audio_pos = 0  # current position in audio_samples
+
+    while True:
+        frame_path = os.path.join(frame_dir, f"frame_{frame_idx:05d}.jpg")
+        if os.path.exists(frame_path):
+            stall_count = 0
+            try:
+                rgb = await asyncio.to_thread(_read_jpeg_as_rgb, frame_path)
+
+                # Encode video frame
+                video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+                video_frame.pts = frame_idx
+                video_frame.time_base = fractions.Fraction(1, fps)
+                for packet in video_stream.encode(video_frame):
+                    container.mux(packet)
+
+                # Encode corresponding audio samples
+                if audio_stream is not None and audio_samples is not None:
+                    start = audio_pos
+                    end = min(start + audio_samples_per_frame, len(audio_samples))
+                    if start < len(audio_samples):
+                        chunk = audio_samples[start:end]
+                        # Pad if needed (last frame)
+                        if len(chunk) < audio_samples_per_frame:
+                            chunk = np.pad(
+                                chunk, (0, audio_samples_per_frame - len(chunk))
+                            )
+                        audio_frame = av.AudioFrame.from_ndarray(
+                            chunk.reshape(1, -1), format="s16", layout="mono"
+                        )
+                        audio_frame.sample_rate = AUDIO_SAMPLE_RATE
+                        audio_frame.pts = start
+                        audio_frame.time_base = fractions.Fraction(
+                            1, AUDIO_SAMPLE_RATE
+                        )
+                        for packet in audio_stream.encode(audio_frame):
+                            container.mux(packet)
+                    audio_pos = end
+
+                # Yield new fMP4 bytes
+                new_bytes = _flush_buf()
+                if new_bytes:
+                    yield new_bytes
+
+            except Exception as e:
+                logger.debug("fMP4 encode error at frame %d: %s", frame_idx, e)
+                continue  # retry on next iteration
+
+            frame_idx += 1
+
+            # Wall-clock pacing
+            now = asyncio.get_event_loop().time()
+            if playback_epoch is None:
+                playback_epoch = now
+            target = playback_epoch + frame_idx * frame_interval
+            delay = target - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+        else:
+            # Check if generation is done
+            done_path = os.path.join(frame_dir, "done")
+            if os.path.exists(done_path):
+                # Drain remaining frames
+                while True:
+                    frame_path = os.path.join(
+                        frame_dir, f"frame_{frame_idx:05d}.jpg"
+                    )
+                    if not os.path.exists(frame_path):
+                        break
+                    try:
+                        rgb = await asyncio.to_thread(
+                            _read_jpeg_as_rgb, frame_path
+                        )
+                        video_frame = av.VideoFrame.from_ndarray(
+                            rgb, format="rgb24"
+                        )
+                        video_frame.pts = frame_idx
+                        video_frame.time_base = fractions.Fraction(1, fps)
+                        for packet in video_stream.encode(video_frame):
+                            container.mux(packet)
+
+                        if audio_stream is not None and audio_samples is not None:
+                            start = audio_pos
+                            end = min(
+                                start + audio_samples_per_frame,
+                                len(audio_samples),
+                            )
+                            if start < len(audio_samples):
+                                chunk = audio_samples[start:end]
+                                if len(chunk) < audio_samples_per_frame:
+                                    chunk = np.pad(
+                                        chunk,
+                                        (0, audio_samples_per_frame - len(chunk)),
+                                    )
+                                audio_frame = av.AudioFrame.from_ndarray(
+                                    chunk.reshape(1, -1),
+                                    format="s16",
+                                    layout="mono",
+                                )
+                                audio_frame.sample_rate = AUDIO_SAMPLE_RATE
+                                audio_frame.pts = start
+                                audio_frame.time_base = fractions.Fraction(
+                                    1, AUDIO_SAMPLE_RATE
+                                )
+                                for packet in audio_stream.encode(audio_frame):
+                                    container.mux(packet)
+                            audio_pos = end
+
+                        new_bytes = _flush_buf()
+                        if new_bytes:
+                            yield new_bytes
+                    except Exception:
+                        break
+
+                    frame_idx += 1
+                    if playback_epoch is not None:
+                        target = playback_epoch + frame_idx * frame_interval
+                        delay = target - asyncio.get_event_loop().time()
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                break
+
+            stall_count += 1
+            if stall_count >= max_stall:
+                break
+            await asyncio.sleep(0.1)
+
+    # ── Flush encoders and close container ──
+    try:
+        for packet in video_stream.encode():
+            container.mux(packet)
+        if audio_stream is not None:
+            for packet in audio_stream.encode():
+                container.mux(packet)
+        container.close()
+        final_bytes = _flush_buf()
+        if final_bytes:
+            yield final_bytes
+    except Exception as e:
+        logger.debug("fMP4 finalize error: %s", e)
+
+    # Schedule cleanup
+    asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=5.0))
+
+
 @router.get("/{video_id}/stream")
-async def stream_video_mjpeg(
+async def stream_video(
     video_id: str = Path(...),
+    format: str = Query("mjpeg", pattern="^(mjpeg|fmp4)$"),
     fps: int = Query(25, ge=1, le=60),
     jpeg_quality: int = Query(85, ge=1, le=100),
     buffer_frames: int = Query(
@@ -758,11 +1050,13 @@ async def stream_video_mjpeg(
         "Recommended: 5*fps (e.g. 125 for 25fps = 5 second buffer).",
     ),
 ):
-    """Stream video frames as MJPEG multipart response.
+    """Stream video frames as MJPEG or fMP4.
+
+    Use ``format=mjpeg`` (default) for MJPEG multipart response, or
+    ``format=fmp4`` for fragmented MP4 (H.264 + AAC) playable via MSE.
 
     Polls the .frames/{video_id}/ directory for frame_NNNNN.jpg files written
-    by the GPU worker pipeline and yields them as an MJPEG stream.  Usable
-    directly in an <img> tag or with curl/VLC.
+    by the GPU worker pipeline and yields them as a stream.
     """
     frame_dir = _frame_dir_for_job(video_id)
 
@@ -770,6 +1064,14 @@ async def stream_video_mjpeg(
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    if format == "fmp4":
+        audio_path = job.get("audio_path")
+        return StreamingResponse(
+            _fmp4_generator(frame_dir, fps, buffer_frames, audio_path),
+            media_type="video/mp4",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     async def _mjpeg_generator():
         frame_idx = 0
