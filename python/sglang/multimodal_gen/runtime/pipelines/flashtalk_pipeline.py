@@ -15,6 +15,7 @@ import os
 import re
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -81,25 +82,20 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
-def _save_chunk_frames_for_streaming(
-    chunk_frames: torch.Tensor,
-    frame_dir: str,
-    chunk_idx: int,
-    frames_per_chunk: int,
-) -> None:
-    """Save per-chunk frames as individual JPEGs for real-time MJPEG streaming.
+def _chunk_frames_to_numpy(chunk_frames: torch.Tensor) -> np.ndarray:
+    """Convert a GPU chunk tensor to a CPU numpy array for JPEG saving.
+
+    This performs the GPU→CPU transfer on the calling thread so that the
+    expensive JPEG encoding can be handed off to a background thread without
+    any CUDA dependency.
 
     Args:
         chunk_frames: Tensor of shape (1, 3, T, H, W) in [0, 1] float range.
-        frame_dir: Directory to write frame_NNNNN.jpg files into.
-        chunk_idx: Zero-based chunk index (used to compute global frame offset).
-        frames_per_chunk: Number of frames per chunk (typically 28).
-    """
-    import imageio
 
-    base_idx = chunk_idx * frames_per_chunk
-    # (1, 3, T, H, W) → (T, H, W, 3) uint8
-    frames_np = (
+    Returns:
+        numpy array of shape (T, H, W, 3) with dtype uint8.
+    """
+    return (
         (chunk_frames[0] * 255)
         .clamp(0, 255)
         .to(torch.uint8)
@@ -107,6 +103,28 @@ def _save_chunk_frames_for_streaming(
         .cpu()
         .numpy()
     )
+
+
+def _save_chunk_frames_for_streaming(
+    frames_np: np.ndarray,
+    frame_dir: str,
+    chunk_idx: int,
+    frames_per_chunk: int,
+) -> None:
+    """Save per-chunk frames as individual JPEGs for real-time MJPEG streaming.
+
+    This function is pure CPU (numpy + imageio) and safe to run in a
+    background thread.
+
+    Args:
+        frames_np: numpy array of shape (T, H, W, 3) uint8.
+        frame_dir: Directory to write frame_NNNNN.jpg files into.
+        chunk_idx: Zero-based chunk index (used to compute global frame offset).
+        frames_per_chunk: Number of frames per chunk (typically 28).
+    """
+    import imageio
+
+    base_idx = chunk_idx * frames_per_chunk
     for i in range(frames_np.shape[0]):
         path = os.path.join(frame_dir, f"frame_{base_idx + i:05d}.jpg")
         imageio.imwrite(path, frames_np[i])
@@ -1438,6 +1456,12 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         _gc_was_enabled = gc.isenabled()
         gc.disable()
 
+        # Background thread pool for streaming JPEG frame saving.
+        # JPEG encoding + disk I/O is pure CPU work (~60-100ms per chunk)
+        # that would otherwise block the main thread and leave the GPU idle.
+        _frame_executor: ThreadPoolExecutor | None = None
+        _frame_futures: list[Future] = []
+
         # File-based progress / cancellation IPC
         _request_id = batch.request_id
         _progress_dir = os.path.join(server_args.output_path, ".progress")
@@ -1468,6 +1492,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             except Exception as e:
                 logger.warning("Failed to set up streaming frame dir: %s", e)
                 _frame_dir = None
+
+        if _frame_dir:
+            _frame_executor = ThreadPoolExecutor(max_workers=1)
 
         # ================================================================
         # SESSION MODE: open-ended chunk loop with audio from files
@@ -1630,10 +1657,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             _pf.write(f"{chunk_idx + 1} -1")
                     except Exception:
                         pass
-                if _frame_dir:
+                if _frame_dir and _frame_executor is not None:
                     try:
-                        _save_chunk_frames_for_streaming(
-                            chunk_frames, _frame_dir, chunk_idx, _frames_per_chunk
+                        frames_np = _chunk_frames_to_numpy(chunk_frames)
+                        _frame_futures.append(
+                            _frame_executor.submit(
+                                _save_chunk_frames_for_streaming,
+                                frames_np, _frame_dir, chunk_idx, _frames_per_chunk,
+                            )
                         )
                     except Exception as e:
                         logger.warning("Session frame save failed for chunk %d: %s", chunk_idx, e)
@@ -1646,6 +1677,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             if _gc_was_enabled:
                 gc.enable()
                 gc.collect()
+
+            # Wait for all background frame saves to finish
+            for fut in _frame_futures:
+                try:
+                    fut.result()
+                except Exception as e:
+                    logger.warning("Background frame save error: %s", e)
+            _frame_futures.clear()
+            if _frame_executor is not None:
+                _frame_executor.shutdown(wait=False)
 
             if _frame_dir:
                 try:
@@ -1863,10 +1904,17 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     pass
 
             # Save per-chunk JPEG frames for real-time MJPEG streaming
-            if _frame_dir:
+            # D2H transfer happens here on the main thread (~1-2ms), then JPEG
+            # encoding + disk I/O (~60-100ms) runs in a background thread so
+            # the GPU can start the next chunk's audio/denoising immediately.
+            if _frame_dir and _frame_executor is not None:
                 try:
-                    _save_chunk_frames_for_streaming(
-                        chunk_frames, _frame_dir, chunk_idx, _frames_per_chunk
+                    frames_np = _chunk_frames_to_numpy(chunk_frames)
+                    _frame_futures.append(
+                        _frame_executor.submit(
+                            _save_chunk_frames_for_streaming,
+                            frames_np, _frame_dir, chunk_idx, _frames_per_chunk,
+                        )
                     )
                 except Exception as e:
                     logger.warning("Streaming frame save failed for chunk %d: %s", chunk_idx, e)
@@ -1903,6 +1951,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         if _gc_was_enabled:
             gc.enable()
             gc.collect()
+
+        # Wait for all background frame saves to finish before writing "done"
+        for fut in _frame_futures:
+            try:
+                fut.result()
+            except Exception as e:
+                logger.warning("Background frame save error: %s", e)
+        _frame_futures.clear()
+        if _frame_executor is not None:
+            _frame_executor.shutdown(wait=False)
 
         # Write done sentinel for streaming clients
         if _frame_dir:
