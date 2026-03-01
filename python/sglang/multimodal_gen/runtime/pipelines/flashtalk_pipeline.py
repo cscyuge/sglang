@@ -1502,7 +1502,19 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         if is_session:
             all_chunk_frames = []
             chunk_idx = 0
-            _session_ended = False
+
+            # Pre-compute loop-invariant values
+            dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
+            gen = batch.generator[0] if isinstance(batch.generator, list) else batch.generator
+            z_dim = pipeline_config.vae_config.arch_config.z_dim
+            vae_spatial_stride = 8
+            vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
+            vae_autocast_enabled = (
+                vae_dtype != torch.float32
+                and not server_args.disable_autocast
+            )
+            sf_dev = shift_factor.to(device=device)
+            sc_dev = scaling_factor.to(device=device)
 
             while True:
                 # Wait for audio chunk or end sentinel
@@ -1516,7 +1528,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _cancelled = True
                     else:
                         logger.info("Session ended at chunk %d", chunk_idx)
-                        _session_ended = True
                     break
 
                 chunk_start = time.time()
@@ -1570,10 +1581,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         audio_encoder.to("cpu", non_blocking=True)
 
                 # b. Fresh noise latents
-                dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
-                gen = batch.generator[0] if isinstance(batch.generator, list) else batch.generator
-                z_dim = pipeline_config.vae_config.arch_config.z_dim
-                vae_spatial_stride = 8
                 latent_shape = (
                     1, z_dim, chunk_latent_num_frames,
                     batch.height // vae_spatial_stride,
@@ -1589,15 +1596,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
                 # d. VAE decode + color correct + motion carry
                 vae.to(device)
-                vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
-                vae_autocast_enabled = (
-                    vae_dtype != torch.float32
-                    and not server_args.disable_autocast
-                )
 
                 denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
-                sf_dev = shift_factor.to(device=device)
-                sc_dev = scaling_factor.to(device=device)
                 denorm_latents = denoised_latents / sc_dev + sf_dev
 
                 torch.cuda.synchronize()
@@ -1676,6 +1676,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 _t_chunk = time.time() - chunk_start
                 logger.info("Session chunk %d: %.3fs", chunk_idx, _t_chunk)
                 chunk_idx += 1
+
+                # Periodically drain completed futures to avoid unbounded list growth
+                if chunk_idx % 50 == 0 and _frame_futures:
+                    _frame_futures = [f for f in _frame_futures if not f.done()]
 
             # --- Session post-loop ---
             if _gc_was_enabled:

@@ -334,7 +334,7 @@ async def process_generation_batch(
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
-        if not result.output and result.output_file_paths is None:
+        if result.output is None and result.output_file_paths is None:
             error_msg = result.error or "No output produced (session may have ended with 0 chunks)"
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"

@@ -220,7 +220,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         )
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
-        logger.error(f"{e}")
+        logger.exception("Job %s dispatch failed:", job_id)
         await VIDEO_STORE.update_fields(
             job_id, {"status": "failed", "error": {"message": str(e)}}
         )
@@ -253,15 +253,18 @@ async def _dispatch_session_async(session_id: str, batch: Req) -> None:
     cancel_file = os.path.join(progress_dir, f"{session_id}.cancel")
 
     _SESSION_STORE[session_id]["status"] = "running"
+    await VIDEO_STORE.update_fields(session_id, {"status": "processing"})
     try:
         _, result = await process_generation_batch(
             async_scheduler_client, batch
         )
         _SESSION_STORE[session_id]["status"] = "ended"
+        await VIDEO_STORE.update_fields(session_id, {"status": "ended", "completed_at": int(time.time())})
     except Exception as e:
-        logger.error("Session %s failed: %s", session_id, e)
+        logger.exception("Session %s failed:", session_id)
         _SESSION_STORE[session_id]["status"] = "failed"
         _SESSION_STORE[session_id]["error"] = {"message": str(e)}
+        await VIDEO_STORE.update_fields(session_id, {"status": "failed", "error": {"message": str(e)}})
     finally:
         try:
             os.remove(cancel_file)
@@ -274,6 +277,11 @@ async def _dispatch_session_async(session_id: str, batch: Req) -> None:
             asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=300.0))
         if os.path.isdir(session_dir):
             asyncio.create_task(_cleanup_frame_dir(session_dir, delay=300.0))
+        # Deferred cleanup of in-memory session entry
+        async def _remove_session():
+            await asyncio.sleep(60)
+            _SESSION_STORE.pop(session_id, None)
+        asyncio.create_task(_remove_session())
 
 
 # ======================================================================
@@ -401,6 +409,7 @@ async def push_session_chunk(
 
     session_dir = _session_dir_for_id(session_id)
     chunk_idx = session["chunks_received"]
+    session["chunks_received"] = chunk_idx + 1  # atomic increment before await
     chunk_path = os.path.join(
         session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy"
     )
@@ -411,22 +420,21 @@ async def push_session_chunk(
 
     if filename.endswith(".npy"):
         # Raw numpy array
-        import io
-        audio_array = np.load(io.BytesIO(audio_bytes))
+        audio_array = np.load(BytesIO(audio_bytes))
     else:
         # Decode audio file (WAV, MP3, etc.) via soundfile or librosa
-        import io
         import soundfile as sf
         try:
-            audio_array, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+            audio_array, sr = sf.read(BytesIO(audio_bytes), dtype="float32")
             if sr != 16000:
                 # Resample to 16kHz
                 import librosa
                 audio_array = librosa.resample(
                     audio_array, orig_sr=sr, target_sr=16000
                 )
-        except Exception:
+        except Exception as sf_err:
             # Fallback to librosa for formats soundfile can't handle
+            logger.debug("soundfile decode failed (%s), falling back to librosa", sf_err)
             import librosa
             import tempfile
             with tempfile.NamedTemporaryFile(suffix=filename, delete=False) as tmp:
@@ -443,8 +451,6 @@ async def push_session_chunk(
     tmp_path = chunk_path.removesuffix(".npy") + ".tmp.npy"
     np.save(tmp_path, audio_array)
     os.rename(tmp_path, chunk_path)
-
-    session["chunks_received"] = chunk_idx + 1
 
     return {
         "success": True,
@@ -481,6 +487,7 @@ async def end_session(session_id: str = Path(...)):
         pass
 
     session["status"] = "ended"
+    await VIDEO_STORE.update_fields(session_id, {"status": "ended", "completed_at": int(time.time())})
     return {"success": True, "session_id": session_id, "status": "ended"}
 
 
@@ -769,15 +776,17 @@ def _load_audio_for_fmp4(
         import av
 
         container = av.open(audio_path)
-        resampler = av.AudioResampler(
-            format="s16", layout="mono", rate=target_sample_rate
-        )
-        frames = []
-        for frame in container.decode(audio=0):
-            for resampled in resampler.resample(frame):
-                arr = resampled.to_ndarray().flatten()
-                frames.append(arr)
-        container.close()
+        try:
+            resampler = av.AudioResampler(
+                format="s16", layout="mono", rate=target_sample_rate
+            )
+            frames = []
+            for frame in container.decode(audio=0):
+                for resampled in resampler.resample(frame):
+                    arr = resampled.to_ndarray().flatten()
+                    frames.append(arr)
+        finally:
+            container.close()
         if not frames:
             return None
         return np.concatenate(frames).astype(np.int16)
@@ -860,9 +869,9 @@ async def _fmp4_generator(
     video_stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
     video_stream.time_base = fractions.Fraction(1, fps)
     if is_session_audio:
-        # Force every frame to be a keyframe so that frag_keyframe produces
-        # a new fMP4 fragment per frame, minimizing streaming latency.
-        video_stream.gop_size = 1
+        # Use a small GOP to produce fMP4 fragments frequently for low-latency
+        # streaming while avoiding the bandwidth cost of all-I-frame encoding.
+        video_stream.gop_size = 5
 
     # Audio stream (optional for file mode, always for session mode)
     audio_stream = None
@@ -918,7 +927,7 @@ async def _fmp4_generator(
             except Exception as e:
                 logger.debug("Session audio chunk %d load error: %s", _session_chunk_idx, e)
                 break
-        return loaded_any
+        return
 
     def _get_session_audio_for_frame(n_samples: int) -> Optional[np.ndarray]:
         """Get *n_samples* int16 samples from session audio buffer.
@@ -981,49 +990,62 @@ async def _fmp4_generator(
     playback_epoch = None
     audio_pos = 0  # current position in audio_samples
 
+    def _encode_one_frame(fidx: int, rgb) -> Optional[bytes]:
+        """Encode a single video+audio frame and return flushed fMP4 bytes."""
+        nonlocal audio_pos
+
+        video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+        video_frame.pts = fidx
+        video_frame.time_base = fractions.Fraction(1, fps)
+        for packet in video_stream.encode(video_frame):
+            container.mux(packet)
+
+        if audio_stream is not None:
+            audio_chunk = None
+            if is_session_audio:
+                audio_chunk = _get_session_audio_for_frame(audio_samples_per_frame)
+            elif audio_samples is not None:
+                start = audio_pos
+                end = min(start + audio_samples_per_frame, len(audio_samples))
+                if start < len(audio_samples):
+                    audio_chunk = audio_samples[start:end]
+                    if len(audio_chunk) < audio_samples_per_frame:
+                        audio_chunk = np.pad(
+                            audio_chunk, (0, audio_samples_per_frame - len(audio_chunk))
+                        )
+                audio_pos = end
+            if audio_chunk is not None:
+                audio_frame = av.AudioFrame.from_ndarray(
+                    audio_chunk.reshape(1, -1), format="s16", layout="mono"
+                )
+                audio_frame.sample_rate = AUDIO_SAMPLE_RATE
+                audio_frame.pts = fidx * audio_samples_per_frame
+                audio_frame.time_base = fractions.Fraction(1, AUDIO_SAMPLE_RATE)
+                for packet in audio_stream.encode(audio_frame):
+                    container.mux(packet)
+
+        return _flush_buf()
+
+    async def _pace_playback(fidx: int) -> None:
+        """Wall-clock pacing for non-session mode."""
+        nonlocal playback_epoch
+        if is_session_audio:
+            return
+        now = asyncio.get_event_loop().time()
+        if playback_epoch is None:
+            playback_epoch = now
+        target = playback_epoch + fidx * frame_interval
+        delay = target - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
     while True:
         frame_path = os.path.join(frame_dir, f"frame_{frame_idx:05d}.jpg")
         if os.path.exists(frame_path):
             stall_count = 0
             try:
                 rgb = await asyncio.to_thread(_read_jpeg_as_rgb, frame_path)
-
-                # Encode video frame
-                video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
-                video_frame.pts = frame_idx
-                video_frame.time_base = fractions.Fraction(1, fps)
-                for packet in video_stream.encode(video_frame):
-                    container.mux(packet)
-
-                # Encode corresponding audio samples
-                if audio_stream is not None:
-                    audio_chunk = None
-                    if is_session_audio:
-                        audio_chunk = _get_session_audio_for_frame(audio_samples_per_frame)
-                    elif audio_samples is not None:
-                        start = audio_pos
-                        end = min(start + audio_samples_per_frame, len(audio_samples))
-                        if start < len(audio_samples):
-                            audio_chunk = audio_samples[start:end]
-                            if len(audio_chunk) < audio_samples_per_frame:
-                                audio_chunk = np.pad(
-                                    audio_chunk, (0, audio_samples_per_frame - len(audio_chunk))
-                                )
-                        audio_pos = end
-                    if audio_chunk is not None:
-                        audio_frame = av.AudioFrame.from_ndarray(
-                            audio_chunk.reshape(1, -1), format="s16", layout="mono"
-                        )
-                        audio_frame.sample_rate = AUDIO_SAMPLE_RATE
-                        audio_frame.pts = audio_pos if not is_session_audio else frame_idx * audio_samples_per_frame
-                        audio_frame.time_base = fractions.Fraction(
-                            1, AUDIO_SAMPLE_RATE
-                        )
-                        for packet in audio_stream.encode(audio_frame):
-                            container.mux(packet)
-
-                # Yield new fMP4 bytes
-                new_bytes = _flush_buf()
+                new_bytes = _encode_one_frame(frame_idx, rgb)
                 if new_bytes:
                     if is_session_audio and frame_idx < 5:
                         logger.info(
@@ -1037,17 +1059,7 @@ async def _fmp4_generator(
                 continue  # retry on next iteration
 
             frame_idx += 1
-
-            # Wall-clock pacing (skip for session mode — push frames ASAP
-            # to minimize latency; the browser paces playback via MSE).
-            if not is_session_audio:
-                now = asyncio.get_event_loop().time()
-                if playback_epoch is None:
-                    playback_epoch = now
-                target = playback_epoch + frame_idx * frame_interval
-                delay = target - now
-                if delay > 0:
-                    await asyncio.sleep(delay)
+            await _pace_playback(frame_idx)
         else:
             # Check if generation is done
             done_path = os.path.join(frame_dir, "done")
@@ -1063,58 +1075,14 @@ async def _fmp4_generator(
                         rgb = await asyncio.to_thread(
                             _read_jpeg_as_rgb, frame_path
                         )
-                        video_frame = av.VideoFrame.from_ndarray(
-                            rgb, format="rgb24"
-                        )
-                        video_frame.pts = frame_idx
-                        video_frame.time_base = fractions.Fraction(1, fps)
-                        for packet in video_stream.encode(video_frame):
-                            container.mux(packet)
-
-                        if audio_stream is not None:
-                            audio_chunk = None
-                            if is_session_audio:
-                                audio_chunk = _get_session_audio_for_frame(audio_samples_per_frame)
-                            elif audio_samples is not None:
-                                start = audio_pos
-                                end = min(
-                                    start + audio_samples_per_frame,
-                                    len(audio_samples),
-                                )
-                                if start < len(audio_samples):
-                                    audio_chunk = audio_samples[start:end]
-                                    if len(audio_chunk) < audio_samples_per_frame:
-                                        audio_chunk = np.pad(
-                                            audio_chunk,
-                                            (0, audio_samples_per_frame - len(audio_chunk)),
-                                        )
-                                audio_pos = end
-                            if audio_chunk is not None:
-                                audio_frame = av.AudioFrame.from_ndarray(
-                                    audio_chunk.reshape(1, -1),
-                                    format="s16",
-                                    layout="mono",
-                                )
-                                audio_frame.sample_rate = AUDIO_SAMPLE_RATE
-                                audio_frame.pts = audio_pos if not is_session_audio else frame_idx * audio_samples_per_frame
-                                audio_frame.time_base = fractions.Fraction(
-                                    1, AUDIO_SAMPLE_RATE
-                                )
-                                for packet in audio_stream.encode(audio_frame):
-                                    container.mux(packet)
-
-                        new_bytes = _flush_buf()
+                        new_bytes = _encode_one_frame(frame_idx, rgb)
                         if new_bytes:
                             yield new_bytes
                     except Exception:
                         break
 
                     frame_idx += 1
-                    if not is_session_audio and playback_epoch is not None:
-                        target = playback_epoch + frame_idx * frame_interval
-                        delay = target - asyncio.get_event_loop().time()
-                        if delay > 0:
-                            await asyncio.sleep(delay)
+                    await _pace_playback(frame_idx)
                 break
 
             stall_count += 1
@@ -1136,8 +1104,9 @@ async def _fmp4_generator(
     except Exception as e:
         logger.debug("fMP4 finalize error: %s", e)
 
-    # Schedule cleanup
-    asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=5.0))
+    # Schedule cleanup (session mode cleanup is handled by _dispatch_session_async)
+    if not is_session_audio:
+        asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=5.0))
 
 
 @router.get("/{video_id}/stream")
