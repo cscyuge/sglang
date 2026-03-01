@@ -1648,7 +1648,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 # e. Collect frames
                 chunk_frames = corrected[:, :, motion_frames_num:].clone()
                 del corrected
-                all_chunk_frames.append(chunk_frames)
+                # Session mode: frames are already streamed via fMP4,
+                # skip accumulating on GPU to avoid OOM on long sessions.
+                if not is_session:
+                    all_chunk_frames.append(chunk_frames)
 
                 # f. Progress + streaming frames
                 if _progress_file:
@@ -1668,6 +1671,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         )
                     except Exception as e:
                         logger.warning("Session frame save failed for chunk %d: %s", chunk_idx, e)
+                del chunk_frames
 
                 _t_chunk = time.time() - chunk_start
                 logger.info("Session chunk %d: %.3fs", chunk_idx, _t_chunk)
@@ -1696,7 +1700,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     pass
 
             if not all_chunk_frames:
-                return OutputBatch(output=None, metrics=batch.metrics)
+                # Session mode: frames already streamed via fMP4, nothing to save.
+                # Set output_file_paths to signal completion without triggering save_outputs.
+                return OutputBatch(
+                    output=None,
+                    output_file_paths=[],
+                    metrics=batch.metrics,
+                )
 
             final_video = torch.cat(all_chunk_frames, dim=2)
             audio_path = batch.extra.get("audio_path")

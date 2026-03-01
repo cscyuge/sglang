@@ -255,19 +255,24 @@ class GPUWorker:
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
             if req.save_output and req.return_file_paths_only and self.rank == 0:
-                output_paths = save_outputs(
-                    output_batch.output,
-                    req.data_type,
-                    req.fps,
-                    True,
-                    lambda idx: req.output_file_path(len(output_batch.output), idx),
-                    audio=output_batch.audio,
-                    audio_sample_rate=output_batch.audio_sample_rate,
-                    audio_path=output_batch.audio_path,
-                    output_compression=req.output_compression,
-                )
-                output_batch.output_file_paths = output_paths
-                output_batch.output = None
+                if output_batch.output_file_paths is not None:
+                    # Pipeline already set output_file_paths (e.g. session mode
+                    # streams frames directly), skip redundant save_outputs.
+                    output_batch.output = None
+                else:
+                    output_paths = save_outputs(
+                        output_batch.output,
+                        req.data_type,
+                        req.fps,
+                        True,
+                        lambda idx: req.output_file_path(len(output_batch.output), idx),
+                        audio=output_batch.audio,
+                        audio_sample_rate=output_batch.audio_sample_rate,
+                        audio_path=output_batch.audio_path,
+                        output_compression=req.output_compression,
+                    )
+                    output_batch.output_file_paths = output_paths
+                    output_batch.output = None
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:

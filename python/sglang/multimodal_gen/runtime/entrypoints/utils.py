@@ -413,6 +413,8 @@ def save_outputs(
     output_compression: Optional[int] = None,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
+    if outputs is None:
+        return []
     output_paths: list[str] = []
     for idx, output in enumerate(outputs):
         save_file_path = build_output_path(idx)
@@ -468,8 +470,10 @@ def post_process_sample(
     if isinstance(sample, torch.Tensor):
         if sample.dim() == 3:
             sample = sample.unsqueeze(1)
+        # Move to CPU first to avoid GPU OOM on large tensors (e.g. long sessions)
+        sample = sample.cpu()
         sample = (sample * 255).clamp(0, 255).to(torch.uint8)
-        videos = sample.permute(1, 2, 3, 0).cpu().numpy()
+        videos = sample.permute(1, 2, 3, 0).numpy()
         frames = list(videos)
     else:
         if not isinstance(sample, np.ndarray):
