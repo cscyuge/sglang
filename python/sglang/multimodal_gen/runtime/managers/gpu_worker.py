@@ -280,6 +280,10 @@ class GPUWorker:
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
         except Exception as e:
+            # Restore GC if it was disabled by the pipeline (e.g. FlashTalk
+            # disables cyclic GC during chunk loops for performance).
+            if not gc.isenabled():
+                gc.enable()
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )

@@ -145,7 +145,8 @@ def get_is_diffusion_model(model_path: str):
             if detector(model_path.lower()):
                 logger.info("Diffusion model detected via registry detector")
                 return True
-    except Exception:
+    except (ImportError, AttributeError):
+        # multimodal_gen may not be installed or registry may lack detectors
         pass
 
     return is_diffusion_model

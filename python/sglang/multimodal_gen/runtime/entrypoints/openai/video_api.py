@@ -10,7 +10,6 @@ from io import BytesIO
 from typing import Any, Dict, Optional
 
 import numpy as np
-
 from fastapi import (
     APIRouter,
     File,
@@ -68,7 +67,9 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         fps = request.fps if request.fps is not None else DEFAULT_FPS
     elif request.fps is not None:
         fps = request.fps
-        seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
+        seconds = (
+            request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
+        )
         num_frames = fps * seconds
     else:
         # Neither num_frames nor fps specified – let model defaults apply
@@ -96,6 +97,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         audio_path=getattr(request, "audio_path", None),
         audio_encode_mode=getattr(request, "audio_encode_mode", None),
     )
+
 
 # extract metadata which http_server needs to know
 def _video_job_from_sampling(
@@ -255,16 +257,20 @@ async def _dispatch_session_async(session_id: str, batch: Req) -> None:
     _SESSION_STORE[session_id]["status"] = "running"
     await VIDEO_STORE.update_fields(session_id, {"status": "processing"})
     try:
-        _, result = await process_generation_batch(
-            async_scheduler_client, batch
+        _, result = await process_generation_batch(async_scheduler_client, batch)
+        was_cancelled = os.path.exists(cancel_file)
+        final_status = "cancelled" if was_cancelled else "ended"
+        _SESSION_STORE[session_id]["status"] = final_status
+        await VIDEO_STORE.update_fields(
+            session_id, {"status": final_status, "completed_at": int(time.time())}
         )
-        _SESSION_STORE[session_id]["status"] = "ended"
-        await VIDEO_STORE.update_fields(session_id, {"status": "ended", "completed_at": int(time.time())})
     except Exception as e:
         logger.exception("Session %s failed:", session_id)
         _SESSION_STORE[session_id]["status"] = "failed"
         _SESSION_STORE[session_id]["error"] = {"message": str(e)}
-        await VIDEO_STORE.update_fields(session_id, {"status": "failed", "error": {"message": str(e)}})
+        await VIDEO_STORE.update_fields(
+            session_id, {"status": "failed", "error": {"message": str(e)}}
+        )
     finally:
         try:
             os.remove(cancel_file)
@@ -277,16 +283,22 @@ async def _dispatch_session_async(session_id: str, batch: Req) -> None:
             asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=300.0))
         if os.path.isdir(session_dir):
             asyncio.create_task(_cleanup_frame_dir(session_dir, delay=300.0))
-        # Deferred cleanup of in-memory session entry
+        # Deferred cleanup of in-memory session entry.
+        # 60s grace period allows clients to fetch final status/events after
+        # the session ends before the entry is removed from memory.
+        _SESSION_CLEANUP_DELAY = 60
+
         async def _remove_session():
-            await asyncio.sleep(60)
+            await asyncio.sleep(_SESSION_CLEANUP_DELAY)
             _SESSION_STORE.pop(session_id, None)
+
         asyncio.create_task(_remove_session())
 
 
 # ======================================================================
 # Session endpoints
 # ======================================================================
+
 
 @router.post("/sessions", response_model=SessionResponse)
 async def create_session(
@@ -367,15 +379,18 @@ async def create_session(
     _SESSION_STORE[session_id] = session_data
 
     # Also register as a video job so /stream and /events endpoints work
-    await VIDEO_STORE.upsert(session_id, {
-        "id": session_id,
-        "object": "video",
-        "status": "processing",
-        "progress": 0,
-        "created_at": session_data["created_at"],
-        "stream_url": session_data["stream_url"],
-        "events_url": session_data["events_url"],
-    })
+    await VIDEO_STORE.upsert(
+        session_id,
+        {
+            "id": session_id,
+            "object": "video",
+            "status": "processing",
+            "progress": 0,
+            "created_at": session_data["created_at"],
+            "stream_url": session_data["stream_url"],
+            "events_url": session_data["events_url"],
+        },
+    )
 
     # Dispatch (blocks GPU worker until session ends)
     asyncio.create_task(_dispatch_session_async(session_id, batch))
@@ -410,9 +425,7 @@ async def push_session_chunk(
     session_dir = _session_dir_for_id(session_id)
     chunk_idx = session["chunks_received"]
     session["chunks_received"] = chunk_idx + 1  # atomic increment before await
-    chunk_path = os.path.join(
-        session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy"
-    )
+    chunk_path = os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
 
     # Read uploaded audio and convert to float32 numpy
     audio_bytes = await audio.read()
@@ -424,19 +437,23 @@ async def push_session_chunk(
     else:
         # Decode audio file (WAV, MP3, etc.) via soundfile or librosa
         import soundfile as sf
+
         try:
             audio_array, sr = sf.read(BytesIO(audio_bytes), dtype="float32")
             if sr != 16000:
                 # Resample to 16kHz
                 import librosa
-                audio_array = librosa.resample(
-                    audio_array, orig_sr=sr, target_sr=16000
-                )
+
+                audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
         except Exception as sf_err:
             # Fallback to librosa for formats soundfile can't handle
-            logger.debug("soundfile decode failed (%s), falling back to librosa", sf_err)
-            import librosa
+            logger.debug(
+                "soundfile decode failed (%s), falling back to librosa", sf_err
+            )
             import tempfile
+
+            import librosa
+
             with tempfile.NamedTemporaryFile(suffix=filename, delete=False) as tmp:
                 tmp.write(audio_bytes)
                 tmp_path = tmp.name
@@ -487,7 +504,9 @@ async def end_session(session_id: str = Path(...)):
         pass
 
     session["status"] = "ended"
-    await VIDEO_STORE.update_fields(session_id, {"status": "ended", "completed_at": int(time.time())})
+    await VIDEO_STORE.update_fields(
+        session_id, {"status": "ended", "completed_at": int(time.time())}
+    )
     return {"success": True, "session_id": session_id, "status": "ended"}
 
 
@@ -876,7 +895,9 @@ async def _fmp4_generator(
     # Audio stream (optional for file mode, always for session mode)
     audio_stream = None
     audio_samples_per_frame = 0
-    has_audio = (audio_samples is not None and len(audio_samples) > 0) or is_session_audio
+    has_audio = (
+        audio_samples is not None and len(audio_samples) > 0
+    ) or is_session_audio
     if has_audio:
         audio_stream = container.add_stream("aac", rate=AUDIO_SAMPLE_RATE)
         audio_stream.layout = "mono"
@@ -917,15 +938,19 @@ async def _fmp4_generator(
                     _session_audio_buf = chunk_s16
                     _session_audio_buf_pos = 0
                 else:
-                    _session_audio_buf = np.concatenate([
-                        _session_audio_buf[_session_audio_buf_pos:],
-                        chunk_s16,
-                    ])
+                    _session_audio_buf = np.concatenate(
+                        [
+                            _session_audio_buf[_session_audio_buf_pos:],
+                            chunk_s16,
+                        ]
+                    )
                     _session_audio_buf_pos = 0
                 _session_chunk_idx += 1
                 loaded_any = True
             except Exception as e:
-                logger.debug("Session audio chunk %d load error: %s", _session_chunk_idx, e)
+                logger.debug(
+                    "Session audio chunk %d load error: %s", _session_chunk_idx, e
+                )
                 break
         return
 
@@ -970,9 +995,7 @@ async def _fmp4_generator(
     if buffer_frames > 0:
         while True:
             ready = 0
-            while os.path.exists(
-                os.path.join(frame_dir, f"frame_{ready:05d}.jpg")
-            ):
+            while os.path.exists(os.path.join(frame_dir, f"frame_{ready:05d}.jpg")):
                 ready += 1
             done_path = os.path.join(frame_dir, "done")
             if ready >= buffer_frames or os.path.exists(done_path):
@@ -1050,7 +1073,8 @@ async def _fmp4_generator(
                     if is_session_audio and frame_idx < 5:
                         logger.info(
                             "fMP4 session: yielding %d bytes at frame %d",
-                            len(new_bytes), frame_idx,
+                            len(new_bytes),
+                            frame_idx,
                         )
                     yield new_bytes
 
@@ -1066,15 +1090,11 @@ async def _fmp4_generator(
             if os.path.exists(done_path):
                 # Drain remaining frames
                 while True:
-                    frame_path = os.path.join(
-                        frame_dir, f"frame_{frame_idx:05d}.jpg"
-                    )
+                    frame_path = os.path.join(frame_dir, f"frame_{frame_idx:05d}.jpg")
                     if not os.path.exists(frame_path):
                         break
                     try:
-                        rgb = await asyncio.to_thread(
-                            _read_jpeg_as_rgb, frame_path
-                        )
+                        rgb = await asyncio.to_thread(_read_jpeg_as_rgb, frame_path)
                         new_bytes = _encode_one_frame(frame_idx, rgb)
                         if new_bytes:
                             yield new_bytes
@@ -1116,7 +1136,9 @@ async def stream_video(
     fps: int = Query(25, ge=1, le=60),
     jpeg_quality: int = Query(85, ge=1, le=100),
     buffer_frames: int = Query(
-        0, ge=0, le=500,
+        0,
+        ge=0,
+        le=500,
         description="Number of frames to pre-buffer before starting playback. "
         "When generation is faster than real-time, buffering absorbs timing "
         "jitter and ensures video duration matches audio exactly. "
@@ -1148,8 +1170,13 @@ async def stream_video(
             if os.path.isdir(chunks_dir):
                 session_audio_dir = chunks_dir
         return StreamingResponse(
-            _fmp4_generator(frame_dir, fps, buffer_frames, audio_path,
-                            session_audio_dir=session_audio_dir),
+            _fmp4_generator(
+                frame_dir,
+                fps,
+                buffer_frames,
+                audio_path,
+                session_audio_dir=session_audio_dir,
+            ),
             media_type="video/mp4",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1168,9 +1195,7 @@ async def stream_video(
             while True:
                 # Count available frames
                 ready = 0
-                while os.path.exists(
-                    os.path.join(frame_dir, f"frame_{ready:05d}.jpg")
-                ):
+                while os.path.exists(os.path.join(frame_dir, f"frame_{ready:05d}.jpg")):
                     ready += 1
                 done_path = os.path.join(frame_dir, "done")
                 if ready >= buffer_frames or os.path.exists(done_path):
@@ -1307,9 +1332,7 @@ async def stream_video_events(
             # Check for new frames (detect chunk boundaries)
             new_frames_found = False
             while True:
-                frame_path = os.path.join(
-                    frame_dir, f"frame_{frames_seen:05d}.jpg"
-                )
+                frame_path = os.path.join(frame_dir, f"frame_{frames_seen:05d}.jpg")
                 if not os.path.exists(frame_path):
                     break
                 new_frames_found = True
@@ -1332,9 +1355,7 @@ async def stream_video_events(
                 if frames_seen % frames_per_chunk == 0:
                     chunk_idx = (frames_seen // frames_per_chunk) - 1
                     progress_pct = (
-                        int(100 * (chunk_idx + 1) / num_chunks)
-                        if num_chunks > 0
-                        else 0
+                        int(100 * (chunk_idx + 1) / num_chunks) if num_chunks > 0 else 0
                     )
                     chunk_data = json.dumps(
                         {

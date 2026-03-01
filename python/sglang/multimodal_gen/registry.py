@@ -9,6 +9,7 @@ information based on model paths or other identifiers.
 
 import dataclasses
 import importlib
+import json
 import os
 import pkgutil
 from functools import lru_cache
@@ -69,11 +70,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.flashtalk import FlashTalkSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
     FluxSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.flashtalk import FlashTalkSamplingParams
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
@@ -280,8 +281,8 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
         else:
             config = maybe_download_model_index(model_path)
         pipeline_name = config.get("_class_name", "").lower()
-    except Exception:
-        # model_index.json not found; still try model path detectors below
+    except (FileNotFoundError, KeyError, json.JSONDecodeError, ValueError, OSError):
+        # model_index.json not found or malformed; still try model path detectors below
         pass
 
     matched_model_names = []
