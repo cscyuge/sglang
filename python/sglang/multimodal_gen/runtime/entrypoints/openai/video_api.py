@@ -857,6 +857,10 @@ async def _fmp4_generator(
     video_stream.pix_fmt = "yuv420p"
     video_stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
     video_stream.time_base = fractions.Fraction(1, fps)
+    if is_session_audio:
+        # Force every frame to be a keyframe so that frag_keyframe produces
+        # a new fMP4 fragment per frame, minimizing streaming latency.
+        video_stream.gop_size = 1
 
     # Audio stream (optional for file mode, always for session mode)
     audio_stream = None
@@ -1019,6 +1023,11 @@ async def _fmp4_generator(
                 # Yield new fMP4 bytes
                 new_bytes = _flush_buf()
                 if new_bytes:
+                    if is_session_audio and frame_idx < 5:
+                        logger.info(
+                            "fMP4 session: yielding %d bytes at frame %d",
+                            len(new_bytes), frame_idx,
+                        )
                     yield new_bytes
 
             except Exception as e:
