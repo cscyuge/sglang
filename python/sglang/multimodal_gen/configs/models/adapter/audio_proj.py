@@ -19,7 +19,9 @@ class AudioProjArchConfig(AdapterArchConfig):
     """
 
     audio_window_first: int = 5  # audio frame window for first video frame
-    audio_window_vf: int = 12  # audio frame window for subsequent frames (vae temporal factor * 3)
+    audio_window_vf: int = (
+        12  # audio frame window for subsequent frames (vae temporal factor * 3)
+    )
     context_tokens: int = 32  # number of output context tokens per timestep
     output_dim: int = 768  # output feature dimension
     hidden_dim: int = 512  # intermediate projection dimension

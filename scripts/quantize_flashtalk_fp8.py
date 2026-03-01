@@ -88,9 +88,7 @@ def quantize_block_fp8(
     assert N % block_size == 0, f"N={N} not divisible by {block_size}"
 
     # Reshape into blocks: (M/B, B, N/B, B)
-    blocks = weight.reshape(
-        M // block_size, block_size, N // block_size, block_size
-    )
+    blocks = weight.reshape(M // block_size, block_size, N // block_size, block_size)
 
     # Per-block max absolute value: (M/B, N/B)
     max_abs = blocks.abs().amax(dim=(1, 3))
@@ -157,13 +155,15 @@ def quantize_model(input_path: str, output_path: str) -> None:
                 # Verify round-trip error
                 with torch.no_grad():
                     M, N = tensor.shape
-                    dequant = weight_fp8.float().reshape(
-                        M // BLOCK_SIZE, BLOCK_SIZE, N // BLOCK_SIZE, BLOCK_SIZE
-                    ) * scale_inv.float()[:, None, :, None]
+                    dequant = (
+                        weight_fp8.float().reshape(
+                            M // BLOCK_SIZE, BLOCK_SIZE, N // BLOCK_SIZE, BLOCK_SIZE
+                        )
+                        * scale_inv.float()[:, None, :, None]
+                    )
                     dequant = dequant.reshape(M, N)
                     rel_err = (
-                        (dequant - weight_f32).abs()
-                        / (weight_f32.abs().mean() + 1e-12)
+                        (dequant - weight_f32).abs() / (weight_f32.abs().mean() + 1e-12)
                     ).mean()
                     print(
                         f"  {name:60s} {str(tuple(tensor.shape)):20s} "
@@ -180,7 +180,9 @@ def quantize_model(input_path: str, output_path: str) -> None:
 
         # Save output safetensors
         out_file = output_path / st_file.name
-        print(f"  Saving {out_file.name} ({file_quantized} quantized, {file_kept} kept)")
+        print(
+            f"  Saving {out_file.name} ({file_quantized} quantized, {file_kept} kept)"
+        )
         save_file(output_tensors, str(out_file))
 
     t_elapsed = time.time() - t_start
@@ -217,7 +219,9 @@ def quantize_model(input_path: str, output_path: str) -> None:
             out_index = output_path / config_file.name
             with open(out_index, "w") as f:
                 json.dump(index, f, indent=2, ensure_ascii=False)
-            print(f"  {config_file.name} (with {len(new_entries)} scale_inv entries added)")
+            print(
+                f"  {config_file.name} (with {len(new_entries)} scale_inv entries added)"
+            )
         else:
             shutil.copy2(config_file, output_path / config_file.name)
             print(f"  {config_file.name}")
@@ -244,16 +248,22 @@ def quantize_model(input_path: str, output_path: str) -> None:
     print(f"Quantization complete in {t_elapsed:.1f}s")
     print(f"  Quantized tensors: {total_quantized}")
     print(f"  Kept tensors:      {total_kept}")
-    print(f"  Quantized params:  {total_params_quantized:,} "
-          f"({total_params_quantized * 2 / 1e9:.2f} GB bf16 -> "
-          f"{total_params_quantized / 1e9:.2f} GB fp8)")
-    print(f"  Kept params:       {total_params_kept:,} "
-          f"({total_params_kept * 2 / 1e9:.2f} GB bf16)")
+    print(
+        f"  Quantized params:  {total_params_quantized:,} "
+        f"({total_params_quantized * 2 / 1e9:.2f} GB bf16 -> "
+        f"{total_params_quantized / 1e9:.2f} GB fp8)"
+    )
+    print(
+        f"  Kept params:       {total_params_kept:,} "
+        f"({total_params_kept * 2 / 1e9:.2f} GB bf16)"
+    )
 
     input_size = sum(f.stat().st_size for f in input_path.glob("*.safetensors"))
     output_size = sum(f.stat().st_size for f in output_path.glob("*.safetensors"))
-    print(f"  Disk size:         {input_size / 1e9:.2f} GB -> {output_size / 1e9:.2f} GB "
-          f"({100 * (1 - output_size / input_size):.1f}% reduction)")
+    print(
+        f"  Disk size:         {input_size / 1e9:.2f} GB -> {output_size / 1e9:.2f} GB "
+        f"({100 * (1 - output_size / input_size):.1f}% reduction)"
+    )
     print(f"  Output: {output_path}")
 
 

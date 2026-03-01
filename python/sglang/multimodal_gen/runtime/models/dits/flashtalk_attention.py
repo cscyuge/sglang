@@ -12,11 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -27,6 +22,11 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 
 
 class RotaryPositionalEmbedding1D(nn.Module):
@@ -37,14 +37,10 @@ class RotaryPositionalEmbedding1D(nn.Module):
         self.dim = dim
         self.theta = theta
         # Precompute inverse frequencies
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, dim, 2).float() / dim)
-        )
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(
-        self, x: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Apply 1D RoPE to input tensor.
 
         Args:
@@ -313,9 +309,7 @@ class FlashTalkAudioCrossAttention(nn.Module):
         )
         max_indices = x_ref_attn_map.argmax(dim=0)
         normalized_map = torch.stack([human1, human2, back], dim=1)
-        normalized_pos = normalized_map[
-            range(x_ref_attn_map.size(1)), max_indices
-        ]
+        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices]
 
         # Apply 1D RoPE to Q
         q = rearrange(q, "(B N_t) S H D -> B H (N_t S) D", N_t=N_t)
@@ -372,12 +366,8 @@ class FlashTalkAudioCrossAttention(nn.Module):
         if audio_N_t != N_t:
             if audio_N_t < N_t:
                 # Pad by repeating the last frame
-                pad = encoder_hidden_states[-1:].expand(
-                    N_t - audio_N_t, -1, -1
-                )
-                encoder_hidden_states = torch.cat(
-                    [encoder_hidden_states, pad], dim=0
-                )
+                pad = encoder_hidden_states[-1:].expand(N_t - audio_N_t, -1, -1)
+                encoder_hidden_states = torch.cat([encoder_hidden_states, pad], dim=0)
             else:
                 # Truncate
                 encoder_hidden_states = encoder_hidden_states[:N_t]

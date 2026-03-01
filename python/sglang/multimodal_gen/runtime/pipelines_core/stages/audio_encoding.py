@@ -14,9 +14,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
-    StageValidators as V,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -191,9 +188,7 @@ class AudioEncodingStage(PipelineStage):
         self.offload_model()
         return batch
 
-    def verify_input(
-        self, batch: Req, server_args: ServerArgs
-    ) -> VerificationResult:
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify audio encoding stage inputs."""
         result = VerificationResult()
         has_audio = (
@@ -203,9 +198,7 @@ class AudioEncodingStage(PipelineStage):
         result.add_check("audio_input", has_audio, lambda x: x is True)
         return result
 
-    def verify_output(
-        self, batch: Req, server_args: ServerArgs
-    ) -> VerificationResult:
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify audio encoding stage outputs."""
         result = VerificationResult()
         return result

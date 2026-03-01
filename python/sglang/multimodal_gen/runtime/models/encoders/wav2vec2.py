@@ -102,9 +102,7 @@ class Wav2Vec2AudioEncoder(nn.Module):
             )
 
         # Step 3: Feature projection (layer norm + projection + dropout)
-        hidden_states, extract_features = wav2vec.feature_projection(
-            extract_features
-        )
+        hidden_states, extract_features = wav2vec.feature_projection(extract_features)
         hidden_states = wav2vec._mask_hidden_states(hidden_states)
 
         # Step 4: Encoder transformer at video framerate

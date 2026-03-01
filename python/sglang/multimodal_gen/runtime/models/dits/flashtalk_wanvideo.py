@@ -20,12 +20,10 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     sequence_model_parallel_all_gather,
 )
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.attention.layer import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
-    ScaleResidualLayerNormScaleShift,
     tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -244,9 +242,7 @@ class FlashTalkWanTransformerBlock(WanTransformerBlock):
             # includes audio output. Without this, the FFN misses the audio
             # signal, causing progressive quality degradation in multi-chunk
             # generation.
-            norm_hidden_states = self.cross_attn_residual_norm.norm(
-                hidden_states
-            )
+            norm_hidden_states = self.cross_attn_residual_norm.norm(hidden_states)
             norm_hidden_states = (
                 norm_hidden_states.float() * (1 + c_scale_msa) + c_shift_msa
             ).to(orig_dtype)

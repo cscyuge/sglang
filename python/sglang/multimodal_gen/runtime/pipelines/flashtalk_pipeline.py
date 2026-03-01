@@ -50,7 +50,6 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multi
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -75,6 +74,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     FlashTalkColorCorrectionStage,
     FlashTalkDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -142,9 +142,7 @@ def _wait_for_session_audio_chunk(
     Returns the audio samples as a float32 numpy array, or None if the
     session ended (``end`` sentinel), was cancelled, or timed out.
     """
-    chunk_path = os.path.join(
-        session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy"
-    )
+    chunk_path = os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
     end_path = os.path.join(session_dir, "end")
 
     deadline = time.time() + timeout
@@ -198,14 +196,21 @@ def _apply_fp8_quant_to_model(model: torch.nn.Module, fp8_config) -> int:
         if out_features % block_size[0] != 0 or in_features % block_size[1] != 0:
             logger.warning(
                 "Skipping FP8 for %s: shape (%d, %d) not divisible by %s",
-                name, out_features, in_features, block_size,
+                name,
+                out_features,
+                in_features,
+                block_size,
             )
             continue
 
         # Replace weight with fp8 dtype
         new_weight = torch.nn.Parameter(
-            torch.empty(out_features, in_features,
-                        dtype=torch.float8_e4m3fn, device=old_weight.device),
+            torch.empty(
+                out_features,
+                in_features,
+                dtype=torch.float8_e4m3fn,
+                device=old_weight.device,
+            ),
             requires_grad=False,
         )
         for attr in ("output_dim", "input_dim"):
@@ -475,9 +480,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 Fp8Config,
             )
 
-            weight_block_size = quant_config_dict.get(
-                "weight_block_size", [128, 128]
-            )
+            weight_block_size = quant_config_dict.get("weight_block_size", [128, 128])
             fp8_config = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
                 activation_scheme="dynamic",
@@ -514,14 +517,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     dim = buf.shape[0] * 2
                     theta = 10000.0
                     inv_freq = 1.0 / (
-                        theta
-                        ** (torch.arange(0, dim, 2, device=target).float() / dim)
+                        theta ** (torch.arange(0, dim, 2, device=target).float() / dim)
                     )
                     parent.register_buffer(attr_name, inv_freq, persistent=False)
                 else:
-                    real_buf = torch.zeros(
-                        buf.shape, dtype=buf.dtype, device=target
-                    )
+                    real_buf = torch.zeros(buf.shape, dtype=buf.dtype, device=target)
                     parent.register_buffer(attr_name, real_buf, persistent=False)
 
         # Verify no meta tensors remain
@@ -529,9 +529,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
         for n, p in iterchain(model.named_parameters(), model.named_buffers()):
             if p.is_meta:
-                raise RuntimeError(
-                    f"Unexpected param or buffer {n} on meta device."
-                )
+                raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
             if isinstance(p, torch.nn.Parameter):
                 p.requires_grad = False
 
@@ -824,16 +822,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # --- Top-level quant convs ---
             if key.startswith("conv1."):
-                new_key = "quant_conv." + key[len("conv1."):]
+                new_key = "quant_conv." + key[len("conv1.") :]
             elif key.startswith("conv2."):
-                new_key = "post_quant_conv." + key[len("conv2."):]
+                new_key = "post_quant_conv." + key[len("conv2.") :]
 
             # --- Encoder ---
             elif key.startswith("encoder.conv1."):
-                new_key = "encoder.conv_in." + key[len("encoder.conv1."):]
+                new_key = "encoder.conv_in." + key[len("encoder.conv1.") :]
 
             elif key.startswith("encoder.head."):
-                rest = key[len("encoder.head."):]
+                rest = key[len("encoder.head.") :]
                 if rest.startswith("0."):
                     # head.0 = RMS_norm → norm_out
                     new_key = "encoder.norm_out." + rest[2:]
@@ -842,7 +840,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     new_key = "encoder.conv_out." + rest[2:]
 
             elif key.startswith("encoder.middle."):
-                rest = key[len("encoder.middle."):]
+                rest = key[len("encoder.middle.") :]
                 m = re.match(r"^(\d+)\.(.+)$", rest)
                 if m:
                     mid_idx = int(m.group(1))
@@ -860,7 +858,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         new_key = f"encoder.mid_block.resnets.1.{mapped_sub}"
 
             elif key.startswith("encoder.downsamples."):
-                rest = key[len("encoder.downsamples."):]
+                rest = key[len("encoder.downsamples.") :]
                 m = re.match(r"^(\d+)\.(.+)$", rest)
                 if m:
                     idx = int(m.group(1))
@@ -871,17 +869,17 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # --- Decoder ---
             elif key.startswith("decoder.conv1."):
-                new_key = "decoder.conv_in." + key[len("decoder.conv1."):]
+                new_key = "decoder.conv_in." + key[len("decoder.conv1.") :]
 
             elif key.startswith("decoder.head."):
-                rest = key[len("decoder.head."):]
+                rest = key[len("decoder.head.") :]
                 if rest.startswith("0."):
                     new_key = "decoder.norm_out." + rest[2:]
                 elif rest.startswith("2."):
                     new_key = "decoder.conv_out." + rest[2:]
 
             elif key.startswith("decoder.middle."):
-                rest = key[len("decoder.middle."):]
+                rest = key[len("decoder.middle.") :]
                 m = re.match(r"^(\d+)\.(.+)$", rest)
                 if m:
                     mid_idx = int(m.group(1))
@@ -896,7 +894,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         new_key = f"decoder.mid_block.resnets.1.{mapped_sub}"
 
             elif key.startswith("decoder.upsamples."):
-                rest = key[len("decoder.upsamples."):]
+                rest = key[len("decoder.upsamples.") :]
                 m = re.match(r"^(\d+)\.(.+)$", rest)
                 if m:
                     idx = int(m.group(1))
@@ -913,8 +911,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             # Resample sub-keys (resample.1.*, time_conv.*)
                             # match directly between original and sglang
                             new_key = (
-                                f"decoder.up_blocks.{block_idx}"
-                                f".upsamplers.0.{sub}"
+                                f"decoder.up_blocks.{block_idx}" f".upsamplers.0.{sub}"
                             )
 
             if new_key is not None:
@@ -956,9 +953,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         mapped_sd = self._remap_openclip_visual_keys(state_dict, model)
         missing, unexpected = model.load_state_dict(mapped_sd, strict=False)
         if missing:
-            logger.warning(
-                "CLIP missing keys (%d): %s", len(missing), missing[:10]
-            )
+            logger.warning("CLIP missing keys (%d): %s", len(missing), missing[:10])
         if unexpected:
             logger.warning(
                 "CLIP unexpected keys (%d): %s", len(unexpected), unexpected[:10]
@@ -1268,16 +1263,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             logger.info(
                 "Session mode: open-ended generation (frame_num=%d, slice_len=%d, "
                 "motion_frames=%d)",
-                frame_num, slice_len, motion_frames_num,
+                frame_num,
+                slice_len,
+                motion_frames_num,
             )
         else:
             # Match the original FlashTalk chunk count formula.
             num_chunks = (total_audio_video_frames - frame_num) // slice_len + 1
 
             # Debug: limit chunks for faster testing
-            _debug_max_chunks = int(
-                os.environ.get("FLASHTALK_MAX_CHUNKS", "0")
-            )
+            _debug_max_chunks = int(os.environ.get("FLASHTALK_MAX_CHUNKS", "0"))
             if _debug_max_chunks > 0:
                 num_chunks = min(num_chunks, _debug_max_chunks)
 
@@ -1295,7 +1290,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         denoising_stage = self.stages[denoising_idx]
         color_correction_stage = None
         decoding_stage = None
-        for stage in self.stages[denoising_idx + 1:]:
+        for stage in self.stages[denoising_idx + 1 :]:
             if isinstance(stage, FlashTalkColorCorrectionStage):
                 color_correction_stage = stage
             elif isinstance(stage, DecodingStage):
@@ -1303,7 +1298,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         if decoding_stage is None:
             raise RuntimeError("DecodingStage not found in pipeline stages")
         if color_correction_stage is None:
-            raise RuntimeError("FlashTalkColorCorrectionStage not found in pipeline stages")
+            raise RuntimeError(
+                "FlashTalkColorCorrectionStage not found in pipeline stages"
+            )
 
         # --- Audio proj + VAE references ---
         audio_proj = self.get_module("audio_proj")
@@ -1320,14 +1317,12 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         raw_audio_array = batch.extra.get("raw_audio_array")
         sample_rate = batch.extra.get("audio_sample_rate", 16000)
         fps = batch.extra.get("audio_fps", 25)
-        cached_audio_duration = getattr(
-            pipeline_config, "cached_audio_duration", 8
-        )
+        cached_audio_duration = getattr(pipeline_config, "cached_audio_duration", 8)
 
         # Session mode always uses streaming audio (chunks arrive via files)
         use_streaming_audio = (
-            (raw_audio_array is not None or is_session) and audio_encoder is not None
-        )
+            raw_audio_array is not None or is_session
+        ) and audio_encoder is not None
 
         speech_slices = None  # only set for non-session streaming audio
 
@@ -1381,8 +1376,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 pass
 
         # VAE normalization factors (same as ImageVAEEncodingStage uses)
-        scaling_factor, shift_factor = (
-            pipeline_config.get_decode_scale_and_shift(device, torch.float32, vae)
+        scaling_factor, shift_factor = pipeline_config.get_decode_scale_and_shift(
+            device, torch.float32, vae
         )
 
         # --- Initial motion latent from image_latent ---
@@ -1466,17 +1461,21 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         _request_id = batch.request_id
         _progress_dir = os.path.join(server_args.output_path, ".progress")
         os.makedirs(_progress_dir, exist_ok=True)
-        _progress_file = os.path.join(_progress_dir, _request_id) if _request_id else None
-        _cancel_file = os.path.join(_progress_dir, f"{_request_id}.cancel") if _request_id else None
+        _progress_file = (
+            os.path.join(_progress_dir, _request_id) if _request_id else None
+        )
+        _cancel_file = (
+            os.path.join(_progress_dir, f"{_request_id}.cancel")
+            if _request_id
+            else None
+        )
         _cancelled = False
 
         # Streaming frame IPC: write per-chunk JPEG frames for MJPEG streaming
         _frame_dir = None
         _frames_per_chunk = slice_len  # typically 28
         if _request_id:
-            _frame_dir = os.path.join(
-                server_args.output_path, ".frames", _request_id
-            )
+            _frame_dir = os.path.join(server_args.output_path, ".frames", _request_id)
             try:
                 os.makedirs(_frame_dir, exist_ok=True)
                 _meta = {
@@ -1505,13 +1504,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # Pre-compute loop-invariant values
             dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
-            gen = batch.generator[0] if isinstance(batch.generator, list) else batch.generator
+            gen = (
+                batch.generator[0]
+                if isinstance(batch.generator, list)
+                else batch.generator
+            )
             z_dim = pipeline_config.vae_config.arch_config.z_dim
             vae_spatial_stride = 8
             vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
             vae_autocast_enabled = (
-                vae_dtype != torch.float32
-                and not server_args.disable_autocast
+                vae_dtype != torch.float32 and not server_args.disable_autocast
             )
             sf_dev = shift_factor.to(device=device)
             sc_dev = scaling_factor.to(device=device)
@@ -1520,7 +1522,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 # Wait for audio chunk or end sentinel
                 logger.info("Session: waiting for audio chunk %d...", chunk_idx)
                 chunk_audio_data = _wait_for_session_audio_chunk(
-                    session_dir, chunk_idx, cancel_file=_cancel_file,
+                    session_dir,
+                    chunk_idx,
+                    cancel_file=_cancel_file,
                 )
                 if chunk_audio_data is None:
                     if _cancel_file and os.path.exists(_cancel_file):
@@ -1566,9 +1570,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     frame_indices = torch.arange(
                         audio_start_idx, audio_end_idx, device=device
                     )
-                    windowed_idx = (
-                        frame_indices.unsqueeze(1) + window_offsets.unsqueeze(0)
-                    )
+                    windowed_idx = frame_indices.unsqueeze(
+                        1
+                    ) + window_offsets.unsqueeze(0)
                     windowed_idx = windowed_idx.clamp(0, audio_end_idx - 1)
                     windowed_features = chunk_wav2vec[:, windowed_idx]
 
@@ -1582,7 +1586,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
                 # b. Fresh noise latents
                 latent_shape = (
-                    1, z_dim, chunk_latent_num_frames,
+                    1,
+                    z_dim,
+                    chunk_latent_num_frames,
                     batch.height // vae_spatial_stride,
                     batch.width // vae_spatial_stride,
                 )
@@ -1603,7 +1609,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 torch.cuda.synchronize()
                 with torch.autocast(
                     device_type=current_platform.device_type,
-                    dtype=vae_dtype, enabled=vae_autocast_enabled,
+                    dtype=vae_dtype,
+                    enabled=vae_autocast_enabled,
                 ):
                     if not vae_autocast_enabled:
                         denorm_latents = denorm_latents.to(vae_dtype)
@@ -1620,7 +1627,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 torch.cuda.synchronize()
                 with torch.autocast(
                     device_type=current_platform.device_type,
-                    dtype=vae_dtype, enabled=vae_autocast_enabled,
+                    dtype=vae_dtype,
+                    enabled=vae_autocast_enabled,
                 ):
                     if not vae_autocast_enabled:
                         cond_frame = cond_frame.to(vae_dtype)
@@ -1666,11 +1674,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _frame_futures.append(
                             _frame_executor.submit(
                                 _save_chunk_frames_for_streaming,
-                                frames_np, _frame_dir, chunk_idx, _frames_per_chunk,
+                                frames_np,
+                                _frame_dir,
+                                chunk_idx,
+                                _frames_per_chunk,
                             )
                         )
                     except Exception as e:
-                        logger.warning("Session frame save failed for chunk %d: %s", chunk_idx, e)
+                        logger.warning(
+                            "Session frame save failed for chunk %d: %s", chunk_idx, e
+                        )
                 del chunk_frames
 
                 _t_chunk = time.time() - chunk_start
@@ -1775,9 +1788,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 frame_indices = torch.arange(
                     audio_start_idx, audio_end_idx, device=device
                 )
-                windowed_idx = (
-                    frame_indices.unsqueeze(1) + window_offsets.unsqueeze(0)
-                )
+                windowed_idx = frame_indices.unsqueeze(1) + window_offsets.unsqueeze(0)
                 windowed_idx = windowed_idx.clamp(0, audio_end_idx - 1)
                 # (frame_num, window_size) indices into (1, 200, ...)
                 windowed_features = chunk_wav2vec[:, windowed_idx]
@@ -1808,7 +1819,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # b. Create fresh noise latents (matching original FlashTalk dtype/shape)
             dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
-            gen = batch.generator[0] if isinstance(batch.generator, list) else batch.generator
+            gen = (
+                batch.generator[0]
+                if isinstance(batch.generator, list)
+                else batch.generator
+            )
             z_dim = pipeline_config.vae_config.arch_config.z_dim
             vae_spatial_stride = 8  # WanVAE spatial stride
             latent_shape = (
@@ -1833,8 +1848,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             vae.to(device)
             vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
             vae_autocast_enabled = (
-                vae_dtype != torch.float32
-                and not server_args.disable_autocast
+                vae_dtype != torch.float32 and not server_args.disable_autocast
             )
 
             # Denormalize latents (like DecodingStage.scale_and_shift)
@@ -1927,11 +1941,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _frame_futures.append(
                         _frame_executor.submit(
                             _save_chunk_frames_for_streaming,
-                            frames_np, _frame_dir, chunk_idx, _frames_per_chunk,
+                            frames_np,
+                            _frame_dir,
+                            chunk_idx,
+                            _frames_per_chunk,
                         )
                     )
                 except Exception as e:
-                    logger.warning("Streaming frame save failed for chunk %d: %s", chunk_idx, e)
+                    logger.warning(
+                        "Streaming frame save failed for chunk %d: %s", chunk_idx, e
+                    )
 
             # Per-chunk timing summary (skip chunk 1 which includes compile)
             _t_chunk = time.time() - chunk_start
@@ -1993,7 +2012,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
         if _cancelled:
             logger.info(
-                "Returning partial result: %d/%d chunks", len(all_chunk_frames), num_chunks
+                "Returning partial result: %d/%d chunks",
+                len(all_chunk_frames),
+                num_chunks,
             )
 
         final_video = torch.cat(all_chunk_frames, dim=2)

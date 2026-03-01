@@ -102,9 +102,7 @@ class AudioProjModel(nn.Module):
         )  # [-2, -1, 0, 1, 2]
         frame_indices = torch.arange(num_video_frames, device=device)
         # (num_frames, window_size): each frame's window indices, clamped
-        windowed_indices = (
-            frame_indices.unsqueeze(1) + window_offsets.unsqueeze(0)
-        )
+        windowed_indices = frame_indices.unsqueeze(1) + window_offsets.unsqueeze(0)
         windowed_indices = windowed_indices.clamp(0, num_video_frames - 1)
         # (B, num_frames, window_size, num_layers, feat_dim)
         windowed = audio_features[:, windowed_indices]
@@ -130,8 +128,12 @@ class AudioProjModel(nn.Module):
         if n_subsequent_steps > 0:
             # Reshape to (B, N_t-1, vae_scale, window, layers, dim)
             grouped = subsequent_windowed.reshape(
-                B, n_subsequent_steps, vae_temporal_factor,
-                self.audio_window_first, num_layers, feat_dim,
+                B,
+                n_subsequent_steps,
+                vae_temporal_factor,
+                self.audio_window_first,
+                num_layers,
+                feat_dim,
             )
             mid = self.audio_window_first // 2  # 2
 
@@ -151,8 +153,11 @@ class AudioProjModel(nn.Module):
             # Last sub-frame (index vae_scale-1): take window[mid:] = [2,3,4] → 3
             last_sub = grouped[:, :, -1:, mid:]
             last_sub = last_sub.reshape(
-                B, n_subsequent_steps,
-                1 * (self.audio_window_first - mid), num_layers, feat_dim,
+                B,
+                n_subsequent_steps,
+                1 * (self.audio_window_first - mid),
+                num_layers,
+                feat_dim,
             )
 
             # Concatenate: (B, N_t-1, 3+n_middle+3, layers, dim)
@@ -208,9 +213,7 @@ class AudioProjModel(nn.Module):
         Returns:
             (B, N_t, context_tokens, output_dim) audio context for DiT.
         """
-        B, num_video_frames, window_size, num_layers, feat_dim = (
-            windowed_features.shape
-        )
+        B, num_video_frames, window_size, num_layers, feat_dim = windowed_features.shape
         N_t = 1 + (num_video_frames - 1) // vae_temporal_factor
 
         # --- First latent temporal step (t=0) ---
@@ -263,7 +266,9 @@ class AudioProjModel(nn.Module):
 
         all_out = torch.relu(self.proj2(all_out))
         context_tokens = self.proj3(all_out)
-        context_tokens = context_tokens.reshape(BN, self.context_tokens, self.output_dim)
+        context_tokens = context_tokens.reshape(
+            BN, self.context_tokens, self.output_dim
+        )
 
         with autocast("cuda", enabled=False):
             context_tokens = self.norm(context_tokens.float())

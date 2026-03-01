@@ -169,9 +169,7 @@ class FlashTalkDenoisingStage(PipelineStage):
             _inductor_cfg.reorder_for_compute_comm_overlap = True
         except ImportError:
             pass
-        mode = os.environ.get(
-            "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-        )
+        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
         logger.info("Compiling FlashTalk transformer with mode: %s", mode)
         module.compile(mode=mode, fullgraph=False, dynamic=None)
 
@@ -216,7 +214,9 @@ class FlashTalkDenoisingStage(PipelineStage):
             self.transformer.to(device)
         elif use_sp and next(self.transformer.parameters()).device.type == "cpu":
             # For multi-GPU SP, move to GPU once and keep it there
-            logger.info("Moving transformer to GPU (SP mode, skipping per-step offload)")
+            logger.info(
+                "Moving transformer to GPU (SP mode, skipping per-step offload)"
+            )
             self.transformer.to(device)
 
         # Wire TeaCache params from sampling_params to batch.
@@ -250,8 +250,10 @@ class FlashTalkDenoisingStage(PipelineStage):
             if self._prev_audio_context is not None:
                 diff = audio_context - self._prev_audio_context
                 rel_l1 = (
-                    diff.abs().mean() / self._prev_audio_context.abs().mean()
-                ).cpu().item()
+                    (diff.abs().mean() / self._prev_audio_context.abs().mean())
+                    .cpu()
+                    .item()
+                )
                 if rel_l1 < batch.teacache_params.teacache_thresh:
                     base_num_steps = max(2, base_num_steps // 2)
                     reduced_steps = True
@@ -308,15 +310,17 @@ class FlashTalkDenoisingStage(PipelineStage):
             # Ensure timesteps ends with 0
             timesteps = list(timesteps)
             if not isinstance(timesteps[-1], torch.Tensor):
-                timesteps = [
-                    torch.tensor([t], device=device) for t in timesteps
-                ]
+                timesteps = [torch.tensor([t], device=device) for t in timesteps]
             timesteps.append(torch.tensor([0.0], device=device))
 
         # Apply motion frame latent if available
         motion_latent = batch.extra.get("motion_latent")
         if motion_latent is not None:
-            n_motion = motion_latent.shape[2] if motion_latent.dim() == 5 else motion_latent.shape[1]
+            n_motion = (
+                motion_latent.shape[2]
+                if motion_latent.dim() == 5
+                else motion_latent.shape[1]
+            )
             if latents.dim() == 5:
                 latents[:, :, :n_motion] = motion_latent
             else:
@@ -487,16 +491,12 @@ class FlashTalkDenoisingStage(PipelineStage):
 
         return batch
 
-    def verify_input(
-        self, batch: Req, server_args: ServerArgs
-    ) -> VerificationResult:
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check("latents", batch.latents, V.is_tensor)
         return result
 
-    def verify_output(
-        self, batch: Req, server_args: ServerArgs
-    ) -> VerificationResult:
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check("latents", batch.latents, V.is_tensor)
         return result
@@ -531,9 +531,7 @@ def _rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
     xyz = xyz.reshape(shape)
 
     # XYZ to Lab
-    xyz_ref = torch.tensor(
-        [0.95047, 1.0, 1.08883], dtype=rgb.dtype, device=rgb.device
-    )
+    xyz_ref = torch.tensor([0.95047, 1.0, 1.08883], dtype=rgb.dtype, device=rgb.device)
     xyz_normalized = xyz / xyz_ref
     xyz_normalized = torch.clamp(xyz_normalized, 1e-8, None)
 
@@ -563,14 +561,10 @@ def _lab_to_rgb(lab: torch.Tensor) -> torch.Tensor:
     kappa = 903.3
 
     x = torch.where(f_x**3 > epsilon, f_x**3, (116 * f_x - 16) / kappa)
-    y = torch.where(
-        L > kappa * epsilon, ((L + 16) / 116) ** 3, L / kappa
-    )
+    y = torch.where(L > kappa * epsilon, ((L + 16) / 116) ** 3, L / kappa)
     z = torch.where(f_z**3 > epsilon, f_z**3, (116 * f_z - 16) / kappa)
 
-    xyz_ref = torch.tensor(
-        [0.95047, 1.0, 1.08883], dtype=lab.dtype, device=lab.device
-    )
+    xyz_ref = torch.tensor([0.95047, 1.0, 1.08883], dtype=lab.dtype, device=lab.device)
     xyz = torch.stack([x, y, z], dim=-1) * xyz_ref
 
     rgb_from_xyz = torch.tensor(
@@ -634,9 +628,7 @@ def match_and_blend_colors(
         source_std < 1e-8, torch.ones_like(source_std), source_std
     )
 
-    corrected_lab = (
-        (source_lab - source_mean) * (ref_std / source_std_safe) + ref_mean
-    )
+    corrected_lab = (source_lab - source_mean) * (ref_std / source_std_safe) + ref_mean
     corrected_rgb = _lab_to_rgb(corrected_lab)
     blended = (1 - strength) * source_p + strength * corrected_rgb
 
@@ -674,18 +666,12 @@ class FlashTalkColorCorrectionStage(PipelineStage):
             return batch
 
         # output is (B, C, T, H, W) in [-1, 1]
-        batch.output = match_and_blend_colors(
-            batch.output, reference, strength
-        )
+        batch.output = match_and_blend_colors(batch.output, reference, strength)
 
         return batch
 
-    def verify_input(
-        self, batch: Req, server_args: ServerArgs
-    ) -> VerificationResult:
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         return VerificationResult()
 
-    def verify_output(
-        self, batch: Req, server_args: ServerArgs
-    ) -> VerificationResult:
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         return VerificationResult()

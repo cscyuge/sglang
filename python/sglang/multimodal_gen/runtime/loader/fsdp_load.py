@@ -27,7 +27,6 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     hf_to_custom_state_dict,
     set_default_torch_dtype,
 )
-
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )

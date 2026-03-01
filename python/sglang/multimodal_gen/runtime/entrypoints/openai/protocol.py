@@ -54,7 +54,9 @@ class VideoResponse(BaseModel):
     id: str
     object: str = "video"
     model: str = "sora-2"
-    status: str = "queued"  # queued | processing | completed | failed | cancelling | cancelled
+    status: str = (
+        "queued"  # queued | processing | completed | failed | cancelling | cancelled
+    )
     progress: int = 0
     created_at: int = Field(default_factory=lambda: int(time.time()))
     size: str = ""

@@ -512,7 +512,9 @@ class SamplingParams:
         # user params so that subclass-specific fields are accepted.
         actual_cls = type(sampling_params)
         actual_field_names = {f.name for f in dataclasses.fields(actual_cls)}
-        filtered_kwargs = {k: v for k, v in user_kwargs.items() if k in actual_field_names}
+        filtered_kwargs = {
+            k: v for k, v in user_kwargs.items() if k in actual_field_names
+        }
         user_sampling_params = actual_cls(*args, **filtered_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
@@ -848,7 +850,11 @@ class SamplingParams:
 
         # Also forward extra CLI args that may belong to model-specific subclasses
         # (e.g. audio_path, audio_encode_mode for FlashTalkSamplingParams).
-        _extra_forwarded_args = ["audio_path", "audio_encode_mode", "audio_encoder_path"]
+        _extra_forwarded_args = [
+            "audio_path",
+            "audio_encode_mode",
+            "audio_encoder_path",
+        ]
         for arg_name in _extra_forwarded_args:
             if hasattr(args, arg_name) and getattr(args, arg_name) is not None:
                 result[arg_name] = getattr(args, arg_name)

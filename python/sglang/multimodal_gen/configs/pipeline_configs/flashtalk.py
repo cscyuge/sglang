@@ -74,9 +74,7 @@ class FlashTalkPipelineConfig(WanI2V720PConfig):
     )
 
     # CLIP ViT-Huge-14 config
-    image_encoder_config: EncoderConfig = field(
-        default_factory=_flashtalk_clip_config
-    )
+    image_encoder_config: EncoderConfig = field(default_factory=_flashtalk_clip_config)
 
     # FlashTalk-specific: no CFG
     use_cfg: bool = False
