@@ -290,6 +290,7 @@ async def create_session(
     size: Optional[str] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     guidance_scale: Optional[float] = Form(None),
+    enable_teacache: Optional[bool] = Form(False),
 ):
     """Create a persistent generation session for live streaming.
 
@@ -331,6 +332,7 @@ async def create_session(
         size=size or "",
         seconds=4,  # placeholder; session runs indefinitely
         num_inference_steps=num_inference_steps,
+        enable_teacache=enable_teacache,
         **({"guidance_scale": guidance_scale} if guidance_scale is not None else {}),
     )
     try:
