@@ -1511,8 +1511,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # causal conv padding.  Keep only the first num_sample_frames,
             # matching ParallelTiledVAE.decode() which does [:, :, :N].
             _vae_decode_num_frames = (
-                (chunk_latent_num_frames - 1) * vae.temporal_compression_ratio + 1
-            )
+                chunk_latent_num_frames - 1
+            ) * vae.temporal_compression_ratio + 1
 
             # Capture decode graph
             sample_dec = torch.randn(
