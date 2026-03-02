@@ -176,6 +176,8 @@ class WanRMS_norm(nn.Module):
     A custom RMS normalization layer.
     """
 
+    _compiled_fn = None
+
     def __init__(
         self,
         dim: int,
@@ -191,8 +193,33 @@ class WanRMS_norm(nn.Module):
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
+        self._fused = False
+
+    def fuse_for_inference(self):
+        """Bake ``scale`` into ``gamma`` and enable ``torch.compile`` fusion.
+
+        After calling this, the forward pass uses a single compiled Triton
+        kernel that fuses L2-normalize + scale + gamma-multiply (6 eager
+        kernels → 2 compiled kernels per norm call).
+        """
+        if self._fused:
+            return
+        with torch.no_grad():
+            self.gamma.data.mul_(self.scale)
+        self.scale = 1.0
+        self._fused = True
+        if WanRMS_norm._compiled_fn is None:
+
+            def _fwd(x, gamma, dim_idx):
+                return F.normalize(x, dim=dim_idx) * gamma
+
+            WanRMS_norm._compiled_fn = torch.compile(_fwd)
 
     def forward(self, x):
+        if self._fused and WanRMS_norm._compiled_fn is not None:
+            return WanRMS_norm._compiled_fn(
+                x, self.gamma, 1 if self.channel_first else -1
+            )
         return (
             F.normalize(x, dim=(1 if self.channel_first else -1))
             * self.scale

@@ -1507,6 +1507,18 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             vae.to(device=device, dtype=_vae_dtype)
 
+            # Fuse WanRMS_norm modules: bake scale into gamma and
+            # torch.compile the forward for Triton kernel fusion
+            # (6 eager kernels → 2 compiled kernels per norm call).
+            from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import (
+                WanRMS_norm,
+            )
+
+            for module in vae.modules():
+                if isinstance(module, WanRMS_norm):
+                    module.fuse_for_inference()
+            logger.info("WanRMS_norm modules fused and compiled for inference")
+
             # _decode() is single-pass — every latent frame (including the
             # first) goes through two temporal upsample stages (×2×2 = ×4),
             # producing 9×4 = 36 pixel frames.  But the first latent frame
