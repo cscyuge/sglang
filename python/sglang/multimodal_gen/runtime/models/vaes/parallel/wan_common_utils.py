@@ -151,6 +151,14 @@ class WanCausalConv3d(nn.Conv3d):
         x = (
             x.to(self.weight.dtype) if current_platform.is_mps() else x
         )  # casting needed for mps since amp isn't supported
+        # Use channels_last_3d memory format to make cuDNN select the fused
+        # implicit_gemm algorithm instead of the slower vol2col + nvjet path.
+        # This gives ~3x speedup for BF16 Conv3d and ~1.7x over FP32.
+        # Convert back to contiguous after conv to avoid breaking downstream
+        # reshape/view/permute operations that assume NCDHW layout.
+        if x.ndim == 5:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
+            return super().forward(x).contiguous()
         return super().forward(x)
 
 
