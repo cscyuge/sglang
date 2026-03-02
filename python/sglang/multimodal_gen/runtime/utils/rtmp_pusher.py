@@ -3,16 +3,11 @@
 Provides ``RTMPPusher``, a queue-based background thread that accepts raw
 video frames (uint8 numpy) and audio samples (float32 16 kHz), encodes them
 to H.264 + AAC via libav, and pushes to an RTMP ingest URL.
-
-Also provides ``generate_aliyun_rtmp_push_url`` for generating authenticated
-Aliyun Live RTMP push URLs.
 """
 
-import hashlib
 import logging
 import queue
 import threading
-import time
 from typing import Optional, Tuple
 
 import numpy as np
@@ -231,39 +226,3 @@ class RTMPPusher:
 
                 audio_pos = chunk_end
                 self._frame_count += 1
-
-
-def generate_aliyun_rtmp_push_url(
-    domain: str,
-    app: str,
-    stream: str,
-    auth_key: str,
-    expire_seconds: int = 3600,
-) -> str:
-    """Generate an authenticated Aliyun Live RTMP push URL.
-
-    Implements Aliyun CDN URL authentication Type A:
-        ``md5("/{app}/{stream}-{timestamp}-0-0-{auth_key}")``
-
-    Parameters
-    ----------
-    domain : str
-        Push domain, e.g. ``"push.example.com"``.
-    app : str
-        Application name, e.g. ``"live"``.
-    stream : str
-        Stream name, e.g. ``"mystream"``.
-    auth_key : str
-        Authentication key configured in Aliyun console.
-    expire_seconds : int
-        URL validity in seconds (default 3600 = 1 hour).
-
-    Returns
-    -------
-    str
-        Full RTMP URL with ``auth_key`` query parameter.
-    """
-    ts = int(time.time()) + expire_seconds
-    plain = f"/{app}/{stream}-{ts}-0-0-{auth_key}"
-    md5_hash = hashlib.md5(plain.encode()).hexdigest()
-    return f"rtmp://{domain}/{app}/{stream}?auth_key={ts}-0-0-{md5_hash}"
