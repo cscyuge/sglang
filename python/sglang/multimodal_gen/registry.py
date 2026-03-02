@@ -421,7 +421,7 @@ def get_model_info(
             logger.warning(f"Could not read model config for '{model_path}': {e}")
             if backend == Backend.AUTO:
                 logger.info("Falling back to diffusers backend")
-                return _get_diffusers_model_info(model_path)
+                return _get_diffusers_model_info()
             return None
 
         pipeline_class_name = config.get("_class_name")
