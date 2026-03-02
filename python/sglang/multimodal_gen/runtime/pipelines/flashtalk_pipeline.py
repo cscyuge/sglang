@@ -1496,7 +1496,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             os.environ.get("SGLANG_FLASHTALK_VAE_CUDA_GRAPH", "0") == "1"
         )
         _vae_decode_runner = None
-        _vae_decode_num_frames = 0  # num pixel frames to keep from _decode output
+        _vae_decode_temporal_trim = 0  # leading frames to discard from _decode output
 
         if use_vae_cuda_graph:
             _vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
@@ -1507,12 +1507,15 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             vae.to(device=device, dtype=_vae_dtype)
 
-            # _decode() may produce more temporal frames than needed due to
-            # causal conv padding.  Keep only the first num_sample_frames,
-            # matching ParallelTiledVAE.decode() which does [:, :, :N].
-            _vae_decode_num_frames = (
-                chunk_latent_num_frames - 1
-            ) * vae.temporal_compression_ratio + 1
+            # _decode() is single-pass — every latent frame (including the
+            # first) goes through two temporal upsample stages (×2×2 = ×4),
+            # producing 9×4 = 36 pixel frames.  But the first latent frame
+            # should only map to 1 pixel frame (not 4): feature-cache
+            # decode() handles this via first_chunk=True, while _decode()
+            # cannot.  The 3 extra frames appear at the START as zero-
+            # padding artifacts from the causal convolutions, so we trim
+            # them to get the correct 33 frames.
+            _vae_decode_temporal_trim = vae.temporal_compression_ratio - 1
 
             # Capture decode graph
             sample_dec = torch.randn(
@@ -1700,7 +1703,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 denorm_latents = denorm_latents.to(vae_dtype)
                 if use_vae_cuda_graph:
                     videos = _vae_decode_runner.replay(denorm_latents)
-                    videos = videos[:, :, :_vae_decode_num_frames].clone()
+                    videos = videos[:, :, _vae_decode_temporal_trim:].clone()
                 else:
                     videos = vae.decode(denorm_latents)
                 torch.cuda.synchronize()
@@ -1947,7 +1950,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             denorm_latents = denorm_latents.to(vae_dtype)
             if use_vae_cuda_graph:
                 videos = _vae_decode_runner.replay(denorm_latents)
-                videos = videos[:, :, :_vae_decode_num_frames].clone()
+                videos = videos[:, :, _vae_decode_temporal_trim:].clone()
             else:
                 videos = vae.decode(denorm_latents)  # [-1, 1]
             torch.cuda.synchronize()
