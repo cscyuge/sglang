@@ -470,8 +470,15 @@ class DiffGenerator:
                 pass
 
         if self.local_scheduler_process:
+            # Use a shared deadline so that all workers get a chance to
+            # complete destroy_process_group() (an NCCL collective) together.
+            # Sequential per-worker timeouts would kill rank 0 first, causing
+            # all remaining ranks to hang in the collective forever.
+            deadline = time.monotonic() + 15
             for process in self.local_scheduler_process:
-                process.join(timeout=10)
+                remaining = max(0, deadline - time.monotonic())
+                process.join(timeout=remaining)
+            for process in self.local_scheduler_process:
                 if process.is_alive():
                     logger.warning(
                         f"Local worker {process.name} did not terminate gracefully, forcing."
