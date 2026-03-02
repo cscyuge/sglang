@@ -31,46 +31,37 @@ def get_is_diffusion_model(model_path: str) -> bool:
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
     """
+    try:
+        from sglang.multimodal_gen.registry import (
+            is_known_non_diffusers_multimodal_model,
+        )
+    except ImportError:
+        is_known_non_diffusers_multimodal_model = lambda _: False
+
     if os.path.isdir(model_path):
         if _is_diffusers_model_dir(model_path):
             return True
-        # Fall through to registry detectors below
-    else:
-        try:
-            if envs.SGLANG_USE_MODELSCOPE.get():
-                from modelscope import model_file_download
+        return is_known_non_diffusers_multimodal_model(model_path)
 
-                file_path = model_file_download(
-                    model_id=model_path, file_path="model_index.json"
-                )
-            else:
-                from huggingface_hub import hf_hub_download
+    if is_known_non_diffusers_multimodal_model(model_path):
+        return True
 
-                file_path = hf_hub_download(
-                    repo_id=model_path, filename="model_index.json"
-                )
-
-            if _is_diffusers_model_dir(os.path.dirname(file_path)):
-                return True
-        except Exception as e:
-            logger.debug(
-                "Failed to auto-detect diffusion model for %s: %s", model_path, e
-            )
-
-    # Also check model_detectors in the multimodal_gen registry
-    # for non-diffusers models (e.g. safetensors-only models like FlashTalk)
     try:
-        from sglang.multimodal_gen.registry import _MODEL_NAME_DETECTORS
+        if envs.SGLANG_USE_MODELSCOPE.get():
+            from modelscope import model_file_download
 
-        for _model_id, detector in _MODEL_NAME_DETECTORS:
-            if detector(model_path.lower()):
-                logger.info("Diffusion model detected via registry detector")
-                return True
-    except (ImportError, AttributeError):
-        # multimodal_gen may not be installed or registry may lack detectors
-        pass
+            file_path = model_file_download(
+                model_id=model_path, file_path="model_index.json"
+            )
+        else:
+            from huggingface_hub import hf_hub_download
 
-    return False
+            file_path = hf_hub_download(repo_id=model_path, filename="model_index.json")
+
+        return _is_diffusers_model_dir(os.path.dirname(file_path))
+    except Exception as e:
+        logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
+        return False
 
 
 def get_model_path(extra_argv):
