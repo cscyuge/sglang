@@ -105,6 +105,48 @@ def _chunk_frames_to_numpy(chunk_frames: torch.Tensor) -> np.ndarray:
     )
 
 
+class VAECudaGraphRunner:
+    """Captures and replays a CUDA graph for a fixed-shape VAE forward pass.
+
+    Used to eliminate kernel launch overhead for per-chunk VAE decode/encode
+    when input shapes are constant across all chunks.
+    """
+
+    def __init__(self, num_warmups: int = 2):
+        self.graph = None
+        self.num_warmups = num_warmups
+        self.static_input = None
+        self.static_output = None
+        self._captured = False
+
+    def capture(self, forward_fn, sample_input):
+        """Warm up and capture a CUDA graph for ``forward_fn``."""
+        self.static_input = sample_input.clone()
+
+        def run_once():
+            return forward_fn(self.static_input)
+
+        # Warmup on a side stream
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(self.num_warmups):
+                run_once()
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Capture
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=s):
+            self.static_output = run_once()
+        self._captured = True
+
+    def replay(self, input_tensor):
+        """Copy *input_tensor* into the static buffer and replay the graph."""
+        self.static_input.copy_(input_tensor)
+        self.graph.replay()
+        return self.static_output
+
+
 def _save_chunk_frames_for_streaming(
     frames_np: np.ndarray,
     frame_dir: str,
@@ -1438,6 +1480,46 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 vae.decode = torch.compile(vae.decode, mode=vae_compile_mode)
                 vae._flashtalk_vae_compiled = True
 
+        # --- VAE CUDA Graph capture (decode only) ---
+        # When enabled, captures vae._decode as a CUDA graph to eliminate
+        # kernel launch overhead across 33+ repeated chunks.  Uses the
+        # single-pass (non-feature-cache) path which is a pure tensor op.
+        #
+        # Encode is NOT captured because motion_frames_num (5) is too few
+        # for the encoder's temporal downsampling — the temporal dimension
+        # shrinks below kernel size after two stride-2 downsamples.  The
+        # feature-cache encode() handles this via frame-by-frame caching.
+        # Encode is only ~0.1s/chunk anyway (vs ~0.7s for decode).
+        use_vae_cuda_graph = (
+            os.environ.get("SGLANG_FLASHTALK_VAE_CUDA_GRAPH", "0") == "1"
+        )
+        _vae_decode_runner = None
+        _vae_decode_temporal_trim = 0  # extra frames to trim from _decode output
+
+        if use_vae_cuda_graph:
+            _vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
+            _z_dim = pipeline_config.vae_config.arch_config.z_dim
+            _vae_spatial_stride = 8
+            _H_lat = batch.height // _vae_spatial_stride
+            _W_lat = batch.width // _vae_spatial_stride
+
+            vae.to(device=device, dtype=_vae_dtype)
+
+            # _decode() produces temporal_compression_ratio - 1 extra frames
+            # at the start due to causal padding; must trim after replay.
+            _vae_decode_temporal_trim = vae.temporal_compression_ratio - 1
+
+            # Capture decode graph
+            sample_dec = torch.randn(
+                1, _z_dim, chunk_latent_num_frames, _H_lat, _W_lat,
+                device=device, dtype=_vae_dtype,
+            )
+            _vae_decode_runner = VAECudaGraphRunner()
+            _vae_decode_runner.capture(vae._decode, sample_dec)
+            del sample_dec
+
+            logger.info("VAE CUDA graph captured for decode")
+
         # Optional debug: save per-chunk outputs (set FLASHTALK_DEBUG_CHUNKS=1)
         _debug_save_chunks = os.environ.get("FLASHTALK_DEBUG_CHUNKS", "0") == "1"
         _debug_out_dir = os.environ.get(
@@ -1598,14 +1680,19 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 batch = denoising_stage.forward(batch, server_args)
 
                 # d. VAE decode + color correct + motion carry
-                vae.to(device=device, dtype=vae_dtype)
+                if not use_vae_cuda_graph:
+                    vae.to(device=device, dtype=vae_dtype)
 
                 denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
                 denorm_latents = denoised_latents / sc_dev + sf_dev
 
                 torch.cuda.synchronize()
                 denorm_latents = denorm_latents.to(vae_dtype)
-                videos = vae.decode(denorm_latents)
+                if use_vae_cuda_graph:
+                    videos = _vae_decode_runner.replay(denorm_latents)
+                    videos = videos[:, :, _vae_decode_temporal_trim:].clone()
+                else:
+                    videos = vae.decode(denorm_latents)
                 torch.cuda.synchronize()
                 del denorm_latents
 
@@ -1635,7 +1722,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 motion_latent_normalized = (motion_latent_f32 - sf_dev) * sc_dev
                 batch.extra["motion_latent"] = motion_latent_normalized
 
-                if server_args.vae_cpu_offload and not skip_vae_offload:
+                if server_args.vae_cpu_offload and not skip_vae_offload and not use_vae_cuda_graph:
                     vae.to("cpu", non_blocking=True)
 
                 # e. Collect frames
@@ -1831,7 +1918,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # 1. Denormalize latents  2. VAE decode → [-1, 1]
             # 3. Color correct in [-1, 1]  4. Motion carry → VAE encode → normalize
             vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
-            vae.to(device=device, dtype=vae_dtype)
+            if not use_vae_cuda_graph:
+                vae.to(device=device, dtype=vae_dtype)
 
             # Denormalize latents (like DecodingStage.scale_and_shift)
             denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
@@ -1843,7 +1931,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             torch.cuda.synchronize()
             _t_vae_dec = time.time()
             denorm_latents = denorm_latents.to(vae_dtype)
-            videos = vae.decode(denorm_latents)  # [-1, 1]
+            if use_vae_cuda_graph:
+                videos = _vae_decode_runner.replay(denorm_latents)
+                videos = videos[:, :, _vae_decode_temporal_trim:].clone()
+            else:
+                videos = vae.decode(denorm_latents)  # [-1, 1]
             torch.cuda.synchronize()
             _t_vae_dec = time.time() - _t_vae_dec
             del denorm_latents
@@ -1883,7 +1975,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             batch.extra["motion_latent"] = motion_latent_normalized
 
             # Offload VAE if configured (skip when keeping on GPU for SP)
-            if server_args.vae_cpu_offload and not skip_vae_offload:
+            if server_args.vae_cpu_offload and not skip_vae_offload and not use_vae_cuda_graph:
                 vae.to("cpu", non_blocking=True)
 
             # g. Collect non-overlapping frames (skip first motion_frames_num)
