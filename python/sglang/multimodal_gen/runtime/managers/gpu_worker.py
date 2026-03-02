@@ -259,7 +259,7 @@ class GPUWorker:
                     # Pipeline already set output_file_paths (e.g. session mode
                     # streams frames directly), skip redundant save_outputs.
                     output_batch.output = None
-                else:
+                elif output_batch.output is not None:
                     output_paths = save_outputs(
                         output_batch.output,
                         req.data_type,
