@@ -1511,8 +1511,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # Capture decode graph
             sample_dec = torch.randn(
-                1, _z_dim, chunk_latent_num_frames, _H_lat, _W_lat,
-                device=device, dtype=_vae_dtype,
+                1,
+                _z_dim,
+                chunk_latent_num_frames,
+                _H_lat,
+                _W_lat,
+                device=device,
+                dtype=_vae_dtype,
             )
             _vae_decode_runner = VAECudaGraphRunner()
             _vae_decode_runner.capture(vae._decode, sample_dec)
@@ -1722,7 +1727,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 motion_latent_normalized = (motion_latent_f32 - sf_dev) * sc_dev
                 batch.extra["motion_latent"] = motion_latent_normalized
 
-                if server_args.vae_cpu_offload and not skip_vae_offload and not use_vae_cuda_graph:
+                if (
+                    server_args.vae_cpu_offload
+                    and not skip_vae_offload
+                    and not use_vae_cuda_graph
+                ):
                     vae.to("cpu", non_blocking=True)
 
                 # e. Collect frames
@@ -1975,7 +1984,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             batch.extra["motion_latent"] = motion_latent_normalized
 
             # Offload VAE if configured (skip when keeping on GPU for SP)
-            if server_args.vae_cpu_offload and not skip_vae_offload and not use_vae_cuda_graph:
+            if (
+                server_args.vae_cpu_offload
+                and not skip_vae_offload
+                and not use_vae_cuda_graph
+            ):
                 vae.to("cpu", non_blocking=True)
 
             # g. Collect non-overlapping frames (skip first motion_frames_num)
