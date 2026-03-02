@@ -315,6 +315,7 @@ async def create_session(
     num_inference_steps: Optional[int] = Form(None),
     guidance_scale: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    rtmp_push_url: Optional[str] = Form(None),
 ):
     """Create a persistent generation session for live streaming.
 
@@ -368,6 +369,7 @@ async def create_session(
     batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
     batch.extra["session_mode"] = True
     batch.extra["session_dir"] = session_dir
+    batch.extra["rtmp_push_url"] = rtmp_push_url
 
     # Store session metadata
     session_data = {
@@ -376,6 +378,7 @@ async def create_session(
         "status": "created",
         "stream_url": f"/v1/videos/{session_id}/stream",
         "events_url": f"/v1/videos/{session_id}/events",
+        "rtmp_push_url": rtmp_push_url,
         "created_at": int(time.time()),
         "chunks_received": 0,
         "chunks_processed": 0,

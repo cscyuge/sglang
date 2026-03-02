@@ -127,6 +127,7 @@ class SessionResponse(BaseModel):
     status: str = "created"  # created | running | ended | failed
     stream_url: Optional[str] = None
     events_url: Optional[str] = None
+    rtmp_push_url: Optional[str] = None
     created_at: int = Field(default_factory=lambda: int(time.time()))
     chunks_received: int = 0
     chunks_processed: int = 0

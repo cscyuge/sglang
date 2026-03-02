@@ -1518,6 +1518,27 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             sf_dev = shift_factor.to(device=device)
             sc_dev = scaling_factor.to(device=device)
 
+            # Optional RTMP push streamer
+            _rtmp_pusher = None
+            _rtmp_url = batch.extra.get("rtmp_push_url")
+            if _rtmp_url:
+                try:
+                    from sglang.multimodal_gen.runtime.utils.rtmp_pusher import (
+                        RTMPPusher,
+                    )
+
+                    _rtmp_pusher = RTMPPusher(
+                        url=_rtmp_url,
+                        width=batch.width,
+                        height=batch.height,
+                        fps=batch.fps or 25,
+                    )
+                    _rtmp_pusher.start()
+                    logger.info("RTMP pusher started: %s", _rtmp_url)
+                except Exception as e:
+                    logger.warning("Failed to start RTMP pusher: %s", e)
+                    _rtmp_pusher = None
+
             while True:
                 # Wait for audio chunk or end sentinel
                 logger.info("Session: waiting for audio chunk %d...", chunk_idx)
@@ -1668,9 +1689,21 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             _pf.write(f"{chunk_idx + 1} -1")
                     except Exception:
                         pass
-                if _frame_dir and _frame_executor is not None:
+                # Compute frames_np once if needed by JPEG saving or RTMP push
+                _need_frames_np = (
+                    (_frame_dir and _frame_executor is not None)
+                    or (_rtmp_pusher is not None and not _rtmp_pusher.failed)
+                )
+                frames_np = None
+                if _need_frames_np:
                     try:
                         frames_np = _chunk_frames_to_numpy(chunk_frames)
+                    except Exception as e:
+                        logger.warning(
+                            "Frame conversion failed for chunk %d: %s", chunk_idx, e
+                        )
+                if frames_np is not None and _frame_dir and _frame_executor is not None:
+                    try:
                         _frame_futures.append(
                             _frame_executor.submit(
                                 _save_chunk_frames_for_streaming,
@@ -1683,6 +1716,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     except Exception as e:
                         logger.warning(
                             "Session frame save failed for chunk %d: %s", chunk_idx, e
+                        )
+                if frames_np is not None and _rtmp_pusher is not None and not _rtmp_pusher.failed:
+                    try:
+                        _rtmp_pusher.push_chunk(frames_np, chunk_audio_data)
+                    except Exception as e:
+                        logger.warning(
+                            "RTMP push failed for chunk %d: %s", chunk_idx, e
                         )
                 del chunk_frames
 
@@ -1708,6 +1748,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _frame_futures.clear()
             if _frame_executor is not None:
                 _frame_executor.shutdown(wait=False)
+            if _rtmp_pusher is not None:
+                _rtmp_pusher.stop(timeout=10.0)
 
             if _frame_dir:
                 try:
