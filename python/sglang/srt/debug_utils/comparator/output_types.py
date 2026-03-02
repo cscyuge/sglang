@@ -281,7 +281,6 @@ class SummaryRecord(_OutputRecord):
         return _format_summary_rich_body(self, verbosity=verbosity)
 
 
-
 class LogRecord(_OutputRecord):
     type: Literal["log"] = "log"
 
