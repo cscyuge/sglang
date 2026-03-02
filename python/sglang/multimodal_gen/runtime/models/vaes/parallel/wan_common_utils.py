@@ -29,6 +29,9 @@ class AvgDown3D(nn.Module):
         pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
         pad = (0, 0, 0, 0, pad_t, 0)
         x = F.pad(x, pad)
+        # Ensure standard NCDHW layout for the view/permute below.
+        if not x.is_contiguous():
+            x = x.contiguous()
         B, C, T, H, W = x.shape
         x = x.view(
             B,
@@ -80,6 +83,9 @@ class DupUp3D(nn.Module):
         self.repeats = out_channels * self.factor // in_channels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure standard NCDHW layout for repeat_interleave/view/permute below.
+        if not x.is_contiguous():
+            x = x.contiguous()
         x = x.repeat_interleave(self.repeats, dim=1)
         x = x.view(
             x.size(0),
@@ -154,11 +160,14 @@ class WanCausalConv3d(nn.Conv3d):
         # Use channels_last_3d memory format to make cuDNN select the fused
         # implicit_gemm algorithm instead of the slower vol2col + nvjet path.
         # This gives ~3x speedup for BF16 Conv3d and ~1.7x over FP32.
-        # Convert back to contiguous after conv to avoid breaking downstream
-        # reshape/view/permute operations that assume NCDHW layout.
+        # Leave output in channels_last_3d — elementwise ops (norm, silu, add)
+        # preserve the format, so consecutive Conv3d layers avoid redundant
+        # NCDHW↔NDHWC round-trips.  Operations that need NCDHW (view, permute
+        # in AvgDown3D/DupUp3D/attention) call .contiguous() explicitly.
         if x.ndim == 5:
-            x = x.contiguous(memory_format=torch.channels_last_3d)
-            return super().forward(x).contiguous()
+            if not x.is_contiguous(memory_format=torch.channels_last_3d):
+                x = x.contiguous(memory_format=torch.channels_last_3d)
+            return super().forward(x)
         return super().forward(x)
 
 

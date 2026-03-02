@@ -128,8 +128,8 @@ def halo_exchange(
     group = sp_group.device_group
     group_ranks = sp_group.ranks
 
-    top_row = x[..., :height_halo_size, :].contiguous()
-    bottom_row = x[..., -height_halo_size:, :].contiguous()
+    top_row = x[..., :height_halo_size, :].clone()
+    bottom_row = x[..., -height_halo_size:, :].clone()
 
     recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row)
     recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row)
@@ -325,9 +325,12 @@ class WanDistCausalConv3d(nn.Conv3d):
 
         # Use channels_last_3d memory format to make cuDNN select the fused
         # implicit_gemm algorithm instead of the slower vol2col + nvjet path.
+        # Leave output in channels_last_3d to avoid redundant format round-trips
+        # between consecutive Conv3d layers (see WanCausalConv3d for details).
         if x_padded.ndim == 5:
-            x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
-            out = super().forward(x_padded).contiguous()
+            if not x_padded.is_contiguous(memory_format=torch.channels_last_3d):
+                x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
+            out = super().forward(x_padded)
         else:
             out = super().forward(x_padded)
 
