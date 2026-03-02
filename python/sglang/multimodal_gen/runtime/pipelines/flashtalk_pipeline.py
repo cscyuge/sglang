@@ -1512,9 +1512,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             z_dim = pipeline_config.vae_config.arch_config.z_dim
             vae_spatial_stride = 8
             vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
-            vae_autocast_enabled = (
-                vae_dtype != torch.float32 and not server_args.disable_autocast
-            )
             sf_dev = shift_factor.to(device=device)
             sc_dev = scaling_factor.to(device=device)
 
@@ -1601,20 +1598,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 batch = denoising_stage.forward(batch, server_args)
 
                 # d. VAE decode + color correct + motion carry
-                vae.to(device)
+                vae.to(device=device, dtype=vae_dtype)
 
                 denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
                 denorm_latents = denoised_latents / sc_dev + sf_dev
 
                 torch.cuda.synchronize()
-                with torch.autocast(
-                    device_type=current_platform.device_type,
-                    dtype=vae_dtype,
-                    enabled=vae_autocast_enabled,
-                ):
-                    if not vae_autocast_enabled:
-                        denorm_latents = denorm_latents.to(vae_dtype)
-                    videos = vae.decode(denorm_latents)
+                denorm_latents = denorm_latents.to(vae_dtype)
+                videos = vae.decode(denorm_latents)
                 torch.cuda.synchronize()
                 del denorm_latents
 
@@ -1625,20 +1616,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
                 cond_frame = videos_corrected[:, :, -motion_frames_num:].clone()
                 torch.cuda.synchronize()
-                with torch.autocast(
-                    device_type=current_platform.device_type,
-                    dtype=vae_dtype,
-                    enabled=vae_autocast_enabled,
-                ):
-                    if not vae_autocast_enabled:
-                        cond_frame = cond_frame.to(vae_dtype)
-                    latent_dist = vae.encode(cond_frame)
-                    if isinstance(latent_dist, DiagonalGaussianDistribution):
-                        motion_latent_raw = latent_dist.mode()
-                    elif hasattr(latent_dist, "latent_dist"):
-                        motion_latent_raw = latent_dist.latent_dist.mode()
-                    else:
-                        motion_latent_raw = latent_dist
+                cond_frame = cond_frame.to(vae_dtype)
+                latent_dist = vae.encode(cond_frame)
+                if isinstance(latent_dist, DiagonalGaussianDistribution):
+                    motion_latent_raw = latent_dist.mode()
+                elif hasattr(latent_dist, "latent_dist"):
+                    motion_latent_raw = latent_dist.latent_dist.mode()
+                else:
+                    motion_latent_raw = latent_dist
                 torch.cuda.synchronize()
                 del cond_frame
 
@@ -1845,11 +1830,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # Match the original FlashTalk flow:
             # 1. Denormalize latents  2. VAE decode → [-1, 1]
             # 3. Color correct in [-1, 1]  4. Motion carry → VAE encode → normalize
-            vae.to(device)
             vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
-            vae_autocast_enabled = (
-                vae_dtype != torch.float32 and not server_args.disable_autocast
-            )
+            vae.to(device=device, dtype=vae_dtype)
 
             # Denormalize latents (like DecodingStage.scale_and_shift)
             denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
@@ -1860,14 +1842,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # VAE decode
             torch.cuda.synchronize()
             _t_vae_dec = time.time()
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=vae_dtype,
-                enabled=vae_autocast_enabled,
-            ):
-                if not vae_autocast_enabled:
-                    denorm_latents = denorm_latents.to(vae_dtype)
-                videos = vae.decode(denorm_latents)  # [-1, 1]
+            denorm_latents = denorm_latents.to(vae_dtype)
+            videos = vae.decode(denorm_latents)  # [-1, 1]
             torch.cuda.synchronize()
             _t_vae_dec = time.time() - _t_vae_dec
             del denorm_latents
@@ -1884,20 +1860,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             cond_frame = videos_corrected[:, :, -motion_frames_num:].clone()
             torch.cuda.synchronize()
             _t_vae_enc = time.time()
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=vae_dtype,
-                enabled=vae_autocast_enabled,
-            ):
-                if not vae_autocast_enabled:
-                    cond_frame = cond_frame.to(vae_dtype)
-                latent_dist = vae.encode(cond_frame)
-                if isinstance(latent_dist, DiagonalGaussianDistribution):
-                    motion_latent_raw = latent_dist.mode()
-                elif hasattr(latent_dist, "latent_dist"):
-                    motion_latent_raw = latent_dist.latent_dist.mode()
-                else:
-                    motion_latent_raw = latent_dist
+            cond_frame = cond_frame.to(vae_dtype)
+            latent_dist = vae.encode(cond_frame)
+            if isinstance(latent_dist, DiagonalGaussianDistribution):
+                motion_latent_raw = latent_dist.mode()
+            elif hasattr(latent_dist, "latent_dist"):
+                motion_latent_raw = latent_dist.latent_dist.mode()
+            else:
+                motion_latent_raw = latent_dist
             torch.cuda.synchronize()
             _t_vae_enc = time.time() - _t_vae_enc
             del cond_frame
