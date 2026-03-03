@@ -35,6 +35,15 @@ def _resample_16k_to_48k_int16(audio_f32: np.ndarray) -> np.ndarray:
     return np.clip(resampled * 32767, -32768, 32767).astype(np.int16)
 
 
+def _is_connection_closed(exc: BaseException) -> bool:
+    """Return True if *exc* indicates a broken pipe / connection reset."""
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+        return True
+    # PyAV may wrap the OS error; check string as fallback
+    msg = str(exc).lower()
+    return "broken pipe" in msg or "connection reset" in msg
+
+
 class RTMPPusher:
     """Queue-based background thread for pushing H.264+AAC to an RTMP URL.
 
@@ -167,9 +176,15 @@ class RTMPPusher:
             audio_samples_per_frame = _OUTPUT_AUDIO_SR // self._fps
 
             self._drain_loop(container, v_stream, a_stream, audio_samples_per_frame)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.info("RTMP connection closed by peer — stream ended")
         except Exception as exc:
-            logger.error("RTMP pusher thread error: %s", exc)
-            self._failed = True
+            # PyAV may wrap OS errors; treat broken-pipe / reset as non-fatal
+            if _is_connection_closed(exc):
+                logger.info("RTMP connection closed by peer — stream ended")
+            else:
+                logger.error("RTMP pusher thread error: %s", exc)
+                self._failed = True
         finally:
             try:
                 container.close()
