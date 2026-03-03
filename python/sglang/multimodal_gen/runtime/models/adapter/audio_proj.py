@@ -126,6 +126,9 @@ class AudioProjModel(nn.Module):
         n_subsequent_steps = N_t - 1
 
         if n_subsequent_steps > 0:
+            # Truncate to exact multiple of vae_temporal_factor
+            usable = n_subsequent_steps * vae_temporal_factor
+            subsequent_windowed = subsequent_windowed[:, :usable]
             # Reshape to (B, N_t-1, vae_scale, window, layers, dim)
             grouped = subsequent_windowed.reshape(
                 B,
@@ -227,7 +230,9 @@ class AudioProjModel(nn.Module):
         n_subsequent_steps = N_t - 1
 
         if n_subsequent_steps > 0:
-            subsequent = windowed_features[:, 1:]  # (B, 32, 5, L, D)
+            # Truncate to exact multiple of vae_temporal_factor
+            usable = n_subsequent_steps * vae_temporal_factor
+            subsequent = windowed_features[:, 1 : 1 + usable]  # (B, usable, 5, L, D)
             # Group by vae_temporal_factor: (B, N_t-1, vae_scale, window, L, D)
             grouped = subsequent.reshape(
                 B,
