@@ -1540,9 +1540,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 WanRMS_norm,
             )
             from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
+                WanDistResample,
                 WanDistResidualBlock,
             )
             from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+                WanResample,
                 WanResidualBlock,
             )
 
@@ -1593,13 +1595,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # temporal dimension shrinks below kernel size for 5-frame
             # input.  Padding fix: set _padding[4]=2 (2 frames of left
             # causal padding) so T=5 → 3 → 2 through the two stages.
-            from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
-                WanDistResample,
-            )
-            from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
-                WanResample,
-            )
-
+            #
+            # NOTE: this permanently mutates time_conv._padding on the
+            # model.  Do NOT call vae.encode() (feature-cache path) after
+            # this — the extra padding would produce wrong temporal dims.
+            # When use_vae_cuda_graph=True only _vae_encode_runner is used.
             for block in vae.encoder.down_blocks:
                 if (
                     isinstance(block, (WanResample, WanDistResample))
@@ -1814,7 +1814,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 cond_frame = cond_frame.to(vae_dtype)
                 if _vae_encode_runner is not None:
                     enc_raw = _vae_encode_runner.replay(cond_frame)
-                    motion_latent_raw = enc_raw[:, :z_dim]
+                    motion_latent_raw = enc_raw[:, :z_dim].clone()
                 else:
                     latent_dist = vae.encode(cond_frame)
                     if isinstance(latent_dist, DiagonalGaussianDistribution):
@@ -2071,7 +2071,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             cond_frame = cond_frame.to(vae_dtype)
             if _vae_encode_runner is not None:
                 enc_raw = _vae_encode_runner.replay(cond_frame)
-                motion_latent_raw = enc_raw[:, :z_dim]
+                motion_latent_raw = enc_raw[:, :z_dim].clone()
             else:
                 latent_dist = vae.encode(cond_frame)
                 if isinstance(latent_dist, DiagonalGaussianDistribution):
