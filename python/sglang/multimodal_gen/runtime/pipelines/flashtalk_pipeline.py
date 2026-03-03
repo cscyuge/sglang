@@ -1593,12 +1593,18 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # temporal dimension shrinks below kernel size for 5-frame
             # input.  Padding fix: set _padding[4]=2 (2 frames of left
             # causal padding) so T=5 → 3 → 2 through the two stages.
+            from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
+                WanDistResample,
+            )
             from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
                 WanResample,
             )
 
             for block in vae.encoder.down_blocks:
-                if isinstance(block, WanResample) and block.mode == "downsample3d":
+                if (
+                    isinstance(block, (WanResample, WanDistResample))
+                    and block.mode == "downsample3d"
+                ):
                     _padding = list(block.time_conv._padding)
                     _padding[4] = 2
                     block.time_conv._padding = tuple(_padding)
