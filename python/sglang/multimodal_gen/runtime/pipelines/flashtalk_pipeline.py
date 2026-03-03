@@ -1482,20 +1482,34 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 vae.decode = torch.compile(vae.decode, mode=vae_compile_mode)
                 vae._flashtalk_vae_compiled = True
 
-        # Compile wav2vec2 audio encoder to reduce Python dispatch overhead.
-        # The encoder's 12 transformer layers are small F32 GEMMs that are
-        # heavily CPU-bound in eager mode (~21ms wall for ~5ms GPU work).
-        # torch.compile fuses the dispatch, saving ~16ms per chunk.
+        # --- Wav2Vec2 CUDA Graph capture ---
+        # The wav2vec2 encoder has fixed input shape (1, 128000) every chunk
+        # (8s × 16kHz) and fixed output (1, 200, 12, 768). Its 12 F32
+        # transformer layers are heavily CPU-bound in eager mode (~21ms wall
+        # for ~5ms GPU work). CUDA graph eliminates all Python dispatch.
+        _wav2vec_graph_runner = None
         if (
             use_streaming_audio
             and audio_encoder is not None
-            and not getattr(audio_encoder, "_flashtalk_compiled", False)
+            and not getattr(audio_encoder, "_flashtalk_wav2vec_graphed", False)
         ):
-            logger.info("Compiling wav2vec2 audio encoder with torch.compile")
-            audio_encoder.wav2vec2.encoder = torch.compile(
-                audio_encoder.wav2vec2.encoder
+            audio_encoder.to(device)
+            audio_encoder.eval()
+            _audio_end_idx = cached_audio_duration * fps  # 200
+            _wav2vec_sample = torch.randn(
+                1, sample_rate * cached_audio_duration,
+                device=device, dtype=torch.float32,
             )
-            audio_encoder._flashtalk_compiled = True
+
+            def _wav2vec_forward(x):
+                with torch.no_grad():
+                    return audio_encoder(x, num_video_frames=_audio_end_idx)
+
+            _wav2vec_graph_runner = VAECudaGraphRunner()
+            _wav2vec_graph_runner.capture(_wav2vec_forward, _wav2vec_sample)
+            del _wav2vec_sample
+            audio_encoder._flashtalk_wav2vec_graphed = True
+            logger.info("Wav2Vec2 CUDA graph captured")
 
         # --- VAE CUDA Graph capture (decode only) ---
         # When enabled, captures vae._decode as a CUDA graph to eliminate
@@ -1697,10 +1711,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         .to(device=device)
                         .unsqueeze(0)
                     )
-                    audio_encoder.to(device)
-                    chunk_wav2vec = audio_encoder(
-                        audio_feature_t, num_video_frames=audio_end_idx
-                    )
+                    if _wav2vec_graph_runner is not None:
+                        chunk_wav2vec = _wav2vec_graph_runner.replay(audio_feature_t)
+                    else:
+                        audio_encoder.to(device)
+                        chunk_wav2vec = audio_encoder(
+                            audio_feature_t, num_video_frames=audio_end_idx
+                        )
 
                     half_w = audio_proj.audio_window_first // 2
                     window_offsets = torch.arange(-half_w, half_w + 1, device=device)
@@ -1718,7 +1735,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         windowed_features, vae_temporal_factor=vae_temporal_factor
                     )
 
-                    if server_args.audio_encoder_cpu_offload and not skip_audio_offload:
+                    if (
+                        server_args.audio_encoder_cpu_offload
+                        and not skip_audio_offload
+                        and _wav2vec_graph_runner is None
+                    ):
                         audio_encoder.to("cpu", non_blocking=True)
 
                 # b. Fresh noise latents
@@ -1904,10 +1925,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     .to(device=device)
                     .unsqueeze(0)
                 )
-                audio_encoder.to(device)
-                chunk_wav2vec = audio_encoder(
-                    audio_feature_t, num_video_frames=audio_end_idx
-                )
+                if _wav2vec_graph_runner is not None:
+                    chunk_wav2vec = _wav2vec_graph_runner.replay(audio_feature_t)
+                else:
+                    audio_encoder.to(device)
+                    chunk_wav2vec = audio_encoder(
+                        audio_feature_t, num_video_frames=audio_end_idx
+                    )
                 # chunk_wav2vec: (1, audio_end_idx, num_layers, feat_dim)
                 #              = (1, 200, 12, 768)
 
@@ -1930,7 +1954,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     windowed_features, vae_temporal_factor=vae_temporal_factor
                 )
 
-                if server_args.audio_encoder_cpu_offload and not skip_audio_offload:
+                if (
+                    server_args.audio_encoder_cpu_offload
+                    and not skip_audio_offload
+                    and _wav2vec_graph_runner is None
+                ):
                     audio_encoder.to("cpu", non_blocking=True)
             else:
                 # Fallback: slice pre-computed features (legacy path)
