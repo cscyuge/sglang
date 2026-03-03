@@ -163,7 +163,6 @@ class RTMPPusher:
             # Audio stream — AAC mono 48 kHz
             a_stream = container.add_stream("aac", rate=_OUTPUT_AUDIO_SR)
             a_stream.layout = "mono"
-            a_stream.channels = 1
 
             audio_samples_per_frame = _OUTPUT_AUDIO_SR // self._fps
 
@@ -183,11 +182,15 @@ class RTMPPusher:
         while True:
             item = self._queue.get()
             if item is None:
-                # Flush encoders
-                for pkt in v_stream.encode(None):
-                    container.mux(pkt)
-                for pkt in a_stream.encode(None):
-                    container.mux(pkt)
+                # Flush encoders — ignore broken-pipe / connection-reset
+                # errors that occur when the CDN closes first.
+                try:
+                    for pkt in v_stream.encode(None):
+                        container.mux(pkt)
+                    for pkt in a_stream.encode(None):
+                        container.mux(pkt)
+                except Exception as exc:
+                    logger.debug("RTMP flush on stop (harmless): %s", exc)
                 break
 
             frames_np, audio_16k = item

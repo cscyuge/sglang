@@ -1610,7 +1610,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             sf_dev = shift_factor.to(device=device)
             sc_dev = scaling_factor.to(device=device)
 
-            # Optional RTMP push streamer
+            # Optional RTMP push streamer (lazy-start: connect on first chunk
+            # to avoid CDN timeout while waiting for initial audio)
             _rtmp_pusher = None
             _rtmp_url = batch.extra.get("rtmp_push_url")
             if _rtmp_url:
@@ -1625,10 +1626,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         height=batch.height,
                         fps=batch.fps or 25,
                     )
-                    _rtmp_pusher.start()
-                    logger.info("RTMP pusher started: %s", _rtmp_url)
+                    logger.info("RTMP pusher ready (lazy): %s", _rtmp_url)
                 except Exception as e:
-                    logger.warning("Failed to start RTMP pusher: %s", e)
+                    logger.warning("Failed to create RTMP pusher: %s", e)
                     _rtmp_pusher = None
 
             while True:
@@ -1808,6 +1808,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         )
                 if frames_np is not None and _rtmp_pusher is not None and not _rtmp_pusher.failed:
                     try:
+                        if not _rtmp_pusher._started:
+                            _rtmp_pusher.start()
+                            logger.info("RTMP pusher connected on first chunk")
                         _rtmp_pusher.push_chunk(frames_np, chunk_audio_data)
                     except Exception as e:
                         logger.warning(
