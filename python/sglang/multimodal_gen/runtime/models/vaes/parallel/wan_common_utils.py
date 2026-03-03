@@ -168,6 +168,7 @@ class WanRMS_norm(nn.Module):
     """
 
     _compiled_fn = None
+    _compiled_fn_silu = None
 
     def __init__(
         self,
@@ -185,32 +186,45 @@ class WanRMS_norm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
         self._fused = False
+        self._fuse_silu = False
 
-    def fuse_for_inference(self):
+    def fuse_for_inference(self, fuse_silu: bool = False):
         """Bake ``scale`` into ``gamma`` and enable ``torch.compile`` fusion.
 
         After calling this, the forward pass uses a single compiled Triton
         kernel that fuses L2-normalize + scale + gamma-multiply (6 eager
         kernels → 2 compiled kernels per norm call).
+
+        When *fuse_silu* is True the compiled kernel also applies SiLU,
+        eliminating the separate activation kernel that follows each norm
+        in residual blocks (3 kernels → 2 per norm+silu pair).
         """
-        if self._fused:
-            return
-        with torch.no_grad():
-            self.gamma.data.mul_(self.scale)
-        self.scale = 1.0
-        self._fused = True
+        if not self._fused:
+            with torch.no_grad():
+                self.gamma.data.mul_(self.scale)
+            self.scale = 1.0
+            self._fused = True
+        self._fuse_silu = fuse_silu
         if WanRMS_norm._compiled_fn is None:
 
             def _fwd(x, gamma, dim_idx):
                 return F.normalize(x, dim=dim_idx) * gamma
 
             WanRMS_norm._compiled_fn = torch.compile(_fwd)
+        if fuse_silu and WanRMS_norm._compiled_fn_silu is None:
+
+            def _fwd_silu(x, gamma, dim_idx):
+                return F.silu(F.normalize(x, dim=dim_idx) * gamma)
+
+            WanRMS_norm._compiled_fn_silu = torch.compile(_fwd_silu)
 
     def forward(self, x):
-        if self._fused and WanRMS_norm._compiled_fn is not None:
-            return WanRMS_norm._compiled_fn(
-                x, self.gamma, 1 if self.channel_first else -1
-            )
+        if self._fused:
+            dim_idx = 1 if self.channel_first else -1
+            if self._fuse_silu and WanRMS_norm._compiled_fn_silu is not None:
+                return WanRMS_norm._compiled_fn_silu(x, self.gamma, dim_idx)
+            if WanRMS_norm._compiled_fn is not None:
+                return WanRMS_norm._compiled_fn(x, self.gamma, dim_idx)
         return (
             F.normalize(x, dim=(1 if self.channel_first else -1))
             * self.scale
@@ -353,8 +367,11 @@ def residual_block_forward(self, x):
     h = self.conv_shortcut(x)
 
     # First normalization and activation
+    # (when norm._fuse_silu is True, SiLU is already included in the
+    # compiled Triton kernel so we skip the separate activation call)
     x = self.norm1(x)
-    x = self.nonlinearity(x)
+    if not self.norm1._fuse_silu:
+        x = self.nonlinearity(x)
 
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
@@ -380,7 +397,8 @@ def residual_block_forward(self, x):
 
     # Second normalization and activation
     x = self.norm2(x)
-    x = self.nonlinearity(x)
+    if not self.norm2._fuse_silu:
+        x = self.nonlinearity(x)
 
     # Dropout
     x = self.dropout(x)

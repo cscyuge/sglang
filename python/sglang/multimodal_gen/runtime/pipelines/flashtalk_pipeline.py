@@ -1510,13 +1510,31 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # Fuse WanRMS_norm modules: bake scale into gamma and
             # torch.compile the forward for Triton kernel fusion
             # (6 eager kernels → 2 compiled kernels per norm call).
+            # Norms inside residual blocks are fused with SiLU to also
+            # eliminate the separate activation kernel (3 → 2 kernels).
             from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import (
                 WanRMS_norm,
             )
+            from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
+                WanDistResidualBlock,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+                WanResidualBlock,
+            )
 
+            # First pass: fuse norms in residual blocks with SiLU
+            _silu_norms: set[int] = set()
             for module in vae.modules():
-                if isinstance(module, WanRMS_norm):
+                if isinstance(module, (WanDistResidualBlock, WanResidualBlock)):
+                    module.norm1.fuse_for_inference(fuse_silu=True)
+                    module.norm2.fuse_for_inference(fuse_silu=True)
+                    _silu_norms.add(id(module.norm1))
+                    _silu_norms.add(id(module.norm2))
+            # Second pass: fuse remaining norms (e.g. in attention blocks)
+            for module in vae.modules():
+                if isinstance(module, WanRMS_norm) and id(module) not in _silu_norms:
                     module.fuse_for_inference()
+            del _silu_norms
             logger.info("WanRMS_norm modules fused and compiled for inference")
 
             # _decode() is single-pass — every latent frame (including the
