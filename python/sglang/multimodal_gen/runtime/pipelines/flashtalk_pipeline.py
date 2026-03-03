@@ -1519,7 +1519,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             os.environ.get("SGLANG_FLASHTALK_VAE_CUDA_GRAPH", "0") == "1"
         )
         _vae_decode_runner = None
-        _vae_encode_runner = None
         _vae_decode_temporal_trim = 0  # leading frames to discard from _decode output
 
         if use_vae_cuda_graph:
@@ -1540,11 +1539,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 WanRMS_norm,
             )
             from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
-                WanDistResample,
                 WanDistResidualBlock,
             )
             from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
-                WanResample,
                 WanResidualBlock,
             )
 
@@ -1589,40 +1586,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             logger.info("VAE CUDA graph captured for decode")
 
-            # Capture encode graph — _encode() is the single-pass path.
-            # The encoder has two downsample3d layers with time_conv
-            # (kernel=3, stride=2).  Without extra causal padding the
-            # temporal dimension shrinks below kernel size for 5-frame
-            # input.  Padding fix: set _padding[4]=2 (2 frames of left
-            # causal padding) so T=5 → 3 → 2 through the two stages.
-            #
-            # NOTE: this permanently mutates time_conv._padding on the
-            # model.  Do NOT call vae.encode() (feature-cache path) after
-            # this — the extra padding would produce wrong temporal dims.
-            # When use_vae_cuda_graph=True only _vae_encode_runner is used.
-            for block in vae.encoder.down_blocks:
-                if (
-                    isinstance(block, (WanResample, WanDistResample))
-                    and block.mode == "downsample3d"
-                ):
-                    _padding = list(block.time_conv._padding)
-                    _padding[4] = 2
-                    block.time_conv._padding = tuple(_padding)
-
-            sample_enc = torch.randn(
-                1,
-                3,
-                motion_frames_num,
-                batch.height,
-                batch.width,
-                device=device,
-                dtype=_vae_dtype,
-            )
-            _vae_encode_runner = VAECudaGraphRunner()
-            _vae_encode_runner.capture(vae._encode, sample_enc)
-            del sample_enc
-
-            logger.info("VAE CUDA graph captured for encode")
+            # NOTE: VAE encode is NOT captured as a CUDA graph.
+            # _encode() (single-pass) uses zero-padding at temporal
+            # boundaries which differs from feature-cache encode() that
+            # preserves exact first-frame values.  This numerical
+            # difference in motion_latent causes visible quality loss
+            # (blurry hands/details) over 33 chunks.  Encode is only
+            # ~53ms/chunk so the performance impact is negligible.
 
         # Optional debug: save per-chunk outputs (set FLASHTALK_DEBUG_CHUNKS=1)
         _debug_save_chunks = os.environ.get("FLASHTALK_DEBUG_CHUNKS", "0") == "1"
@@ -1812,17 +1782,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
                 cond_frame = videos_corrected[:, :, -motion_frames_num:].clone()
                 cond_frame = cond_frame.to(vae_dtype)
-                if _vae_encode_runner is not None:
-                    enc_raw = _vae_encode_runner.replay(cond_frame)
-                    motion_latent_raw = enc_raw[:, :z_dim].clone()
+                latent_dist = vae.encode(cond_frame)
+                if isinstance(latent_dist, DiagonalGaussianDistribution):
+                    motion_latent_raw = latent_dist.mode()
+                elif hasattr(latent_dist, "latent_dist"):
+                    motion_latent_raw = latent_dist.latent_dist.mode()
                 else:
-                    latent_dist = vae.encode(cond_frame)
-                    if isinstance(latent_dist, DiagonalGaussianDistribution):
-                        motion_latent_raw = latent_dist.mode()
-                    elif hasattr(latent_dist, "latent_dist"):
-                        motion_latent_raw = latent_dist.latent_dist.mode()
-                    else:
-                        motion_latent_raw = latent_dist
+                    motion_latent_raw = latent_dist
                 del cond_frame
 
                 corrected = (videos_corrected + 1) / 2
@@ -2069,17 +2035,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # releases the reference to the full decoded video tensor.
             cond_frame = videos_corrected[:, :, -motion_frames_num:].clone()
             cond_frame = cond_frame.to(vae_dtype)
-            if _vae_encode_runner is not None:
-                enc_raw = _vae_encode_runner.replay(cond_frame)
-                motion_latent_raw = enc_raw[:, :z_dim].clone()
+            latent_dist = vae.encode(cond_frame)
+            if isinstance(latent_dist, DiagonalGaussianDistribution):
+                motion_latent_raw = latent_dist.mode()
+            elif hasattr(latent_dist, "latent_dist"):
+                motion_latent_raw = latent_dist.latent_dist.mode()
             else:
-                latent_dist = vae.encode(cond_frame)
-                if isinstance(latent_dist, DiagonalGaussianDistribution):
-                    motion_latent_raw = latent_dist.mode()
-                elif hasattr(latent_dist, "latent_dist"):
-                    motion_latent_raw = latent_dist.latent_dist.mode()
-                else:
-                    motion_latent_raw = latent_dist
+                motion_latent_raw = latent_dist
             del cond_frame
 
             # Convert to [0, 1] for chunk frame collection
