@@ -139,11 +139,13 @@ class FlashTalkAudioCrossAttention(nn.Module):
 
         self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
 
-        # Attention
+        # Attention — skip SP communication since audio KV is replicated
+        # across all sequence-parallel ranks.
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
             head_size=self.head_dim,
             causal=False,
+            skip_sequence_parallel=True,
         )
 
     def _project_q(self, x: torch.Tensor) -> torch.Tensor:

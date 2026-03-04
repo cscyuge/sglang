@@ -147,13 +147,13 @@ async def _save_audio_input(
     audio_upload: Optional[UploadFile],
     audio_url: Optional[str],
     request_id: str,
+    uploads_dir: str = "inputs/uploads",
 ) -> Optional[str]:
     """Resolve an audio UploadFile or URL to a local path."""
     source = audio_upload or audio_url
     if source is None:
         return None
 
-    uploads_dir = os.path.join("inputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
 
     if isinstance(source, str):
@@ -346,9 +346,13 @@ async def create_session(
         raise HTTPException(status_code=400, detail="prompt is required")
 
     # Save reference image
+    uploads_dir = server_args.input_save_path or os.path.join("inputs", "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
     image_sources = merge_image_input_list(input_reference, reference_url)
     try:
-        input_path = await _save_first_input_image(image_sources, session_id)
+        input_path = await _save_first_input_image(
+            image_sources, session_id, uploads_dir
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Image error: {e}")
 
@@ -599,7 +603,9 @@ async def create_video(
 
         # Resolve audio input (multipart upload or URL)
         try:
-            audio_path = await _save_audio_input(audio, audio_url, request_id)
+            audio_path = await _save_audio_input(
+                audio, audio_url, request_id, uploads_dir
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=400, detail=f"Failed to process audio source: {str(e)}"
@@ -683,7 +689,7 @@ async def create_video(
             if payload.get("audio_url") and not payload.get("audio_path"):
                 try:
                     audio_path = await _save_audio_input(
-                        None, payload.pop("audio_url"), request_id
+                        None, payload.pop("audio_url"), request_id, uploads_dir
                     )
                     payload["audio_path"] = audio_path
                 except Exception as e:

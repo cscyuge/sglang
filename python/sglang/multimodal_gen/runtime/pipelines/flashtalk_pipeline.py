@@ -1529,8 +1529,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             audio_encoder.eval()
             _audio_end_idx = cached_audio_duration * fps  # 200
             _wav2vec_sample = torch.randn(
-                1, sample_rate * cached_audio_duration,
-                device=device, dtype=torch.float32,
+                1,
+                sample_rate * cached_audio_duration,
+                device=device,
+                dtype=torch.float32,
             )
 
             def _wav2vec_forward(x):
@@ -1703,8 +1705,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     audio_start_idx, audio_end_idx, device=device
                 )
                 _s_audio_windowed_idx = (
-                    _s_frame_indices.unsqueeze(1)
-                    + _s_window_offsets.unsqueeze(0)
+                    _s_frame_indices.unsqueeze(1) + _s_window_offsets.unsqueeze(0)
                 ).clamp(0, audio_end_idx - 1)
 
             while True:
@@ -1912,9 +1913,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         # Pre-compute loop invariants to avoid per-chunk Python overhead.
         dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
         gen = (
-            batch.generator[0]
-            if isinstance(batch.generator, list)
-            else batch.generator
+            batch.generator[0] if isinstance(batch.generator, list) else batch.generator
         )
         z_dim = pipeline_config.vae_config.arch_config.z_dim
         vae_spatial_stride = 8  # WanVAE spatial stride
@@ -1942,8 +1941,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 audio_start_idx, audio_end_idx, device=device
             )
             _audio_windowed_idx = (
-                _audio_frame_indices.unsqueeze(1)
-                + _audio_window_offsets.unsqueeze(0)
+                _audio_frame_indices.unsqueeze(1) + _audio_window_offsets.unsqueeze(0)
             ).clamp(0, audio_end_idx - 1)
 
         # Thread executor for overlapping CPU audio prep with GPU work.
@@ -1980,8 +1978,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     # Chunk 0 or no executor: run synchronously.
                     _new_samples = (
                         speech_slices[chunk_idx]
-                        if speech_slices is not None
-                        and chunk_idx < len(speech_slices)
+                        if speech_slices is not None and chunk_idx < len(speech_slices)
                         else None
                     )
                     audio_feature_np = _prepare_audio_cpu(

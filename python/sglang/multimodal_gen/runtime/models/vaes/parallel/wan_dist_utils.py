@@ -323,13 +323,7 @@ class WanDistCausalConv3d(nn.Conv3d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
 
-        # Use channels_last_3d memory format to make cuDNN select the fused
-        # implicit_gemm algorithm instead of the slower vol2col + nvjet path.
-        if x_padded.ndim == 5:
-            x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
-            out = super().forward(x_padded).contiguous()
-        else:
-            out = super().forward(x_padded)
+        out = super().forward(x_padded)
 
         if self.height_halo_size == 0:
             return out
