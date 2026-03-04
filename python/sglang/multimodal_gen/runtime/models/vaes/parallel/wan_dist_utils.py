@@ -224,7 +224,12 @@ class WanDistConv2d(nn.Conv2d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
 
-        out = super().forward(x_padded)
+        # channels_last_3d for cuDNN implicit_gemm (activation + weight)
+        if x_padded.ndim == 5:
+            x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
+            out = super().forward(x_padded).contiguous()
+        else:
+            out = super().forward(x_padded)
 
         if self.height_halo_size == 0:
             return out
@@ -323,7 +328,12 @@ class WanDistCausalConv3d(nn.Conv3d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
 
-        out = super().forward(x_padded)
+        # channels_last_3d for cuDNN implicit_gemm (activation + weight)
+        if x_padded.ndim == 5:
+            x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
+            out = super().forward(x_padded).contiguous()
+        else:
+            out = super().forward(x_padded)
 
         if self.height_halo_size == 0:
             return out
