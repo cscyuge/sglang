@@ -105,6 +105,38 @@ def _chunk_frames_to_numpy(chunk_frames: torch.Tensor) -> np.ndarray:
     )
 
 
+def _prepare_audio_cpu(
+    audio_dq: deque,
+    new_samples: np.ndarray | None,
+    wav2vec_feature_extractor,
+    sample_rate: int,
+    pyln_mod,
+    pyln_meter,
+) -> np.ndarray:
+    """CPU-only audio preprocessing for one chunk.
+
+    Extends the sliding audio deque, applies loudness normalization,
+    and runs the HuggingFace wav2vec2 feature extractor.  Returns a
+    numpy array ready for ``torch.from_numpy(...).to(device)``.
+
+    Designed to run in a background thread so GPU VAE decode/encode
+    can proceed in parallel.
+    """
+    if new_samples is not None:
+        audio_dq.extend(new_samples.tolist())
+    audio_array = np.array(audio_dq)
+
+    if pyln_mod is not None and pyln_meter is not None:
+        loudness = pyln_meter.integrated_loudness(audio_array)
+        if abs(loudness) <= 100:
+            audio_array = pyln_mod.normalize.loudness(audio_array, loudness, -23.0)
+
+    audio_feature_np = np.squeeze(
+        wav2vec_feature_extractor(audio_array, sampling_rate=sample_rate).input_values
+    )
+    return audio_feature_np
+
+
 class VAECudaGraphRunner:
     """Captures and replays a CUDA graph for a fixed-shape VAE forward pass.
 
@@ -1530,35 +1562,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             vae.to(device=device, dtype=_vae_dtype)
 
-            # Fuse WanRMS_norm modules: bake scale into gamma and
-            # torch.compile the forward for Triton kernel fusion
-            # (6 eager kernels → 2 compiled kernels per norm call).
-            # Norms inside residual blocks are fused with SiLU to also
-            # eliminate the separate activation kernel (3 → 2 kernels).
-            from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import (
-                WanRMS_norm,
-            )
-            from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
-                WanDistResidualBlock,
-            )
-            from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
-                WanResidualBlock,
-            )
-
-            # First pass: fuse norms in residual blocks with SiLU
-            _silu_norms: set[int] = set()
-            for module in vae.modules():
-                if isinstance(module, (WanDistResidualBlock, WanResidualBlock)):
-                    module.norm1.fuse_for_inference(fuse_silu=True)
-                    module.norm2.fuse_for_inference(fuse_silu=True)
-                    _silu_norms.add(id(module.norm1))
-                    _silu_norms.add(id(module.norm2))
-            # Second pass: fuse remaining norms (e.g. in attention blocks)
-            for module in vae.modules():
-                if isinstance(module, WanRMS_norm) and id(module) not in _silu_norms:
-                    module.fuse_for_inference()
-            del _silu_norms
-            logger.info("WanRMS_norm modules fused and compiled for inference")
+            # torch.compile the decoder module to fuse elementwise kernels
+            # before CUDA graph capture.  The _decode path (feat_cache=None)
+            # has no ContextVar mutations, making it compile-safe.  This
+            # replaces the manual WanRMS_norm fusion — torch.compile handles
+            # all kernel fusion (norm+scale+SiLU, residual adds, etc.)
+            # automatically with broader optimization scope.
+            if not getattr(vae, "_flashtalk_decoder_compiled", False):
+                vae.decoder = torch.compile(vae.decoder, mode="default")
+                vae._flashtalk_decoder_compiled = True
+                logger.info("VAE decoder torch.compiled (mode=default)")
 
             # _decode() is single-pass — every latent frame (including the
             # first) goes through two temporal upsample stages (×2×2 = ×4),
@@ -1668,8 +1681,31 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             z_dim = pipeline_config.vae_config.arch_config.z_dim
             vae_spatial_stride = 8
             vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
+            latent_shape = (
+                1,
+                z_dim,
+                chunk_latent_num_frames,
+                batch.height // vae_spatial_stride,
+                batch.width // vae_spatial_stride,
+            )
             sf_dev = shift_factor.to(device=device)
             sc_dev = scaling_factor.to(device=device)
+
+            # Pre-compute audio window tensors (constant across chunks)
+            _s_audio_half_w = None
+            _s_audio_windowed_idx = None
+            if use_streaming_audio:
+                _s_audio_half_w = audio_proj.audio_window_first // 2
+                _s_window_offsets = torch.arange(
+                    -_s_audio_half_w, _s_audio_half_w + 1, device=device
+                )
+                _s_frame_indices = torch.arange(
+                    audio_start_idx, audio_end_idx, device=device
+                )
+                _s_audio_windowed_idx = (
+                    _s_frame_indices.unsqueeze(1)
+                    + _s_window_offsets.unsqueeze(0)
+                ).clamp(0, audio_end_idx - 1)
 
             while True:
                 # Wait for audio chunk or end sentinel
@@ -1721,16 +1757,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             audio_feature_t, num_video_frames=audio_end_idx
                         )
 
-                    half_w = audio_proj.audio_window_first // 2
-                    window_offsets = torch.arange(-half_w, half_w + 1, device=device)
-                    frame_indices = torch.arange(
-                        audio_start_idx, audio_end_idx, device=device
-                    )
-                    windowed_idx = frame_indices.unsqueeze(
-                        1
-                    ) + window_offsets.unsqueeze(0)
-                    windowed_idx = windowed_idx.clamp(0, audio_end_idx - 1)
-                    windowed_features = chunk_wav2vec[:, windowed_idx]
+                    windowed_features = chunk_wav2vec[:, _s_audio_windowed_idx]
 
                     audio_proj.to(device)
                     batch.extra["audio_context"] = audio_proj.forward_prewindowed(
@@ -1745,13 +1772,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         audio_encoder.to("cpu", non_blocking=True)
 
                 # b. Fresh noise latents
-                latent_shape = (
-                    1,
-                    z_dim,
-                    chunk_latent_num_frames,
-                    batch.height // vae_spatial_stride,
-                    batch.width // vae_spatial_stride,
-                )
                 batch.latents = torch.randn(
                     latent_shape, dtype=dit_dtype, device=device, generator=gen
                 )
@@ -1889,6 +1909,49 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         # ================================================================
         # NORMAL MULTI-CHUNK MODE (existing code)
         # ================================================================
+        # Pre-compute loop invariants to avoid per-chunk Python overhead.
+        dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
+        gen = (
+            batch.generator[0]
+            if isinstance(batch.generator, list)
+            else batch.generator
+        )
+        z_dim = pipeline_config.vae_config.arch_config.z_dim
+        vae_spatial_stride = 8  # WanVAE spatial stride
+        latent_shape = (
+            1,
+            z_dim,
+            chunk_latent_num_frames,
+            batch.height // vae_spatial_stride,
+            batch.width // vae_spatial_stride,
+        )
+        vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
+        sf_dev = shift_factor.to(device=device)
+        sc_dev = scaling_factor.to(device=device)
+
+        # Pre-compute audio window tensors (constant across chunks).
+        _audio_half_w = None
+        _audio_window_offsets = None
+        _audio_frame_indices = None
+        if use_streaming_audio:
+            _audio_half_w = audio_proj.audio_window_first // 2  # 2
+            _audio_window_offsets = torch.arange(
+                -_audio_half_w, _audio_half_w + 1, device=device
+            )
+            _audio_frame_indices = torch.arange(
+                audio_start_idx, audio_end_idx, device=device
+            )
+            _audio_windowed_idx = (
+                _audio_frame_indices.unsqueeze(1)
+                + _audio_window_offsets.unsqueeze(0)
+            ).clamp(0, audio_end_idx - 1)
+
+        # Thread executor for overlapping CPU audio prep with GPU work.
+        _audio_executor: ThreadPoolExecutor | None = None
+        _audio_future: Future | None = None
+        if use_streaming_audio and speech_slices is not None:
+            _audio_executor = ThreadPoolExecutor(max_workers=1)
+
         for chunk_idx in range(num_chunks):
             # Check for cancellation at the start of each chunk
             if _cancel_file and os.path.exists(_cancel_file):
@@ -1901,26 +1964,35 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # a. Per-chunk audio: sliding window wav2vec2 processing
             #    (matches original FlashTalk's "stream" mode exactly)
+            #
+            # Optimization: CPU audio preprocessing (numpy deque, loudness
+            # norm, HF feature extraction ~19ms) overlaps with GPU VAE
+            # decode+encode (~288ms).  For chunk 0 no VAE work precedes it
+            # so we run synchronously; for chunks 1+ the future was
+            # submitted in the previous iteration's post-DiT section.
             if use_streaming_audio:
-                # Add this chunk's audio samples to the sliding deque
-                if chunk_idx < len(speech_slices):
-                    audio_dq.extend(speech_slices[chunk_idx].tolist())
-                audio_array = np.array(audio_dq)
+                if _audio_future is not None:
+                    # Collect result from background thread (overlapped
+                    # with previous iteration's VAE decode+encode).
+                    audio_feature_np = _audio_future.result()
+                    _audio_future = None
+                else:
+                    # Chunk 0 or no executor: run synchronously.
+                    _new_samples = (
+                        speech_slices[chunk_idx]
+                        if speech_slices is not None
+                        and chunk_idx < len(speech_slices)
+                        else None
+                    )
+                    audio_feature_np = _prepare_audio_cpu(
+                        audio_dq,
+                        _new_samples,
+                        wav2vec_feature_extractor,
+                        sample_rate,
+                        _pyln,
+                        _pyln_meter,
+                    )
 
-                # Per-chunk loudness normalization (matching original)
-                if _pyln is not None and _pyln_meter is not None:
-                    loudness = _pyln_meter.integrated_loudness(audio_array)
-                    if abs(loudness) <= 100:
-                        audio_array = _pyln.normalize.loudness(
-                            audio_array, loudness, -23.0
-                        )
-
-                # Process through wav2vec2 feature extractor + encoder
-                audio_feature_np = np.squeeze(
-                    wav2vec_feature_extractor(
-                        audio_array, sampling_rate=sample_rate
-                    ).input_values
-                )
                 audio_feature_t = (
                     torch.from_numpy(audio_feature_np)
                     .float()
@@ -1937,18 +2009,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 # chunk_wav2vec: (1, audio_end_idx, num_layers, feat_dim)
                 #              = (1, 200, 12, 768)
 
-                # Window on the FULL wav2vec output (matching original's
-                # get_audio_embedding), then slice the last frame_num frames.
-                half_w = audio_proj.audio_window_first // 2  # 2
-                window_offsets = torch.arange(-half_w, half_w + 1, device=device)
-                frame_indices = torch.arange(
-                    audio_start_idx, audio_end_idx, device=device
-                )
-                windowed_idx = frame_indices.unsqueeze(1) + window_offsets.unsqueeze(0)
-                windowed_idx = windowed_idx.clamp(0, audio_end_idx - 1)
-                # (frame_num, window_size) indices into (1, 200, ...)
-                windowed_features = chunk_wav2vec[:, windowed_idx]
-                # (1, frame_num, window_size, num_layers, feat_dim)
+                windowed_features = chunk_wav2vec[:, _audio_windowed_idx]
 
                 # Project through AudioProjModel with pre-windowed features
                 audio_proj.to(device)
@@ -1977,22 +2038,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     chunk_audio, vae_temporal_factor=vae_temporal_factor
                 )
 
-            # b. Create fresh noise latents (matching original FlashTalk dtype/shape)
-            dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
-            gen = (
-                batch.generator[0]
-                if isinstance(batch.generator, list)
-                else batch.generator
-            )
-            z_dim = pipeline_config.vae_config.arch_config.z_dim
-            vae_spatial_stride = 8  # WanVAE spatial stride
-            latent_shape = (
-                1,
-                z_dim,
-                chunk_latent_num_frames,
-                batch.height // vae_spatial_stride,
-                batch.width // vae_spatial_stride,
-            )
+            # b. Create fresh noise latents
             batch.latents = torch.randn(
                 latent_shape, dtype=dit_dtype, device=device, generator=gen
             )
@@ -2005,14 +2051,33 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # Match the original FlashTalk flow:
             # 1. Denormalize latents  2. VAE decode → [-1, 1]
             # 3. Color correct in [-1, 1]  4. Motion carry → VAE encode → normalize
-            vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
             if not use_vae_cuda_graph:
                 vae.to(device=device, dtype=vae_dtype)
 
+            # Submit NEXT chunk's audio CPU prep to background thread
+            # so it overlaps with VAE decode+encode (~288ms GPU time).
+            if (
+                _audio_executor is not None
+                and chunk_idx + 1 < num_chunks
+                and speech_slices is not None
+            ):
+                _next_samples = (
+                    speech_slices[chunk_idx + 1]
+                    if chunk_idx + 1 < len(speech_slices)
+                    else None
+                )
+                _audio_future = _audio_executor.submit(
+                    _prepare_audio_cpu,
+                    audio_dq,
+                    _next_samples,
+                    wav2vec_feature_extractor,
+                    sample_rate,
+                    _pyln,
+                    _pyln_meter,
+                )
+
             # Denormalize latents (like DecodingStage.scale_and_shift)
             denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
-            sf_dev = shift_factor.to(device=device)
-            sc_dev = scaling_factor.to(device=device)
             denorm_latents = denoised_latents / sc_dev + sf_dev
 
             # VAE decode
@@ -2138,6 +2203,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         _frame_futures.clear()
         if _frame_executor is not None:
             _frame_executor.shutdown(wait=False)
+        if _audio_executor is not None:
+            # Drain any pending future to avoid thread leak
+            if _audio_future is not None:
+                try:
+                    _audio_future.result()
+                except Exception:
+                    pass
+            _audio_executor.shutdown(wait=False)
 
         # Write done sentinel for streaming clients
         if _frame_dir:
