@@ -135,8 +135,15 @@ class RTMPPusher:
         """Signal the thread to flush remaining items and exit."""
         if not self._started:
             return
-        # Sentinel to tell the thread to exit
-        self._queue.put(None)
+        # Drain the queue first to guarantee room for the sentinel.
+        # Without this, put(None) can block forever if the drain thread
+        # is stuck (e.g., broken pipe in mux) and the queue is full.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        self._queue.put_nowait(None)
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():

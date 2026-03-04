@@ -1694,25 +1694,33 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             sc_dev = scaling_factor.to(device=device)
 
             # Optional RTMP push streamer (lazy-start: connect on first chunk
-            # to avoid CDN timeout while waiting for initial audio)
+            # to avoid CDN timeout while waiting for initial audio).
+            # Only rank 0 pushes — creating pushers on all workers would
+            # open N duplicate RTMP connections and, worse, stop() can
+            # deadlock the worker → gloo broadcast timeout → scheduler crash.
             _rtmp_pusher = None
             _rtmp_url = batch.extra.get("rtmp_push_url")
             if _rtmp_url:
-                try:
-                    from sglang.multimodal_gen.runtime.utils.rtmp_pusher import (
-                        RTMPPusher,
-                    )
+                from sglang.multimodal_gen.runtime.distributed import (
+                    get_world_rank,
+                )
 
-                    _rtmp_pusher = RTMPPusher(
-                        url=_rtmp_url,
-                        width=batch.width,
-                        height=batch.height,
-                        fps=batch.fps or 25,
-                    )
-                    logger.info("RTMP pusher ready (lazy): %s", _rtmp_url)
-                except Exception as e:
-                    logger.warning("Failed to create RTMP pusher: %s", e)
-                    _rtmp_pusher = None
+                if get_world_rank() == 0:
+                    try:
+                        from sglang.multimodal_gen.runtime.utils.rtmp_pusher import (
+                            RTMPPusher,
+                        )
+
+                        _rtmp_pusher = RTMPPusher(
+                            url=_rtmp_url,
+                            width=batch.width,
+                            height=batch.height,
+                            fps=batch.fps or 25,
+                        )
+                        logger.info("RTMP pusher ready (lazy): %s", _rtmp_url)
+                    except Exception as e:
+                        logger.warning("Failed to create RTMP pusher: %s", e)
+                        _rtmp_pusher = None
 
             # Pre-compute audio window tensors (constant across chunks)
             _s_audio_half_w = None
