@@ -1672,6 +1672,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         if is_session:
             all_chunk_frames = []
             chunk_idx = 0
+            audio_chunk_idx = 0  # separate counter for audio file lookups
+            _silence_samples = slice_len * sample_rate // fps  # 17920
+            _chunk_wall_time = slice_len / fps  # ~1.12s
+            _end_path = os.path.join(session_dir, "end")
 
             # Pre-compute loop-invariant values
             dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
@@ -1738,27 +1742,55 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 ).clamp(0, audio_end_idx - 1)
 
             while True:
-                # Wait for audio chunk or end sentinel
-                logger.info("Session: waiting for audio chunk %d...", chunk_idx)
-                chunk_audio_data = _wait_for_session_audio_chunk(
-                    session_dir,
-                    chunk_idx,
-                    cancel_file=_cancel_file,
-                    # Shorter timeout for the first chunk: if no audio arrives
-                    # within 60 s the session is likely orphaned (client
-                    # disconnected without sending DELETE).
-                    timeout=60.0 if chunk_idx == 0 else 300.0,
-                )
-                if chunk_audio_data is None:
-                    if _cancel_file and os.path.exists(_cancel_file):
-                        logger.info("Session cancelled at chunk %d", chunk_idx)
-                        _cancelled = True
-                    else:
-                        logger.info("Session ended at chunk %d", chunk_idx)
+                # --- Non-blocking audio poll (silence fill) ---
+                if os.path.exists(_end_path):
+                    logger.info("Session ended at chunk %d", chunk_idx)
+                    break
+                if _cancel_file and os.path.exists(_cancel_file):
+                    logger.info("Session cancelled at chunk %d", chunk_idx)
+                    _cancelled = True
                     break
 
+                _used_silence = False
+                _audio_chunk_path = os.path.join(
+                    session_dir,
+                    "audio_chunks",
+                    f"chunk_{audio_chunk_idx:04d}.npy",
+                )
+                if os.path.exists(_audio_chunk_path):
+                    try:
+                        chunk_audio_data = np.load(_audio_chunk_path)
+                        audio_chunk_idx += 1
+                    except Exception:
+                        time.sleep(0.01)
+                        try:
+                            chunk_audio_data = np.load(_audio_chunk_path)
+                            audio_chunk_idx += 1
+                        except Exception:
+                            chunk_audio_data = np.zeros(
+                                _silence_samples, dtype=np.float32
+                            )
+                            _used_silence = True
+                else:
+                    chunk_audio_data = np.zeros(
+                        _silence_samples, dtype=np.float32
+                    )
+                    _used_silence = True
+
                 chunk_start = time.time()
-                logger.info("Session: generating chunk %d", chunk_idx)
+                if _used_silence:
+                    logger.info(
+                        "Session: generating chunk %d (silence, "
+                        "audio_chunk_idx=%d)",
+                        chunk_idx,
+                        audio_chunk_idx,
+                    )
+                else:
+                    logger.info(
+                        "Session: generating chunk %d (audio chunk %d)",
+                        chunk_idx,
+                        audio_chunk_idx - 1,
+                    )
 
                 # a. Per-chunk audio processing (same as streaming mode)
                 if use_streaming_audio:
@@ -1918,6 +1950,27 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 _t_chunk = time.time() - chunk_start
                 logger.info("Session chunk %d: %.3fs", chunk_idx, _t_chunk)
                 chunk_idx += 1
+
+                # Real-time pacing for silence chunks: sleep up to one
+                # chunk's wall-clock duration, breaking early if audio
+                # arrives or the session ends.
+                if _used_silence:
+                    _remaining = _chunk_wall_time - _t_chunk
+                    while _remaining > 0:
+                        time.sleep(min(0.05, _remaining))
+                        _remaining = _chunk_wall_time - (time.time() - chunk_start)
+                        # Break early on end/cancel/audio arrival
+                        if os.path.exists(_end_path):
+                            break
+                        if _cancel_file and os.path.exists(_cancel_file):
+                            break
+                        _next_audio = os.path.join(
+                            session_dir,
+                            "audio_chunks",
+                            f"chunk_{audio_chunk_idx:04d}.npy",
+                        )
+                        if os.path.exists(_next_audio):
+                            break
 
                 # Periodically drain completed futures to avoid unbounded list growth
                 if chunk_idx % 50 == 0 and _frame_futures:
