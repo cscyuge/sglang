@@ -346,6 +346,22 @@ async def create_session(
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
+    # Auto-end any existing sessions.  The scheduler processes sessions
+    # serially; orphan sessions (client disconnected without DELETE) would
+    # block the pipeline for up to 300 s.  Writing the ``end`` sentinel
+    # causes _wait_for_session_audio_chunk to return immediately.
+    for sid, sdata in list(_SESSION_STORE.items()):
+        if sdata["status"] in ("created", "running"):
+            try:
+                end_path = os.path.join(_session_dir_for_id(sid), "end")
+                os.makedirs(os.path.dirname(end_path), exist_ok=True)
+                with open(end_path, "w"):
+                    pass
+            except Exception:
+                pass
+            sdata["status"] = "ended"
+            logger.info("Auto-ended previous session %s", sid)
+
     # Save reference image
     uploads_dir = server_args.input_save_path or os.path.join("inputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
