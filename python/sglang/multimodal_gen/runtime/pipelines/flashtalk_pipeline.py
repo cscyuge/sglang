@@ -1745,9 +1745,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     chunk_idx,
                     cancel_file=_cancel_file,
                     # Shorter timeout for the first chunk: if no audio arrives
-                    # within 30 s the session is likely orphaned (client
+                    # within 60 s the session is likely orphaned (client
                     # disconnected without sending DELETE).
-                    timeout=30.0 if chunk_idx == 0 else 300.0,
+                    timeout=60.0 if chunk_idx == 0 else 300.0,
                 )
                 if chunk_audio_data is None:
                     if _cancel_file and os.path.exists(_cancel_file):
