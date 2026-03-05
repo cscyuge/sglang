@@ -83,6 +83,7 @@ class RTMPPusher:
             queue.Queue(maxsize=queue_maxsize)
         )
         self._thread: Optional[threading.Thread] = None
+        self._container = None  # set by _run(); used by stop() to force-close
         self._failed = False
         self._started = False
         self._frame_count = 0
@@ -148,7 +149,21 @@ class RTMPPusher:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
                 logger.warning("RTMP pusher thread did not exit within %.1fs", timeout)
+                # Force-close the container so PyAV's __dealloc__ doesn't
+                # try to write a trailer on a broken connection (segfault).
+                self._force_close_container()
         self._started = False
+
+    def _force_close_container(self) -> None:
+        """Best-effort close of the RTMP container from the main thread."""
+        c = self._container
+        if c is None:
+            return
+        try:
+            c.close()
+        except Exception:
+            pass
+        self._container = None
 
     # ------------------------------------------------------------------
     # Background thread
@@ -159,6 +174,7 @@ class RTMPPusher:
             import av
 
             container = av.open(self._url, mode="w", format="flv")
+            self._container = container  # expose for force-close in stop()
         except Exception as exc:
             logger.error("RTMP pusher: failed to open %s: %s", self._url, exc)
             self._failed = True
@@ -197,6 +213,7 @@ class RTMPPusher:
                 container.close()
             except Exception:
                 pass
+            self._container = None
 
     def _drain_loop(self, container, v_stream, a_stream, audio_samples_per_frame) -> None:
         import av
