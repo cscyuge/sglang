@@ -151,19 +151,35 @@ class RTMPPusher:
                 logger.warning("RTMP pusher thread did not exit within %.1fs", timeout)
                 # Force-close the container so PyAV's __dealloc__ doesn't
                 # try to write a trailer on a broken connection (segfault).
+                # The drain thread's _run() skips container.close() when
+                # _container is None, avoiding a deadlock where both
+                # threads call close() on the same PyAV container.
                 self._force_close_container()
         self._started = False
 
     def _force_close_container(self) -> None:
-        """Best-effort close of the RTMP container from the main thread."""
+        """Best-effort close of the RTMP container from the main thread.
+
+        Uses a timeout to avoid blocking indefinitely when
+        ``container.close()`` → ``av_write_trailer()`` hangs on a
+        broken TCP connection (half-open socket, no RST received).
+        """
         c = self._container
         if c is None:
             return
-        try:
-            c.close()
-        except Exception:
-            pass
-        self._container = None
+        self._container = None  # clear first so GC/other threads skip it
+
+        def _do_close():
+            try:
+                c.close()
+            except Exception:
+                pass
+
+        closer = threading.Thread(target=_do_close, daemon=True, name="rtmp-close")
+        closer.start()
+        closer.join(timeout=5.0)
+        if closer.is_alive():
+            logger.warning("RTMP container close did not finish within 5 s, abandoning")
 
     # ------------------------------------------------------------------
     # Background thread
@@ -209,11 +225,15 @@ class RTMPPusher:
                 logger.error("RTMP pusher thread error: %s", exc)
                 self._failed = True
         finally:
-            try:
-                container.close()
-            except Exception:
-                pass
-            self._container = None
+            # Only close if _container is still set — if stop() already
+            # called _force_close_container(), _container is None and we
+            # must NOT call close() again (PyAV internal lock deadlock).
+            if self._container is not None:
+                self._container = None
+                try:
+                    container.close()
+                except Exception:
+                    pass
 
     def _drain_loop(self, container, v_stream, a_stream, audio_samples_per_frame) -> None:
         import av

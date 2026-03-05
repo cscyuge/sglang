@@ -1924,6 +1924,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _frame_futures = [f for f in _frame_futures if not f.done()]
 
             # --- Session post-loop ---
+            logger.info("Session post-loop: starting cleanup")
+
+            # Stop RTMP pusher FIRST, before gc.collect().  Garbage
+            # collection can trigger PyAV container __dealloc__ which
+            # tries av_write_trailer on a broken connection — potentially
+            # hanging rank 0 and causing a gloo broadcast timeout.
+            if _rtmp_pusher is not None:
+                _rtmp_pusher.stop(timeout=10.0)
+                _rtmp_pusher = None  # break reference before GC
+
             if _gc_was_enabled:
                 gc.enable()
                 gc.collect()
@@ -1937,8 +1947,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _frame_futures.clear()
             if _frame_executor is not None:
                 _frame_executor.shutdown(wait=False)
-            if _rtmp_pusher is not None:
-                _rtmp_pusher.stop(timeout=10.0)
 
             if _frame_dir:
                 try:
@@ -1946,6 +1954,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         pass
                 except Exception:
                     pass
+
+            logger.info("Session post-loop: cleanup complete")
 
             if not all_chunk_frames:
                 # Session mode: frames already streamed via fMP4, nothing to save.
