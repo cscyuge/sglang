@@ -17,6 +17,30 @@ try:
 except ImportError:
     _use_tilelang_conv3d = False
 
+try:
+    from sglang.multimodal_gen.runtime.kernels.fused_norm_silu import (
+        fused_rms_norm_silu as _triton_fused_norm_silu,
+        is_available as _fused_norm_silu_available,
+    )
+
+    _use_fused_norm_silu = _fused_norm_silu_available()
+except ImportError:
+    _use_fused_norm_silu = False
+
+
+def _fused_norm_silu(x, norm_module, apply_silu=True):
+    """Fused WanRMS_norm + optional SiLU. Uses Triton when available."""
+    if (
+        _use_fused_norm_silu
+        and x.ndim == 5
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and not torch.compiler.is_compiling()
+    ):
+        return _triton_fused_norm_silu(x, norm_module, apply_silu=apply_silu)
+    if apply_silu:
+        return F.silu(norm_module(x))
+    return norm_module(x)
+
 
 class AvgDown3D(nn.Module):
     def __init__(
@@ -177,7 +201,7 @@ class WanCausalConv3d(nn.Conv3d):
         # cuDNN path with channels_last_3d for fused implicit_gemm dispatch
         if x.ndim == 5:
             x = x.contiguous(memory_format=torch.channels_last_3d)
-            return super().forward(x).contiguous()
+            return super().forward(x)
         return super().forward(x)
 
 
@@ -345,8 +369,7 @@ def residual_block_forward(self, x):
     h = self.conv_shortcut(x)
 
     # First normalization and activation
-    x = self.norm1(x)
-    x = self.nonlinearity(x)
+    x = _fused_norm_silu(x, self.norm1)
 
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
@@ -371,8 +394,7 @@ def residual_block_forward(self, x):
         x = self.conv1(x)
 
     # Second normalization and activation
-    x = self.norm2(x)
-    x = self.nonlinearity(x)
+    x = _fused_norm_silu(x, self.norm2)
 
     # Dropout
     x = self.dropout(x)

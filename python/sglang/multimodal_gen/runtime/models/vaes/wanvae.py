@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     WanCausalConv3d,
     WanRMS_norm,
     WanUpsample,
+    _fused_norm_silu,
     attention_block_forward,
     bind_context,
     mid_block_forward,
@@ -735,8 +736,7 @@ class WanDecoder3d(nn.Module):
             x = up_block(x)
 
         ## head
-        x = self.norm_out(x)
-        x = self.nonlinearity(x)
+        x = _fused_norm_silu(x, self.norm_out)
         _feat_cache = feat_cache.get()
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:

@@ -93,7 +93,7 @@ class TestTileLangConv3D(unittest.TestCase):
         self._run_conv3d_test(96, 96, 3, 770, 450)
 
     def test_output_contiguous(self):
-        """Verify output is contiguous NCDHW."""
+        """Verify output is CL3D (channels_last_3d) format."""
         from sglang.multimodal_gen.runtime.kernels.tilelang_conv3d import (
             tilelang_conv3d_forward,
         )
@@ -102,7 +102,7 @@ class TestTileLangConv3D(unittest.TestCase):
         x = torch.randn(1, 16, 3, 98, 58, device=self.device, dtype=self.dtype)
         w = torch.randn(384, 16, 3, 3, 3, device=self.device, dtype=self.dtype)
         out = tilelang_conv3d_forward(x, w, None)
-        self.assertTrue(out.is_contiguous())
+        self.assertTrue(out.is_contiguous(memory_format=torch.channels_last_3d))
         self.assertEqual(out.shape, (1, 384, 1, 96, 56))
 
     def test_no_bias(self):
