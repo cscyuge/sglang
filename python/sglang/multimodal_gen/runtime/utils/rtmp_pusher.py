@@ -1,14 +1,19 @@
-"""RTMP push-streaming via PyAV (H.264 + AAC → RTMP/FLV).
+"""Push-streaming via PyAV (H.264 + AAC → RTMP/FLV or SRT/MPEG-TS).
 
-Provides ``RTMPPusher``, a queue-based background thread that accepts raw
+Provides ``StreamPusher``, a queue-based background thread that accepts raw
 video frames (uint8 numpy) and audio samples (float32 16 kHz), encodes them
-to H.264 + AAC via libav, and pushes to an RTMP ingest URL.
+to H.264 + AAC via libav, and pushes to an RTMP or SRT ingest URL.
+
+Supported URL schemes:
+- ``rtmp://...`` — RTMP over FLV container
+- ``srt://...``  — SRT over MPEG-TS container (Alibaba Cloud, etc.)
 """
 
 import logging
 import queue
 import threading
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -44,12 +49,17 @@ def _is_connection_closed(exc: BaseException) -> bool:
     return "broken pipe" in msg or "connection reset" in msg
 
 
-class RTMPPusher:
-    """Queue-based background thread for pushing H.264+AAC to an RTMP URL.
+class StreamPusher:
+    """Queue-based background thread for pushing H.264+AAC to RTMP or SRT.
+
+    Automatically detects the protocol from the URL scheme:
+    - ``rtmp://`` → FLV container
+    - ``srt://``  → MPEG-TS container
 
     Usage::
 
-        pusher = RTMPPusher("rtmp://...", width=448, height=448, fps=25)
+        pusher = StreamPusher("srt://push.example.com:1105?streamid=...",
+                              width=448, height=448, fps=25)
         pusher.start()
         for chunk_frames, chunk_audio in generate():
             pusher.push_chunk(chunk_frames, chunk_audio)
@@ -58,7 +68,7 @@ class RTMPPusher:
     Parameters
     ----------
     url : str
-        RTMP ingest URL (e.g. ``rtmp://push.example.com/live/stream``).
+        Ingest URL.  Supported schemes: ``rtmp://``, ``srt://``.
     width, height : int
         Video frame dimensions.
     fps : int
@@ -79,6 +89,16 @@ class RTMPPusher:
         self._width = width
         self._height = height
         self._fps = fps
+
+        # Detect protocol from URL scheme
+        scheme = urlparse(url).scheme.lower()
+        if scheme == "srt":
+            self._container_format = "mpegts"
+            self._protocol = "srt"
+        else:
+            self._container_format = "flv"
+            self._protocol = "rtmp"
+
         self._queue: queue.Queue[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]] = (
             queue.Queue(maxsize=queue_maxsize)
         )
@@ -96,7 +116,9 @@ class RTMPPusher:
         """Spawn the background encoding/push thread."""
         if self._started:
             return
-        self._thread = threading.Thread(target=self._run, daemon=True, name="rtmp-push")
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"{self._protocol}-push"
+        )
         self._thread.start()
         self._started = True
 
@@ -105,7 +127,7 @@ class RTMPPusher:
         frames_np: np.ndarray,
         audio_16k: Optional[np.ndarray] = None,
     ) -> None:
-        """Enqueue a video chunk for encoding and RTMP push.
+        """Enqueue a video chunk for encoding and push.
 
         Parameters
         ----------
@@ -130,7 +152,7 @@ class RTMPPusher:
                 self._queue.put_nowait(item)
             except queue.Full:
                 pass
-            logger.warning("RTMP pusher queue full — dropped oldest chunk")
+            logger.warning("Stream pusher queue full — dropped oldest chunk")
 
     def stop(self, timeout: float = 10.0) -> None:
         """Signal the thread to flush remaining items and exit."""
@@ -148,7 +170,7 @@ class RTMPPusher:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
-                logger.warning("RTMP pusher thread did not exit within %.1fs", timeout)
+                logger.warning("Stream pusher thread did not exit within %.1fs", timeout)
                 # Force-close the container so PyAV's __dealloc__ doesn't
                 # try to write a trailer on a broken connection (segfault).
                 # The drain thread's _run() skips container.close() when
@@ -158,7 +180,7 @@ class RTMPPusher:
         self._started = False
 
     def _force_close_container(self) -> None:
-        """Best-effort close of the RTMP container from the main thread.
+        """Best-effort close of the output container from the main thread.
 
         Uses a timeout to avoid blocking indefinitely when
         ``container.close()`` → ``av_write_trailer()`` hangs on a
@@ -179,7 +201,7 @@ class RTMPPusher:
         closer.start()
         closer.join(timeout=5.0)
         if closer.is_alive():
-            logger.warning("RTMP container close did not finish within 5 s, abandoning")
+            logger.warning("Stream container close did not finish within 5 s, abandoning")
 
     # ------------------------------------------------------------------
     # Background thread
@@ -189,10 +211,17 @@ class RTMPPusher:
         try:
             import av
 
-            container = av.open(self._url, mode="w", format="flv")
+            container = av.open(
+                self._url, mode="w", format=self._container_format
+            )
             self._container = container  # expose for force-close in stop()
         except Exception as exc:
-            logger.error("RTMP pusher: failed to open %s: %s", self._url, exc)
+            logger.error(
+                "%s pusher: failed to open %s: %s",
+                self._protocol.upper(),
+                self._url,
+                exc,
+            )
             self._failed = True
             return
 
@@ -202,11 +231,16 @@ class RTMPPusher:
             v_stream.width = self._width
             v_stream.height = self._height
             v_stream.pix_fmt = "yuv420p"
-            v_stream.options = {
+            v_opts = {
                 "preset": "ultrafast",
                 "tune": "zerolatency",
                 "g": str(self._fps),  # GOP = 1 second
             }
+            if self._protocol == "srt":
+                # MPEG-TS requires Annex B byte-stream format with SPS/PPS
+                # repeated at each keyframe for mid-stream joins.
+                v_opts["x264opts"] = "repeat-headers=1"
+            v_stream.options = v_opts
 
             # Audio stream — AAC mono 48 kHz
             a_stream = container.add_stream("aac", rate=_OUTPUT_AUDIO_SR)
@@ -216,13 +250,13 @@ class RTMPPusher:
 
             self._drain_loop(container, v_stream, a_stream, audio_samples_per_frame)
         except (BrokenPipeError, ConnectionResetError):
-            logger.info("RTMP connection closed by peer — stream ended")
+            logger.info("%s connection closed by peer — stream ended", self._protocol.upper())
         except Exception as exc:
             # PyAV may wrap OS errors; treat broken-pipe / reset as non-fatal
             if _is_connection_closed(exc):
-                logger.info("RTMP connection closed by peer — stream ended")
+                logger.info("%s connection closed by peer — stream ended", self._protocol.upper())
             else:
-                logger.error("RTMP pusher thread error: %s", exc)
+                logger.error("%s pusher thread error: %s", self._protocol.upper(), exc)
                 self._failed = True
         finally:
             # Only close if _container is still set — if stop() already
@@ -249,7 +283,7 @@ class RTMPPusher:
                     for pkt in a_stream.encode(None):
                         container.mux(pkt)
                 except Exception as exc:
-                    logger.debug("RTMP flush on stop (harmless): %s", exc)
+                    logger.debug("Stream flush on stop (harmless): %s", exc)
                 break
 
             frames_np, audio_16k = item
@@ -288,3 +322,7 @@ class RTMPPusher:
 
                 audio_pos = chunk_end
                 self._frame_count += 1
+
+
+# Backwards-compatible alias
+RTMPPusher = StreamPusher

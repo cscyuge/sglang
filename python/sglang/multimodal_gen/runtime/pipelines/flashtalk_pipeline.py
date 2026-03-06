@@ -1697,10 +1697,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             sf_dev = shift_factor.to(device=device)
             sc_dev = scaling_factor.to(device=device)
 
-            # Optional RTMP push streamer (lazy-start: connect on first chunk
+            # Optional push streamer (lazy-start: connect on first chunk
             # to avoid CDN timeout while waiting for initial audio).
+            # Supports RTMP (rtmp://...) and SRT (srt://...) protocols.
             # Only rank 0 pushes — creating pushers on all workers would
-            # open N duplicate RTMP connections and, worse, stop() can
+            # open N duplicate connections and, worse, stop() can
             # deadlock the worker → gloo broadcast timeout → scheduler crash.
             _rtmp_pusher = None
             _rtmp_url = batch.extra.get("rtmp_push_url")
@@ -1712,18 +1713,18 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 if get_world_rank() == 0:
                     try:
                         from sglang.multimodal_gen.runtime.utils.rtmp_pusher import (
-                            RTMPPusher,
+                            StreamPusher,
                         )
 
-                        _rtmp_pusher = RTMPPusher(
+                        _rtmp_pusher = StreamPusher(
                             url=_rtmp_url,
                             width=batch.width,
                             height=batch.height,
                             fps=batch.fps or 25,
                         )
-                        logger.info("RTMP pusher ready (lazy): %s", _rtmp_url)
+                        logger.info("Stream pusher ready (lazy): %s", _rtmp_url)
                     except Exception as e:
-                        logger.warning("Failed to create RTMP pusher: %s", e)
+                        logger.warning("Failed to create stream pusher: %s", e)
                         _rtmp_pusher = None
 
             # Pre-compute audio window tensors (constant across chunks)
@@ -1939,7 +1940,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     try:
                         if not _rtmp_pusher._started:
                             _rtmp_pusher.start()
-                            logger.info("RTMP pusher connected on first chunk")
+                            logger.info("Stream pusher connected on first chunk")
                         _rtmp_pusher.push_chunk(frames_np, chunk_audio_data)
                     except Exception as e:
                         logger.warning(
@@ -1979,7 +1980,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # --- Session post-loop ---
             logger.info("Session post-loop: starting cleanup")
 
-            # Stop RTMP pusher FIRST, before gc.collect().  Garbage
+            # Stop stream pusher FIRST, before gc.collect().  Garbage
             # collection can trigger PyAV container __dealloc__ which
             # tries av_write_trailer on a broken connection — potentially
             # hanging rank 0 and causing a gloo broadcast timeout.
