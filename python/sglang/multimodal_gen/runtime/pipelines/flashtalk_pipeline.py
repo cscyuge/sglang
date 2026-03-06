@@ -137,6 +137,107 @@ def _prepare_audio_cpu(
     return audio_feature_np
 
 
+def _prefetch_audio_full(
+    session_dir: str,
+    audio_chunk_idx: int,
+    audio_dq_snapshot: np.ndarray,
+    cached_audio_length: int,
+    wav2vec_feature_extractor,
+    sample_rate: int,
+    pyln_mod,
+    pyln_meter,
+    silence_samples: int,
+    audio_encoder,
+    audio_proj,
+    device: torch.device,
+    audio_end_idx: int,
+    s_audio_windowed_idx: torch.Tensor,
+    vae_temporal_factor: int,
+    overlap_stream: "torch.cuda.Stream",
+) -> tuple:
+    """Prefetch next chunk's audio processing in a background thread.
+
+    Runs CPU-bound audio preprocessing (file I/O, loudness normalization,
+    wav2vec2 tokenizer) followed by GPU inference (wav2vec2 encoder +
+    audio_proj) on a secondary CUDA stream that overlaps with the default
+    stream's VAE decode.
+
+    Parameters
+    ----------
+    audio_dq_snapshot : np.ndarray
+        Snapshot of the audio deque as a numpy array (float64, length
+        ``cached_audio_length``).  The real deque is updated by the
+        caller after the prefetch result is consumed.
+
+    Returns
+    -------
+    tuple of (audio_context, chunk_audio_data, used_silence, audio_loaded, event)
+    """
+    # --- CPU Phase: load audio file + preprocess ---
+    audio_chunk_path = os.path.join(
+        session_dir, "audio_chunks", f"chunk_{audio_chunk_idx:04d}.npy"
+    )
+    used_silence = False
+    audio_loaded = False
+    if os.path.exists(audio_chunk_path):
+        try:
+            chunk_audio_data = np.load(audio_chunk_path)
+            audio_loaded = True
+        except Exception:
+            time.sleep(0.01)
+            try:
+                chunk_audio_data = np.load(audio_chunk_path)
+                audio_loaded = True
+            except Exception:
+                chunk_audio_data = np.zeros(silence_samples, dtype=np.float32)
+                used_silence = True
+    else:
+        chunk_audio_data = np.zeros(silence_samples, dtype=np.float32)
+        used_silence = True
+
+    # Simulate deque extend: shift out oldest samples, append new ones
+    n_new = len(chunk_audio_data)
+    if 0 < n_new < cached_audio_length:
+        audio_array = np.concatenate(
+            [audio_dq_snapshot[n_new:], chunk_audio_data.astype(np.float64)]
+        )
+    else:
+        audio_array = audio_dq_snapshot.copy()
+
+    if pyln_mod is not None and pyln_meter is not None:
+        loudness = pyln_meter.integrated_loudness(audio_array)
+        if abs(loudness) <= 100:
+            audio_array = pyln_mod.normalize.loudness(
+                audio_array, loudness, -23.0
+            )
+
+    audio_feature_np = np.squeeze(
+        wav2vec_feature_extractor(
+            audio_array, sampling_rate=sample_rate
+        ).input_values
+    )
+
+    # --- GPU Phase: wav2vec + audio_proj on secondary stream ---
+    with torch.cuda.stream(overlap_stream):
+        audio_feature_t = (
+            torch.from_numpy(audio_feature_np)
+            .float()
+            .to(device=device)
+            .unsqueeze(0)
+        )
+        with torch.no_grad():
+            chunk_wav2vec = audio_encoder(
+                audio_feature_t, num_video_frames=audio_end_idx
+            )
+        windowed_features = chunk_wav2vec[:, s_audio_windowed_idx]
+        audio_context = audio_proj.forward_prewindowed(
+            windowed_features, vae_temporal_factor=vae_temporal_factor
+        )
+
+    event = overlap_stream.record_event()
+    return audio_context, chunk_audio_data, used_silence, audio_loaded, event
+
+
 class VAECudaGraphRunner:
     """Captures and replays a CUDA graph for a fixed-shape VAE forward pass.
 
@@ -1742,6 +1843,27 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _s_frame_indices.unsqueeze(1) + _s_window_offsets.unsqueeze(0)
                 ).clamp(0, audio_end_idx - 1)
 
+            # Audio overlap: prefetch next chunk's CPU + GPU audio processing
+            # during VAE decode to hide the ~30ms audio processing latency.
+            # Only enabled when models stay on GPU (multi-GPU SP mode) to
+            # avoid complications with CPU offloading.
+            _audio_prefetch_pool: ThreadPoolExecutor | None = None
+            _audio_overlap_stream: torch.cuda.Stream | None = None
+            _prefetched_result = None  # tuple from _prefetch_audio_full
+            _enable_audio_overlap = (
+                use_streaming_audio
+                and skip_audio_offload
+                and audio_encoder is not None
+            )
+            if _enable_audio_overlap:
+                _audio_prefetch_pool = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="audio-prefetch"
+                )
+                _audio_overlap_stream = torch.cuda.Stream(device=device)
+                logger.info(
+                    "Audio overlap enabled: CPU+GPU prefetch on secondary stream"
+                )
+
             while True:
                 # --- Non-blocking audio poll (silence fill) ---
                 if os.path.exists(_end_path):
@@ -1752,49 +1874,78 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _cancelled = True
                     break
 
-                _used_silence = False
-                _audio_chunk_path = os.path.join(
-                    session_dir,
-                    "audio_chunks",
-                    f"chunk_{audio_chunk_idx:04d}.npy",
-                )
-                if os.path.exists(_audio_chunk_path):
-                    try:
-                        chunk_audio_data = np.load(_audio_chunk_path)
+                # --- Audio: use prefetch or load+process normally ---
+                _audio_prefetched = False
+                if _prefetched_result is not None:
+                    # Previous chunk prefetched this chunk's audio
+                    (
+                        _pf_audio_context,
+                        _pf_chunk_audio,
+                        _pf_silence,
+                        _pf_loaded,
+                        _pf_event,
+                    ) = _prefetched_result
+                    _prefetched_result = None
+
+                    # Sync the secondary stream (should already be done)
+                    _pf_event.synchronize()
+
+                    chunk_audio_data = _pf_chunk_audio
+                    _used_silence = _pf_silence
+                    if _pf_loaded:
                         audio_chunk_idx += 1
-                    except Exception:
-                        time.sleep(0.01)
+
+                    # Update the real deque (prefetch used a snapshot)
+                    audio_dq.extend(chunk_audio_data.tolist())
+                    batch.extra["audio_context"] = _pf_audio_context
+                    _audio_prefetched = True
+                else:
+                    # Normal path: load audio file
+                    _used_silence = False
+                    _audio_chunk_path = os.path.join(
+                        session_dir,
+                        "audio_chunks",
+                        f"chunk_{audio_chunk_idx:04d}.npy",
+                    )
+                    if os.path.exists(_audio_chunk_path):
                         try:
                             chunk_audio_data = np.load(_audio_chunk_path)
                             audio_chunk_idx += 1
                         except Exception:
-                            chunk_audio_data = np.zeros(
-                                _silence_samples, dtype=np.float32
-                            )
-                            _used_silence = True
-                else:
-                    chunk_audio_data = np.zeros(
-                        _silence_samples, dtype=np.float32
-                    )
-                    _used_silence = True
+                            time.sleep(0.01)
+                            try:
+                                chunk_audio_data = np.load(_audio_chunk_path)
+                                audio_chunk_idx += 1
+                            except Exception:
+                                chunk_audio_data = np.zeros(
+                                    _silence_samples, dtype=np.float32
+                                )
+                                _used_silence = True
+                    else:
+                        chunk_audio_data = np.zeros(
+                            _silence_samples, dtype=np.float32
+                        )
+                        _used_silence = True
 
                 chunk_start = time.time()
                 if _used_silence:
                     logger.info(
                         "Session: generating chunk %d (silence, "
-                        "audio_chunk_idx=%d)",
+                        "audio_chunk_idx=%d)%s",
                         chunk_idx,
                         audio_chunk_idx,
+                        " [prefetched]" if _audio_prefetched else "",
                     )
                 else:
                     logger.info(
-                        "Session: generating chunk %d (audio chunk %d)",
+                        "Session: generating chunk %d (audio chunk %d)%s",
                         chunk_idx,
                         audio_chunk_idx - 1,
+                        " [prefetched]" if _audio_prefetched else "",
                     )
 
-                # a. Per-chunk audio processing (same as streaming mode)
-                if use_streaming_audio:
+                # a. Per-chunk audio processing (skip if prefetched)
+                if use_streaming_audio and not _audio_prefetched:
                     audio_dq.extend(chunk_audio_data.tolist())
                     audio_array = np.array(audio_dq)
 
@@ -1861,6 +2012,32 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 else:
                     videos = vae.decode(denorm_latents)
                 del denorm_latents
+
+                # Launch audio prefetch for next chunk on secondary stream.
+                # VAE decode is now queued on the default stream (async);
+                # CPU audio preprocessing + GPU wav2vec/audio_proj can run
+                # concurrently while we wait for decode to finish.
+                _audio_prefetch_future: Future | None = None
+                if _enable_audio_overlap and _audio_prefetch_pool is not None:
+                    _audio_prefetch_future = _audio_prefetch_pool.submit(
+                        _prefetch_audio_full,
+                        session_dir,
+                        audio_chunk_idx,
+                        np.array(audio_dq),  # snapshot
+                        cached_audio_length,
+                        wav2vec_feature_extractor,
+                        sample_rate,
+                        _pyln,
+                        _pyln_meter,
+                        _silence_samples,
+                        audio_encoder,
+                        audio_proj,
+                        device,
+                        audio_end_idx,
+                        _s_audio_windowed_idx,
+                        vae_temporal_factor,
+                        _audio_overlap_stream,
+                    )
 
                 batch.output = videos
                 batch = color_correction_stage.forward(batch, server_args)
@@ -1948,6 +2125,20 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         )
                 del chunk_frames
 
+                # Collect audio prefetch result (should be done by now:
+                # prefetch takes ~30ms, VAE decode+encode+frames took ~310ms)
+                if _audio_prefetch_future is not None:
+                    try:
+                        _prefetched_result = _audio_prefetch_future.result(
+                            timeout=5.0
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Audio prefetch failed for next chunk: %s", e
+                        )
+                        _prefetched_result = None
+                    _audio_prefetch_future = None
+
                 _t_chunk = time.time() - chunk_start
                 logger.info("Session chunk %d: %.3fs", chunk_idx, _t_chunk)
                 chunk_idx += 1
@@ -1971,6 +2162,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             f"chunk_{audio_chunk_idx:04d}.npy",
                         )
                         if os.path.exists(_next_audio):
+                            # Audio arrived during pacing — invalidate
+                            # the prefetch (it used silence data with a
+                            # stale deque snapshot).
+                            _prefetched_result = None
                             break
 
                 # Periodically drain completed futures to avoid unbounded list growth
@@ -1979,6 +2174,12 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # --- Session post-loop ---
             logger.info("Session post-loop: starting cleanup")
+
+            # Shut down audio prefetch pool
+            if _audio_prefetch_pool is not None:
+                _audio_prefetch_pool.shutdown(wait=False)
+                _audio_prefetch_pool = None
+                _prefetched_result = None
 
             # Stop stream pusher FIRST, before gc.collect().  Garbage
             # collection can trigger PyAV container __dealloc__ which
