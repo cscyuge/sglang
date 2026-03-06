@@ -6,6 +6,17 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
+try:
+    from sglang.multimodal_gen.runtime.kernels.tilelang_conv3d import (
+        TARGET_CHANNEL_PAIRS,
+        is_available as _tilelang_conv3d_available,
+        tilelang_conv3d_forward,
+    )
+
+    _use_tilelang_conv3d = _tilelang_conv3d_available()
+except ImportError:
+    _use_tilelang_conv3d = False
+
 
 class AvgDown3D(nn.Module):
     def __init__(
@@ -151,10 +162,19 @@ class WanCausalConv3d(nn.Conv3d):
         x = (
             x.to(self.weight.dtype) if current_platform.is_mps() else x
         )  # casting needed for mps since amp isn't supported
-        # Use channels_last_3d memory format to make cuDNN select the fused
-        # implicit_gemm algorithm instead of the slower vol2col + nvjet path.
-        # Weight-level conversion (vae_loader) alone is insufficient — the
-        # activation tensor must also be channels_last_3d for cuDNN dispatch.
+
+        # TileLang path: faster implicit GEMM for 3x3x3 stride=1 convolutions
+        if (
+            _use_tilelang_conv3d
+            and x.ndim == 5
+            and self.kernel_size == (3, 3, 3)
+            and self.stride == (1, 1, 1)
+            and x.dtype == torch.bfloat16
+            and (self.in_channels, self.out_channels) in TARGET_CHANNEL_PAIRS
+        ):
+            return tilelang_conv3d_forward(x, self.weight, self.bias)
+
+        # cuDNN path with channels_last_3d for fused implicit_gemm dispatch
         if x.ndim == 5:
             x = x.contiguous(memory_format=torch.channels_last_3d)
             return super().forward(x).contiguous()

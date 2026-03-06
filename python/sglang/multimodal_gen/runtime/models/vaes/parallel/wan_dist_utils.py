@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     WanCausalConv3d,
     WanRMS_norm,
     WanUpsample,
+    _use_tilelang_conv3d,
     attention_block_forward,
     mid_block_forward,
     resample_forward,
@@ -26,6 +27,12 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     up_block_forward,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+
+if _use_tilelang_conv3d:
+    from sglang.multimodal_gen.runtime.kernels.tilelang_conv3d import (
+        TARGET_CHANNEL_PAIRS,
+        tilelang_conv3d_forward,
+    )
 
 
 def tensor_pad(x: torch.Tensor, len_to_pad: int, dim: int = -2):
@@ -328,8 +335,18 @@ class WanDistCausalConv3d(nn.Conv3d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
 
+        # TileLang path: faster implicit GEMM for 3x3x3 stride=1 convolutions
+        if (
+            _use_tilelang_conv3d
+            and x_padded.ndim == 5
+            and self.kernel_size == (3, 3, 3)
+            and self.stride == (1, 1, 1)
+            and x_padded.dtype == torch.bfloat16
+            and (self.in_channels, self.out_channels) in TARGET_CHANNEL_PAIRS
+        ):
+            out = tilelang_conv3d_forward(x_padded, self.weight, self.bias)
         # channels_last_3d for cuDNN implicit_gemm (activation + weight)
-        if x_padded.ndim == 5:
+        elif x_padded.ndim == 5:
             x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
             out = super().forward(x_padded).contiguous()
         else:
