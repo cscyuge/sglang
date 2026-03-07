@@ -84,6 +84,10 @@ class TestTileLangConv3D(unittest.TestCase):
         """mid block: 384->384, larger spatial."""
         self._run_conv3d_test(384, 384, 3, 194, 114)
 
+    def test_up1_192_384(self):
+        """up_block 1 resnets[0].conv1: 192->384."""
+        self._run_conv3d_test(192, 384, 3, 194, 114)
+
     def test_up2_192_192(self):
         """up_block 2: 192->192."""
         self._run_conv3d_test(192, 192, 3, 386, 226)
