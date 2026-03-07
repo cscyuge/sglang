@@ -120,6 +120,10 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 
+def set_deep_gemm_m_list(m_list: list[int], gpu_id: int = 0) -> None:
+    compile_utils.set_deep_gemm_m_list(m_list, gpu_id)
+
+
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
     if num_sms is None:

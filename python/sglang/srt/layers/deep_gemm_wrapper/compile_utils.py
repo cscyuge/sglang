@@ -92,6 +92,18 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
 
 
+def set_deep_gemm_m_list(m_list: List[int], gpu_id: int = 0) -> None:
+    """Set the DeepGEMM M list for pre-compilation.
+
+    For workloads with fixed/known M dimensions (e.g. diffusion models),
+    this avoids the default 16384-value exhaustive warmup.
+    """
+    global _BUILTIN_M_LIST, _DO_COMPILE_ALL, _IS_FIRST_RANK_ON_NODE
+    _BUILTIN_M_LIST = sorted(set(m_list))
+    _IS_FIRST_RANK_ON_NODE = gpu_id == 0
+    _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
+
+
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()

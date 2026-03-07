@@ -151,6 +151,7 @@ class FlashTalkDenoisingStage(PipelineStage):
         self._prev_audio_context: torch.Tensor | None = None
         self._teacache_reduced: int = 0
         self._teacache_total_chunks: int = 0
+        self._deep_gemm_configured: bool = False
         self._maybe_enable_torch_compile(self.transformer)
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
@@ -172,6 +173,50 @@ class FlashTalkDenoisingStage(PipelineStage):
         mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
         logger.info("Compiling FlashTalk transformer with mode: %s", mode)
         module.compile(mode=mode, fullgraph=False, dynamic=None)
+
+    def _configure_deep_gemm_for_latents(
+        self, latents: torch.Tensor, sp_size: int
+    ) -> None:
+        """Configure DeepGEMM M-list for diffusion's fixed sequence length.
+
+        The default M-list has 16384 values (for LLM variable-length batches).
+        Diffusion has a fixed M = B * T * (H/p) * (W/p) / SP, so we only need
+        to warm up that single value, reducing warmup from ~19s to <1s.
+        """
+        try:
+            from sglang.srt.layers.deep_gemm_wrapper import (
+                ENABLE_JIT_DEEPGEMM,
+                set_deep_gemm_m_list,
+            )
+
+            if not ENABLE_JIT_DEEPGEMM:
+                return
+
+            # latents: [B, C, T, H, W]
+            if latents.dim() != 5:
+                return
+
+            B, _C, T, H, W = latents.shape
+            patch_size = getattr(self.transformer, "patch_size", [1, 2, 2])
+            if isinstance(patch_size, int):
+                patch_size = [1, patch_size, patch_size]
+            seq_len = T * (H // patch_size[1]) * (W // patch_size[2])
+            sp = max(sp_size, 1)
+            local_seq_len = (seq_len + sp - 1) // sp
+            m_value = B * local_seq_len
+
+            gpu_id = latents.device.index if latents.device.index is not None else 0
+            set_deep_gemm_m_list([m_value], gpu_id=gpu_id)
+            logger.info(
+                "DeepGEMM configured for diffusion: M=%d "
+                "(B=%d, seq=%d, SP=%d)",
+                m_value,
+                B,
+                seq_len,
+                sp,
+            )
+        except ImportError:
+            pass
 
     def _timestep_transform(
         self, t: torch.Tensor, shift: float = 5.0, num_timesteps: int = 1000
@@ -234,6 +279,13 @@ class FlashTalkDenoisingStage(PipelineStage):
         timesteps = batch.timesteps
         audio_context = batch.extra.get("audio_context")
         human_num = batch.extra.get("human_num", 1)
+
+        # Configure DeepGEMM M-list once: diffusion has fixed sequence lengths,
+        # so the default 16384-value exhaustive warmup is wasteful (~19s).
+        # We only need the specific M value for this resolution.
+        if not self._deep_gemm_configured:
+            self._deep_gemm_configured = True
+            self._configure_deep_gemm_for_latents(latents, sp_size)
 
         # Adaptive step reduction: use fewer denoising steps for chunks
         # with similar audio context.  This avoids the mosaic artifacts
