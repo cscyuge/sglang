@@ -20,6 +20,17 @@ except ImportError:
     _use_tilelang_conv3d = False
 
 try:
+    from sglang.multimodal_gen.runtime.kernels.tilelang_conv2d import (
+        TARGET_CHANNEL_PAIRS_2D,
+        is_available as _tilelang_conv2d_available,
+        tilelang_conv2d_forward,
+    )
+
+    _use_tilelang_conv2d = _tilelang_conv2d_available()
+except ImportError:
+    _use_tilelang_conv2d = False
+
+try:
     from sglang.multimodal_gen.runtime.kernels.fused_norm_silu import (
         fused_rms_norm_silu as _triton_fused_norm_silu,
         is_available as _fused_norm_silu_available,

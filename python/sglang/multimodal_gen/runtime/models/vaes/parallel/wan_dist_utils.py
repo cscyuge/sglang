@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     WanCausalConv3d,
     WanRMS_norm,
     WanUpsample,
+    _use_tilelang_conv2d,
     _use_tilelang_conv3d,
     attention_block_forward,
     mid_block_forward,
@@ -32,6 +33,12 @@ if _use_tilelang_conv3d:
     from sglang.multimodal_gen.runtime.kernels.tilelang_conv3d import (
         TARGET_CHANNEL_PAIRS,
         tilelang_conv3d_forward,
+    )
+
+if _use_tilelang_conv2d:
+    from sglang.multimodal_gen.runtime.kernels.tilelang_conv2d import (
+        TARGET_CHANNEL_PAIRS_2D,
+        tilelang_conv2d_forward,
     )
 
 
@@ -139,12 +146,15 @@ def halo_exchange(
     group = sp_group.device_group
     group_ranks = sp_group.ranks
 
-    top_row = x[..., :height_halo_size, :].contiguous(
-        memory_format=torch.channels_last_3d if x.is_contiguous(memory_format=torch.channels_last_3d) else torch.contiguous_format
-    )
-    bottom_row = x[..., -height_halo_size:, :].contiguous(
-        memory_format=torch.channels_last_3d if x.is_contiguous(memory_format=torch.channels_last_3d) else torch.contiguous_format
-    )
+    if x.ndim == 5 and x.is_contiguous(memory_format=torch.channels_last_3d):
+        mem_fmt = torch.channels_last_3d
+    elif x.ndim == 4 and x.is_contiguous(memory_format=torch.channels_last):
+        mem_fmt = torch.channels_last
+    else:
+        mem_fmt = torch.contiguous_format
+
+    top_row = x[..., :height_halo_size, :].contiguous(memory_format=mem_fmt)
+    bottom_row = x[..., -height_halo_size:, :].contiguous(memory_format=mem_fmt)
 
     recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row)
     recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row)
@@ -239,9 +249,19 @@ class WanDistConv2d(nn.Conv2d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
 
+        # TileLang path: faster implicit GEMM for 3x3 stride=1 2D convolutions
+        if (
+            _use_tilelang_conv2d
+            and x_padded.ndim == 4
+            and self.kernel_size == (3, 3)
+            and self.stride == (1, 1)
+            and x_padded.dtype == torch.bfloat16
+            and (self.in_channels, self.out_channels) in TARGET_CHANNEL_PAIRS_2D
+        ):
+            out = tilelang_conv2d_forward(x_padded, self.weight, self.bias)
         # channels_last_3d for cuDNN implicit_gemm (activation + weight).
         # Output stays CL3D (no .contiguous()) to avoid costly format conversion.
-        if x_padded.ndim == 5:
+        elif x_padded.ndim == 5:
             x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
             out = super().forward(x_padded)
         else:
