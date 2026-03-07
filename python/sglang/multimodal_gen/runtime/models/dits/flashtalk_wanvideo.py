@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     tensor_parallel_rms_norm,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import _ensure_contiguous
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
 )
@@ -242,10 +243,27 @@ class FlashTalkWanTransformerBlock(WanTransformerBlock):
             # includes audio output. Without this, the FFN misses the audio
             # signal, causing progressive quality degradation in multi-chunk
             # generation.
-            norm_hidden_states = self.cross_attn_residual_norm.norm(hidden_states)
-            norm_hidden_states = (
-                norm_hidden_states.float() * (1 + c_scale_msa) + c_shift_msa
-            ).to(orig_dtype)
+            # Use the fused CuTe DSL kernel (norm + scale_shift in one pass)
+            # instead of separate FP32LayerNorm + manual scale_shift, which
+            # would generate ~8 small kernels per block (bf16→fp32, layer_norm,
+            # fp32→bf16, bf16→fp32 again, add, mul, add, fp32→bf16).
+            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+                fused_norm_scale_shift,
+            )
+
+            norm_hidden_states = fused_norm_scale_shift(
+                hidden_states.contiguous(),
+                _ensure_contiguous(
+                    getattr(self.cross_attn_residual_norm.norm, "weight", None)
+                ),
+                _ensure_contiguous(
+                    getattr(self.cross_attn_residual_norm.norm, "bias", None)
+                ),
+                c_scale_msa.contiguous(),
+                c_shift_msa.contiguous(),
+                self.cross_attn_residual_norm.norm_type,
+                self.cross_attn_residual_norm.eps,
+            )
 
         # 4. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
