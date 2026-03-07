@@ -493,33 +493,72 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
         loaded_components: dict[str, Any] = {}
 
-        # ---- 4a. Transformer (sharded safetensors via FSDP loader) ----
+        # ---- Parallel I/O: pre-load .pth files while transformer streams ----
+        # torch.load() is I/O bound and thread-safe. We overlap these reads
+        # with the transformer's safetensors streaming (~46s) to hide latency.
+        # Note: only torch.load is backgrounded — weight copying (load_weights,
+        # load_state_dict) stays sequential to avoid CPU memory bandwidth
+        # contention with the transformer's weight loading.
+        t5_path = os.path.join(model_path, "models_t5_umt5-xxl-enc-bf16.pth")
+        vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
+        clip_path = os.path.join(
+            model_path, "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+        )
+
+        io_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="pth_load")
+        t5_future = None
+        vae_future = None
+        clip_future = None
+
+        if os.path.exists(t5_path):
+            logger.info("Starting background torch.load for T5 encoder...")
+            t5_future = io_executor.submit(
+                torch.load, t5_path, map_location="cpu", weights_only=True
+            )
+        if os.path.exists(vae_path):
+            logger.info("Starting background torch.load for VAE...")
+            vae_future = io_executor.submit(
+                torch.load, vae_path, map_location="cpu", weights_only=True
+            )
+        if os.path.exists(clip_path):
+            logger.info("Starting background torch.load for CLIP...")
+            clip_future = io_executor.submit(
+                torch.load, clip_path, map_location="cpu", weights_only=True
+            )
+
+        # ---- Transformer (sharded safetensors via FSDP loader) ----
+        # This is the main bottleneck (~46s). T5/VAE/CLIP torch.load runs
+        # in background threads during this time.
         logger.info("Loading FlashTalk transformer...")
         loaded_components["transformer"] = self._load_transformer(
             model_path, server_args, device
         )
 
-        # ---- 4b. AudioProj (from same safetensors, audio_proj.* keys) ----
+        # ---- AudioProj (from same safetensors, audio_proj.* keys) ----
         logger.info("Loading FlashTalk AudioProjModel...")
         loaded_components["audio_proj"] = self._load_audio_proj(
             model_path, server_args, device
         )
 
-        # ---- 4c. VAE (Wan2.1_VAE.pth) ----
+        # ---- VAE (Wan2.1_VAE.pth) — use pre-loaded state dict ----
         logger.info("Loading FlashTalk VAE...")
-        loaded_components["vae"] = self._load_vae(model_path, server_args, device)
+        loaded_components["vae"] = self._load_vae(
+            model_path, server_args, device, preloaded_state_dict=vae_future
+        )
 
-        # ---- 4d. T5 Text Encoder ----
+        # ---- T5 Text Encoder — use pre-loaded state dict ----
         logger.info("Loading FlashTalk T5 text encoder...")
         loaded_components["text_encoder"] = self._load_text_encoder(
-            model_path, server_args, device
+            model_path, server_args, device, preloaded_state_dict=t5_future
         )
 
-        # ---- 4e. CLIP Image Encoder ----
+        # ---- CLIP Image Encoder — use pre-loaded state dict ----
         logger.info("Loading FlashTalk CLIP image encoder...")
         loaded_components["image_encoder"] = self._load_image_encoder(
-            model_path, server_args, device
+            model_path, server_args, device, preloaded_state_dict=clip_future
         )
+
+        io_executor.shutdown(wait=False)
 
         # ---- 4f. Tokenizer ----
         logger.info("Loading FlashTalk tokenizer...")
@@ -621,7 +660,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         # Re-derive hidden_size and num_channels_latents
         dit_config.arch_config.__post_init__()
 
-        safetensors_list = _list_safetensors_files(model_path)
+        safetensors_list = [
+            f
+            for f in _list_safetensors_files(model_path)
+            if os.path.basename(f).startswith("diffusion_pytorch_model")
+        ]
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {model_path}")
 
@@ -723,7 +766,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             raw_config = json.load(f)
 
         # Extract audio_proj.* keys from safetensors first to derive dimensions
-        safetensors_list = _list_safetensors_files(model_path)
+        safetensors_list = [
+            f
+            for f in _list_safetensors_files(model_path)
+            if os.path.basename(f).startswith("diffusion_pytorch_model")
+        ]
         audio_proj_state_dict = {}
         prefix = "audio_proj."
         for st_file in safetensors_list:
@@ -783,11 +830,15 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         return audio_proj
 
     def _load_vae(
-        self, model_path: str, server_args: ServerArgs, device: torch.device
+        self,
+        model_path: str,
+        server_args: ServerArgs,
+        device: torch.device,
+        preloaded_state_dict: "Future | None" = None,
     ) -> torch.nn.Module:
         """Load VAE from Wan2.1_VAE.pth."""
         vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
-        if not os.path.exists(vae_path):
+        if preloaded_state_dict is None and not os.path.exists(vae_path):
             raise FileNotFoundError(f"VAE checkpoint not found: {vae_path}")
 
         vae_config = server_args.pipeline_config.vae_config
@@ -803,7 +854,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         with set_default_torch_dtype(vae_dtype), skip_init_modules():
             vae = vae_cls(vae_config).to(target_device)
 
-        state_dict = torch.load(vae_path, map_location="cpu", weights_only=True)
+        if preloaded_state_dict is not None:
+            state_dict = preloaded_state_dict.result()
+        else:
+            state_dict = torch.load(vae_path, map_location="cpu", weights_only=True)
         mapped_sd = self._remap_wan_vae_keys(state_dict, vae_config)
         del state_dict
         missing, unexpected = vae.load_state_dict(mapped_sd, strict=False)
@@ -824,22 +878,20 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         return vae
 
     def _load_text_encoder(
-        self, model_path: str, server_args: ServerArgs, device: torch.device
+        self,
+        model_path: str,
+        server_args: ServerArgs,
+        device: torch.device,
+        preloaded_state_dict: "Future | None" = None,
     ) -> torch.nn.Module:
         """Load T5 encoder from models_t5_umt5-xxl-enc-bf16.pth with key remapping."""
         t5_path = os.path.join(model_path, "models_t5_umt5-xxl-enc-bf16.pth")
-        if not os.path.exists(t5_path):
+        if preloaded_state_dict is None and not os.path.exists(t5_path):
             raise FileNotFoundError(f"T5 checkpoint not found: {t5_path}")
 
         encoder_config = server_args.pipeline_config.text_encoder_configs[0]
         encoder_precision = server_args.pipeline_config.text_encoder_precisions[0]
         encoder_dtype = PRECISION_TO_TYPE[encoder_precision]
-
-        # Check if we should use FSDP-based CPU offloading (matching standard loader)
-        should_offload = server_args.text_encoder_cpu_offload
-        arch_config = getattr(encoder_config, "arch_config", encoder_config)
-        fsdp_conditions = getattr(arch_config, "_fsdp_shard_conditions", [])
-        use_fsdp_offload = should_offload and len(fsdp_conditions) > 0
 
         # Resolve T5 encoder from registry (UMT5EncoderModel for umt5-xxl)
         model_cls, _ = ModelRegistry.resolve_model_cls("UMT5EncoderModel")
@@ -847,7 +899,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         with set_default_torch_dtype(encoder_dtype), skip_init_modules():
             model = model_cls(encoder_config)
 
-        state_dict = torch.load(t5_path, map_location="cpu", weights_only=True)
+        if preloaded_state_dict is not None:
+            state_dict = preloaded_state_dict.result()
+        else:
+            state_dict = torch.load(t5_path, map_location="cpu", weights_only=True)
 
         # Remap Wan's original T5 keys to sglang UMT5EncoderModel keys
         mapped_sd = self._remap_wan_t5_keys(state_dict)
@@ -855,27 +910,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         model.load_weights(mapped_sd.items())
         del state_dict, mapped_sd
 
-        if use_fsdp_offload:
-            # Use FSDP sharding with CPU offload (auto-moves params to GPU during forward)
-            import torch.distributed as dist
-
-            from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
-
-            mesh = dist.init_device_mesh(
-                current_platform.device_type,
-                mesh_shape=(1, dist.get_world_size()),
-                mesh_dim_names=("offload", "replicate"),
-            )
-            shard_model(
-                model,
-                cpu_offload=True,
-                reshard_after_forward=True,
-                mesh=mesh["offload"],
-                fsdp_shard_conditions=fsdp_conditions,
-                pin_cpu_memory=server_args.pin_cpu_memory,
-            )
-        else:
-            model = model.to(device)
+        # Skip FSDP sharding for FlashTalk — T5 is used only once for text
+        # encoding, so the 20-25s FSDP startup cost isn't worthwhile.
+        # With H20 96GB GPUs and peak usage ~34GB, 11GB T5 on GPU is fine.
+        model = model.to(device)
 
         model.eval()
         total_params = sum(p.numel() for p in model.parameters())
@@ -1100,12 +1138,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         return mapped
 
     def _load_image_encoder(
-        self, model_path: str, server_args: ServerArgs, device: torch.device
+        self,
+        model_path: str,
+        server_args: ServerArgs,
+        device: torch.device,
+        preloaded_state_dict: "Future | None" = None,
     ) -> torch.nn.Module:
         """Load CLIP image encoder from .pth file with OpenCLIP->sglang key mapping."""
         clip_pattern = "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
         clip_path = os.path.join(model_path, clip_pattern)
-        if not os.path.exists(clip_path):
+        if preloaded_state_dict is None and not os.path.exists(clip_path):
             logger.warning(
                 "CLIP checkpoint not found at %s; image encoder will not be loaded.",
                 clip_path,
@@ -1124,7 +1166,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         with set_default_torch_dtype(encoder_dtype), skip_init_modules():
             model = model_cls(encoder_config)
 
-        state_dict = torch.load(clip_path, map_location="cpu", weights_only=True)
+        if preloaded_state_dict is not None:
+            state_dict = preloaded_state_dict.result()
+        else:
+            state_dict = torch.load(clip_path, map_location="cpu", weights_only=True)
 
         # Remap OpenCLIP visual keys to sglang CLIPVisionModel keys
         mapped_sd = self._remap_openclip_visual_keys(state_dict, model)
