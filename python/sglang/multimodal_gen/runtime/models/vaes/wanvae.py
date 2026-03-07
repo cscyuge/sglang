@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     residual_up_block_forward,
     up_block_forward,
 )
+from sglang.multimodal_gen.runtime.models.vaes.parallel import wan_common_utils
 from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
     WanDistAttentionBlock,
     WanDistCausalConv3d,
@@ -884,6 +885,13 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self._enc_feat_map = [None] * self._enc_conv_num
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
+        wan_common_utils._in_encoder = True
+        try:
+            return self._encode_impl(x)
+        finally:
+            wan_common_utils._in_encoder = False
+
+    def _encode_impl(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
             self.clear_cache()
             if self.config.patch_size is not None:
@@ -916,12 +924,16 @@ class AutoencoderKLWan(ParallelTiledVAE):
         return enc
 
     def _encode(self, x: torch.Tensor, first_frame=False) -> torch.Tensor:
-        with forward_context(first_frame_arg=first_frame):
-            out = self.encoder(x)
-        enc = self.quant_conv(out)
-        mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
-        enc = torch.cat([mu, logvar], dim=1)
-        return enc
+        wan_common_utils._in_encoder = True
+        try:
+            with forward_context(first_frame_arg=first_frame):
+                out = self.encoder(x)
+            enc = self.quant_conv(out)
+            mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
+            enc = torch.cat([mu, logvar], dim=1)
+            return enc
+        finally:
+            wan_common_utils._in_encoder = False
 
     def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
         first_frame = x[:, :, 0, :, :].unsqueeze(2)

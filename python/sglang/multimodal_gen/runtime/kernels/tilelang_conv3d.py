@@ -220,8 +220,8 @@ def tilelang_conv3d_forward(
     if bias is not None:
         out_ndhwc = out_ndhwc + bias.view(1, 1, 1, 1, -1)
 
-    # NDHWC -> NCDHW (channels_last_3d view, no copy)
-    out = out_ndhwc.permute(0, 4, 1, 2, 3)
+    # NDHWC -> NCDHW (contiguous copy back to standard layout)
+    out = out_ndhwc.permute(0, 4, 1, 2, 3).contiguous()
     return out
 
 

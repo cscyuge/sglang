@@ -144,6 +144,13 @@ def fused_rms_norm_silu(
         output: same shape and memory format as x
     """
     B, C, T_dim, H, W = x.shape
+
+    # Kernel assumes spatial elements are compactly packed (m * stride_s
+    # linearly indexes all M elements). This breaks on sliced views where
+    # e.g. stride(2) = C*H_full*W > C*H_local*W. Ensure contiguity first.
+    if not x.is_contiguous():
+        x = x.contiguous()
+
     THW = T_dim * H * W
     M = B * THW
 

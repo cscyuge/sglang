@@ -101,6 +101,10 @@ def split_for_parallel_decode(
 def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
     if expected_height is None:
         return x
+    # all_gather_into_tensor copies flat memory into an NCTHW output buffer,
+    # so the input must be standard-contiguous (not channels_last_3d).
+    if not x.is_contiguous():
+        x = x.contiguous()
     x = get_sp_group().all_gather(x, dim=-2)
     if x.shape[-2] != expected_height:
         x = x[..., :expected_height, :].contiguous()
@@ -234,7 +238,7 @@ class WanDistConv2d(nn.Conv2d):
         # channels_last_3d for cuDNN implicit_gemm (activation + weight)
         if x_padded.ndim == 5:
             x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
-            out = super().forward(x_padded)
+            out = super().forward(x_padded).contiguous()
         else:
             out = super().forward(x_padded)
 
@@ -348,7 +352,7 @@ class WanDistCausalConv3d(nn.Conv3d):
         # channels_last_3d for cuDNN implicit_gemm (activation + weight)
         elif x_padded.ndim == 5:
             x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
-            out = super().forward(x_padded)
+            out = super().forward(x_padded).contiguous()
         else:
             out = super().forward(x_padded)
 
@@ -511,6 +515,8 @@ class WanDistAttentionBlock(nn.Module):
 
     def forward(self, x):
         if self.world_size > 1:
+            if not x.is_contiguous():
+                x = x.contiguous()
             x = self.sp_group.all_gather(x, dim=-2)
             x = x.contiguous()
         x = attention_block_forward(self, x)

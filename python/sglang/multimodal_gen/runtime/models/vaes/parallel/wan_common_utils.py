@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +25,9 @@ try:
         is_available as _fused_norm_silu_available,
     )
 
-    _use_fused_norm_silu = _fused_norm_silu_available()
+    _use_fused_norm_silu = _fused_norm_silu_available() and not os.environ.get(
+        "SGLANG_DISABLE_FUSED_NORM_SILU"
+    )
 except ImportError:
     _use_fused_norm_silu = False
 
@@ -32,6 +36,7 @@ def _fused_norm_silu(x, norm_module, apply_silu=True):
     """Fused WanRMS_norm + optional SiLU. Uses Triton when available."""
     if (
         _use_fused_norm_silu
+        and not _in_encoder
         and x.ndim == 5
         and x.dtype in (torch.bfloat16, torch.float16)
         and not torch.compiler.is_compiling()
@@ -201,7 +206,7 @@ class WanCausalConv3d(nn.Conv3d):
         # cuDNN path with channels_last_3d for fused implicit_gemm dispatch
         if x.ndim == 5:
             x = x.contiguous(memory_format=torch.channels_last_3d)
-            return super().forward(x)
+            return super().forward(x).contiguous()
         return super().forward(x)
 
 
@@ -249,6 +254,11 @@ feat_cache = None
 feat_idx = None
 cache_t = None
 first_chunk = None
+
+# When True, _fused_norm_silu falls back to PyTorch (no Triton kernel).
+# Toggled during encoding to avoid precision differences that get amplified
+# through the few-step denoising process.
+_in_encoder = False
 
 
 def bind_context(
