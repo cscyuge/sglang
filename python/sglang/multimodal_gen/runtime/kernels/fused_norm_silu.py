@@ -148,7 +148,11 @@ def fused_rms_norm_silu(
     # Kernel assumes spatial elements are compactly packed (m * stride_s
     # linearly indexes all M elements). This breaks on sliced views where
     # e.g. stride(2) = C*H_full*W > C*H_local*W. Ensure contiguity first.
-    if not x.is_contiguous():
+    # Accept both NCTHW (contiguous) and CL3D (channels_last_3d) — only
+    # force a copy for irregular strides (sliced views, etc.).
+    if not x.is_contiguous() and not x.is_contiguous(
+        memory_format=torch.channels_last_3d
+    ):
         x = x.contiguous()
 
     THW = T_dim * H * W

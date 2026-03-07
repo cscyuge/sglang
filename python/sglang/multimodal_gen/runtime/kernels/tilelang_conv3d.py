@@ -220,8 +220,13 @@ def tilelang_conv3d_forward(
     if bias is not None:
         out_ndhwc = out_ndhwc + bias.view(1, 1, 1, 1, -1)
 
-    # NDHWC -> NCDHW (contiguous copy back to standard layout)
-    out = out_ndhwc.permute(0, 4, 1, 2, 3).contiguous()
+    # NDHWC -> NCDHW as a channels_last_3d view (no data copy).
+    # The permuted view has shape (B, C, OD, OH, OW) with NDHWC strides,
+    # which IS channels_last_3d format.  Downstream ops (norm, silu, add,
+    # F.pad, clone) all work correctly on CL3D tensors, and the next
+    # tl_conv3d call's input permute(0,2,3,4,1).contiguous() becomes a
+    # no-op because the memory is already NDHWC-contiguous.
+    out = out_ndhwc.permute(0, 4, 1, 2, 3)
     return out
 
 

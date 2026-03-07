@@ -203,10 +203,12 @@ class WanCausalConv3d(nn.Conv3d):
         ):
             return tilelang_conv3d_forward(x, self.weight, self.bias)
 
-        # cuDNN path with channels_last_3d for fused implicit_gemm dispatch
+        # cuDNN path with channels_last_3d for fused implicit_gemm dispatch.
+        # Output stays CL3D (no .contiguous() back to NCDHW) so that
+        # downstream ops and the next conv's CL3D conversion are free.
         if x.ndim == 5:
             x = x.contiguous(memory_format=torch.channels_last_3d)
-            return super().forward(x).contiguous()
+            return super().forward(x)
         return super().forward(x)
 
 

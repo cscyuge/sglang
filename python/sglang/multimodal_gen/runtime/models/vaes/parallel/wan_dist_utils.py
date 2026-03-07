@@ -139,8 +139,12 @@ def halo_exchange(
     group = sp_group.device_group
     group_ranks = sp_group.ranks
 
-    top_row = x[..., :height_halo_size, :].contiguous()
-    bottom_row = x[..., -height_halo_size:, :].contiguous()
+    top_row = x[..., :height_halo_size, :].contiguous(
+        memory_format=torch.channels_last_3d if x.is_contiguous(memory_format=torch.channels_last_3d) else torch.contiguous_format
+    )
+    bottom_row = x[..., -height_halo_size:, :].contiguous(
+        memory_format=torch.channels_last_3d if x.is_contiguous(memory_format=torch.channels_last_3d) else torch.contiguous_format
+    )
 
     recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row)
     recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row)
@@ -235,10 +239,11 @@ class WanDistConv2d(nn.Conv2d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
 
-        # channels_last_3d for cuDNN implicit_gemm (activation + weight)
+        # channels_last_3d for cuDNN implicit_gemm (activation + weight).
+        # Output stays CL3D (no .contiguous()) to avoid costly format conversion.
         if x_padded.ndim == 5:
             x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
-            out = super().forward(x_padded).contiguous()
+            out = super().forward(x_padded)
         else:
             out = super().forward(x_padded)
 
@@ -349,10 +354,11 @@ class WanDistCausalConv3d(nn.Conv3d):
             and (self.in_channels, self.out_channels) in TARGET_CHANNEL_PAIRS
         ):
             out = tilelang_conv3d_forward(x_padded, self.weight, self.bias)
-        # channels_last_3d for cuDNN implicit_gemm (activation + weight)
+        # channels_last_3d for cuDNN implicit_gemm (activation + weight).
+        # Output stays CL3D (no .contiguous()) to avoid costly format conversion.
         elif x_padded.ndim == 5:
             x_padded = x_padded.contiguous(memory_format=torch.channels_last_3d)
-            out = super().forward(x_padded).contiguous()
+            out = super().forward(x_padded)
         else:
             out = super().forward(x_padded)
 
