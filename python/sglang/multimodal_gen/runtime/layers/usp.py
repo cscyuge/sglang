@@ -102,6 +102,54 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
+def _usp_input_all_to_all_qkv(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched Ulysses input all-to-all for QKV (head_dim=2 layout).
+
+    Fuses 3 separate all-to-all calls into 1 by interleaving QKV heads
+    in a single packed buffer. Reduces 6 copy kernels + 3 NCCL calls
+    to 2 Triton kernels + 1 NCCL call.
+
+    Only supports the head_dim=2 layout: q, k, v are [B, S_local, H, D].
+    Falls back to 3 separate calls for GQA (num_kv_heads < num_heads).
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return q, k, v
+
+    # GQA guard: q and k/v must have the same number of heads
+    if q.shape != k.shape or q.shape != v.shape:
+        q = _usp_input_all_to_all(q, head_dim=2)
+        k = _usp_input_all_to_all(k, head_dim=2)
+        v = _usp_input_all_to_all(v, head_dim=2)
+        return q, k, v
+
+    B, S_local, H_global, D = q.shape
+    assert H_global % world_size == 0, (
+        f"H_global ({H_global}) must be divisible by world_size ({world_size})"
+    )
+    H_local = H_global // world_size
+
+    from sglang.jit_kernel.diffusion.triton.usp_permute import (
+        fused_pack_qkv_for_all_to_all,
+        fused_unpack_qkv_from_all_to_all,
+    )
+
+    # 1. Fused pack: q,k,v [B,S,H,D] → packed [3*H, B, S, D]
+    packed = fused_pack_qkv_for_all_to_all(q, k, v)
+
+    # 2. Single NCCL all-to-all
+    packed = _usp_all_to_all_single(packed)
+
+    # 3. Fused unpack: packed [3*H, B, S_local, D] → q,k,v [B, S_global, H_local, D]
+    q, k, v = fused_unpack_qkv_from_all_to_all(
+        packed, B, S_local, H_local, D, world_size
+    )
+
+    return q, k, v
+
+
 def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
