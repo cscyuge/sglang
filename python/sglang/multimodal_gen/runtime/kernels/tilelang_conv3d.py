@@ -51,7 +51,7 @@ def conv3d_implicit_gemm(
     OHW = OH * OW
 
     @T.prim_func
-    def main(
+    def tl_conv3d(
         data: T.Tensor((N_batch, D_in, H_in, W_in, C_in), dtype),
         weight: T.Tensor((K_total, C_out), dtype),
         output: T.Tensor((M_total, C_out), dtype),
@@ -107,7 +107,7 @@ def conv3d_implicit_gemm(
             T.copy(out_local, out_shared)
             T.copy(out_shared, output[bm * block_M, bn * block_N])
 
-    return main
+    return tl_conv3d
 
 
 def prepare_weight(weight_pytorch: torch.Tensor) -> torch.Tensor:
