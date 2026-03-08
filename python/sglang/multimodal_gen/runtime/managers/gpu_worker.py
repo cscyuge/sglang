@@ -499,6 +499,7 @@ def run_scheduler_process(
             task_pipes_to_slaves=task_pipes_to_slaves,
             result_pipes_from_slaves=result_pipes_from_slaves,
         )
+        scheduler.process_warmup()
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
             {

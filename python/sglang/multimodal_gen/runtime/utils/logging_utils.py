@@ -403,6 +403,7 @@ def globally_suppress_loggers():
         "python_multipart.multipart",
         "filelock",
         "urllib3",
+        "torch._dynamo",
     ]
 
     for name in target_names:

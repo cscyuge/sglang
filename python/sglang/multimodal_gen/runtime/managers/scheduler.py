@@ -261,6 +261,47 @@ class Scheduler:
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
 
+    def process_warmup(self):
+        """Drain warmup queue synchronously before signaling ready.
+
+        All ranks call this simultaneously after prepare_server_warmup_reqs().
+        NCCL collectives inside forward keep ranks in sync — no broadcast needed.
+        """
+        if not self.waiting_queue:
+            return
+        logger.info(
+            "Processing %d warmup request(s) synchronously...",
+            len(self.waiting_queue),
+        )
+        while self.waiting_queue:
+            items = self.get_next_batch_to_run()
+            if not items:
+                break
+            reqs = [item[1] for item in items]
+            processed_req = reqs[0]
+            if not isinstance(processed_req, Req):
+                continue
+            try:
+                output_batch = self._handle_generation(reqs)
+                is_warmup = getattr(processed_req, "is_warmup", False)
+                if is_warmup:
+                    if output_batch.error is None:
+                        logger.info(
+                            "Warmup (%d/%d) done in %.2fs",
+                            self._warmup_processed,
+                            self._warmup_total,
+                            output_batch.metrics.total_duration_s,
+                        )
+                    else:
+                        logger.warning(
+                            "Warmup (%d/%d) failed: %s",
+                            self._warmup_processed,
+                            self._warmup_total,
+                            output_batch.error,
+                        )
+            except Exception as e:
+                logger.error("Warmup failed: %s", e, exc_info=True)
+
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: List[tuple[bytes, Any]]
     ) -> List[tuple[bytes, Any]]:

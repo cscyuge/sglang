@@ -1416,6 +1416,20 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
         denoising_idx = self._find_denoising_stage_index()
 
+        # When VAE CUDA graph is enabled, prevent the ImageVAEEncoding stage
+        # from offloading the VAE to CPU after encoding the condition image.
+        # CUDA graphs embed parameter addresses; a CPU round-trip gives new
+        # addresses and invalidates the graph.  The VAE is only ~250 MB so
+        # keeping it on GPU is negligible on 8×H20 (95 GB each).
+        _use_vae_cuda_graph = (
+            os.environ.get("SGLANG_FLASHTALK_VAE_CUDA_GRAPH", "0") == "1"
+        )
+        if _use_vae_cuda_graph:
+            for stage in self.stages[:denoising_idx]:
+                if isinstance(stage, ImageVAEEncodingStage):
+                    stage.offload_model = lambda: None
+                    break
+
         # --- Run one-time stages (0 .. denoising_idx-1) ---
         for stage in self.stages[:denoising_idx]:
             batch = stage.forward(batch, server_args)
@@ -1731,21 +1745,37 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # them to get the correct 33 frames.
             _vae_decode_temporal_trim = vae.temporal_compression_ratio - 1
 
-            # Capture decode graph
-            sample_dec = torch.randn(
-                1,
-                _z_dim,
-                chunk_latent_num_frames,
-                _H_lat,
-                _W_lat,
-                device=device,
-                dtype=_vae_dtype,
-            )
-            _vae_decode_runner = VAECudaGraphRunner()
-            _vae_decode_runner.capture(vae._decode, sample_dec)
-            del sample_dec
-
-            logger.info("VAE CUDA graph captured for decode")
+            # Reuse the CUDA graph across requests when the shape matches
+            # AND parameter addresses haven't changed.  The ImageVAEEncoding
+            # stage calls vae.to("cpu") after encoding the condition image,
+            # so the next vae.to(device) gives new GPU addresses, invaliding
+            # any captured CUDA graph.
+            _dec_shape = (1, _z_dim, chunk_latent_num_frames, _H_lat, _W_lat)
+            _param_ptr = next(vae.decoder.parameters()).data_ptr()
+            _prev = getattr(self, "_vae_decode_runner_cached", None)
+            if (
+                _prev is not None
+                and _prev[0] == _dec_shape
+                and _prev[2] == _param_ptr
+            ):
+                _vae_decode_runner = _prev[1]
+                logger.info("Reusing cached VAE decode CUDA graph for shape %s", _dec_shape)
+            else:
+                # Explicitly destroy old graph before capturing new one to
+                # avoid two CUDA graphs coexisting in the memory pool.
+                if _prev is not None:
+                    del self._vae_decode_runner_cached
+                    _prev = None
+                sample_dec = torch.randn(
+                    *_dec_shape,
+                    device=device,
+                    dtype=_vae_dtype,
+                )
+                _vae_decode_runner = VAECudaGraphRunner()
+                _vae_decode_runner.capture(vae._decode, sample_dec)
+                del sample_dec
+                self._vae_decode_runner_cached = (_dec_shape, _vae_decode_runner, _param_ptr)
+                logger.info("VAE CUDA graph captured for decode, shape %s", _dec_shape)
 
             # NOTE: VAE encode is NOT captured as a CUDA graph.
             # _encode() (single-pass) uses zero-padding at temporal
