@@ -26,7 +26,9 @@ try:
         tilelang_conv2d_forward,
     )
 
-    _use_tilelang_conv2d = _tilelang_conv2d_available()
+    _use_tilelang_conv2d = _tilelang_conv2d_available() and not os.environ.get(
+        "SGLANG_DISABLE_TILELANG_CONV2D"
+    )
 except ImportError:
     _use_tilelang_conv2d = False
 
@@ -36,8 +38,16 @@ try:
         is_available as _fused_norm_silu_available,
     )
 
-    _use_fused_norm_silu = _fused_norm_silu_available() and not os.environ.get(
-        "SGLANG_DISABLE_FUSED_NORM_SILU"
+    # Disabled by default: the Triton kernel computes in f32 and rounds to bf16
+    # once, while PyTorch has multiple bf16 intermediate roundings.  The
+    # single-call difference is tiny (~0.001 mean), but it compounds through
+    # the VAE feature-cache decode path (frame-by-frame with cached temporal
+    # context), causing visible quality degradation over 33 chunks.
+    # Use SGLANG_ENABLE_FUSED_NORM_SILU=1 to force-enable (e.g. with
+    # torch.compile which bypasses the Triton path anyway).
+    _use_fused_norm_silu = (
+        _fused_norm_silu_available()
+        and os.environ.get("SGLANG_ENABLE_FUSED_NORM_SILU") == "1"
     )
 except ImportError:
     _use_fused_norm_silu = False

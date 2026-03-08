@@ -259,6 +259,10 @@ class WanDistConv2d(nn.Conv2d):
             and (self.in_channels, self.out_channels) in TARGET_CHANNEL_PAIRS_2D
         ):
             out = tilelang_conv2d_forward(x_padded, self.weight, self.bias)
+            # TileLang output is channels_last (NHWC physical via permute).
+            # Convert to standard contiguous so downstream view/reshape and
+            # halo_exchange concat work with expected memory layout.
+            out = out.contiguous()
         # channels_last_3d for cuDNN implicit_gemm (activation + weight).
         # Output stays CL3D (no .contiguous()) to avoid costly format conversion.
         elif x_padded.ndim == 5:
