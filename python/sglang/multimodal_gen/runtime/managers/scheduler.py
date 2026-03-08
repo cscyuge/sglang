@@ -244,14 +244,18 @@ class Scheduler:
                     import numpy as np
 
                     chunk_frame_num = getattr(pipeline_config, "chunk_frame_num", 33)
+                    motion_frames_num = getattr(pipeline_config, "motion_frames_num", 5)
                     fps = 25
                     req.num_frames = chunk_frame_num
                     req.fps = fps
                     req.adjust_frames = False
-                    # Audio must produce exactly chunk_frame_num video frames
-                    # so AudioProjModel's reshape (requires (nframes-1) % 4 == 0)
-                    # works correctly. chunk_frame_num / fps seconds of silence.
-                    n_audio_samples = int(chunk_frame_num / fps * 16000)
+                    # Audio must produce MORE than chunk_frame_num video frames
+                    # so forward() enters the multi-chunk path (which initialises
+                    # VAE torch.compile, VAE CUDA graph, Wav2Vec2 CUDA graph).
+                    # Two chunks is enough: chunk_frame_num + slice_len frames.
+                    slice_len = chunk_frame_num - motion_frames_num
+                    warmup_video_frames = chunk_frame_num + slice_len
+                    n_audio_samples = int(warmup_video_frames / fps * 16000)
                     req.extra["audio_tensor"] = np.zeros(
                         n_audio_samples, dtype=np.float32
                     )
