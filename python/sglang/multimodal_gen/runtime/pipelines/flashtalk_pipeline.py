@@ -9,6 +9,7 @@ Overrides load_modules to support FlashTalk's flat directory structure with
 original (non-diffusers) naming conventions.
 """
 
+import functools
 import gc
 import json
 import os
@@ -106,7 +107,7 @@ def _chunk_frames_to_numpy(chunk_frames: torch.Tensor) -> np.ndarray:
 
 
 def _prepare_audio_cpu(
-    audio_dq: deque,
+    audio_dq_or_snapshot,
     new_samples: np.ndarray | None,
     wav2vec_feature_extractor,
     sample_rate: int,
@@ -115,16 +116,27 @@ def _prepare_audio_cpu(
 ) -> np.ndarray:
     """CPU-only audio preprocessing for one chunk.
 
-    Extends the sliding audio deque, applies loudness normalization,
-    and runs the HuggingFace wav2vec2 feature extractor.  Returns a
-    numpy array ready for ``torch.from_numpy(...).to(device)``.
+    Applies loudness normalization and runs the HuggingFace wav2vec2
+    feature extractor.  Returns a numpy array ready for
+    ``torch.from_numpy(...).to(device)``.
 
     Designed to run in a background thread so GPU VAE decode/encode
     can proceed in parallel.
+
+    When called from the main thread (chunk 0), *audio_dq_or_snapshot*
+    is the live deque and *new_samples* are extended into it.  When
+    called from a background thread, *audio_dq_or_snapshot* must be a
+    numpy snapshot (the caller updates the real deque on the main
+    thread beforehand to avoid a race condition).
     """
-    if new_samples is not None:
-        audio_dq.extend(new_samples.tolist())
-    audio_array = np.array(audio_dq)
+    if isinstance(audio_dq_or_snapshot, deque):
+        # Main-thread path: mutate the deque directly (no race).
+        if new_samples is not None:
+            audio_dq_or_snapshot.extend(new_samples.tolist())
+        audio_array = np.array(audio_dq_or_snapshot)
+    else:
+        # Background-thread path: snapshot already includes new_samples.
+        audio_array = audio_dq_or_snapshot
 
     if pyln_mod is not None and pyln_meter is not None:
         loudness = pyln_meter.integrated_loudness(audio_array)
@@ -413,6 +425,21 @@ def _apply_fp8_quant_to_model(model: torch.nn.Module, fp8_config) -> int:
 
     logger.info("Applied FP8 block quantization to %d linear layers", patched)
     return patched
+
+
+def _ensure_gc_restored(func):
+    """Decorator ensuring gc.disable() inside forward() is always restored on exception."""
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        gc_was_enabled = gc.isenabled()
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            if gc_was_enabled and not gc.isenabled():
+                gc.enable()
+
+    return wrapper
 
 
 class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
@@ -1393,6 +1420,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         raise RuntimeError("FlashTalkDenoisingStage not found in pipeline stages")
 
     @torch.no_grad()
+    @_ensure_gc_restored
     def forward(
         self,
         batch: Req,
@@ -1797,6 +1825,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         # CUDA synchronisation points) is deferred until after the loop.
         _gc_was_enabled = gc.isenabled()
         gc.disable()
+        # The @_ensure_gc_restored decorator guarantees gc.enable() is called
+        # even if an exception aborts the chunk loop.
 
         # Background thread pool for streaming JPEG frame saving.
         # JPEG encoding + disk I/O is pure CPU work (~60-100ms per chunk)
@@ -2450,6 +2480,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # Submit NEXT chunk's audio CPU prep to background thread
             # so it overlaps with VAE decode+encode (~288ms GPU time).
+            # Update the deque on the main thread and pass a snapshot to
+            # avoid a race condition (the background thread must not
+            # mutate the shared deque while the main thread reads it).
             if (
                 _audio_executor is not None
                 and chunk_idx + 1 < num_chunks
@@ -2460,10 +2493,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     if chunk_idx + 1 < len(speech_slices)
                     else None
                 )
+                # Update deque on main thread, then snapshot for bg thread
+                if _next_samples is not None:
+                    audio_dq.extend(_next_samples.tolist())
+                _audio_snapshot = np.array(audio_dq)
                 _audio_future = _audio_executor.submit(
                     _prepare_audio_cpu,
-                    audio_dq,
-                    _next_samples,
+                    _audio_snapshot,
+                    None,  # samples already applied above
                     wav2vec_feature_extractor,
                     sample_rate,
                     _pyln,
