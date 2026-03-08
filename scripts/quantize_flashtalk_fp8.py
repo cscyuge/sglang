@@ -110,7 +110,7 @@ def quantize_block_fp8(
     return weight_fp8, scale_inv
 
 
-def quantize_model(input_path: str, output_path: str) -> None:
+def quantize_model(input_path: str, output_path: str, block_size: int = BLOCK_SIZE) -> None:
     """Quantize FlashTalk model weights to FP8 block-wise format."""
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -144,7 +144,7 @@ def quantize_model(input_path: str, output_path: str) -> None:
             if should_quantize(name):
                 # Quantize to FP8
                 weight_f32 = tensor.float()  # compute in fp32 for precision
-                weight_fp8, scale_inv = quantize_block_fp8(weight_f32)
+                weight_fp8, scale_inv = quantize_block_fp8(weight_f32, block_size)
 
                 output_tensors[name] = weight_fp8
                 output_tensors[f"{name}_scale_inv"] = scale_inv
@@ -157,7 +157,7 @@ def quantize_model(input_path: str, output_path: str) -> None:
                     M, N = tensor.shape
                     dequant = (
                         weight_fp8.float().reshape(
-                            M // BLOCK_SIZE, BLOCK_SIZE, N // BLOCK_SIZE, BLOCK_SIZE
+                            M // block_size, block_size, N // block_size, block_size
                         )
                         * scale_inv.float()[:, None, :, None]
                     )
@@ -198,7 +198,7 @@ def quantize_model(input_path: str, output_path: str) -> None:
                 "quant_method": "fp8",
                 "fmt": "e4m3",
                 "activation_scheme": "dynamic",
-                "weight_block_size": [BLOCK_SIZE, BLOCK_SIZE],
+                "weight_block_size": [block_size, block_size],
             }
             out_config = output_path / config_file.name
             with open(out_config, "w") as f:
@@ -291,10 +291,7 @@ def main():
     )
     args = parser.parse_args()
 
-    global BLOCK_SIZE
-    BLOCK_SIZE = args.block_size
-
-    quantize_model(args.input_path, args.output_path)
+    quantize_model(args.input_path, args.output_path, block_size=args.block_size)
 
 
 if __name__ == "__main__":
