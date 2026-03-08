@@ -123,12 +123,24 @@ class FlashTalkCudaGraphRunner:
         ac_shape = audio_context.shape if audio_context is not None else None
         self._captured_shapes = (hidden_states.shape, ac_shape)
 
-    def replay(self, hidden_states, timestep, audio_context=None):
+    def replay(
+        self, hidden_states, timestep, audio_context=None,
+        encoder_hidden_states=None, encoder_hidden_states_image=None,
+    ):
         """Copy dynamic inputs to static buffers and replay."""
         self.static_hidden_states.copy_(hidden_states)
         self.static_timestep.copy_(timestep)
         if audio_context is not None and self.static_audio_context is not None:
             self.static_audio_context.copy_(audio_context)
+        if encoder_hidden_states is not None:
+            self.static_encoder_hidden_states.copy_(encoder_hidden_states)
+        if (
+            encoder_hidden_states_image is not None
+            and self.static_encoder_hidden_states_image is not None
+        ):
+            self.static_encoder_hidden_states_image.copy_(
+                encoder_hidden_states_image
+            )
         self.graph.replay()
         return self.static_output
 
@@ -430,9 +442,18 @@ class FlashTalkDenoisingStage(PipelineStage):
                     "CUDA Graph captured for DiT forward (%d warmups)",
                     runner.num_warmups,
                 )
-            elif audio_context is not None and runner.static_audio_context is not None:
-                # Same shapes — just update audio context for new chunk
-                runner.static_audio_context.copy_(audio_context)
+            else:
+                # Same shapes — update conditioning for new chunk/request
+                if audio_context is not None and runner.static_audio_context is not None:
+                    runner.static_audio_context.copy_(audio_context)
+                runner.static_encoder_hidden_states.copy_(encoder_hidden_states)
+                if (
+                    encoder_hidden_states_image is not None
+                    and runner.static_encoder_hidden_states_image is not None
+                ):
+                    runner.static_encoder_hidden_states_image.copy_(
+                        encoder_hidden_states_image
+                    )
 
         denoising_start_time = time.time()
         num_steps = len(timesteps) - 1
@@ -467,7 +488,9 @@ class FlashTalkDenoisingStage(PipelineStage):
                     # Single forward pass (no CFG)
                     if use_cuda_graph:
                         noise_pred = runner.replay(
-                            latent_model_input, t_i, audio_context
+                            latent_model_input, t_i, audio_context,
+                            encoder_hidden_states,
+                            encoder_hidden_states_image,
                         )
                     else:
                         with set_forward_context(
