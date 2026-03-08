@@ -112,9 +112,11 @@ class FlashTalkCudaGraphRunner:
                 run_once()
         torch.cuda.current_stream().wait_stream(s)
 
-        # 3. Capture
+        # 3. Capture on the *current* (default) stream so that replay() —
+        # which also runs on the default stream — has no cross-stream
+        # synchronisation gap with the copy_() that precedes it.
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, stream=s):
+        with torch.cuda.graph(self.graph):
             self.static_output = run_once()
 
         self._captured = True

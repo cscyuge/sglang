@@ -119,7 +119,7 @@ def prepare_weight(weight_pytorch: torch.Tensor) -> torch.Tensor:
 
 # Optimal tile configs from sweep on H100
 _BEST_TILES = {
-    (16, 384): (64, 64, 64),
+    (16, 384): (64, 64, 48),  # K_total=3*3*3*16=432, 432%48=0
     (96, 96): (64, 96, 32),
     (192, 192): (64, 64, 32),
     (192, 384): (64, 64, 32),
