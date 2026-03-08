@@ -230,6 +230,8 @@ def _prefetch_audio_full(
     )
 
     # --- GPU Phase: wav2vec + audio_proj on secondary stream ---
+    # Ensure model parameters written on the default stream are visible.
+    overlap_stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(overlap_stream):
         audio_feature_t = (
             torch.from_numpy(audio_feature_np)
@@ -241,10 +243,10 @@ def _prefetch_audio_full(
             chunk_wav2vec = audio_encoder(
                 audio_feature_t, num_video_frames=audio_end_idx
             )
-        windowed_features = chunk_wav2vec[:, s_audio_windowed_idx]
-        audio_context = audio_proj.forward_prewindowed(
-            windowed_features, vae_temporal_factor=vae_temporal_factor
-        )
+            windowed_features = chunk_wav2vec[:, s_audio_windowed_idx]
+            audio_context = audio_proj.forward_prewindowed(
+                windowed_features, vae_temporal_factor=vae_temporal_factor
+            )
 
     event = overlap_stream.record_event()
     return audio_context, chunk_audio_data, used_silence, audio_loaded, event
