@@ -1421,6 +1421,201 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 return i
         raise RuntimeError("FlashTalkDenoisingStage not found in pipeline stages")
 
+    @staticmethod
+    def _post_loop_cleanup(
+        gc_was_enabled: bool,
+        frame_futures: list,
+        frame_executor: ThreadPoolExecutor | None,
+        frame_dir: str | None,
+        audio_executor: ThreadPoolExecutor | None = None,
+        audio_future: "Future | None" = None,
+        audio_prefetch_pool: ThreadPoolExecutor | None = None,
+        rtmp_pusher=None,
+    ) -> None:
+        """Shared post-loop cleanup for both session and normal modes.
+
+        Shuts down audio prefetch pool and RTMP pusher (if provided),
+        re-enables GC, drains frame futures, shuts down executors, and
+        writes the done sentinel for streaming clients.
+        """
+        # Session-specific: shut down audio prefetch pool
+        if audio_prefetch_pool is not None:
+            audio_prefetch_pool.shutdown(wait=False)
+
+        # Session-specific: stop stream pusher FIRST, before gc.collect().
+        # Garbage collection can trigger PyAV container __dealloc__ which
+        # tries av_write_trailer on a broken connection — potentially
+        # hanging rank 0 and causing a gloo broadcast timeout.
+        if rtmp_pusher is not None:
+            rtmp_pusher.stop(timeout=10.0)
+
+        # Re-enable garbage collection (was disabled during chunk loop)
+        if gc_was_enabled:
+            gc.enable()
+            gc.collect()
+
+        # Wait for all background frame saves to finish
+        for fut in frame_futures:
+            try:
+                fut.result()
+            except Exception as e:
+                logger.warning("Background frame save error: %s", e)
+        frame_futures.clear()
+        if frame_executor is not None:
+            frame_executor.shutdown(wait=False)
+
+        # Normal-mode: drain pending audio future and shut down executor
+        if audio_executor is not None:
+            if audio_future is not None:
+                try:
+                    audio_future.result()
+                except Exception:
+                    pass
+            audio_executor.shutdown(wait=False)
+
+        # Write done sentinel for streaming clients
+        if frame_dir:
+            try:
+                with open(os.path.join(frame_dir, "done"), "w") as _df:
+                    pass
+            except Exception:
+                pass
+
+    @staticmethod
+    def _save_streaming_frames(
+        chunk_frames: torch.Tensor,
+        chunk_idx: int,
+        frame_dir: str | None,
+        frame_executor: ThreadPoolExecutor | None,
+        frame_futures: list,
+        frames_per_chunk: int,
+        rtmp_pusher=None,
+        chunk_audio_data=None,
+    ) -> None:
+        """Save per-chunk JPEG frames for streaming and optionally push via RTMP/SRT.
+
+        D2H transfer happens on the calling thread (~1-2ms), then JPEG
+        encoding + disk I/O runs in a background thread so the GPU can
+        start the next chunk immediately.
+        """
+        need_frames_np = (
+            (frame_dir and frame_executor is not None)
+            or (rtmp_pusher is not None and not rtmp_pusher.failed)
+        )
+        frames_np = None
+        if need_frames_np:
+            try:
+                frames_np = _chunk_frames_to_numpy(chunk_frames)
+            except Exception as e:
+                logger.warning(
+                    "Frame conversion failed for chunk %d: %s", chunk_idx, e
+                )
+        if frames_np is not None and frame_dir and frame_executor is not None:
+            try:
+                frame_futures.append(
+                    frame_executor.submit(
+                        _save_chunk_frames_for_streaming,
+                        frames_np,
+                        frame_dir,
+                        chunk_idx,
+                        frames_per_chunk,
+                    )
+                )
+            except Exception as e:
+                logger.warning(
+                    "Streaming frame save failed for chunk %d: %s", chunk_idx, e
+                )
+        if frames_np is not None and rtmp_pusher is not None and not rtmp_pusher.failed:
+            try:
+                if not rtmp_pusher._started:
+                    rtmp_pusher.start()
+                    logger.info("Stream pusher connected on first chunk")
+                rtmp_pusher.push_chunk(frames_np, chunk_audio_data)
+            except Exception as e:
+                logger.warning(
+                    "RTMP push failed for chunk %d: %s", chunk_idx, e
+                )
+
+    @staticmethod
+    def _vae_decode_color_correct_motion_carry(
+        batch: Req,
+        vae,
+        vae_dtype: torch.dtype,
+        sc_dev: torch.Tensor,
+        sf_dev: torch.Tensor,
+        use_vae_cuda_graph: bool,
+        _vae_decode_runner,
+        _vae_decode_temporal_trim: int,
+        color_correction_stage,
+        motion_frames_num: int,
+        server_args,
+        device: torch.device,
+        skip_vae_offload: bool,
+    ) -> tuple[torch.Tensor, "Req"]:
+        """Shared VAE decode → color correct → motion carry logic.
+
+        Returns (chunk_frames_01, batch) where chunk_frames_01 is in [0, 1]
+        with the motion_frames_num prefix trimmed, and batch has updated
+        motion_latent.
+        """
+        if not use_vae_cuda_graph:
+            vae.to(device=device, dtype=vae_dtype)
+
+        # Denormalize latents
+        denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
+        denorm_latents = denoised_latents / sc_dev + sf_dev
+
+        # VAE decode
+        denorm_latents = denorm_latents.to(vae_dtype)
+        if use_vae_cuda_graph:
+            videos = _vae_decode_runner.replay(denorm_latents)
+            videos = videos[:, :, _vae_decode_temporal_trim:].clone()
+        else:
+            videos = vae.decode(denorm_latents)
+        del denorm_latents
+
+        # Color correction (operates on [-1, 1])
+        batch.output = videos
+        batch = color_correction_stage.forward(batch, server_args)
+        videos_corrected = batch.output
+        del videos
+
+        # Motion carry: last frames → VAE encode → normalize
+        cond_frame = videos_corrected[:, :, -motion_frames_num:].clone()
+        cond_frame = cond_frame.to(vae_dtype)
+        latent_dist = vae.encode(cond_frame)
+        if isinstance(latent_dist, DiagonalGaussianDistribution):
+            motion_latent_raw = latent_dist.mode()
+        elif hasattr(latent_dist, "latent_dist"):
+            motion_latent_raw = latent_dist.latent_dist.mode()
+        else:
+            motion_latent_raw = latent_dist
+        del cond_frame
+
+        # Convert to [0, 1]
+        corrected = (videos_corrected + 1) / 2
+        corrected = corrected.clamp(0, 1)
+        del videos_corrected
+
+        # Normalize the motion latent in float32
+        motion_latent_f32 = motion_latent_raw.float()
+        motion_latent_normalized = (motion_latent_f32 - sf_dev) * sc_dev
+        batch.extra["motion_latent"] = motion_latent_normalized
+
+        # Offload VAE if configured
+        if (
+            server_args.vae_cpu_offload
+            and not skip_vae_offload
+            and not use_vae_cuda_graph
+        ):
+            vae.to("cpu", non_blocking=True)
+
+        # Extract non-overlapping frames
+        chunk_frames = corrected[:, :, motion_frames_num:].clone()
+        del corrected
+
+        return chunk_frames, batch
+
     @torch.no_grad()
     @_ensure_gc_restored
     def forward(
@@ -1874,6 +2069,40 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         if _frame_dir:
             _frame_executor = ThreadPoolExecutor(max_workers=1)
 
+        # Pre-compute loop-invariant values (shared by Session and Normal)
+        dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
+        gen = (
+            batch.generator[0]
+            if isinstance(batch.generator, list)
+            else batch.generator
+        )
+        z_dim = pipeline_config.vae_config.arch_config.z_dim
+        vae_spatial_stride = 8
+        vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
+        latent_shape = (
+            1,
+            z_dim,
+            chunk_latent_num_frames,
+            batch.height // vae_spatial_stride,
+            batch.width // vae_spatial_stride,
+        )
+        sf_dev = shift_factor.to(device=device)
+        sc_dev = scaling_factor.to(device=device)
+
+        # Pre-compute audio window tensors (constant across chunks).
+        _audio_windowed_idx = None
+        if use_streaming_audio:
+            _audio_half_w = audio_proj.audio_window_first // 2
+            _audio_window_offsets = torch.arange(
+                -_audio_half_w, _audio_half_w + 1, device=device
+            )
+            _audio_frame_indices = torch.arange(
+                audio_start_idx, audio_end_idx, device=device
+            )
+            _audio_windowed_idx = (
+                _audio_frame_indices.unsqueeze(1) + _audio_window_offsets.unsqueeze(0)
+            ).clamp(0, audio_end_idx - 1)
+
         # ================================================================
         # SESSION MODE: open-ended chunk loop with audio from files
         # ================================================================
@@ -1884,26 +2113,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _silence_samples = slice_len * sample_rate // fps  # 17920
             _chunk_wall_time = slice_len / fps  # ~1.12s
             _end_path = os.path.join(session_dir, "end")
-
-            # Pre-compute loop-invariant values
-            dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
-            gen = (
-                batch.generator[0]
-                if isinstance(batch.generator, list)
-                else batch.generator
-            )
-            z_dim = pipeline_config.vae_config.arch_config.z_dim
-            vae_spatial_stride = 8
-            vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
-            latent_shape = (
-                1,
-                z_dim,
-                chunk_latent_num_frames,
-                batch.height // vae_spatial_stride,
-                batch.width // vae_spatial_stride,
-            )
-            sf_dev = shift_factor.to(device=device)
-            sc_dev = scaling_factor.to(device=device)
 
             # Optional push streamer (lazy-start: connect on first chunk
             # to avoid CDN timeout while waiting for initial audio).
@@ -1934,21 +2143,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     except Exception as e:
                         logger.warning("Failed to create stream pusher: %s", e)
                         _rtmp_pusher = None
-
-            # Pre-compute audio window tensors (constant across chunks)
-            _s_audio_half_w = None
-            _s_audio_windowed_idx = None
-            if use_streaming_audio:
-                _s_audio_half_w = audio_proj.audio_window_first // 2
-                _s_window_offsets = torch.arange(
-                    -_s_audio_half_w, _s_audio_half_w + 1, device=device
-                )
-                _s_frame_indices = torch.arange(
-                    audio_start_idx, audio_end_idx, device=device
-                )
-                _s_audio_windowed_idx = (
-                    _s_frame_indices.unsqueeze(1) + _s_window_offsets.unsqueeze(0)
-                ).clamp(0, audio_end_idx - 1)
 
             # Audio overlap: prefetch next chunk's CPU + GPU audio processing
             # during VAE decode to hide the ~30ms audio processing latency.
@@ -2082,7 +2276,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             audio_feature_t, num_video_frames=audio_end_idx
                         )
 
-                    windowed_features = chunk_wav2vec[:, _s_audio_windowed_idx]
+                    windowed_features = chunk_wav2vec[:, _audio_windowed_idx]
 
                     audio_proj.to(device)
                     batch.extra["audio_context"] = audio_proj.forward_prewindowed(
@@ -2106,24 +2300,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 batch = denoising_stage.forward(batch, server_args)
 
                 # d. VAE decode + color correct + motion carry
-                if not use_vae_cuda_graph:
-                    vae.to(device=device, dtype=vae_dtype)
-
-                denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
-                denorm_latents = denoised_latents / sc_dev + sf_dev
-
-                denorm_latents = denorm_latents.to(vae_dtype)
-                if use_vae_cuda_graph:
-                    videos = _vae_decode_runner.replay(denorm_latents)
-                    videos = videos[:, :, _vae_decode_temporal_trim:].clone()
-                else:
-                    videos = vae.decode(denorm_latents)
-                del denorm_latents
-
                 # Launch audio prefetch for next chunk on secondary stream.
-                # VAE decode is now queued on the default stream (async);
                 # CPU audio preprocessing + GPU wav2vec/audio_proj can run
-                # concurrently while we wait for decode to finish.
+                # concurrently while VAE decode+encode runs on the default stream.
                 _audio_prefetch_future: Future | None = None
                 if _enable_audio_overlap and _audio_prefetch_pool is not None:
                     _audio_prefetch_future = _audio_prefetch_pool.submit(
@@ -2141,45 +2320,17 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         audio_proj,
                         device,
                         audio_end_idx,
-                        _s_audio_windowed_idx,
+                        _audio_windowed_idx,
                         vae_temporal_factor,
                         _audio_overlap_stream,
                     )
 
-                batch.output = videos
-                batch = color_correction_stage.forward(batch, server_args)
-                videos_corrected = batch.output
-                del videos
-
-                cond_frame = videos_corrected[:, :, -motion_frames_num:].clone()
-                cond_frame = cond_frame.to(vae_dtype)
-                latent_dist = vae.encode(cond_frame)
-                if isinstance(latent_dist, DiagonalGaussianDistribution):
-                    motion_latent_raw = latent_dist.mode()
-                elif hasattr(latent_dist, "latent_dist"):
-                    motion_latent_raw = latent_dist.latent_dist.mode()
-                else:
-                    motion_latent_raw = latent_dist
-                del cond_frame
-
-                corrected = (videos_corrected + 1) / 2
-                corrected = corrected.clamp(0, 1)
-                del videos_corrected
-
-                motion_latent_f32 = motion_latent_raw.float()
-                motion_latent_normalized = (motion_latent_f32 - sf_dev) * sc_dev
-                batch.extra["motion_latent"] = motion_latent_normalized
-
-                if (
-                    server_args.vae_cpu_offload
-                    and not skip_vae_offload
-                    and not use_vae_cuda_graph
-                ):
-                    vae.to("cpu", non_blocking=True)
-
-                # e. Collect frames
-                chunk_frames = corrected[:, :, motion_frames_num:].clone()
-                del corrected
+                chunk_frames, batch = self._vae_decode_color_correct_motion_carry(
+                    batch, vae, vae_dtype, sc_dev, sf_dev,
+                    use_vae_cuda_graph, _vae_decode_runner, _vae_decode_temporal_trim,
+                    color_correction_stage, motion_frames_num, server_args, device,
+                    skip_vae_offload,
+                )
                 # Session mode: frames are already streamed via fMP4,
                 # skip accumulating on GPU to avoid OOM on long sessions.
                 if not is_session:
@@ -2192,44 +2343,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             _pf.write(f"{chunk_idx + 1} -1")
                     except Exception:
                         pass
-                # Compute frames_np once if needed by JPEG saving or RTMP push
-                _need_frames_np = (
-                    (_frame_dir and _frame_executor is not None)
-                    or (_rtmp_pusher is not None and not _rtmp_pusher.failed)
+                self._save_streaming_frames(
+                    chunk_frames, chunk_idx, _frame_dir, _frame_executor,
+                    _frame_futures, _frames_per_chunk,
+                    rtmp_pusher=_rtmp_pusher, chunk_audio_data=chunk_audio_data,
                 )
-                frames_np = None
-                if _need_frames_np:
-                    try:
-                        frames_np = _chunk_frames_to_numpy(chunk_frames)
-                    except Exception as e:
-                        logger.warning(
-                            "Frame conversion failed for chunk %d: %s", chunk_idx, e
-                        )
-                if frames_np is not None and _frame_dir and _frame_executor is not None:
-                    try:
-                        _frame_futures.append(
-                            _frame_executor.submit(
-                                _save_chunk_frames_for_streaming,
-                                frames_np,
-                                _frame_dir,
-                                chunk_idx,
-                                _frames_per_chunk,
-                            )
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Session frame save failed for chunk %d: %s", chunk_idx, e
-                        )
-                if frames_np is not None and _rtmp_pusher is not None and not _rtmp_pusher.failed:
-                    try:
-                        if not _rtmp_pusher._started:
-                            _rtmp_pusher.start()
-                            logger.info("Stream pusher connected on first chunk")
-                        _rtmp_pusher.push_chunk(frames_np, chunk_audio_data)
-                    except Exception as e:
-                        logger.warning(
-                            "RTMP push failed for chunk %d: %s", chunk_idx, e
-                        )
                 del chunk_frames
 
                 # Collect audio prefetch result (should be done by now:
@@ -2281,42 +2399,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # --- Session post-loop ---
             logger.info("Session post-loop: starting cleanup")
-
-            # Shut down audio prefetch pool
-            if _audio_prefetch_pool is not None:
-                _audio_prefetch_pool.shutdown(wait=False)
-                _audio_prefetch_pool = None
-                _prefetched_result = None
-
-            # Stop stream pusher FIRST, before gc.collect().  Garbage
-            # collection can trigger PyAV container __dealloc__ which
-            # tries av_write_trailer on a broken connection — potentially
-            # hanging rank 0 and causing a gloo broadcast timeout.
-            if _rtmp_pusher is not None:
-                _rtmp_pusher.stop(timeout=10.0)
-                _rtmp_pusher = None  # break reference before GC
-
-            if _gc_was_enabled:
-                gc.enable()
-                gc.collect()
-
-            # Wait for all background frame saves to finish
-            for fut in _frame_futures:
-                try:
-                    fut.result()
-                except Exception as e:
-                    logger.warning("Background frame save error: %s", e)
-            _frame_futures.clear()
-            if _frame_executor is not None:
-                _frame_executor.shutdown(wait=False)
-
-            if _frame_dir:
-                try:
-                    with open(os.path.join(_frame_dir, "done"), "w") as _df:
-                        pass
-                except Exception:
-                    pass
-
+            self._post_loop_cleanup(
+                _gc_was_enabled, _frame_futures, _frame_executor, _frame_dir,
+                audio_prefetch_pool=_audio_prefetch_pool,
+                rtmp_pusher=_rtmp_pusher,
+            )
+            _audio_prefetch_pool = None
+            _prefetched_result = None
+            _rtmp_pusher = None  # break reference after cleanup
             logger.info("Session post-loop: cleanup complete")
 
             if not all_chunk_frames:
@@ -2339,40 +2429,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         # ================================================================
         # NORMAL MULTI-CHUNK MODE (existing code)
         # ================================================================
-        # Pre-compute loop invariants to avoid per-chunk Python overhead.
-        dit_dtype = PRECISION_TO_TYPE[pipeline_config.precision]
-        gen = (
-            batch.generator[0] if isinstance(batch.generator, list) else batch.generator
-        )
-        z_dim = pipeline_config.vae_config.arch_config.z_dim
-        vae_spatial_stride = 8  # WanVAE spatial stride
-        latent_shape = (
-            1,
-            z_dim,
-            chunk_latent_num_frames,
-            batch.height // vae_spatial_stride,
-            batch.width // vae_spatial_stride,
-        )
-        vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
-        sf_dev = shift_factor.to(device=device)
-        sc_dev = scaling_factor.to(device=device)
-
-        # Pre-compute audio window tensors (constant across chunks).
-        _audio_half_w = None
-        _audio_window_offsets = None
-        _audio_frame_indices = None
-        if use_streaming_audio:
-            _audio_half_w = audio_proj.audio_window_first // 2  # 2
-            _audio_window_offsets = torch.arange(
-                -_audio_half_w, _audio_half_w + 1, device=device
-            )
-            _audio_frame_indices = torch.arange(
-                audio_start_idx, audio_end_idx, device=device
-            )
-            _audio_windowed_idx = (
-                _audio_frame_indices.unsqueeze(1) + _audio_window_offsets.unsqueeze(0)
-            ).clamp(0, audio_end_idx - 1)
-
         # Thread executor for overlapping CPU audio prep with GPU work.
         _audio_executor: ThreadPoolExecutor | None = None
         _audio_future: Future | None = None
@@ -2474,12 +2530,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             batch = denoising_stage.forward(batch, server_args)
 
             # d+e+f. Decode → color correct → motion carry
-            # Match the original FlashTalk flow:
-            # 1. Denormalize latents  2. VAE decode → [-1, 1]
-            # 3. Color correct in [-1, 1]  4. Motion carry → VAE encode → normalize
-            if not use_vae_cuda_graph:
-                vae.to(device=device, dtype=vae_dtype)
-
             # Submit NEXT chunk's audio CPU prep to background thread
             # so it overlaps with VAE decode+encode (~288ms GPU time).
             # Update the deque on the main thread and pass a snapshot to
@@ -2509,62 +2559,12 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _pyln_meter,
                 )
 
-            # Denormalize latents (like DecodingStage.scale_and_shift)
-            denoised_latents = batch.latents.to(device=device, dtype=torch.float32)
-            denorm_latents = denoised_latents / sc_dev + sf_dev
-
-            # VAE decode
-            denorm_latents = denorm_latents.to(vae_dtype)
-            if use_vae_cuda_graph:
-                videos = _vae_decode_runner.replay(denorm_latents)
-                videos = videos[:, :, _vae_decode_temporal_trim:].clone()
-            else:
-                videos = vae.decode(denorm_latents)  # [-1, 1]
-            del denorm_latents
-
-            # Color correction (operates on [-1, 1])
-            batch.output = videos
-            batch = color_correction_stage.forward(batch, server_args)
-            videos_corrected = batch.output  # [-1, 1]
-            del videos
-
-            # Motion carry: last 5 frames in [-1, 1] → VAE encode
-            # .clone() ensures contiguous memory for VAE encode and
-            # releases the reference to the full decoded video tensor.
-            cond_frame = videos_corrected[:, :, -motion_frames_num:].clone()
-            cond_frame = cond_frame.to(vae_dtype)
-            latent_dist = vae.encode(cond_frame)
-            if isinstance(latent_dist, DiagonalGaussianDistribution):
-                motion_latent_raw = latent_dist.mode()
-            elif hasattr(latent_dist, "latent_dist"):
-                motion_latent_raw = latent_dist.latent_dist.mode()
-            else:
-                motion_latent_raw = latent_dist
-            del cond_frame
-
-            # Convert to [0, 1] for chunk frame collection
-            corrected = (videos_corrected + 1) / 2  # [0, 1]
-            corrected = corrected.clamp(0, 1)
-            del videos_corrected
-
-            # Normalize the motion latent in float32
-            motion_latent_f32 = motion_latent_raw.float()
-            motion_latent_normalized = (motion_latent_f32 - sf_dev) * sc_dev
-            batch.extra["motion_latent"] = motion_latent_normalized
-
-            # Offload VAE if configured (skip when keeping on GPU for SP)
-            if (
-                server_args.vae_cpu_offload
-                and not skip_vae_offload
-                and not use_vae_cuda_graph
-            ):
-                vae.to("cpu", non_blocking=True)
-
-            # g. Collect non-overlapping frames (skip first motion_frames_num)
-            # .clone() releases the full corrected tensor (33 frames) and
-            # keeps only the 28 new frames, reducing memory pressure.
-            chunk_frames = corrected[:, :, motion_frames_num:].clone()
-            del corrected
+            chunk_frames, batch = self._vae_decode_color_correct_motion_carry(
+                batch, vae, vae_dtype, sc_dev, sf_dev,
+                use_vae_cuda_graph, _vae_decode_runner, _vae_decode_temporal_trim,
+                color_correction_stage, motion_frames_num, server_args, device,
+                skip_vae_offload,
+            )
             all_chunk_frames.append(chunk_frames)
 
             # Write progress file for HTTP polling
@@ -2575,26 +2575,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 except Exception:
                     pass
 
-            # Save per-chunk JPEG frames for real-time MJPEG streaming
-            # D2H transfer happens here on the main thread (~1-2ms), then JPEG
-            # encoding + disk I/O (~60-100ms) runs in a background thread so
-            # the GPU can start the next chunk's audio/denoising immediately.
-            if _frame_dir and _frame_executor is not None:
-                try:
-                    frames_np = _chunk_frames_to_numpy(chunk_frames)
-                    _frame_futures.append(
-                        _frame_executor.submit(
-                            _save_chunk_frames_for_streaming,
-                            frames_np,
-                            _frame_dir,
-                            chunk_idx,
-                            _frames_per_chunk,
-                        )
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Streaming frame save failed for chunk %d: %s", chunk_idx, e
-                    )
+            self._save_streaming_frames(
+                chunk_frames, chunk_idx, _frame_dir, _frame_executor,
+                _frame_futures, _frames_per_chunk,
+            )
 
             # Per-chunk timing summary (skip chunk 1 which includes compile)
             _t_chunk = time.time() - chunk_start
@@ -2622,36 +2606,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     logger.warning("Debug chunk save failed: %s", e)
 
         # --- Concatenate all chunks & return ---
-        # Re-enable garbage collection (was disabled during chunk loop)
-        if _gc_was_enabled:
-            gc.enable()
-            gc.collect()
-
-        # Wait for all background frame saves to finish before writing "done"
-        for fut in _frame_futures:
-            try:
-                fut.result()
-            except Exception as e:
-                logger.warning("Background frame save error: %s", e)
-        _frame_futures.clear()
-        if _frame_executor is not None:
-            _frame_executor.shutdown(wait=False)
-        if _audio_executor is not None:
-            # Drain any pending future to avoid thread leak
-            if _audio_future is not None:
-                try:
-                    _audio_future.result()
-                except Exception:
-                    pass
-            _audio_executor.shutdown(wait=False)
-
-        # Write done sentinel for streaming clients
-        if _frame_dir:
-            try:
-                with open(os.path.join(_frame_dir, "done"), "w") as _df:
-                    pass
-            except Exception:
-                pass
+        self._post_loop_cleanup(
+            _gc_was_enabled, _frame_futures, _frame_executor, _frame_dir,
+            audio_executor=_audio_executor, audio_future=_audio_future,
+        )
 
         if _cancelled and not all_chunk_frames:
             logger.info("Cancelled before any chunk completed — returning empty output")
