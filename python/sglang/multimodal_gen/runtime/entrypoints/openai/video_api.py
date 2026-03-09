@@ -1148,67 +1148,82 @@ async def _fmp4_generator(
         if delay > 0:
             await asyncio.sleep(delay)
 
-    while True:
-        frame_path = os.path.join(frame_dir, f"frame_{frame_idx:05d}.jpg")
-        if os.path.exists(frame_path):
-            stall_count = 0
-            try:
-                rgb = await asyncio.to_thread(_read_jpeg_as_rgb, frame_path)
-                new_bytes = _encode_one_frame(frame_idx, rgb)
-                if new_bytes:
-                    if is_session_audio and frame_idx < 5:
-                        logger.info(
-                            "fMP4 session: yielding %d bytes at frame %d",
-                            len(new_bytes),
-                            frame_idx,
-                        )
-                    yield new_bytes
-
-            except Exception as e:
-                logger.debug("fMP4 encode error at frame %d: %s", frame_idx, e)
-                continue  # retry on next iteration
-
-            frame_idx += 1
-            await _pace_playback(frame_idx)
-        else:
-            # Check if generation is done
-            done_path = os.path.join(frame_dir, "done")
-            if os.path.exists(done_path):
-                # Drain remaining frames
-                while True:
-                    frame_path = os.path.join(frame_dir, f"frame_{frame_idx:05d}.jpg")
-                    if not os.path.exists(frame_path):
-                        break
-                    try:
-                        rgb = await asyncio.to_thread(_read_jpeg_as_rgb, frame_path)
-                        new_bytes = _encode_one_frame(frame_idx, rgb)
-                        if new_bytes:
-                            yield new_bytes
-                    except Exception:
-                        break
-
-                    frame_idx += 1
-                    await _pace_playback(frame_idx)
-                break
-
-            stall_count += 1
-            if stall_count >= max_stall:
-                break
-            await asyncio.sleep(0.1)
-
-    # ── Flush encoders and close container ──
+    # Wrap the streaming loop in try/finally to ensure the container is
+    # closed even when the client disconnects (GeneratorExit at yield).
+    _container_closed = False
     try:
-        for packet in video_stream.encode():
-            container.mux(packet)
-        if audio_stream is not None:
-            for packet in audio_stream.encode():
+        while True:
+            frame_path = os.path.join(frame_dir, f"frame_{frame_idx:05d}.jpg")
+            if os.path.exists(frame_path):
+                stall_count = 0
+                try:
+                    rgb = await asyncio.to_thread(_read_jpeg_as_rgb, frame_path)
+                    new_bytes = _encode_one_frame(frame_idx, rgb)
+                    if new_bytes:
+                        if is_session_audio and frame_idx < 5:
+                            logger.info(
+                                "fMP4 session: yielding %d bytes at frame %d",
+                                len(new_bytes),
+                                frame_idx,
+                            )
+                        yield new_bytes
+
+                except Exception as e:
+                    logger.debug("fMP4 encode error at frame %d: %s", frame_idx, e)
+                    continue  # retry on next iteration
+
+                frame_idx += 1
+                await _pace_playback(frame_idx)
+            else:
+                # Check if generation is done
+                done_path = os.path.join(frame_dir, "done")
+                if os.path.exists(done_path):
+                    # Drain remaining frames
+                    while True:
+                        frame_path = os.path.join(
+                            frame_dir, f"frame_{frame_idx:05d}.jpg"
+                        )
+                        if not os.path.exists(frame_path):
+                            break
+                        try:
+                            rgb = await asyncio.to_thread(
+                                _read_jpeg_as_rgb, frame_path
+                            )
+                            new_bytes = _encode_one_frame(frame_idx, rgb)
+                            if new_bytes:
+                                yield new_bytes
+                        except Exception:
+                            break
+
+                        frame_idx += 1
+                        await _pace_playback(frame_idx)
+                    break
+
+                stall_count += 1
+                if stall_count >= max_stall:
+                    break
+                await asyncio.sleep(0.1)
+
+        # ── Flush encoders and close container ──
+        try:
+            for packet in video_stream.encode():
                 container.mux(packet)
-        container.close()
-        final_bytes = _flush_buf()
-        if final_bytes:
-            yield final_bytes
-    except Exception as e:
-        logger.debug("fMP4 finalize error: %s", e)
+            if audio_stream is not None:
+                for packet in audio_stream.encode():
+                    container.mux(packet)
+            container.close()
+            _container_closed = True
+            final_bytes = _flush_buf()
+            if final_bytes:
+                yield final_bytes
+        except Exception as e:
+            logger.debug("fMP4 finalize error: %s", e)
+    finally:
+        if not _container_closed:
+            try:
+                container.close()
+            except Exception:
+                pass
 
     # Schedule cleanup (session mode cleanup is handled by _dispatch_session_async)
     if not is_session_audio:

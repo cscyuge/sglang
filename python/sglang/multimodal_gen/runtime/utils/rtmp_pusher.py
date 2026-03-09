@@ -104,6 +104,7 @@ class StreamPusher:
         )
         self._thread: Optional[threading.Thread] = None
         self._container = None  # set by _run(); used by stop() to force-close
+        self._container_lock = threading.Lock()
         self._failed = False
         self._started = False
         self._frame_count = 0
@@ -186,10 +187,11 @@ class StreamPusher:
         ``container.close()`` → ``av_write_trailer()`` hangs on a
         broken TCP connection (half-open socket, no RST received).
         """
-        c = self._container
-        if c is None:
-            return
-        self._container = None  # clear first so GC/other threads skip it
+        with self._container_lock:
+            c = self._container
+            if c is None:
+                return
+            self._container = None  # clear first so _run() finally block skips it
 
         def _do_close():
             try:
@@ -214,7 +216,8 @@ class StreamPusher:
             container = av.open(
                 self._url, mode="w", format=self._container_format
             )
-            self._container = container  # expose for force-close in stop()
+            with self._container_lock:
+                self._container = container  # expose for force-close in stop()
         except Exception as exc:
             logger.error(
                 "%s pusher: failed to open %s: %s",
@@ -262,8 +265,10 @@ class StreamPusher:
             # Only close if _container is still set — if stop() already
             # called _force_close_container(), _container is None and we
             # must NOT call close() again (PyAV internal lock deadlock).
-            if self._container is not None:
+            with self._container_lock:
+                should_close = self._container is not None
                 self._container = None
+            if should_close:
                 try:
                     container.close()
                 except Exception:
