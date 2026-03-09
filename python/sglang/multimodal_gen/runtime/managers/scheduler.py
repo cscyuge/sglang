@@ -225,6 +225,12 @@ class Scheduler:
                         negative_prompt="",
                         image_path=[input_path],
                     )
+                    # Req() lazily creates SamplingParams with width/height=None
+                    # (triggering __post_init__ to set *_not_provided=True), then
+                    # sets width/height AFTER construction.  Fix the stale flags
+                    # so InputValidationStage respects the warmup resolution.
+                    req.width_not_provided = False
+                    req.height_not_provided = False
                 else:
                     req = Req(
                         data_type=task_type.data_type(),
@@ -232,6 +238,8 @@ class Scheduler:
                         height=height,
                         prompt="",
                     )
+                    req.width_not_provided = False
+                    req.height_not_provided = False
 
                 # FlashTalk-specific warmup: set correct frame count and
                 # provide dummy audio so the audio encoder, audio cross-
