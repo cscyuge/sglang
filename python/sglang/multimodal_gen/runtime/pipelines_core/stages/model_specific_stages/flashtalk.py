@@ -163,6 +163,7 @@ class FlashTalkDenoisingStage(PipelineStage):
         self._cuda_graph_runner: FlashTalkCudaGraphRunner | None = None
         # TeaCache adaptive step reduction state
         self._prev_audio_context: torch.Tensor | None = None
+        self._prev_request_id: str | None = None
         self._teacache_reduced: int = 0
         self._teacache_total_chunks: int = 0
         self._deep_gemm_configured: bool = False
@@ -313,13 +314,21 @@ class FlashTalkDenoisingStage(PipelineStage):
         ):
             self._teacache_total_chunks += 1
 
+            # Reset state on new request to avoid cross-request leakage
+            current_request_id = getattr(batch, "request_id", None)
+            if current_request_id != self._prev_request_id:
+                self._prev_audio_context = None
+                self._prev_request_id = current_request_id
+
             if self._prev_audio_context is not None:
                 diff = audio_context - self._prev_audio_context
-                rel_l1 = (
-                    (diff.abs().mean() / self._prev_audio_context.abs().mean())
-                    .cpu()
-                    .item()
-                )
+                prev_mean = self._prev_audio_context.abs().mean()
+                if prev_mean > 0:
+                    rel_l1 = (diff.abs().mean() / prev_mean).cpu().item()
+                else:
+                    # Silence → treat as maximally different to avoid
+                    # incorrectly reducing steps.
+                    rel_l1 = float("inf")
                 if rel_l1 < batch.teacache_params.teacache_thresh:
                     base_num_steps = max(2, base_num_steps // 2)
                     reduced_steps = True
