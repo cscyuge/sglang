@@ -105,8 +105,10 @@ class StreamPusher:
         self._thread: Optional[threading.Thread] = None
         self._container = None  # set by _run(); used by stop() to force-close
         self._container_lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._failed = False
         self._started = False
+        self._abandoned = False
         self._frame_count = 0
 
     @property
@@ -159,6 +161,8 @@ class StreamPusher:
         """Signal the thread to flush remaining items and exit."""
         if not self._started:
             return
+        # Signal the drain loop to stop checking the queue.
+        self._stop_event.set()
         # Drain the queue first to guarantee room for the sentinel.
         # Without this, put(None) can block forever if the drain thread
         # is stuck (e.g., broken pipe in mux) and the queue is full.
@@ -178,6 +182,9 @@ class StreamPusher:
                 # _container is None, avoiding a deadlock where both
                 # threads call close() on the same PyAV container.
                 self._force_close_container()
+                # Mark as abandoned so the _run() finally block also
+                # skips container.close() on its thread-local reference.
+                self._abandoned = True
         self._started = False
 
     def _force_close_container(self) -> None:
@@ -262,9 +269,15 @@ class StreamPusher:
                 logger.error("%s pusher thread error: %s", self._protocol.upper(), exc)
                 self._failed = True
         finally:
-            # Only close if _container is still set — if stop() already
-            # called _force_close_container(), _container is None and we
-            # must NOT call close() again (PyAV internal lock deadlock).
+            # Only close if _container is still set AND stop() hasn't
+            # abandoned us.  If stop() called _force_close_container(),
+            # _container is None and we must NOT call close() again
+            # (PyAV internal lock deadlock).  If _abandoned is True,
+            # stop() already force-closed the container and the
+            # thread-local `container` ref is stale — skip close to
+            # avoid double-close and potential __dealloc__ hangs.
+            if self._abandoned:
+                return
             with self._container_lock:
                 should_close = self._container is not None
                 self._container = None
@@ -278,7 +291,17 @@ class StreamPusher:
         import av
 
         while True:
-            item = self._queue.get()
+            # Use a timeout so we periodically check _stop_event.
+            # This prevents blocking forever when mux() was hanging and
+            # stop() drained the queue + sent a sentinel we missed.
+            try:
+                item = self._queue.get(timeout=2.0)
+            except queue.Empty:
+                if self._stop_event.is_set():
+                    logger.debug("Stream drain loop exiting — stop event set")
+                    break
+                continue
+
             if item is None:
                 # Flush encoders — ignore broken-pipe / connection-reset
                 # errors that occur when the CDN closes first.

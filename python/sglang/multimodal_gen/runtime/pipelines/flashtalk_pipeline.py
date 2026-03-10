@@ -14,6 +14,7 @@ import gc
 import json
 import os
 import re
+import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1437,49 +1438,86 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         Shuts down audio prefetch pool and RTMP pusher (if provided),
         re-enables GC, drains frame futures, shuts down executors, and
         writes the done sentinel for streaming clients.
+
+        The entire cleanup runs inside a daemon thread with a hard 30 s
+        deadline.  If any sub-step hangs (e.g., ``rtmp_pusher.stop()`` on
+        a broken SRT connection, or ``gc.collect()`` triggering PyAV
+        ``__dealloc__``), the deadline ensures this rank still reaches the
+        next ``broadcast_pyobj`` call, preventing a gloo timeout that
+        would kill the scheduler.
         """
-        # Session-specific: shut down audio prefetch pool
-        if audio_prefetch_pool is not None:
-            audio_prefetch_pool.shutdown(wait=False)
 
-        # Session-specific: stop stream pusher FIRST, before gc.collect().
-        # Garbage collection can trigger PyAV container __dealloc__ which
-        # tries av_write_trailer on a broken connection — potentially
-        # hanging rank 0 and causing a gloo broadcast timeout.
-        if rtmp_pusher is not None:
-            rtmp_pusher.stop(timeout=10.0)
+        def _do_cleanup() -> None:
+            # Session-specific: shut down audio prefetch pool
+            if audio_prefetch_pool is not None:
+                audio_prefetch_pool.shutdown(wait=False)
 
-        # Re-enable garbage collection (was disabled during chunk loop)
-        if gc_was_enabled:
-            gc.enable()
-            gc.collect()
+            # Session-specific: stop stream pusher FIRST, before gc.collect().
+            # Garbage collection can trigger PyAV container __dealloc__ which
+            # tries av_write_trailer on a broken connection — potentially
+            # hanging rank 0 and causing a gloo broadcast timeout.
+            if rtmp_pusher is not None:
+                rtmp_pusher.stop(timeout=10.0)
 
-        # Wait for all background frame saves to finish
-        for fut in frame_futures:
-            try:
-                fut.result()
-            except Exception as e:
-                logger.warning("Background frame save error: %s", e)
-        frame_futures.clear()
-        if frame_executor is not None:
-            frame_executor.shutdown(wait=False)
+            # Re-enable garbage collection (was disabled during chunk loop).
+            # Run gc.collect() in a sub-thread with a timeout because PyAV
+            # __dealloc__ can hang indefinitely on broken connections.
+            if gc_was_enabled:
+                gc.enable()
 
-        # Normal-mode: drain pending audio future and shut down executor
-        if audio_executor is not None:
-            if audio_future is not None:
+                def _gc():
+                    gc.collect()
+
+                gc_thread = threading.Thread(target=_gc, daemon=True, name="gc-collect")
+                gc_thread.start()
+                gc_thread.join(timeout=5.0)
+                if gc_thread.is_alive():
+                    logger.warning(
+                        "gc.collect() did not finish within 5 s (likely PyAV __dealloc__ hang), continuing"
+                    )
+
+            # Wait for all background frame saves to finish
+            for fut in frame_futures:
                 try:
-                    audio_future.result()
+                    fut.result(timeout=5.0)
+                except Exception as e:
+                    logger.warning("Background frame save error: %s", e)
+            frame_futures.clear()
+            if frame_executor is not None:
+                frame_executor.shutdown(wait=False)
+
+            # Normal-mode: drain pending audio future and shut down executor
+            if audio_executor is not None:
+                if audio_future is not None:
+                    try:
+                        audio_future.result(timeout=5.0)
+                    except Exception:
+                        pass
+                audio_executor.shutdown(wait=False)
+
+            # Write done sentinel for streaming clients
+            if frame_dir:
+                try:
+                    with open(os.path.join(frame_dir, "done"), "w") as _df:
+                        pass
                 except Exception:
                     pass
-            audio_executor.shutdown(wait=False)
 
-        # Write done sentinel for streaming clients
-        if frame_dir:
-            try:
-                with open(os.path.join(frame_dir, "done"), "w") as _df:
-                    pass
-            except Exception:
-                pass
+        # Run the entire cleanup in a daemon thread with a hard deadline.
+        # This guarantees the rank returns within ~30 s and reaches the
+        # next broadcast_pyobj, preventing gloo desync.
+        _CLEANUP_DEADLINE = 30.0
+        cleanup_thread = threading.Thread(
+            target=_do_cleanup, daemon=True, name="post-loop-cleanup"
+        )
+        cleanup_thread.start()
+        cleanup_thread.join(timeout=_CLEANUP_DEADLINE)
+        if cleanup_thread.is_alive():
+            logger.warning(
+                "_post_loop_cleanup did not finish within %.0f s — "
+                "abandoning to avoid broadcast desync",
+                _CLEANUP_DEADLINE,
+            )
 
     @staticmethod
     def _save_streaming_frames(
