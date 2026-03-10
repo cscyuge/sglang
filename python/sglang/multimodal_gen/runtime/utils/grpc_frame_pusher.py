@@ -58,6 +58,7 @@ class GrpcFramePusher:
         self._queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
         self._thread: Optional[threading.Thread] = None
         self._failed = False
+        self._started = False
         self._frame_count = 0
         self._chunk_index = 0
         self._meta_written = False
@@ -68,10 +69,13 @@ class GrpcFramePusher:
 
     def start(self) -> None:
         """Start the background encoding thread."""
+        if self._started:
+            return
         self._thread = threading.Thread(
             target=self._run, name="grpc-frame-encoder", daemon=True
         )
         self._thread.start()
+        self._started = True
 
     def push_chunk(self, frames_np: np.ndarray, audio_16k: Optional[np.ndarray] = None) -> None:
         """Enqueue a chunk of video frames + optional audio for encoding.
