@@ -33,9 +33,12 @@ _FRAME_TIMEOUT_S = 120.0  # max wait between consecutive frames
 def _get_session_dir(session_id: str) -> str:
     """Resolve the session directory from session_id.
 
-    Mirrors the convention in video_api.py: outputs/sessions/<session_id>/
+    Uses the same path as video_api.py: {output_path}/.sessions/{session_id}/
     """
-    return os.path.join("outputs", "sessions", session_id)
+    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+    server_args = get_global_server_args()
+    return os.path.join(server_args.output_path, ".sessions", session_id)
 
 
 def _parse_video_meta(data: bytes) -> pb2.VideoMeta:
