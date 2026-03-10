@@ -80,7 +80,7 @@ class FlashTalkStreamingServicer(pb2_grpc.FlashTalkStreamingServicer):
         meta_path = os.path.join(frames_dir, "video_meta.bin")
         video_meta = self._wait_for_meta(meta_path, context)
         if video_meta is None:
-            if not context.cancelled():
+            if not context.is_active():
                 context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
                 context.set_details(
                     f"Timed out waiting for video metadata (session={session_id})"
@@ -91,7 +91,7 @@ class FlashTalkStreamingServicer(pb2_grpc.FlashTalkStreamingServicer):
         next_index = 0
         include_meta = True  # attach VideoMeta to first packet
 
-        while not context.cancelled():
+        while context.is_active():
             # Check for end sentinel
             end_path = os.path.join(frames_dir, "end")
             frame_path = os.path.join(frames_dir, f"frame_{next_index:06d}.bin")
@@ -141,7 +141,7 @@ class FlashTalkStreamingServicer(pb2_grpc.FlashTalkStreamingServicer):
         """Poll for video_meta.bin, return parsed VideoMeta or None on timeout."""
         deadline = time.monotonic() + _META_TIMEOUT_S
         while time.monotonic() < deadline:
-            if context.cancelled():
+            if not context.is_active():
                 return None
             if os.path.exists(meta_path):
                 try:
