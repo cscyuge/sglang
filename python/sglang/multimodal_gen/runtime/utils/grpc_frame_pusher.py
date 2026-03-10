@@ -129,7 +129,7 @@ class GrpcFramePusher:
             codec_ctx.width = self._width
             codec_ctx.height = self._height
             codec_ctx.pix_fmt = "yuv420p"
-            codec_ctx.time_base = av.Fraction(1, self._fps)
+            codec_ctx.time_base = __import__('fractions').Fraction(1, self._fps)
             codec_ctx.options = {
                 "preset": "ultrafast",
                 "tune": "zerolatency",
