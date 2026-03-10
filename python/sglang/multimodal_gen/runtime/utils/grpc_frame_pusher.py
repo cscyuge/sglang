@@ -54,6 +54,11 @@ class GrpcFramePusher:
 
         self._frames_dir = os.path.join(session_dir, "grpc_frames")
         os.makedirs(self._frames_dir, exist_ok=True)
+        logger.info(
+            "GrpcFramePusher created: frames_dir=%s (abs=%s)",
+            self._frames_dir,
+            os.path.abspath(self._frames_dir),
+        )
 
         self._queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
         self._thread: Optional[threading.Thread] = None
@@ -196,6 +201,11 @@ class GrpcFramePusher:
                 h264_data=h264_data,
                 pcm_data=pcm_bytes,
             )
+            if self._chunk_index == 0:
+                logger.info(
+                    "gRPC first frame written: h264=%d bytes, pcm=%d bytes, dir=%s",
+                    len(h264_data), len(pcm_bytes), os.path.abspath(self._frames_dir),
+                )
             self._chunk_index += 1
 
     def _write_video_meta(self, extradata: bytes) -> None:

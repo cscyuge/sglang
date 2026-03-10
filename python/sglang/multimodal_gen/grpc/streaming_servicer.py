@@ -77,17 +77,28 @@ class FlashTalkStreamingServicer(pb2_grpc.FlashTalkStreamingServicer):
         session_dir = _get_session_dir(session_id)
         frames_dir = os.path.join(session_dir, "grpc_frames")
 
-        logger.info("StreamFrames started for session %s", session_id)
+        logger.info(
+            "StreamFrames started for session %s, frames_dir=%s, exists=%s",
+            session_id,
+            os.path.abspath(frames_dir),
+            os.path.isdir(frames_dir),
+        )
 
         # Wait for video_meta.bin to appear
         meta_path = os.path.join(frames_dir, "video_meta.bin")
         video_meta = self._wait_for_meta(meta_path, context)
         if video_meta is None:
-            if not context.is_active():
+            if context.is_active():
                 context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
                 context.set_details(
                     f"Timed out waiting for video metadata (session={session_id})"
                 )
+            logger.warning(
+                "StreamFrames: video_meta not found at %s (dir exists=%s, contents=%s)",
+                meta_path,
+                os.path.isdir(frames_dir),
+                os.listdir(frames_dir) if os.path.isdir(frames_dir) else "N/A",
+            )
             return
 
         # Stream frames
