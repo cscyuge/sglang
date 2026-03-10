@@ -1,0 +1,26 @@
+syntax = "proto3";
+package sglang.multimodal_gen;
+
+service FlashTalkStreaming {
+  rpc StreamFrames(StreamFramesRequest) returns (stream FramePacket) {}
+}
+
+message StreamFramesRequest {
+  string session_id = 1;
+}
+
+message FramePacket {
+  uint32 chunk_index = 1;
+  bytes h264_data = 2;       // Raw H.264 NAL units (Annex B)
+  bytes pcm_audio = 3;       // 16kHz float32 mono little-endian
+  uint64 pts_ms = 4;         // Presentation timestamp (ms)
+  bool is_keyframe = 5;
+  VideoMeta video_meta = 6;  // Only in first packet
+}
+
+message VideoMeta {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 fps = 3;
+  bytes codec_extra_data = 4; // H.264 SPS+PPS
+}

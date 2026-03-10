@@ -298,6 +298,9 @@ class ServerArgs:
 
     scheduler_port: int = 5555
 
+    # Optional gRPC port for frame streaming (FlashTalk)
+    grpc_port: int | None = None
+
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
 
@@ -858,6 +861,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.webui_port,
             help="Whether to use webui for better display",
+        )
+        parser.add_argument(
+            "--grpc-port",
+            type=int,
+            default=ServerArgs.grpc_port,
+            help="Port for gRPC frame streaming server (FlashTalk). Disabled if not set.",
         )
         parser.add_argument(
             "--output-path",

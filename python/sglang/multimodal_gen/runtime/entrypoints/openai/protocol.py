@@ -128,6 +128,7 @@ class SessionResponse(BaseModel):
     stream_url: Optional[str] = None
     events_url: Optional[str] = None
     rtmp_push_url: Optional[str] = None
+    stream_mode: Optional[str] = None  # "grpc" or None (default RTMP/SRT)
     created_at: int = Field(default_factory=lambda: int(time.time()))
     chunks_received: int = 0
     chunks_processed: int = 0

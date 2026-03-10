@@ -189,6 +189,11 @@ def launch_http_server_only(server_args):
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
     app = create_app(server_args)
+
+    # Start gRPC frame-streaming server if configured
+    if server_args.grpc_port is not None:
+        _start_grpc_server(server_args)
+
     uvicorn.run(
         app,
         use_colors=True,
@@ -197,6 +202,37 @@ def launch_http_server_only(server_args):
         port=server_args.port,
         reload=False,
     )
+
+
+def _start_grpc_server(server_args):
+    """Start the gRPC frame-streaming server in a daemon thread."""
+    import logging
+
+    import grpc
+    from concurrent import futures
+
+    from sglang.multimodal_gen.grpc.flashtalk_streaming_pb2_grpc import (
+        add_FlashTalkStreamingServicer_to_server,
+    )
+    from sglang.multimodal_gen.grpc.streaming_servicer import (
+        FlashTalkStreamingServicer,
+    )
+
+    logger = logging.getLogger(__name__)
+
+    def _serve():
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+        add_FlashTalkStreamingServicer_to_server(
+            FlashTalkStreamingServicer(), server
+        )
+        bind_addr = f"[::]:{server_args.grpc_port}"
+        server.add_insecure_port(bind_addr)
+        server.start()
+        logger.info("gRPC frame-streaming server started on port %d", server_args.grpc_port)
+        server.wait_for_termination()
+
+    t = threading.Thread(target=_serve, name="grpc-server", daemon=True)
+    t.start()
 
 
 if __name__ == "__main__":

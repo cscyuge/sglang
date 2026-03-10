@@ -2116,12 +2116,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # Optional push streamer (lazy-start: connect on first chunk
             # to avoid CDN timeout while waiting for initial audio).
-            # Supports RTMP (rtmp://...) and SRT (srt://...) protocols.
+            # Supports RTMP (rtmp://...), SRT (srt://...), and gRPC frame output.
             # Only rank 0 pushes — creating pushers on all workers would
             # open N duplicate connections and, worse, stop() can
             # deadlock the worker → gloo broadcast timeout → scheduler crash.
             _rtmp_pusher = None
             _rtmp_url = batch.extra.get("rtmp_push_url")
+            _stream_mode = batch.extra.get("stream_mode")
             if _rtmp_url:
                 from sglang.multimodal_gen.runtime.distributed import (
                     get_world_rank,
@@ -2142,6 +2143,27 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         logger.info("Stream pusher ready (lazy): %s", _rtmp_url)
                     except Exception as e:
                         logger.warning("Failed to create stream pusher: %s", e)
+                        _rtmp_pusher = None
+            elif _stream_mode == "grpc":
+                from sglang.multimodal_gen.runtime.distributed import (
+                    get_world_rank,
+                )
+
+                if get_world_rank() == 0:
+                    try:
+                        from sglang.multimodal_gen.runtime.utils.grpc_frame_pusher import (
+                            GrpcFramePusher,
+                        )
+
+                        _rtmp_pusher = GrpcFramePusher(
+                            session_dir=session_dir,
+                            width=batch.width,
+                            height=batch.height,
+                            fps=batch.fps or 25,
+                        )
+                        logger.info("gRPC frame pusher ready (lazy) for session %s", session_dir)
+                    except Exception as e:
+                        logger.warning("Failed to create gRPC frame pusher: %s", e)
                         _rtmp_pusher = None
 
             # Audio overlap: prefetch next chunk's CPU + GPU audio processing
