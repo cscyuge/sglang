@@ -84,6 +84,12 @@ class FlashTalkStreamingServicer(pb2_grpc.FlashTalkStreamingServicer):
             os.path.isdir(frames_dir),
         )
 
+        try:
+            yield from self._stream_frames_inner(session_id, frames_dir, context)
+        except Exception:
+            logger.exception("StreamFrames unexpected error for session %s", session_id)
+
+    def _stream_frames_inner(self, session_id, frames_dir, context):
         # Wait for video_meta.bin to appear
         meta_path = os.path.join(frames_dir, "video_meta.bin")
         video_meta = self._wait_for_meta(meta_path, context)
@@ -94,16 +100,27 @@ class FlashTalkStreamingServicer(pb2_grpc.FlashTalkStreamingServicer):
                     f"Timed out waiting for video metadata (session={session_id})"
                 )
             logger.warning(
-                "StreamFrames: video_meta not found at %s (dir exists=%s, contents=%s)",
+                "StreamFrames: video_meta not found at %s "
+                "(dir exists=%s, contents=%s, context.is_active=%s)",
                 meta_path,
                 os.path.isdir(frames_dir),
                 os.listdir(frames_dir) if os.path.isdir(frames_dir) else "N/A",
+                context.is_active(),
             )
             return
+
+        logger.info(
+            "StreamFrames: video_meta found for session %s (%dx%d @ %dfps)",
+            session_id,
+            video_meta.width,
+            video_meta.height,
+            video_meta.fps,
+        )
 
         # Stream frames
         next_index = 0
         include_meta = True  # attach VideoMeta to first packet
+        last_frame_time = time.monotonic()
 
         while context.is_active():
             # Check for end sentinel
@@ -131,6 +148,16 @@ class FlashTalkStreamingServicer(pb2_grpc.FlashTalkStreamingServicer):
                     pkt.video_meta.CopyFrom(video_meta)
                     include_meta = False
 
+                if next_index % 10 == 0:
+                    logger.info(
+                        "StreamFrames: yielding frame %d (h264=%dB pcm=%dB) "
+                        "for session %s",
+                        next_index,
+                        len(h264_data),
+                        len(pcm_data),
+                        session_id,
+                    )
+
                 yield pkt
                 next_index += 1
                 last_frame_time = time.monotonic()
@@ -148,21 +175,36 @@ class FlashTalkStreamingServicer(pb2_grpc.FlashTalkStreamingServicer):
                 time.sleep(_POLL_INTERVAL_S)
 
         logger.info(
-            "StreamFrames ended for session %s (sent %d frames)", session_id, next_index
+            "StreamFrames ended for session %s (sent %d frames, context.is_active=%s)",
+            session_id,
+            next_index,
+            context.is_active(),
         )
 
     def _wait_for_meta(self, meta_path: str, context) -> pb2.VideoMeta | None:
         """Poll for video_meta.bin, return parsed VideoMeta or None on timeout."""
         deadline = time.monotonic() + _META_TIMEOUT_S
+        poll_count = 0
         while time.monotonic() < deadline:
             if not context.is_active():
+                logger.info(
+                    "StreamFrames: client disconnected while waiting for meta "
+                    "(polled %d times)",
+                    poll_count,
+                )
                 return None
             if os.path.exists(meta_path):
                 try:
                     with open(meta_path, "rb") as f:
                         data = f.read()
+                    logger.info(
+                        "StreamFrames: found video_meta.bin (%d bytes) after %d polls",
+                        len(data),
+                        poll_count,
+                    )
                     return _parse_video_meta(data)
                 except Exception as exc:
                     logger.warning("Failed to parse video_meta.bin: %s", exc)
+            poll_count += 1
             time.sleep(_POLL_INTERVAL_S)
         return None
