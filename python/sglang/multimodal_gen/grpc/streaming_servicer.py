@@ -25,7 +25,7 @@ _META_HEADER_FMT = "<4I"
 _META_HEADER_SIZE = struct.calcsize(_META_HEADER_FMT)  # 16 bytes
 
 # Polling / timeout constants
-_POLL_INTERVAL_S = 0.1
+_POLL_INTERVAL_S = 0.02
 _META_TIMEOUT_S = 60.0
 _FRAME_TIMEOUT_S = 120.0  # max wait between consecutive frames
 
