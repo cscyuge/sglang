@@ -10,6 +10,10 @@ from sglang.multimodal_gen.configs.sample.sampling_params import CacheParams
 class TeaCacheParams(CacheParams):
     cache_type: str = "teacache"
     teacache_thresh: float = 0.0
+    # Aggressive threshold for further step reduction (e.g., 2→1 steps).
+    # When rel_l1 < teacache_thresh_aggressive (and < teacache_thresh),
+    # steps are reduced more aggressively. Set to 0.0 to disable.
+    teacache_thresh_aggressive: float = 0.0
     coefficients: list[float] = field(default_factory=list)
 
 

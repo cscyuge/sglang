@@ -329,7 +329,16 @@ class FlashTalkDenoisingStage(PipelineStage):
                     # Silence → treat as maximally different to avoid
                     # incorrectly reducing steps.
                     rel_l1 = float("inf")
-                if rel_l1 < batch.teacache_params.teacache_thresh:
+                aggressive_thresh = getattr(
+                    batch.teacache_params, "teacache_thresh_aggressive", 0.0
+                )
+                if aggressive_thresh > 0 and rel_l1 < aggressive_thresh:
+                    # Very similar audio → 1 step
+                    base_num_steps = 1
+                    reduced_steps = True
+                    self._teacache_reduced += 1
+                elif rel_l1 < batch.teacache_params.teacache_thresh:
+                    # Similar audio → half steps (4→2)
                     base_num_steps = max(2, base_num_steps // 2)
                     reduced_steps = True
                     self._teacache_reduced += 1
@@ -364,7 +373,9 @@ class FlashTalkDenoisingStage(PipelineStage):
         # base_num_steps may be reduced by adaptive step reduction above.
         if timesteps is None:
             num_steps = base_num_steps
-            if num_steps == 2:
+            if num_steps == 1:
+                ts_list = [1000]
+            elif num_steps == 2:
                 ts_list = [1000, 500]
             elif num_steps == 4:
                 ts_list = [1000, 750, 500, 250]

@@ -49,6 +49,7 @@ class FlashTalkSamplingParams(SamplingParams):
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
             teacache_thresh=0.15,
+            teacache_thresh_aggressive=0.05,  # very similar → 1 step
             coefficients=[1.0, 0.0],  # identity polynomial (no rescaling)
         )
     )
