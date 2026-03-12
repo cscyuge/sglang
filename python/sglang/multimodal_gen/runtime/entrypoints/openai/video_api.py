@@ -529,6 +529,21 @@ async def get_session(session_id: str = Path(...)):
     return SessionResponse(**_SESSION_STORE[session_id])
 
 
+@router.get("/status")
+async def get_server_status():
+    """Return current server status including active session info."""
+    active_sessions = [
+        {"session_id": sid, "status": s["status"], "created_at": s.get("created_at")}
+        for sid, s in _SESSION_STORE.items()
+        if s["status"] in ("created", "running")
+    ]
+    return {
+        "has_active_session": len(active_sessions) > 0,
+        "active_sessions": active_sessions,
+        "total_sessions": len(_SESSION_STORE),
+    }
+
+
 @router.delete("/sessions/{session_id}")
 async def end_session(session_id: str = Path(...)):
     """End a running session.
