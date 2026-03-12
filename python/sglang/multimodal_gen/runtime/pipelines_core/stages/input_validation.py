@@ -5,10 +5,13 @@
 Input validation stage for diffusion pipelines.
 """
 
+import logging
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -212,6 +215,17 @@ class InputValidationStage(PipelineStage):
                     max_area, aspect_ratio, mod_value
                 )
 
+            logger.info(
+                "InputValidation: preprocess_condition_image WanI2V480P: "
+                "user_provided=%s, output_dims=(%d, %d), "
+                "max_area=%s, aspect_ratio=%.4f, mod_value=%d",
+                user_provided,
+                width,
+                height,
+                getattr(server_args.pipeline_config, "max_area", None),
+                condition_image_height / condition_image_width,
+                mod_value,
+            )
             batch.condition_image = batch.condition_image.resize((width, height))
             batch.height = height
             batch.width = width
@@ -328,6 +342,20 @@ class InputValidationStage(PipelineStage):
                     image.height,
                 )
                 batch.original_condition_image_size = image.size
+
+            logger.info(
+                "InputValidation: loaded image_path=%s, "
+                "condition_image_size=(%d, %d), "
+                "sampling_params width=%s height=%s "
+                "width_not_provided=%s height_not_provided=%s",
+                batch.image_path,
+                condition_image_width,
+                condition_image_height,
+                getattr(batch.sampling_params, "width", None),
+                getattr(batch.sampling_params, "height", None),
+                getattr(batch.sampling_params, "width_not_provided", None),
+                getattr(batch.sampling_params, "height_not_provided", None),
+            )
 
             if server_args.pipeline_config.task_type != ModelTaskType.I2M:
                 self.preprocess_condition_image(
