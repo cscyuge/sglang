@@ -128,7 +128,6 @@ class SessionResponse(BaseModel):
     stream_url: Optional[str] = None
     events_url: Optional[str] = None
     artc_channel: Optional[str] = None
-    stream_mode: Optional[str] = None  # "grpc" or None (default ARTC)
     created_at: int = Field(default_factory=lambda: int(time.time()))
     chunks_received: int = 0
     chunks_processed: int = 0

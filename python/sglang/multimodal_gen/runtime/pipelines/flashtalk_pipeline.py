@@ -2152,8 +2152,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _chunk_wall_time = slice_len / fps  # ~1.12s
             _end_path = os.path.join(session_dir, "end")
 
-            # Optional push streamer (lazy-start: connect on first chunk).
-            # Supports ARTC (AliRTC SDK) and gRPC frame output.
+            # Optional ARTC push streamer (lazy-start: connect on first chunk).
             # Only rank 0 pushes — creating pushers on all workers would
             # open N duplicate connections and, worse, stop() can
             # deadlock the worker → gloo broadcast timeout → scheduler crash.
@@ -2161,7 +2160,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _artc_token = batch.extra.get("artc_token")
             _artc_channel = batch.extra.get("artc_channel")
             _artc_userid = batch.extra.get("artc_userid")
-            _stream_mode = batch.extra.get("stream_mode")
             if _artc_token and _artc_channel:
                 from sglang.multimodal_gen.runtime.distributed import (
                     get_world_rank,
@@ -2184,27 +2182,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         logger.info("ARTC pusher ready (lazy) for channel %s", _artc_channel)
                     except Exception as e:
                         logger.warning("Failed to create ARTC pusher: %s", e)
-                        _stream_pusher = None
-            elif _stream_mode == "grpc":
-                from sglang.multimodal_gen.runtime.distributed import (
-                    get_world_rank,
-                )
-
-                if get_world_rank() == 0:
-                    try:
-                        from sglang.multimodal_gen.runtime.utils.grpc_frame_pusher import (
-                            GrpcFramePusher,
-                        )
-
-                        _stream_pusher = GrpcFramePusher(
-                            session_dir=session_dir,
-                            width=batch.width,
-                            height=batch.height,
-                            fps=batch.fps or 25,
-                        )
-                        logger.info("gRPC frame pusher ready (lazy) for session %s", session_dir)
-                    except Exception as e:
-                        logger.warning("Failed to create gRPC frame pusher: %s", e)
                         _stream_pusher = None
 
             # Audio overlap: prefetch next chunk's CPU + GPU audio processing
