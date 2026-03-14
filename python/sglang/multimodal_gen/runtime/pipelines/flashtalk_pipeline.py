@@ -2152,36 +2152,39 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _chunk_wall_time = slice_len / fps  # ~1.12s
             _end_path = os.path.join(session_dir, "end")
 
-            # Optional push streamer (lazy-start: connect on first chunk
-            # to avoid CDN timeout while waiting for initial audio).
-            # Supports RTMP (rtmp://...), SRT (srt://...), and gRPC frame output.
+            # Optional push streamer (lazy-start: connect on first chunk).
+            # Supports ARTC (AliRTC SDK) and gRPC frame output.
             # Only rank 0 pushes — creating pushers on all workers would
             # open N duplicate connections and, worse, stop() can
             # deadlock the worker → gloo broadcast timeout → scheduler crash.
-            _rtmp_pusher = None
-            _rtmp_url = batch.extra.get("rtmp_push_url")
+            _stream_pusher = None
+            _artc_token = batch.extra.get("artc_token")
+            _artc_channel = batch.extra.get("artc_channel")
+            _artc_userid = batch.extra.get("artc_userid")
             _stream_mode = batch.extra.get("stream_mode")
-            if _rtmp_url:
+            if _artc_token and _artc_channel:
                 from sglang.multimodal_gen.runtime.distributed import (
                     get_world_rank,
                 )
 
                 if get_world_rank() == 0:
                     try:
-                        from sglang.multimodal_gen.runtime.utils.rtmp_pusher import (
-                            StreamPusher,
+                        from sglang.multimodal_gen.runtime.utils.artc_pusher import (
+                            ArtcPusher,
                         )
 
-                        _rtmp_pusher = StreamPusher(
-                            url=_rtmp_url,
+                        _stream_pusher = ArtcPusher(
+                            artc_token=_artc_token,
+                            artc_channel=_artc_channel,
+                            artc_userid=_artc_userid or "sglang",
                             width=batch.width,
                             height=batch.height,
                             fps=batch.fps or 25,
                         )
-                        logger.info("Stream pusher ready (lazy): %s", _rtmp_url)
+                        logger.info("ARTC pusher ready (lazy) for channel %s", _artc_channel)
                     except Exception as e:
-                        logger.warning("Failed to create stream pusher: %s", e)
-                        _rtmp_pusher = None
+                        logger.warning("Failed to create ARTC pusher: %s", e)
+                        _stream_pusher = None
             elif _stream_mode == "grpc":
                 from sglang.multimodal_gen.runtime.distributed import (
                     get_world_rank,
@@ -2193,7 +2196,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             GrpcFramePusher,
                         )
 
-                        _rtmp_pusher = GrpcFramePusher(
+                        _stream_pusher = GrpcFramePusher(
                             session_dir=session_dir,
                             width=batch.width,
                             height=batch.height,
@@ -2202,7 +2205,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         logger.info("gRPC frame pusher ready (lazy) for session %s", session_dir)
                     except Exception as e:
                         logger.warning("Failed to create gRPC frame pusher: %s", e)
-                        _rtmp_pusher = None
+                        _stream_pusher = None
 
             # Audio overlap: prefetch next chunk's CPU + GPU audio processing
             # during VAE decode to hide the ~30ms audio processing latency.
@@ -2406,7 +2409,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 self._save_streaming_frames(
                     chunk_frames, chunk_idx, _frame_dir, _frame_executor,
                     _frame_futures, _frames_per_chunk,
-                    rtmp_pusher=_rtmp_pusher, chunk_audio_data=chunk_audio_data,
+                    rtmp_pusher=_stream_pusher, chunk_audio_data=chunk_audio_data,
                 )
                 del chunk_frames
 
@@ -2462,11 +2465,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             self._post_loop_cleanup(
                 _gc_was_enabled, _frame_futures, _frame_executor, _frame_dir,
                 audio_prefetch_pool=_audio_prefetch_pool,
-                rtmp_pusher=_rtmp_pusher,
+                rtmp_pusher=_stream_pusher,
             )
             _audio_prefetch_pool = None
             _prefetched_result = None
-            _rtmp_pusher = None  # break reference after cleanup
+            _stream_pusher = None  # break reference after cleanup
             logger.info("Session post-loop: cleanup complete")
 
             if not all_chunk_frames:
