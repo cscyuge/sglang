@@ -1304,31 +1304,52 @@ class AliRTCEngineInterface(ABC):
 
 def CreateAliRTCEngine(eventHandler:EngineEventHandlerInterface, lowPort:int, highPort:int, \
                        logPath:str, coreServicePath:str, h5mode:bool, extra:str) -> AliRTCEngineInterface:
-    import AliRTCEngineImpl
-    engine = AliRTCEngineImpl.AliRtcEngineImpl(eventHandler, lowPort, highPort, coreServicePath)
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+    """Create and initialise an AliRTC engine.
 
-    if loop and loop.is_running():
-        # Already inside an async context — run in a new thread to avoid
-        # "cannot call run_until_complete while the loop is running".
-        import concurrent.futures
-        def _init():
-            _loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(_loop)
-            try:
-                _loop.run_until_complete(engine.InitializeEngine(logPath, h5mode, extra))
-            finally:
-                _loop.close()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            pool.submit(_init).result()
-    else:
-        _loop = asyncio.new_event_loop()
+    InitializeEngine schedules long-lived async coroutines (__recvCoroutine,
+    __heartbeatCoroutine) on the event loop.  The loop must keep running in a
+    background thread so those coroutines can process SDK callbacks (e.g.
+    OnJoinChannelResult).  We therefore start a daemon thread that runs the
+    loop forever; all subsequent SDK method calls submit coroutines to that
+    loop via asyncio.run_coroutine_threadsafe().
+    """
+    import AliRTCEngineImpl
+    import threading
+
+    engine = AliRTCEngineImpl.AliRtcEngineImpl(eventHandler, lowPort, highPort, coreServicePath)
+
+    # Create a dedicated event loop for this engine and keep it running.
+    _loop = asyncio.new_event_loop()
+
+    # Store loop on engine early so SDK methods can find it once the
+    # loop thread starts run_forever().
+    engine._artc_loop = _loop
+
+    init_done = threading.Event()
+    init_error = [None]
+
+    def _run_loop():
         asyncio.set_event_loop(_loop)
+        # Run InitializeEngine first, then keep the loop alive for the
+        # receive/heartbeat coroutines scheduled during init.
         try:
             _loop.run_until_complete(engine.InitializeEngine(logPath, h5mode, extra))
-        finally:
-            _loop.close()
+        except Exception as exc:
+            init_error[0] = exc
+            init_done.set()
+            return
+        init_done.set()
+        # Keep loop running so __recvCoroutine and __heartbeatCoroutine
+        # can process incoming SDK messages / callbacks.
+        _loop.run_forever()
+
+    t = threading.Thread(target=_run_loop, daemon=True, name="artc-loop")
+    t.start()
+
+    init_done.wait(timeout=15.0)
+    if init_error[0] is not None:
+        raise init_error[0]
+
+    engine._artc_thread = t
+
     return engine

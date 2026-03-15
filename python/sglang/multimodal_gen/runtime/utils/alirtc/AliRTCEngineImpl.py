@@ -11,29 +11,6 @@ import struct
 import hashlib
 import base64
 import asyncio
-import threading as _threading
-
-# Per-thread event loop cache — avoids creating/destroying loops on every SDK call
-_thread_loops: dict = {}
-_thread_loops_lock = _threading.Lock()
-
-
-def _get_or_create_event_loop():
-    """Get or create a persistent event loop for the current thread.
-
-    Python 3.10+ raises RuntimeError from asyncio.get_event_loop() when
-    there is no current event loop.  This helper creates one per thread
-    and reuses it across calls, avoiding GC churn from short-lived loops.
-    """
-    tid = _threading.current_thread().ident
-    with _thread_loops_lock:
-        loop = _thread_loops.get(tid)
-        if loop is not None and not loop.is_closed():
-            return loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        _thread_loops[tid] = loop
-        return loop
 import threading
 import datetime
 import logging
@@ -939,6 +916,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
                coreServicePath:str) -> None:
         if eventHandler == None or lowPort > highPort:
             raise ValueError("[Python] Parameter error, cannot create RTC instance")
+        self._artc_loop = None  # Set by CreateAliRTCEngine after init
+        self._artc_thread = None
         self.__audio_queue = Queue()
         self.__push_thread = None
         self.__thread_running = False
@@ -984,6 +963,7 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
                     break
         else:
             raise ValueError("[Python] Parameter error, cannot create RTC instance")
+
 
 
     async def InitializeEngine(self, logPath:str, h5mode:bool, extra:str) -> None:
@@ -1090,16 +1070,16 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
         with self.__lock:
             async def internalSleep(seconds: float) -> None:
                 await asyncio.sleep(seconds)
-            loop = _get_or_create_event_loop()
+            loop = self._artc_loop
             init = time.time()
             while self.__joinState == True and self.__leaveState == False:
-                loop.run_until_complete(internalSleep(0.5))
+                asyncio.run_coroutine_threadsafe(internalSleep(0.5), loop).result()
                 if time.time() - init >= 10:
                     self.__logger.error("Unable to destroy, please leave channel first")
                     print(f"[Python] Unable to destroy, please leave channel first")
                     return -1
             self.__didCallRelease = True
-            loop.run_until_complete(self.__UninitializeEngine(self.__socketWriter))       
+            asyncio.run_coroutine_threadsafe(self.__UninitializeEngine(self.__socketWriter), loop).result()       
             # loop.close()
             return 0            
 
@@ -1149,8 +1129,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1185,8 +1165,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1224,8 +1204,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1250,8 +1230,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1286,8 +1266,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1324,8 +1304,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
                 interTs = time.time()
 
                 leftChunks = 1 if frame.dataLen % self.__SERVER_RECV_BUF_SIZE > 0 else 0
@@ -1334,8 +1314,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
                 for idx in range(chunks):
                     length = frame.dataLen - offset if offset + self.__SERVER_RECV_BUF_SIZE > frame.dataLen \
                         else self.__SERVER_RECV_BUF_SIZE
-                    loop.run_until_complete(self.__writeDataInternal(self.__socketWriter, frame.data, \
-                                                                    offset, length))
+                    asyncio.run_coroutine_threadsafe(self.__writeDataInternal(self.__socketWriter, frame.data, \
+                                                                    offset, length), loop).result()
                     offset += length
                 endTs = time.time()
                 if endTs - beginTs > 0.1:
@@ -1365,8 +1345,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1380,8 +1360,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__logger.info("[Python] clear data buffer")
             return 0
         else:
@@ -1401,8 +1381,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1416,8 +1396,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1431,8 +1411,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1467,8 +1447,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
                 
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
                 interTs = time.time()
 
                 leftChunks = 1 if frame.dataLen % self.__SERVER_RECV_BUF_SIZE > 0 else 0
@@ -1477,8 +1457,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
                 for idx in range(chunks):
                     length = frame.dataLen - offset if offset + self.__SERVER_RECV_BUF_SIZE > frame.dataLen \
                         else self.__SERVER_RECV_BUF_SIZE
-                    loop.run_until_complete(self.__writeDataInternal(self.__socketWriter, frame.data,\
-                                                                    offset, length))
+                    asyncio.run_coroutine_threadsafe(self.__writeDataInternal(self.__socketWriter, frame.data,\
+                                                                    offset, length), loop).result()
                     offset = offset + length
                 
                 endTs = time.time()
@@ -1518,8 +1498,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
         if self.__socketWriter != None:
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1570,8 +1550,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
         if self.__socketWriter != None:
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1622,8 +1602,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
         if self.__socketWriter != None:
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1646,8 +1626,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
         if self.__socketWriter != None:
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1663,8 +1643,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__externalAudioVolume = volume
             self.__logger.info(f"[Python] set audio volume {volume}")
             return 0
@@ -1688,8 +1668,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1711,16 +1691,16 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
                 leftChunks = 1 if len(message) % self.__SERVER_RECV_BUF_SIZE > 0 else 0
                 chunks = len(message) // self.__SERVER_RECV_BUF_SIZE + leftChunks
                 offset = 0
                 for idx in range(chunks):
                     length = len(message) - offset if offset + self.__SERVER_RECV_BUF_SIZE > len(message) \
                         else self.__SERVER_RECV_BUF_SIZE
-                    loop.run_until_complete(self.__writeDataInternal(self.__socketWriter, message, \
-                                                                    offset, length))
+                    asyncio.run_coroutine_threadsafe(self.__writeDataInternal(self.__socketWriter, message, \
+                                                                    offset, length), loop).result()
                     offset += length
             return 0
         else:
@@ -1737,8 +1717,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__localDualPublishEnabled = enabled
             self.__logger.info(f"[Python] publish local dual stream {enabled}")
             return 0
@@ -1757,8 +1737,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__localCameraPublishEnabled = enabled
             self.__logger.info(f"[Python] publish local video stream {enabled}")
             return 0
@@ -1777,8 +1757,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__localAudioPublishEnabled = enabled
             self.__logger.info(f"[Python] publish local audio stream {enabled}")
             return 0
@@ -1797,8 +1777,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__localScreenPublishEnabled = enabled
             self.__logger.info(f"[Python] publish screen share {enabled}")
             return 0
@@ -1830,8 +1810,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1850,8 +1830,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1878,8 +1858,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1902,8 +1882,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1920,8 +1900,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -1937,8 +1917,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__logger.info(f"[Python] mute local camera {mute}")
             return 0
         else:
@@ -1955,8 +1935,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__logger.info(f"[Python] mute local mic {mute}")
             return 0
         else:
@@ -1973,8 +1953,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__logger.info(f"[Python] set client role {clientRole.value}")
             return 0
         else:
@@ -1991,8 +1971,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2008,8 +1988,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2025,8 +2005,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2042,8 +2022,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2059,8 +2039,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             self.__logger.info("[Python] set parameter {params}")
             return 0
         else:
@@ -2101,16 +2081,16 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
                 leftChunks = 1 if len(ctrlMsg.data) % self.__SERVER_RECV_BUF_SIZE > 0 else 0
                 chunks = len(ctrlMsg.data) // self.__SERVER_RECV_BUF_SIZE + leftChunks
                 offset = 0
                 for idx in range(chunks):
                     length = len(ctrlMsg.data) - offset if offset + self.__SERVER_RECV_BUF_SIZE > len(ctrlMsg.data) \
                         else self.__SERVER_RECV_BUF_SIZE
-                    loop.run_until_complete(self.__writeDataInternal(self.__socketWriter, ctrlMsg.data, \
-                                                                    offset, length))
+                    asyncio.run_coroutine_threadsafe(self.__writeDataInternal(self.__socketWriter, ctrlMsg.data, \
+                                                                    offset, length), loop).result()
                     offset += length
             return 0
         else:
@@ -2129,8 +2109,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2143,8 +2123,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2157,14 +2137,14 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
 
                 async def internalSleep(seconds: float) -> None:
                     await asyncio.sleep(seconds)
                 init = time.time()
                 while self.__didGetNeedTestLoopbackLatency == False:
-                    loop.run_until_complete(internalSleep(0.0001))
+                    asyncio.run_coroutine_threadsafe(internalSleep(0.0001), loop).result()
                     if time.time() - init >= 10:
                         return self.__testLoopbackLatencyEnabled
             return self.__testLoopbackLatencyEnabled
@@ -2176,7 +2156,7 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             try:
                 if not self.__audio_queue.empty() and not self.__pushAudioFull:
                     data = self.__audio_queue.get()
-                    loop = _get_or_create_event_loop()
+                    loop = self._artc_loop
                     if (self.__remoteAudioSampleRate != 0 and self.__remoteAudioChannel != 0) and (self.__pushAudioSampleRate != self.__remoteAudioSampleRate or self.__pushAudioChannel != self.__remoteAudioChannel):
                         print(f"[Python] ReSetExternalAudioSource: {self.__remoteAudioSampleRate} {self.__remoteAudioChannel}")
                         self.SetExternalAudioSource(True, self.__remoteAudioSampleRate, self.__remoteAudioChannel)
@@ -2201,13 +2181,13 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
                 async def internalSleep(seconds: float) -> None:
                     await asyncio.sleep(seconds)
                 init = time.time()
                 while len(self.__sdkVersion) == 0:
-                    loop.run_until_complete(internalSleep(0.0001))
+                    asyncio.run_coroutine_threadsafe(internalSleep(0.0001), loop).result()
                     if time.time() - init >= 10:
                         return self.__sdkVersion
         return self.__sdkVersion
@@ -2227,8 +2207,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2244,8 +2224,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2267,8 +2247,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2284,8 +2264,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2298,8 +2278,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2316,8 +2296,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2333,13 +2313,13 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
                 async def internalSleep(seconds: float) -> None:
                     await asyncio.sleep(seconds)
                 init = time.time()
                 while self.__didGetAudioEffectPublishVolume == False:
-                    loop.run_until_complete(internalSleep(0.0001))
+                    asyncio.run_coroutine_threadsafe(internalSleep(0.0001), loop).result()
                     if time.time() - init >= 10:
                         return 0
             return self.__audioEffectPublishVolume
@@ -2358,8 +2338,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2375,13 +2355,13 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
                 async def internalSleep(seconds: float) -> None:
                     await asyncio.sleep(seconds)
                 init = time.time()
                 while self.__didGetAudioEffectPlayoutVolume == False:
-                    loop.run_until_complete(internalSleep(0.0001))
+                    asyncio.run_coroutine_threadsafe(internalSleep(0.0001), loop).result()
                     if time.time() - init >= 10:
                         return 0
             return self.__audioEffectPlayoutVolume
@@ -2399,8 +2379,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2416,8 +2396,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2433,8 +2413,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2447,8 +2427,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2464,8 +2444,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2478,8 +2458,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2509,8 +2489,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2526,8 +2506,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2539,8 +2519,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2569,8 +2549,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2582,8 +2562,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2595,8 +2575,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
@@ -2612,8 +2592,8 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             with self.__lock:
-                loop = _get_or_create_event_loop()
-                loop.run_until_complete(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')))
+                loop = self._artc_loop
+                asyncio.run_coroutine_threadsafe(self.__writeData(self.__socketWriter, jobj_str.encode('utf-8')), loop).result()
             return 0
         else:
             return -1
