@@ -350,6 +350,8 @@ class ArtcPusher:
         """Drain the queue and push frames/audio to AliRTC SDK."""
         try:
             from AliRTCLinuxSdkDefine import (
+                VideoBufferType,
+                VideoDataFormat,
                 VideoDataSample,
                 VideoSource,
             )
@@ -388,8 +390,8 @@ class ArtcPusher:
                 video_sample = VideoDataSample()
                 video_sample.width = self._width
                 video_sample.height = self._height
-                video_sample.format = 5  # VideoDataFormatRGB24
-                video_sample.bufferType = 0  # VideoBufferTypeRawData
+                video_sample.format = VideoDataFormat.VideoDataFormatRGB24
+                video_sample.bufferType = VideoBufferType.VideoBufferTypeRawData
                 video_sample.data = frame.tobytes()
                 video_sample.dataLen = self._width * self._height * 3
                 video_sample.timeStamp = self._v_ts
