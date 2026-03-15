@@ -259,7 +259,7 @@ class ArtcPusher:
             logPath=log_path,
             coreServicePath=core_service,
             h5mode=False,
-            extra="",
+            extra="{}",
         )
 
         # Configure video encoder
