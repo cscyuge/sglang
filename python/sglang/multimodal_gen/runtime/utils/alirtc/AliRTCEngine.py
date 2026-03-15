@@ -1317,6 +1317,7 @@ def CreateAliRTCEngine(eventHandler:EngineEventHandlerInterface, lowPort:int, hi
         import concurrent.futures
         def _init():
             _loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(_loop)
             try:
                 _loop.run_until_complete(engine.InitializeEngine(logPath, h5mode, extra))
             finally:
@@ -1325,6 +1326,7 @@ def CreateAliRTCEngine(eventHandler:EngineEventHandlerInterface, lowPort:int, hi
             pool.submit(_init).result()
     else:
         _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
         try:
             _loop.run_until_complete(engine.InitializeEngine(logPath, h5mode, extra))
         finally:
