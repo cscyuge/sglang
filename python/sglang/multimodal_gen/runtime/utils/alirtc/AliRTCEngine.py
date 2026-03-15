@@ -1306,6 +1306,27 @@ def CreateAliRTCEngine(eventHandler:EngineEventHandlerInterface, lowPort:int, hi
                        logPath:str, coreServicePath:str, h5mode:bool, extra:str) -> AliRTCEngineInterface:
     import AliRTCEngineImpl
     engine = AliRTCEngineImpl.AliRtcEngineImpl(eventHandler, lowPort, highPort, coreServicePath)
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(engine.InitializeEngine(logPath, h5mode, extra))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # Already inside an async context — run in a new thread to avoid
+        # "cannot call run_until_complete while the loop is running".
+        import concurrent.futures
+        def _init():
+            _loop = asyncio.new_event_loop()
+            try:
+                _loop.run_until_complete(engine.InitializeEngine(logPath, h5mode, extra))
+            finally:
+                _loop.close()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_init).result()
+    else:
+        _loop = asyncio.new_event_loop()
+        try:
+            _loop.run_until_complete(engine.InitializeEngine(logPath, h5mode, extra))
+        finally:
+            _loop.close()
     return engine
