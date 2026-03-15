@@ -304,7 +304,7 @@ class ArtcPusher:
         self._engine.PublishLocalAudioStream(True)
 
         # Set interactive role (broadcaster)
-        self._engine.SetClientRole(AliEngineClientRole.Interactive)
+        self._engine.SetClientRole(AliEngineClientRole.AliEngineClientRoleInteractive)
 
         # Join channel
         join_cfg = JoinChannelConfig()

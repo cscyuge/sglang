@@ -11,23 +11,28 @@ import struct
 import hashlib
 import base64
 import asyncio
+import threading as _threading
+
+# Per-thread event loop cache — avoids creating/destroying loops on every SDK call
+_thread_loops: dict = {}
+_thread_loops_lock = _threading.Lock()
 
 
 def _get_or_create_event_loop():
-    """Get the current event loop or create a new one for this thread.
+    """Get or create a persistent event loop for the current thread.
 
-    Python 3.10+ raises RuntimeError from get_event_loop() when there is no
-    current event loop in the running thread.  This helper creates one and
-    sets it so that subsequent calls in the same thread succeed.
+    Python 3.10+ raises RuntimeError from asyncio.get_event_loop() when
+    there is no current event loop.  This helper creates one per thread
+    and reuses it across calls, avoiding GC churn from short-lived loops.
     """
-    try:
-        loop = _get_or_create_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("closed")
-        return loop
-    except RuntimeError:
+    tid = _threading.current_thread().ident
+    with _thread_loops_lock:
+        loop = _thread_loops.get(tid)
+        if loop is not None and not loop.is_closed():
+            return loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        _thread_loops[tid] = loop
         return loop
 import threading
 import datetime
@@ -2171,11 +2176,7 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             try:
                 if not self.__audio_queue.empty() and not self.__pushAudioFull:
                     data = self.__audio_queue.get()
-                    try:
-                        loop = _get_or_create_event_loop()
-                    except RuntimeError:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
+                    loop = _get_or_create_event_loop()
                     if (self.__remoteAudioSampleRate != 0 and self.__remoteAudioChannel != 0) and (self.__pushAudioSampleRate != self.__remoteAudioSampleRate or self.__pushAudioChannel != self.__remoteAudioChannel):
                         print(f"[Python] ReSetExternalAudioSource: {self.__remoteAudioSampleRate} {self.__remoteAudioChannel}")
                         self.SetExternalAudioSource(True, self.__remoteAudioSampleRate, self.__remoteAudioChannel)
