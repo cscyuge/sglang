@@ -395,6 +395,10 @@ class ArtcPusher:
                 video_sample.data = frame.tobytes()
                 video_sample.dataLen = self._width * self._height * 3
                 video_sample.timeStamp = self._v_ts
+                video_sample.strideY = 0
+                video_sample.strideU = 0
+                video_sample.strideV = 0
+                video_sample.rotation = 0
                 self._engine.PushExternalVideoFrame(
                     video_sample, VideoSource.VideoSourceCamera
                 )
