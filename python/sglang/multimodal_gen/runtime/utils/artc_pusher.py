@@ -242,8 +242,14 @@ class ArtcPusher:
         from AliRTCEngine import CreateAliRTCEngine  # noqa: E402
         from AliRTCLinuxSdkDefine import (  # noqa: E402
             AliEngineClientRole,
+            AliEngineFrameRate,
+            AliEngineRotationMode,
             AliEngineVideoEncoderConfiguration,
+            AliEngineVideoEncoderOrientationMode,
+            AliEngineVideoMirrorMode,
             JoinChannelConfig,
+            PublishAvsyncMode,
+            PublishMode,
             RenderMode,
             VideoSource,
         )
@@ -262,12 +268,29 @@ class ArtcPusher:
             extra="{}",
         )
 
-        # Configure video encoder
-        video_cfg = AliEngineVideoEncoderConfiguration()
-        video_cfg.width = self._width
-        video_cfg.height = self._height
-        video_cfg.frameRate = self._fps
-        video_cfg.bitrate = 2000
+        # Configure video encoder — constructor requires all positional args
+        # Map fps int to SDK enum (default to 25fps if no exact match)
+        _fps_map = {
+            5: AliEngineFrameRate.AliEngineFrameRateFps5,
+            10: AliEngineFrameRate.AliEngineFrameRateFps10,
+            15: AliEngineFrameRate.AliEngineFrameRateFps15,
+            20: AliEngineFrameRate.AliEngineFrameRateFps20,
+            25: AliEngineFrameRate.AliEngineFrameRateFps25,
+            30: AliEngineFrameRate.AliEngineFrameRateFps30,
+            60: AliEngineFrameRate.AliEngineFrameRateFps60,
+        }
+        frame_rate_enum = _fps_map.get(
+            self._fps, AliEngineFrameRate.AliEngineFrameRateFps25
+        )
+        video_cfg = AliEngineVideoEncoderConfiguration(
+            width=self._width,
+            height=self._height,
+            f=frame_rate_enum,
+            b=2000,
+            ori=AliEngineVideoEncoderOrientationMode.AliEngineVideoEncoderOrientationModeAdaptive,
+            mr=AliEngineVideoMirrorMode.AliEngineVideoMirrorModeDisabled,
+            rotation=AliEngineRotationMode.AliEngineRotationMode_0,
+        )
         self._engine.SetVideoEncoderConfiguration(video_cfg)
 
         # External video/audio sources
@@ -285,9 +308,8 @@ class ArtcPusher:
 
         # Join channel
         join_cfg = JoinChannelConfig()
-        join_cfg.channelProfile = 1  # InteractiveLive
-        join_cfg.publishAvsyncMode = 1  # PublishAvsyncWithPts
-        join_cfg.publishMode = 0  # PublishAutomatically
+        join_cfg.publishAvsyncMode = PublishAvsyncMode.PublishAvsyncWithPts
+        join_cfg.publishMode = PublishMode.PublishAutomatically
         self._engine.JoinChannel(
             self._token, self._channel, self._userid, self._userid, join_cfg
         )
