@@ -347,7 +347,13 @@ class ArtcPusher:
     # ------------------------------------------------------------------
 
     def _drain_loop(self) -> None:
-        """Drain the queue and push frames/audio to AliRTC SDK."""
+        """Drain the queue and push frames/audio to AliRTC SDK.
+
+        Frames are pushed at real-time pace (1/fps interval) to avoid
+        overwhelming the SDK encoder and causing buffer-full oscillation.
+        When generation is faster than real-time, the queue absorbs bursts;
+        when slower, the pacer catches up naturally.
+        """
         try:
             from AliRTCLinuxSdkDefine import (
                 VideoBufferType,
@@ -360,8 +366,13 @@ class ArtcPusher:
             self._failed = True
             return
 
-        ms_per_frame = 1000 // self._fps  # 40ms @ 25fps
+        sec_per_frame = 1.0 / self._fps  # 0.04s @ 25fps
         samples_per_frame = 16000 // self._fps  # 640 @ 25fps
+        ms_per_frame = 1000 // self._fps  # 40ms @ 25fps
+
+        # Wall-clock pacer: first frame anchors the timeline.
+        _t0: float | None = None  # set on first frame
+        _frame_count = 0
 
         while True:
             try:
@@ -379,12 +390,27 @@ class ArtcPusher:
                 if self._failed:
                     return
 
+                # --- Real-time pacing ---
+                # Sleep until this frame's wall-clock deadline.
+                now = time.monotonic()
+                if _t0 is None:
+                    _t0 = now
+                target = _t0 + _frame_count * sec_per_frame
+                sleep_time = target - now
+                if sleep_time > 0.001:
+                    time.sleep(sleep_time)
+
                 # --- Push video frame ---
-                # Wait if SDK buffer is full
+                # Brief wait if SDK buffer is still full (shouldn't happen
+                # often with proper pacing, but keep as safety valve).
+                _full_wait = 0
                 while self._push_video_full:
                     time.sleep(0.001)
+                    _full_wait += 1
                     if self._failed:
                         return
+                    if _full_wait > 200:  # 200ms max wait
+                        break
 
                 frame = frames_np[i]
                 video_sample = VideoDataSample()
@@ -406,10 +432,14 @@ class ArtcPusher:
 
                 # --- Push corresponding audio slice ---
                 if audio_int16 is not None:
+                    _full_wait = 0
                     while self._push_audio_full:
                         time.sleep(0.001)
+                        _full_wait += 1
                         if self._failed:
                             return
+                        if _full_wait > 200:
+                            break
 
                     start = i * samples_per_frame
                     end = min(start + samples_per_frame, len(audio_int16))
@@ -425,3 +455,5 @@ class ArtcPusher:
                         audio_bytes, len(audio_bytes), self._a_ts
                     )
                     self._a_ts += ms_per_frame
+
+                _frame_count += 1
