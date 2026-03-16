@@ -349,10 +349,11 @@ class ArtcPusher:
     def _drain_loop(self) -> None:
         """Drain the queue and push frames/audio to AliRTC SDK.
 
-        Frames are pushed at real-time pace (1/fps interval) to avoid
-        overwhelming the SDK encoder and causing buffer-full oscillation.
-        When generation is faster than real-time, the queue absorbs bursts;
-        when slower, the pacer catches up naturally.
+        Chunk-level pacing: before pushing each chunk's frames, sleep once
+        until the chunk's wall-clock deadline.  Within a chunk the 28 frames
+        are pushed as fast as the SDK allows (buffer-full wait as backpressure).
+        This limits GIL contention to one sleep per chunk (~1.12s) instead of
+        28 sleeps per chunk which was adding ~30ms to the generation thread.
         """
         try:
             from AliRTCLinuxSdkDefine import (
@@ -366,13 +367,13 @@ class ArtcPusher:
             self._failed = True
             return
 
-        sec_per_frame = 1.0 / self._fps  # 0.04s @ 25fps
         samples_per_frame = 16000 // self._fps  # 640 @ 25fps
         ms_per_frame = 1000 // self._fps  # 40ms @ 25fps
+        sec_per_chunk = 0.0  # set on first chunk
 
-        # Wall-clock pacer: first frame anchors the timeline.
-        _t0: float | None = None  # set on first frame
-        _frame_count = 0
+        # Wall-clock pacer: first chunk anchors the timeline.
+        _t0: float | None = None
+        _chunk_count = 0
 
         while True:
             try:
@@ -386,23 +387,26 @@ class ArtcPusher:
             frames_np, audio_int16 = item
             num_frames = frames_np.shape[0]
 
+            # --- Chunk-level pacing ---
+            # Sleep once before pushing this chunk's frames so we don't
+            # overwhelm the SDK encoder.  Within the chunk, frames are
+            # pushed as fast as the SDK buffer allows.
+            now = time.monotonic()
+            if _t0 is None:
+                _t0 = now
+                sec_per_chunk = num_frames / self._fps  # ~1.12s @ 28 frames, 25fps
+            target = _t0 + _chunk_count * sec_per_chunk
+            sleep_time = target - now
+            if sleep_time > 0.01:
+                time.sleep(sleep_time)
+            _chunk_count += 1
+
             for i in range(num_frames):
                 if self._failed:
                     return
 
-                # --- Real-time pacing ---
-                # Sleep until this frame's wall-clock deadline.
-                now = time.monotonic()
-                if _t0 is None:
-                    _t0 = now
-                target = _t0 + _frame_count * sec_per_frame
-                sleep_time = target - now
-                if sleep_time > 0.001:
-                    time.sleep(sleep_time)
-
                 # --- Push video frame ---
-                # Brief wait if SDK buffer is still full (shouldn't happen
-                # often with proper pacing, but keep as safety valve).
+                # Wait if SDK buffer is full (natural backpressure).
                 _full_wait = 0
                 while self._push_video_full:
                     time.sleep(0.001)
@@ -455,5 +459,3 @@ class ArtcPusher:
                         audio_bytes, len(audio_bytes), self._a_ts
                     )
                     self._a_ts += ms_per_frame
-
-                _frame_count += 1
