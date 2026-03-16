@@ -2442,19 +2442,22 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 logger.info("Session chunk %d: %.3fs", chunk_idx, _t_chunk)
                 chunk_idx += 1
 
-                # Real-time pacing for silence chunks: sleep up to one
-                # chunk's wall-clock duration, breaking early if audio
-                # arrives or the session ends.
-                if _used_silence:
-                    _remaining = _chunk_wall_time - _t_chunk
-                    while _remaining > 0:
-                        time.sleep(min(0.05, _remaining))
-                        _remaining = _chunk_wall_time - (time.time() - chunk_start)
-                        # Break early on end/cancel/audio arrival
-                        if os.path.exists(_end_path):
-                            break
-                        if _cancel_file and os.path.exists(_cancel_file):
-                            break
+                # Real-time pacing: sleep up to one chunk's wall-clock
+                # duration so generation rate matches the real-time
+                # audio arrival / SDK push rate.  Without this, chunks
+                # generated faster than real-time would pile up in the
+                # push queue and get dropped.
+                _remaining = _chunk_wall_time - _t_chunk
+                while _remaining > 0:
+                    time.sleep(min(0.05, _remaining))
+                    _remaining = _chunk_wall_time - (time.time() - chunk_start)
+                    # Break early on end/cancel
+                    if os.path.exists(_end_path):
+                        break
+                    if _cancel_file and os.path.exists(_cancel_file):
+                        break
+                    # For silence chunks, also break when real audio arrives
+                    if _used_silence:
                         _next_audio = os.path.join(
                             session_dir,
                             "audio_chunks",
