@@ -347,7 +347,15 @@ class ArtcPusher:
     # ------------------------------------------------------------------
 
     def _drain_loop(self) -> None:
-        """Drain the queue and push frames/audio to AliRTC SDK."""
+        """Drain the queue and push frames/audio to AliRTC SDK.
+
+        Uses a "skip-to-latest" strategy: before pushing a chunk, drain
+        any accumulated items from the queue and keep only the newest one.
+        This bounds latency to ~1 chunk (~1.12s) while still pushing all
+        28 frames of each selected chunk (no intra-chunk frame drops).
+        Intermediate chunks are skipped only when the queue accumulates
+        (generation outpacing real-time), roughly 1 skip per 9 chunks.
+        """
         try:
             from AliRTCLinuxSdkDefine import (
                 VideoBufferType,
@@ -371,6 +379,29 @@ class ArtcPusher:
 
             if item is None:
                 break  # sentinel
+
+            # --- Skip to latest: drain intermediate chunks ---
+            _skipped = 0
+            _skipped_frames = 0
+            while True:
+                try:
+                    newer = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if newer is None:
+                    # Sentinel — put it back so outer loop sees it
+                    self._queue.put(None)
+                    break
+                _skipped += 1
+                _skipped_frames += item[0].shape[0]
+                item = newer
+            if _skipped > 0:
+                # Advance timestamps for skipped chunks to keep A/V sync
+                self._v_ts += _skipped_frames * ms_per_frame
+                self._a_ts += _skipped_frames * ms_per_frame
+                logger.info(
+                    "ARTC drain: skipped %d chunk(s) to reduce latency", _skipped
+                )
 
             frames_np, audio_int16 = item
             num_frames = frames_np.shape[0]
