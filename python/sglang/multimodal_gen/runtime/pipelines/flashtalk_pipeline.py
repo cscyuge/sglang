@@ -84,6 +84,51 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
+class AudioRingBuffer:
+    """Fixed-size ring buffer backed by a numpy array.
+
+    Drop-in replacement for ``deque([0.0]*N, maxlen=N)`` that avoids the
+    costly ``.tolist()`` / ``.extend()`` round-trip through Python lists.
+    Provides O(1) ``extend`` (memcpy) and O(1) ``snapshot`` (two slices +
+    concatenate, but no per-element Python object creation).
+    """
+
+    __slots__ = ("_buf", "_pos", "_cap")
+
+    def __init__(self, capacity: int):
+        self._buf = np.zeros(capacity, dtype=np.float64)
+        self._pos = 0  # write head (points to oldest element)
+        self._cap = capacity
+
+    def extend(self, samples: np.ndarray) -> None:
+        """Append *samples* (1-D float array), dropping oldest values."""
+        n = len(samples)
+        if n == 0:
+            return
+        if n >= self._cap:
+            # More samples than capacity — keep only the last _cap samples.
+            np.copyto(self._buf, samples[-self._cap :])
+            self._pos = 0
+            return
+        # Write in up to two segments (wrap around).
+        end = self._pos + n
+        if end <= self._cap:
+            self._buf[self._pos : end] = samples
+        else:
+            first = self._cap - self._pos
+            self._buf[self._pos :] = samples[:first]
+            self._buf[: n - first] = samples[first:]
+        self._pos = end % self._cap
+
+    def snapshot(self) -> np.ndarray:
+        """Return a contiguous copy in chronological order."""
+        if self._pos == 0:
+            return self._buf.copy()
+        return np.concatenate(
+            (self._buf[self._pos :], self._buf[: self._pos])
+        )
+
+
 def _chunk_frames_to_numpy(chunk_frames: torch.Tensor) -> np.ndarray:
     """Convert a GPU chunk tensor to a CPU numpy array for JPEG saving.
 
@@ -124,19 +169,19 @@ def _prepare_audio_cpu(
     Designed to run in a background thread so GPU VAE decode/encode
     can proceed in parallel.
 
-    When called from the main thread (chunk 0), *audio_dq_or_snapshot*
-    is the live deque and *new_samples* are extended into it.  When
-    called from a background thread, *audio_dq_or_snapshot* must be a
-    numpy snapshot (the caller updates the real deque on the main
-    thread beforehand to avoid a race condition).
+    *audio_dq_or_snapshot* may be an :class:`AudioRingBuffer` (main-thread
+    path, chunk 0), a legacy ``deque`` (kept for compat), or a plain numpy
+    snapshot (background-thread path).
     """
-    if isinstance(audio_dq_or_snapshot, deque):
-        # Main-thread path: mutate the deque directly (no race).
+    if isinstance(audio_dq_or_snapshot, AudioRingBuffer):
+        if new_samples is not None:
+            audio_dq_or_snapshot.extend(new_samples)
+        audio_array = audio_dq_or_snapshot.snapshot()
+    elif isinstance(audio_dq_or_snapshot, deque):
         if new_samples is not None:
             audio_dq_or_snapshot.extend(new_samples.tolist())
         audio_array = np.array(audio_dq_or_snapshot)
     else:
-        # Background-thread path: snapshot already includes new_samples.
         audio_array = audio_dq_or_snapshot
 
     if pyln_mod is not None and pyln_meter is not None:
@@ -154,7 +199,6 @@ def _prefetch_audio_full(
     session_dir: str,
     audio_chunk_idx: int,
     audio_dq_snapshot: np.ndarray,
-    cached_audio_length: int,
     wav2vec_feature_extractor,
     sample_rate: int,
     pyln_mod,
@@ -174,13 +218,6 @@ def _prefetch_audio_full(
     wav2vec2 tokenizer) followed by GPU inference (wav2vec2 encoder +
     audio_proj) on a secondary CUDA stream that overlaps with the default
     stream's VAE decode.
-
-    Parameters
-    ----------
-    audio_dq_snapshot : np.ndarray
-        Snapshot of the audio deque as a numpy array (float64, length
-        ``cached_audio_length``).  The real deque is updated by the
-        caller after the prefetch result is consumed.
 
     Returns
     -------
@@ -208,11 +245,12 @@ def _prefetch_audio_full(
         chunk_audio_data = np.zeros(silence_samples, dtype=np.float32)
         used_silence = True
 
-    # Simulate deque extend: shift out oldest samples, append new ones
+    # Simulate ring-buffer extend on the snapshot.
     n_new = len(chunk_audio_data)
-    if 0 < n_new < cached_audio_length:
+    cap = len(audio_dq_snapshot)
+    if 0 < n_new < cap:
         audio_array = np.concatenate(
-            [audio_dq_snapshot[n_new:], chunk_audio_data.astype(np.float64)]
+            [audio_dq_snapshot[n_new:], chunk_audio_data.astype(audio_dq_snapshot.dtype)]
         )
     else:
         audio_array = audio_dq_snapshot.copy()
@@ -231,7 +269,6 @@ def _prefetch_audio_full(
     )
 
     # --- GPU Phase: wav2vec + audio_proj on secondary stream ---
-    # Ensure model parameters written on the default stream are visible.
     overlap_stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(overlap_stream):
         audio_feature_t = (
@@ -1830,10 +1867,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             audio_end_idx = cached_audio_duration * fps  # 200
             audio_start_idx = audio_end_idx - frame_num  # 167
 
-            # Initialize sliding audio deque with silence (matching original)
-            audio_dq: deque = deque(
-                [0.0] * cached_audio_length, maxlen=cached_audio_length
-            )
+            # Initialize sliding audio ring buffer with silence (matching original)
+            audio_dq = AudioRingBuffer(cached_audio_length)
 
             if raw_audio_array is not None:
                 # Normal multi-chunk: split raw audio into per-chunk sample slices
@@ -2236,8 +2271,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     if _pf_loaded:
                         audio_chunk_idx += 1
 
-                    # Update the real deque (prefetch used a snapshot)
-                    audio_dq.extend(chunk_audio_data.tolist())
+                    # Update the real ring buffer (prefetch used a snapshot)
+                    audio_dq.extend(chunk_audio_data)
                     batch.extra["audio_context"] = _pf_audio_context
                     _audio_prefetched = True
                 else:
@@ -2287,8 +2322,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
                 # a. Per-chunk audio processing (skip if prefetched)
                 if use_streaming_audio and not _audio_prefetched:
-                    audio_dq.extend(chunk_audio_data.tolist())
-                    audio_array = np.array(audio_dq)
+                    audio_dq.extend(chunk_audio_data)
+                    audio_array = audio_dq.snapshot()
 
                     if _pyln is not None and _pyln_meter is not None:
                         loudness = _pyln_meter.integrated_loudness(audio_array)
@@ -2349,8 +2384,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _prefetch_audio_full,
                         session_dir,
                         audio_chunk_idx,
-                        np.array(audio_dq),  # snapshot
-                        cached_audio_length,
+                        audio_dq.snapshot(),
                         wav2vec_feature_extractor,
                         sample_rate,
                         _pyln,
@@ -2585,10 +2619,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     if chunk_idx + 1 < len(speech_slices)
                     else None
                 )
-                # Update deque on main thread, then snapshot for bg thread
+                # Update ring buffer on main thread, then snapshot for bg thread
                 if _next_samples is not None:
-                    audio_dq.extend(_next_samples.tolist())
-                _audio_snapshot = np.array(audio_dq)
+                    audio_dq.extend(_next_samples)
+                _audio_snapshot = audio_dq.snapshot()
                 _audio_future = _audio_executor.submit(
                     _prepare_audio_cpu,
                     _audio_snapshot,
