@@ -330,13 +330,14 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
     if not data:
         raise ValueError(f"{_B64_FMT_HINT} (empty data payload)")
     # get ext from url
-    if media_type.startswith("image/"):
-        ext = media_type.split("/")[-1].lower()
-        if ext == "jpeg":
+    if not os.path.splitext(target_path)[1]:
+        if media_type.startswith("image/"):
+            ext = media_type.split("/")[-1].lower()
+            if ext == "jpeg":
+                ext = "jpg"
+        else:
             ext = "jpg"
-    else:
-        ext = "jpg"
-    target_path = f"{target_path}.{ext}"
+        target_path = f"{target_path}.{ext}"
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     try:

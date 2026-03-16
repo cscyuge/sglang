@@ -124,7 +124,7 @@ class ImageEncodingStage(PipelineStage):
                 continue
 
             cur_kwargs = image_processor_kwargs.copy()
-            if texts and idx < len(texts):
+            if texts and idx < len(texts) and texts[idx] is not None:
                 cur_kwargs["text"] = [texts[idx]]
 
             image_inputs = self.image_processor(
