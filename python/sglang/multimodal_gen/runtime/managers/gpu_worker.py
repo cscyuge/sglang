@@ -43,7 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     OffloadableDiTMixin,
     iter_materialized_weights,
@@ -274,9 +274,20 @@ class GPUWorker:
                         frame_interpolation_exp=req.frame_interpolation_exp,
                         frame_interpolation_scale=req.frame_interpolation_scale,
                         frame_interpolation_model_path=req.frame_interpolation_model_path,
+                        enable_upscaling=req.enable_upscaling,
+                        upscaling_model_path=req.upscaling_model_path,
+                        upscaling_scale=req.upscaling_scale,
                     )
                     output_batch.output_file_paths = output_paths
-                    output_batch.output = None
+
+                # No rank needs to hold on to generated tensors once the file-path
+                # response has been materialized on rank 0
+                output_batch.output = None
+                output_batch.audio = None
+                output_batch.audio_sample_rate = None
+
+                if torch.cuda.is_initialized():
+                    torch.cuda.empty_cache()
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
@@ -483,6 +494,8 @@ def run_scheduler_process(
     globally_suppress_loggers()
     if current_platform.is_cuda():
         set_cuda_arch()
+    elif current_platform.is_musa():
+        set_musa_arch()
 
     port_args = PortArgs.from_server_args(server_args)
 
