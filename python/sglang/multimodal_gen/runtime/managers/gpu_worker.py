@@ -213,6 +213,10 @@ class GPUWorker:
         output_batch = None
         try:
             if self.rank == 0:
+                logger.info(
+                    "Worker: starting forward for request %s",
+                    getattr(req, "request_id", "?"),
+                )
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
@@ -286,8 +290,18 @@ class GPUWorker:
                 output_batch.audio = None
                 output_batch.audio_sample_rate = None
 
-                if torch.cuda.is_initialized():
-                    torch.cuda.empty_cache()
+            # Free CUDA cache on ALL ranks to prevent OOM on the next
+            # request.  Previously only rank 0 freed cache; other ranks
+            # could accumulate stale allocations across sessions, leading
+            # to OOM → NCCL deadlock on the next forward pass.
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
+
+            if self.rank == 0:
+                logger.info(
+                    "Worker: forward complete for request %s",
+                    getattr(req, "request_id", "?"),
+                )
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:

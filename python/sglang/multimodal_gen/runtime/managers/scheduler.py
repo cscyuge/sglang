@@ -165,6 +165,9 @@ class Scheduler:
                 )
             else:
                 logger.info("Processing warmup req...")
+        else:
+            req_id = getattr(reqs[0], "request_id", "?") if reqs else "?"
+            logger.info("Scheduler: dispatching generation request %s", req_id)
         return self.worker.execute_forward(reqs)
 
     def return_result(
@@ -360,6 +363,10 @@ class Scheduler:
                 if not isinstance(recv_reqs, list):
                     recv_reqs = [recv_reqs]
 
+                logger.info(
+                    "Scheduler: received %d request(s) from ZMQ", len(recv_reqs)
+                )
+
                 # Pack with identity for rank 0
                 recv_reqs = [(identity, req) for req in recv_reqs]
         else:
@@ -437,6 +444,11 @@ class Scheduler:
 
             identities = [item[0] for item in items]
             reqs = [item[1] for item in items]
+            logger.info(
+                "Scheduler: dequeued request type=%s queue_remaining=%d",
+                type(reqs[0]).__name__ if reqs else "?",
+                len(self.waiting_queue),
+            )
 
             try:
                 processed_req = reqs[0]
@@ -460,6 +472,10 @@ class Scheduler:
                 )
 
             # 3. return results
+            logger.info(
+                "Scheduler: handler returned, error=%s",
+                output_batch.error[:80] if output_batch.error else None,
+            )
             try:
                 # log warmup info
                 is_warmup = (
