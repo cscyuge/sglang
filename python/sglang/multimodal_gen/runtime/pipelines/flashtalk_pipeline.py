@@ -2253,6 +2253,30 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 # --- Audio: use prefetch or load+process normally ---
                 _audio_prefetched = False
                 if _prefetched_result is not None:
+                    # Previous chunk prefetched this chunk's audio.
+                    # Check if newer audio chunks have arrived since
+                    # the prefetch was submitted — if so, the prefetched
+                    # data is stale; discard it and fall through to the
+                    # normal path which does skip-to-latest.
+                    _pf_next_idx = audio_chunk_idx + 1
+                    _pf_stale = os.path.exists(
+                        os.path.join(
+                            session_dir, "audio_chunks",
+                            f"chunk_{_pf_next_idx:04d}.npy",
+                        )
+                    )
+                    if _pf_stale:
+                        # Sync event to release GPU resources, then discard
+                        _prefetched_result[-1].synchronize()
+                        _prefetched_result = None
+                        logger.info(
+                            "Session: discarding stale prefetch "
+                            "(newer audio available beyond idx %d)",
+                            audio_chunk_idx,
+                        )
+                        # Fall through to normal path below
+
+                if _prefetched_result is not None:
                     # Previous chunk prefetched this chunk's audio
                     (
                         _pf_audio_context,
@@ -2278,6 +2302,33 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 else:
                     # Normal path: load audio file
                     _used_silence = False
+
+                    # Skip-to-latest: if multiple audio chunks have
+                    # accumulated (e.g. first chunk took longer due to
+                    # CUDA graph capture, or a slow chunk), jump to the
+                    # newest available audio chunk.  Without this, the
+                    # pipeline would be permanently behind by however
+                    # many chunks accumulated during the slow period.
+                    _skipped_audio = 0
+                    while True:
+                        _ahead_path = os.path.join(
+                            session_dir,
+                            "audio_chunks",
+                            f"chunk_{audio_chunk_idx + 1:04d}.npy",
+                        )
+                        if os.path.exists(_ahead_path):
+                            audio_chunk_idx += 1
+                            _skipped_audio += 1
+                        else:
+                            break
+                    if _skipped_audio > 0:
+                        logger.info(
+                            "Session: skipped %d stale audio chunk(s), "
+                            "now at audio_chunk_idx=%d",
+                            _skipped_audio,
+                            audio_chunk_idx,
+                        )
+
                     _audio_chunk_path = os.path.join(
                         session_dir,
                         "audio_chunks",
