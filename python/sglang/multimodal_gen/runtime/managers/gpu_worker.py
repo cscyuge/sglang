@@ -213,11 +213,12 @@ class GPUWorker:
         req = batch[0]
         output_batch = None
         try:
+            logger.info(
+                "Worker rank %d: starting forward for request %s",
+                self.rank,
+                getattr(req, "request_id", "?"),
+            )
             if self.rank == 0:
-                logger.info(
-                    "Worker: starting forward for request %s",
-                    getattr(req, "request_id", "?"),
-                )
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
@@ -228,7 +229,9 @@ class GPUWorker:
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
+            logger.info("Worker rank %d: entering pipeline.forward()", self.rank)
             result = self.pipeline.forward(req, self.server_args)
+            logger.info("Worker rank %d: pipeline.forward() returned", self.rank)
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
@@ -302,6 +305,9 @@ class GPUWorker:
             # 30 s, skip empty_cache and log a warning — better to leak some
             # CUDA memory than to deadlock the entire server.
             if torch.cuda.is_initialized():
+                logger.info(
+                    "Worker rank %d: cuda.synchronize() starting", self.rank
+                )
                 _sync_ok = threading.Event()
 
                 def _cuda_sync():
@@ -318,20 +324,25 @@ class GPUWorker:
                 _sync_ok.wait(timeout=30.0)
 
                 if _sync_ok.is_set():
+                    logger.info(
+                        "Worker rank %d: cuda.synchronize() done, "
+                        "calling empty_cache()",
+                        self.rank,
+                    )
                     torch.cuda.empty_cache()
                 else:
                     logger.warning(
-                        "torch.cuda.synchronize() did not complete within "
-                        "30 s — skipping empty_cache to avoid broadcast "
-                        "desync (rank %d)",
+                        "Worker rank %d: cuda.synchronize() did not "
+                        "complete within 30 s — skipping empty_cache "
+                        "to avoid broadcast desync",
                         self.rank,
                     )
 
-            if self.rank == 0:
-                logger.info(
-                    "Worker: forward complete for request %s",
-                    getattr(req, "request_id", "?"),
-                )
+            logger.info(
+                "Worker rank %d: forward complete for request %s",
+                self.rank,
+                getattr(req, "request_id", "?"),
+            )
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:

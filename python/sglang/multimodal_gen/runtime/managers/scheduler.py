@@ -374,7 +374,7 @@ class Scheduler:
 
         # TODO: fix this condition
         if self.server_args.sp_degree != 1:
-            logger.debug(
+            logger.info(
                 "Scheduler rank %d: entering SP broadcast_pyobj",
                 self.worker.sp_group.rank,
             )
@@ -384,7 +384,7 @@ class Scheduler:
                 self.worker.sp_cpu_group,
                 src=self.worker.sp_group.ranks[0],
             )
-            logger.debug(
+            logger.info(
                 "Scheduler rank %d: SP broadcast_pyobj done",
                 self.worker.sp_group.rank,
             )
@@ -481,7 +481,8 @@ class Scheduler:
 
             # 3. return results
             logger.info(
-                "Scheduler: handler returned, error=%s",
+                "Scheduler rank %d: handler returned, error=%s",
+                self.gpu_id,
                 output_batch.error[:80] if output_batch.error else None,
             )
             try:
