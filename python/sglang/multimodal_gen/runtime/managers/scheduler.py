@@ -374,23 +374,11 @@ class Scheduler:
 
         # TODO: fix this condition
         if self.server_args.sp_degree != 1:
-            logger.info(
-                "Scheduler rank %d: entering SP broadcast_pyobj",
-                self.worker.sp_group.rank,
-                main_process_only=False,
-                local_main_process_only=False,
-            )
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.worker.sp_group.rank,
                 self.worker.sp_cpu_group,
                 src=self.worker.sp_group.ranks[0],
-            )
-            logger.info(
-                "Scheduler rank %d: SP broadcast_pyobj done",
-                self.worker.sp_group.rank,
-                main_process_only=False,
-                local_main_process_only=False,
             )
 
         if self.server_args.enable_cfg_parallel:
@@ -484,13 +472,6 @@ class Scheduler:
                 )
 
             # 3. return results
-            logger.info(
-                "Scheduler rank %d: handler returned, error=%s",
-                self.gpu_id,
-                output_batch.error[:80] if output_batch.error else None,
-                main_process_only=False,
-                local_main_process_only=False,
-            )
             try:
                 # log warmup info
                 is_warmup = (

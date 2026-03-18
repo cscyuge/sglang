@@ -487,7 +487,7 @@ def configure_logger(server_args, prefix: str = ""):
     plain_formatter = logging.Formatter(log_format, datefmt=datefmt)
     file_handler = logging.FileHandler(log_file, mode="a")
     file_handler.setFormatter(plain_formatter)
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(getattr(logging, server_args.log_level.upper()))
     root.addHandler(file_handler)
 
     set_uvicorn_logging_configs()
