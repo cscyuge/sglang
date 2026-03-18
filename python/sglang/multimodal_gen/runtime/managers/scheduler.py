@@ -374,11 +374,19 @@ class Scheduler:
 
         # TODO: fix this condition
         if self.server_args.sp_degree != 1:
+            logger.debug(
+                "Scheduler rank %d: entering SP broadcast_pyobj",
+                self.worker.sp_group.rank,
+            )
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.worker.sp_group.rank,
                 self.worker.sp_cpu_group,
                 src=self.worker.sp_group.ranks[0],
+            )
+            logger.debug(
+                "Scheduler rank %d: SP broadcast_pyobj done",
+                self.worker.sp_group.rank,
             )
 
         if self.server_args.enable_cfg_parallel:

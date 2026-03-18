@@ -4,6 +4,7 @@
 import gc
 import multiprocessing as mp
 import os
+import threading
 import time
 from typing import List, Union
 
@@ -291,11 +292,40 @@ class GPUWorker:
                 output_batch.audio_sample_rate = None
 
             # Free CUDA cache on ALL ranks to prevent OOM on the next
-            # request.  Previously only rank 0 freed cache; other ranks
-            # could accumulate stale allocations across sessions, leading
-            # to OOM → NCCL deadlock on the next forward pass.
+            # request.  empty_cache() internally calls cudaDeviceSynchronize()
+            # which blocks until ALL CUDA streams finish.  If a lingering
+            # async op on any stream (e.g. secondary audio overlap stream,
+            # cleanup daemon gc) never completes, this rank hangs and
+            # desynchronizes from broadcast_pyobj, deadlocking the scheduler.
+            #
+            # Guard with a timed synchronize: if CUDA doesn't quiesce within
+            # 30 s, skip empty_cache and log a warning — better to leak some
+            # CUDA memory than to deadlock the entire server.
             if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+                _sync_ok = threading.Event()
+
+                def _cuda_sync():
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    _sync_ok.set()
+
+                _sync_thread = threading.Thread(
+                    target=_cuda_sync, daemon=True, name="cuda-sync"
+                )
+                _sync_thread.start()
+                _sync_ok.wait(timeout=30.0)
+
+                if _sync_ok.is_set():
+                    torch.cuda.empty_cache()
+                else:
+                    logger.warning(
+                        "torch.cuda.synchronize() did not complete within "
+                        "30 s — skipping empty_cache to avoid broadcast "
+                        "desync (rank %d)",
+                        self.rank,
+                    )
 
             if self.rank == 0:
                 logger.info(

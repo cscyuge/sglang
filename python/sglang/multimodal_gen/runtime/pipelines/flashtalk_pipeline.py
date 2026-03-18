@@ -2476,6 +2476,24 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
 
             # --- Session post-loop ---
             logger.info("Session post-loop: starting cleanup")
+
+            # Synchronize the audio overlap stream BEFORE cleanup so any
+            # lingering async GPU ops (wav2vec / audio_proj from the last
+            # prefetch) are guaranteed finished.  Without this, the cleanup
+            # daemon's pool.shutdown(wait=False) could leave a prefetch task
+            # still executing on the secondary stream, and the subsequent
+            # torch.cuda.empty_cache() → cudaDeviceSynchronize() in
+            # execute_forward would block waiting for it — potentially
+            # hanging this rank and deadlocking broadcast_pyobj.
+            if _audio_overlap_stream is not None:
+                try:
+                    _audio_overlap_stream.synchronize()
+                except Exception as e:
+                    logger.warning(
+                        "Audio overlap stream sync failed: %s", e
+                    )
+                _audio_overlap_stream = None
+
             self._post_loop_cleanup(
                 _gc_was_enabled, _frame_futures, _frame_executor, _frame_dir,
                 audio_prefetch_pool=_audio_prefetch_pool,
