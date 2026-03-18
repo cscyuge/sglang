@@ -477,6 +477,19 @@ def configure_logger(server_args, prefix: str = ""):
     root.addHandler(handler)
     root.setLevel(getattr(logging, server_args.log_level.upper()))
 
+    # With mp.set_start_method("spawn"), child processes may not inherit
+    # the parent's stdout redirection.  Add a file handler so ALL ranks
+    # (including non-rank-0 workers) write to a shared log file.
+    log_dir = os.environ.get("SGLANG_LOG_DIR", "/tmp/sglang_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+    log_file = os.path.join(log_dir, f"worker_rank{rank}.log")
+    plain_formatter = logging.Formatter(log_format, datefmt=datefmt)
+    file_handler = logging.FileHandler(log_file, mode="a")
+    file_handler.setFormatter(plain_formatter)
+    file_handler.setLevel(logging.DEBUG)
+    root.addHandler(file_handler)
+
     set_uvicorn_logging_configs()
 
 

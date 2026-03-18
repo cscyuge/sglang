@@ -28,6 +28,7 @@ from transformers import AutoTokenizer
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_world_size,
+    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -2196,10 +2197,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _artc_channel = batch.extra.get("artc_channel")
             _artc_userid = batch.extra.get("artc_userid")
             if _artc_token and _artc_channel:
-                from sglang.multimodal_gen.runtime.distributed import (
-                    get_world_rank,
-                )
-
                 if get_world_rank() == 0:
                     try:
                         from sglang.multimodal_gen.runtime.utils.artc_pusher import (
@@ -2241,11 +2238,39 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 )
 
             while True:
-                # --- Non-blocking audio poll (silence fill) ---
-                if os.path.exists(_end_path):
+                # --- Synchronized end/cancel check ---
+                # All ranks must agree on whether to stop BEFORE the
+                # denoising step (which uses NCCL collectives).  Without
+                # this broadcast, a race on the filesystem sentinel can
+                # cause one rank to break while others proceed to
+                # denoising — an NCCL deadlock that hangs inter-session.
+                _should_stop = False
+                _should_cancel = False
+                if sp_size > 1:
+                    _stop_flag = torch.zeros(
+                        1, dtype=torch.int32, device=device
+                    )
+                    if get_world_rank() == 0:
+                        if os.path.exists(_end_path):
+                            _stop_flag[0] = 1
+                        elif _cancel_file and os.path.exists(_cancel_file):
+                            _stop_flag[0] = 2
+                    torch.distributed.broadcast(_stop_flag, src=0)
+                    if _stop_flag[0] == 1:
+                        _should_stop = True
+                    elif _stop_flag[0] == 2:
+                        _should_cancel = True
+                    del _stop_flag
+                else:
+                    if os.path.exists(_end_path):
+                        _should_stop = True
+                    elif _cancel_file and os.path.exists(_cancel_file):
+                        _should_cancel = True
+
+                if _should_stop:
                     logger.info("Session ended at chunk %d", chunk_idx)
                     break
-                if _cancel_file and os.path.exists(_cancel_file):
+                if _should_cancel:
                     logger.info("Session cancelled at chunk %d", chunk_idx)
                     _cancelled = True
                     break

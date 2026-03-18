@@ -217,6 +217,8 @@ class GPUWorker:
                 "Worker rank %d: starting forward for request %s",
                 self.rank,
                 getattr(req, "request_id", "?"),
+                main_process_only=False,
+                local_main_process_only=False,
             )
             if self.rank == 0:
                 torch.get_device_module().reset_peak_memory_stats()
@@ -229,9 +231,9 @@ class GPUWorker:
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
-            logger.info("Worker rank %d: entering pipeline.forward()", self.rank)
+            logger.info("Worker rank %d: entering pipeline.forward()", self.rank, main_process_only=False, local_main_process_only=False)
             result = self.pipeline.forward(req, self.server_args)
-            logger.info("Worker rank %d: pipeline.forward() returned", self.rank)
+            logger.info("Worker rank %d: pipeline.forward() returned", self.rank, main_process_only=False, local_main_process_only=False)
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
@@ -306,7 +308,8 @@ class GPUWorker:
             # CUDA memory than to deadlock the entire server.
             if torch.cuda.is_initialized():
                 logger.info(
-                    "Worker rank %d: cuda.synchronize() starting", self.rank
+                    "Worker rank %d: cuda.synchronize() starting", self.rank,
+                    main_process_only=False, local_main_process_only=False,
                 )
                 _sync_ok = threading.Event()
 
@@ -328,6 +331,8 @@ class GPUWorker:
                         "Worker rank %d: cuda.synchronize() done, "
                         "calling empty_cache()",
                         self.rank,
+                        main_process_only=False,
+                        local_main_process_only=False,
                     )
                     torch.cuda.empty_cache()
                 else:
@@ -342,6 +347,8 @@ class GPUWorker:
                 "Worker rank %d: forward complete for request %s",
                 self.rank,
                 getattr(req, "request_id", "?"),
+                main_process_only=False,
+                local_main_process_only=False,
             )
 
             # TODO: extract to avoid duplication
@@ -568,7 +575,7 @@ def run_scheduler_process(
             result_pipes_from_slaves=result_pipes_from_slaves,
         )
         scheduler.process_warmup()
-        logger.info(f"Worker {rank}: Scheduler loop started.")
+        logger.info(f"Worker {rank}: Scheduler loop started.", main_process_only=False, local_main_process_only=False)
         pipe_writer.send(
             {
                 "status": "ready",
@@ -587,4 +594,4 @@ def run_scheduler_process(
             torch.cuda.empty_cache()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
-        logger.info(f"Worker {rank}: Shutdown complete.")
+        logger.info(f"Worker {rank}: Shutdown complete.", main_process_only=False, local_main_process_only=False)
