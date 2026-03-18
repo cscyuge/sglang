@@ -2253,30 +2253,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 # --- Audio: use prefetch or load+process normally ---
                 _audio_prefetched = False
                 if _prefetched_result is not None:
-                    # Previous chunk prefetched this chunk's audio.
-                    # Check if newer audio chunks have arrived since
-                    # the prefetch was submitted — if so, the prefetched
-                    # data is stale; discard it and fall through to the
-                    # normal path which does skip-to-latest.
-                    _pf_next_idx = audio_chunk_idx + 1
-                    _pf_stale = os.path.exists(
-                        os.path.join(
-                            session_dir, "audio_chunks",
-                            f"chunk_{_pf_next_idx:04d}.npy",
-                        )
-                    )
-                    if _pf_stale:
-                        # Sync event to release GPU resources, then discard
-                        _prefetched_result[-1].synchronize()
-                        _prefetched_result = None
-                        logger.info(
-                            "Session: discarding stale prefetch "
-                            "(newer audio available beyond idx %d)",
-                            audio_chunk_idx,
-                        )
-                        # Fall through to normal path below
-
-                if _prefetched_result is not None:
                     # Previous chunk prefetched this chunk's audio
                     (
                         _pf_audio_context,
@@ -2302,33 +2278,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 else:
                     # Normal path: load audio file
                     _used_silence = False
-
-                    # Skip-to-latest: if multiple audio chunks have
-                    # accumulated (e.g. first chunk took longer due to
-                    # CUDA graph capture, or a slow chunk), jump to the
-                    # newest available audio chunk.  Without this, the
-                    # pipeline would be permanently behind by however
-                    # many chunks accumulated during the slow period.
-                    _skipped_audio = 0
-                    while True:
-                        _ahead_path = os.path.join(
-                            session_dir,
-                            "audio_chunks",
-                            f"chunk_{audio_chunk_idx + 1:04d}.npy",
-                        )
-                        if os.path.exists(_ahead_path):
-                            audio_chunk_idx += 1
-                            _skipped_audio += 1
-                        else:
-                            break
-                    if _skipped_audio > 0:
-                        logger.info(
-                            "Session: skipped %d stale audio chunk(s), "
-                            "now at audio_chunk_idx=%d",
-                            _skipped_audio,
-                            audio_chunk_idx,
-                        )
-
                     _audio_chunk_path = os.path.join(
                         session_dir,
                         "audio_chunks",
@@ -2498,28 +2447,41 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 # audio arrival / SDK push rate.  Without this, chunks
                 # generated faster than real-time would pile up in the
                 # push queue and get dropped.
-                _remaining = _chunk_wall_time - _t_chunk
-                while _remaining > 0:
-                    time.sleep(min(0.05, _remaining))
-                    _remaining = _chunk_wall_time - (time.time() - chunk_start)
-                    # Break early on end/cancel
-                    if os.path.exists(_end_path):
-                        break
-                    if _cancel_file and os.path.exists(_cancel_file):
-                        break
-                    # For silence chunks, also break when real audio arrives
-                    if _used_silence:
-                        _next_audio = os.path.join(
-                            session_dir,
-                            "audio_chunks",
-                            f"chunk_{audio_chunk_idx:04d}.npy",
+                #
+                # Skip pacing entirely when the next audio chunk is
+                # already on disk — this means audio arrived faster
+                # than real-time (e.g. burst upload) and we should
+                # generate as fast as possible to catch up.
+                _next_audio_path = os.path.join(
+                    session_dir,
+                    "audio_chunks",
+                    f"chunk_{audio_chunk_idx:04d}.npy",
+                )
+                _has_pending_audio = os.path.exists(_next_audio_path)
+
+                if _has_pending_audio:
+                    # Catch-up mode: audio is queued, skip pacing to
+                    # process the backlog as fast as possible.
+                    # Invalidate prefetch since it may have used stale
+                    # data (silence when real audio was available).
+                    _prefetched_result = None
+                else:
+                    _remaining = _chunk_wall_time - _t_chunk
+                    while _remaining > 0:
+                        time.sleep(min(0.05, _remaining))
+                        _remaining = _chunk_wall_time - (
+                            time.time() - chunk_start
                         )
-                        if os.path.exists(_next_audio):
-                            # Audio arrived during pacing — invalidate
-                            # the prefetch (it used silence data with a
-                            # stale deque snapshot).
-                            _prefetched_result = None
+                        # Break early on end/cancel
+                        if os.path.exists(_end_path):
                             break
+                        if _cancel_file and os.path.exists(_cancel_file):
+                            break
+                        # For silence chunks, break when real audio arrives
+                        if _used_silence:
+                            if os.path.exists(_next_audio_path):
+                                _prefetched_result = None
+                                break
 
                 # Periodically drain completed futures to avoid unbounded list growth
                 if chunk_idx % 50 == 0 and _frame_futures:
