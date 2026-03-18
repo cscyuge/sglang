@@ -410,6 +410,22 @@ class ArtcPusher:
                 if self._failed:
                     return
 
+                # Intra-chunk preemption: if a newer chunk has arrived
+                # while we're pushing frames, abort the current chunk
+                # and let the outer loop pick up the newer one.  This
+                # cuts up to 1.12s of latency when a real-audio chunk
+                # arrives while we're mid-way through a stale chunk.
+                if not self._queue.empty():
+                    remaining_frames = num_frames - i
+                    self._v_ts += remaining_frames * ms_per_frame
+                    self._a_ts += remaining_frames * ms_per_frame
+                    logger.info(
+                        "ARTC drain: preempted chunk at frame %d/%d "
+                        "(newer chunk available)",
+                        i, num_frames,
+                    )
+                    break
+
                 # --- Push video frame ---
                 # Wait if SDK buffer is full
                 while self._push_video_full:
