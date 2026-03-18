@@ -380,28 +380,34 @@ class ArtcPusher:
             if item is None:
                 break  # sentinel
 
-            # --- Skip to latest: drain intermediate chunks ---
-            _skipped = 0
-            _skipped_frames = 0
-            while True:
-                try:
-                    newer = self._queue.get_nowait()
-                except queue.Empty:
-                    break
-                if newer is None:
-                    # Sentinel — put it back so outer loop sees it
-                    self._queue.put(None)
-                    break
-                _skipped += 1
-                _skipped_frames += item[0].shape[0]
-                item = newer
-            if _skipped > 0:
-                # Advance timestamps for skipped chunks to keep A/V sync
-                self._v_ts += _skipped_frames * ms_per_frame
-                self._a_ts += _skipped_frames * ms_per_frame
-                logger.info(
-                    "ARTC drain: skipped %d chunk(s) to reduce latency", _skipped
-                )
+            # --- Skip to latest when queue is near-full ---
+            # Only skip when the queue is severely backed up (>= 6/8).
+            # During normal catch-up (1-2 pending), push all chunks to
+            # avoid dropping valid audio/video content.
+            _qsize = self._queue.qsize()
+            if _qsize >= self._queue.maxsize - 2:
+                _skipped = 0
+                _skipped_frames = 0
+                while True:
+                    try:
+                        newer = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if newer is None:
+                        # Sentinel — put it back so outer loop sees it
+                        self._queue.put(None)
+                        break
+                    _skipped += 1
+                    _skipped_frames += item[0].shape[0]
+                    item = newer
+                if _skipped > 0:
+                    # Advance timestamps for skipped chunks to keep A/V sync
+                    self._v_ts += _skipped_frames * ms_per_frame
+                    self._a_ts += _skipped_frames * ms_per_frame
+                    logger.info(
+                        "ARTC drain: queue near-full, skipped %d chunk(s)",
+                        _skipped,
+                    )
 
             frames_np, audio_int16 = item
             num_frames = frames_np.shape[0]
@@ -409,22 +415,6 @@ class ArtcPusher:
             for i in range(num_frames):
                 if self._failed:
                     return
-
-                # Intra-chunk preemption: if a newer chunk has arrived
-                # while we're pushing frames, abort the current chunk
-                # and let the outer loop pick up the newer one.  This
-                # cuts up to 1.12s of latency when a real-audio chunk
-                # arrives while we're mid-way through a stale chunk.
-                if not self._queue.empty():
-                    remaining_frames = num_frames - i
-                    self._v_ts += remaining_frames * ms_per_frame
-                    self._a_ts += remaining_frames * ms_per_frame
-                    logger.info(
-                        "ARTC drain: preempted chunk at frame %d/%d "
-                        "(newer chunk available)",
-                        i, num_frames,
-                    )
-                    break
 
                 # --- Push video frame ---
                 # Wait if SDK buffer is full
