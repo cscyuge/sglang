@@ -27,6 +27,7 @@ from transformers import AutoTokenizer
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
+    get_sp_group,
     get_sp_world_size,
     get_world_rank,
 )
@@ -2247,15 +2248,18 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 _should_stop = False
                 _should_cancel = False
                 if sp_size > 1:
-                    _stop_flag = torch.zeros(
-                        1, dtype=torch.int32, device=device
-                    )
+                    # Use CPU tensor + gloo backend to avoid interfering
+                    # with CUDA graph replay on the default CUDA stream.
+                    _stop_flag = torch.zeros(1, dtype=torch.int32)
                     if get_world_rank() == 0:
                         if os.path.exists(_end_path):
                             _stop_flag[0] = 1
                         elif _cancel_file and os.path.exists(_cancel_file):
                             _stop_flag[0] = 2
-                    torch.distributed.broadcast(_stop_flag, src=0)
+                    torch.distributed.broadcast(
+                        _stop_flag, src=0,
+                        group=get_sp_group().cpu_group,
+                    )
                     if _stop_flag[0] == 1:
                         _should_stop = True
                     elif _stop_flag[0] == 2:
