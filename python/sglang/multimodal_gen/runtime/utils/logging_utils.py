@@ -482,7 +482,7 @@ def configure_logger(server_args, prefix: str = ""):
     # (including non-rank-0 workers) write to a shared log file.
     log_dir = os.environ.get("SGLANG_LOG_DIR", "/tmp/sglang_logs")
     os.makedirs(log_dir, exist_ok=True)
-    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "unknown"))
     log_file = os.path.join(log_dir, f"worker_rank{rank}.log")
     plain_formatter = logging.Formatter(log_format, datefmt=datefmt)
     file_handler = logging.FileHandler(log_file, mode="a")
@@ -491,6 +491,35 @@ def configure_logger(server_args, prefix: str = ""):
     root.addHandler(file_handler)
 
     set_uvicorn_logging_configs()
+
+
+def _reconfigure_file_handler(server_args, rank: int) -> None:
+    """Replace the per-rank file handler after RANK env var is known.
+
+    ``configure_logger`` runs before ``RANK`` is set, so all workers
+    initially write to ``worker_rankunknown.log``.  Call this once RANK
+    is available to switch to ``worker_rank<N>.log``.
+    """
+    log_dir = os.environ.get("SGLANG_LOG_DIR", "/tmp/sglang_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"worker_rank{rank}.log")
+
+    root = logging.getLogger()
+    # Remove the old file handler (the one with "unknown" or "0" rank)
+    for h in list(root.handlers):
+        if isinstance(h, logging.FileHandler) and h.baseFilename.startswith(
+            os.path.join(log_dir, "worker_rank")
+        ):
+            root.removeHandler(h)
+            h.close()
+
+    log_format = f"[%(asctime)s rank{rank}] %(message)s"
+    datefmt = "%m-%d %H:%M:%S"
+    plain_formatter = logging.Formatter(log_format, datefmt=datefmt)
+    file_handler = logging.FileHandler(log_file, mode="a")
+    file_handler.setFormatter(plain_formatter)
+    file_handler.setLevel(getattr(logging, server_args.log_level.upper()))
+    root.addHandler(file_handler)
 
 
 @lru_cache(maxsize=1)

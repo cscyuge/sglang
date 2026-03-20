@@ -2513,25 +2513,35 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _frame_futures = [f for f in _frame_futures if not f.done()]
 
             # --- Session post-loop ---
-            logger.info("Session post-loop: starting cleanup")
+            _my_rank = get_world_rank()
+            logger.info(
+                "Rank %d: session loop exited at chunk %d",
+                _my_rank, chunk_idx,
+                main_process_only=False,
+                local_main_process_only=False,
+            )
 
             # Synchronize the audio overlap stream BEFORE cleanup so any
             # lingering async GPU ops (wav2vec / audio_proj from the last
-            # prefetch) are guaranteed finished.  Without this, the cleanup
-            # daemon's pool.shutdown(wait=False) could leave a prefetch task
-            # still executing on the secondary stream, and the subsequent
-            # torch.cuda.empty_cache() → cudaDeviceSynchronize() in
-            # execute_forward would block waiting for it — potentially
-            # hanging this rank and deadlocking broadcast_pyobj.
+            # prefetch) are guaranteed finished.
             if _audio_overlap_stream is not None:
                 try:
                     _audio_overlap_stream.synchronize()
                 except Exception as e:
                     logger.warning(
-                        "Audio overlap stream sync failed: %s", e
+                        "Rank %d: audio overlap stream sync failed: %s",
+                        _my_rank, e,
+                        main_process_only=False,
+                        local_main_process_only=False,
                     )
                 _audio_overlap_stream = None
 
+            logger.info(
+                "Rank %d: entering _post_loop_cleanup",
+                _my_rank,
+                main_process_only=False,
+                local_main_process_only=False,
+            )
             self._post_loop_cleanup(
                 _gc_was_enabled, _frame_futures, _frame_executor, _frame_dir,
                 audio_prefetch_pool=_audio_prefetch_pool,
@@ -2540,7 +2550,12 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _audio_prefetch_pool = None
             _prefetched_result = None
             _stream_pusher = None  # break reference after cleanup
-            logger.info("Session post-loop: cleanup complete")
+            logger.info(
+                "Rank %d: session cleanup complete, returning from pipeline.forward()",
+                _my_rank,
+                main_process_only=False,
+                local_main_process_only=False,
+            )
 
             if not all_chunk_frames:
                 # Session mode: frames already streamed via fMP4, nothing to save.

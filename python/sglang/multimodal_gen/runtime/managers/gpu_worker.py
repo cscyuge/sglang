@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import gc
 import multiprocessing as mp
+import threading
 import os
 import time
 from typing import List, Union
@@ -49,6 +50,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    _reconfigure_file_handler,
     configure_logger,
     globally_suppress_loggers,
     init_logger,
@@ -98,6 +100,10 @@ class GPUWorker:
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
+
+        # Re-add per-rank file handler now that RANK is set
+        # (configure_logger ran before RANK was available)
+        _reconfigure_file_handler(self.server_args, self.rank)
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
@@ -287,9 +293,34 @@ class GPUWorker:
                 output_batch.audio_sample_rate = None
 
             # Free CUDA cache on ALL ranks to prevent OOM on the next request.
+            # Guard with a timed synchronize: if CUDA doesn't quiesce within
+            # 30 s, skip empty_cache to avoid deadlocking broadcast_pyobj.
             if torch.cuda.is_initialized():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                _sync_ok = threading.Event()
+
+                def _cuda_sync():
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    _sync_ok.set()
+
+                _sync_thread = threading.Thread(
+                    target=_cuda_sync, daemon=True, name="cuda-sync"
+                )
+                _sync_thread.start()
+                _sync_ok.wait(timeout=30.0)
+
+                if _sync_ok.is_set():
+                    torch.cuda.empty_cache()
+                else:
+                    logger.warning(
+                        "Worker rank %d: cuda.synchronize() timed out "
+                        "(30 s) — skipping empty_cache",
+                        self.rank,
+                        main_process_only=False,
+                        local_main_process_only=False,
+                    )
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
