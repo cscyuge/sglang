@@ -2044,7 +2044,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             # replaces the manual WanRMS_norm fusion — torch.compile handles
             # all kernel fusion (norm+scale+SiLU, residual adds, etc.)
             # automatically with broader optimization scope.
-            if not getattr(vae, "_flashtalk_decoder_compiled", False):
+            _use_vae_compile = (
+                os.environ.get("SGLANG_FLASHTALK_VAE_TORCH_COMPILE", "0") == "1"
+            )
+            if _use_vae_compile and not getattr(vae, "_flashtalk_decoder_compiled", False):
                 vae.decoder = torch.compile(vae.decoder, mode="default")
                 vae._flashtalk_decoder_compiled = True
                 logger.info("VAE decoder torch.compiled (mode=default)")
