@@ -213,6 +213,7 @@ def _prefetch_audio_full(
     s_audio_windowed_idx: torch.Tensor,
     vae_temporal_factor: int,
     overlap_stream: "torch.cuda.Stream",
+    after_denoise_event: "torch.cuda.Event | None" = None,
 ) -> tuple:
     """Prefetch next chunk's audio processing in a background thread.
 
@@ -220,6 +221,14 @@ def _prefetch_audio_full(
     wav2vec2 tokenizer) followed by GPU inference (wav2vec2 encoder +
     audio_proj) on a secondary CUDA stream that overlaps with the default
     stream's VAE decode.
+
+    Parameters
+    ----------
+    after_denoise_event : torch.cuda.Event, optional
+        Event recorded on the default stream right after denoising completes
+        (before CUDA graph replay).  The overlap stream waits for this event
+        to guarantee it only starts GPU work after denoising outputs are
+        visible — without depending on CPU thread scheduling.
 
     Returns
     -------
@@ -271,7 +280,12 @@ def _prefetch_audio_full(
     )
 
     # --- GPU Phase: wav2vec + audio_proj on secondary stream ---
-    overlap_stream.wait_stream(torch.cuda.current_stream(device))
+    # Use the pre-recorded event for deterministic synchronisation.
+    # Fallback to wait_stream for backward compat (non-deterministic).
+    if after_denoise_event is not None:
+        overlap_stream.wait_event(after_denoise_event)
+    else:
+        overlap_stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(overlap_stream):
         audio_feature_t = (
             torch.from_numpy(audio_feature_np)
@@ -2292,8 +2306,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     ) = _prefetched_result
                     _prefetched_result = None
 
-                    # Sync the secondary stream (should already be done)
-                    _pf_event.synchronize()
+                    # Sync: make default stream wait for the overlap stream's
+                    # GPU work (wav2vec + audio_proj) to finish before we use
+                    # the prefetched audio_context tensor in denoising.
+                    # Stream-side wait avoids unnecessary CPU blocking.
+                    torch.cuda.current_stream(device).wait_event(_pf_event)
 
                     chunk_audio_data = _pf_chunk_audio
                     _used_silence = _pf_silence
@@ -2409,6 +2426,13 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 # concurrently while VAE decode+encode runs on the default stream.
                 _audio_prefetch_future: Future | None = None
                 if _enable_audio_overlap and _audio_prefetch_pool is not None:
+                    # Record event BEFORE graph replay so the overlap stream
+                    # has a deterministic sync point (denoising done, VAE not
+                    # yet started).  The overlap stream waits for this event
+                    # rather than probing current_stream from the bg thread.
+                    _after_denoise_event = torch.cuda.Event()
+                    _after_denoise_event.record(torch.cuda.current_stream(device))
+
                     _audio_prefetch_future = _audio_prefetch_pool.submit(
                         _prefetch_audio_full,
                         session_dir,
@@ -2426,6 +2450,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _audio_windowed_idx,
                         vae_temporal_factor,
                         _audio_overlap_stream,
+                        _after_denoise_event,
                     )
 
                 chunk_frames, batch = self._vae_decode_color_correct_motion_carry(
@@ -2491,9 +2516,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 if _has_pending_audio:
                     # Catch-up mode: audio is queued, skip pacing to
                     # process the backlog as fast as possible.
-                    # Invalidate prefetch since it may have used stale
-                    # data (silence when real audio was available).
-                    _prefetched_result = None
+                    # Only invalidate the prefetch if it fell back to
+                    # silence — the real audio file may have arrived
+                    # after the prefetch checked.  When the prefetch
+                    # successfully loaded real audio, keep it to avoid
+                    # re-processing on the critical path (~120 ms).
+                    if (
+                        _prefetched_result is not None
+                        and _prefetched_result[2]  # used_silence
+                    ):
+                        _prefetched_result = None
                 else:
                     _remaining = _chunk_wall_time - _t_chunk
                     while _remaining > 0:
