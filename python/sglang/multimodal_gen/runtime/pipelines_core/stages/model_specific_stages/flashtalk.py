@@ -16,7 +16,9 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
+    get_sp_group,
     get_sp_world_size,
+    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -344,6 +346,19 @@ class FlashTalkDenoisingStage(PipelineStage):
                     self._teacache_reduced += 1
 
             self._prev_audio_context = audio_context.detach().clone()
+
+        # Broadcast step count across SP ranks to prevent NCCL deadlock.
+        # Each rank computes audio_context independently (wav2vec + audio_proj
+        # have no SP parallelism), so CUDA floating-point non-determinism can
+        # cause rel_l1 to land on different sides of the threshold on different
+        # GPUs — leading to divergent step counts and mismatched NCCL collectives.
+        sp_size = get_sp_world_size()
+        if sp_size > 1:
+            _steps_t = torch.tensor([base_num_steps], dtype=torch.int32)
+            torch.distributed.broadcast(
+                _steps_t, src=0, group=get_sp_group().cpu_group
+            )
+            base_num_steps = _steps_t.item()
 
         # Get conditioning
         encoder_hidden_states = batch.prompt_embeds
