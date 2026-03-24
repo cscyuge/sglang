@@ -65,6 +65,25 @@ class ListLorasReq:
 
 
 @dataclass
+class StartProfileReq:
+    output_dir: str = "/tmp/sglang_profile"
+    activities: list = field(default_factory=lambda: ["CPU", "GPU"])
+    with_stack: bool = False
+    record_shapes: bool = False
+
+
+@dataclass
+class StopProfileReq:
+    pass
+
+
+@dataclass
+class ProfileReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class ShutdownReq:
     pass
 

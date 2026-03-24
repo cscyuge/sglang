@@ -9,7 +9,10 @@ from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
+    ProfileReqOutput,
     SetLoraReq,
+    StartProfileReq,
+    StopProfileReq,
     UnmergeLoraWeightsReq,
     format_lora_message,
 )
@@ -247,3 +250,53 @@ async def retrieve_model(model: str):
 
     # Return dict to preserve extended fields
     return DiffusionModelCard(**card_kwargs).model_dump()
+
+
+class StartProfileInput(BaseModel):
+    output_dir: Optional[str] = None
+    activities: Optional[List[str]] = None
+    with_stack: Optional[bool] = None
+    record_shapes: Optional[bool] = None
+
+
+@router.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile(obj: Optional[StartProfileInput] = None):
+    """Start torch profiler on all GPU workers."""
+    if obj is None:
+        obj = StartProfileInput()
+    req = StartProfileReq(
+        output_dir=obj.output_dir or "/tmp/sglang_profile",
+        activities=obj.activities or ["CPU", "GPU"],
+        with_stack=obj.with_stack or False,
+        record_shapes=obj.record_shapes or False,
+    )
+    try:
+        output: OutputBatch = await async_scheduler_client.forward(req)
+        result: ProfileReqOutput = output.output
+        if result.success:
+            return {"status": "ok", "message": result.message}
+        else:
+            raise HTTPException(status_code=400, detail=result.message)
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        logger.error(f"Error starting profile: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile():
+    """Stop torch profiler and export traces from all GPU workers."""
+    req = StopProfileReq()
+    try:
+        output: OutputBatch = await async_scheduler_client.forward(req)
+        result: ProfileReqOutput = output.output
+        if result.success:
+            return {"status": "ok", "message": result.message}
+        else:
+            raise HTTPException(status_code=400, detail=result.message)
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        logger.error(f"Error stopping profile: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

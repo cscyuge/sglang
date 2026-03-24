@@ -21,8 +21,11 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
+    ProfileReqOutput,
     SetLoraReq,
     ShutdownReq,
+    StartProfileReq,
+    StopProfileReq,
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
@@ -96,7 +99,14 @@ class Scheduler:
             ShutdownReq: self._handle_shutdown,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            StartProfileReq: self._handle_start_profile,
+            StopProfileReq: self._handle_stop_profile,
         }
+
+        # Profiler state
+        self.torch_profiler = None
+        self.profile_in_progress = False
+        self.torch_profiler_output_dir = None
 
         # FIFO, new reqs are appended
         self.waiting_queue: deque[tuple[bytes, Req]] = deque()
@@ -135,6 +145,88 @@ class Scheduler:
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
+
+    def _handle_start_profile(self, reqs: List[Any]) -> OutputBatch:
+        import time
+
+        import torch.profiler
+
+        req = reqs[0]
+        if self.profile_in_progress:
+            return OutputBatch(
+                output=ProfileReqOutput(
+                    success=False, message="Profiling is already in progress"
+                )
+            )
+
+        activity_map = {
+            "CPU": torch.profiler.ProfilerActivity.CPU,
+            "CUDA": torch.profiler.ProfilerActivity.CUDA,
+            "GPU": torch.profiler.ProfilerActivity.CUDA,
+        }
+        activities = []
+        for a in req.activities:
+            act = activity_map.get(a.upper())
+            if act is not None:
+                activities.append(act)
+        if not activities:
+            activities = [
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+
+        output_dir = req.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self.torch_profiler_output_dir = output_dir
+
+        self.torch_profiler = torch.profiler.profile(
+            activities=activities,
+            with_stack=req.with_stack,
+            record_shapes=req.record_shapes,
+        )
+        self.torch_profiler.start()
+        self.profile_in_progress = True
+
+        logger.info(
+            "Started torch profiler on rank %d (output_dir=%s)",
+            self.gpu_id,
+            output_dir,
+        )
+        return OutputBatch(
+            output=ProfileReqOutput(
+                success=True, message=f"Profiling started (output_dir={output_dir})"
+            )
+        )
+
+    def _handle_stop_profile(self, _reqs: List[Any]) -> OutputBatch:
+        import time
+
+        if not self.profile_in_progress or self.torch_profiler is None:
+            return OutputBatch(
+                output=ProfileReqOutput(
+                    success=False, message="No profiling in progress"
+                )
+            )
+
+        self.torch_profiler.stop()
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        trace_path = os.path.join(
+            self.torch_profiler_output_dir,
+            f"profile-{timestamp}-rank{self.gpu_id}.trace.json.gz",
+        )
+        self.torch_profiler.export_chrome_trace(trace_path)
+        logger.info("Exported trace to %s", trace_path)
+
+        self.torch_profiler = None
+        self.profile_in_progress = False
+        self.torch_profiler_output_dir = None
+
+        return OutputBatch(
+            output=ProfileReqOutput(
+                success=True, message=f"Profiling stopped, trace saved to {trace_path}"
+            )
+        )
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
