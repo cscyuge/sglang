@@ -291,6 +291,19 @@ async def _dispatch_session_async(session_id: str, batch: Req) -> None:
         await VIDEO_STORE.update_fields(
             session_id, {"status": "failed", "error": {"message": str(e)}}
         )
+        # Write end sentinel so the pipeline's chunk loop (which may still
+        # be running in the GPU worker) sees it and exits.  Without this,
+        # a ZMQ timeout kills the HTTP-side future but the pipeline keeps
+        # generating chunks forever — and directory cleanup below removes
+        # the session dir, making it impossible to signal the pipeline later.
+        session_dir = _session_dir_for_id(session_id)
+        end_path = os.path.join(session_dir, "end")
+        try:
+            os.makedirs(session_dir, exist_ok=True)
+            with open(end_path, "w"):
+                pass
+        except OSError:
+            pass
     finally:
         try:
             os.remove(cancel_file)
