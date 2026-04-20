@@ -9,6 +9,9 @@ from sglang.multimodal_gen.configs.models.dits.wanvideo import (
     FlashTalkWanVideoConfig,
     WanVideoConfig,
 )
+from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
+    StableDiffusion3TransformerConfig,
+)
 
 __all__ = [
     "FlashTalkWanVideoConfig",
@@ -18,4 +21,5 @@ __all__ = [
     "Hunyuan3DDiTConfig",
     "MOVAAudioConfig",
     "MOVAVideoConfig",
+    "StableDiffusion3TransformerConfig",
 ]

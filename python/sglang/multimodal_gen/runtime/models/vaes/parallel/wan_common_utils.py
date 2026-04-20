@@ -210,8 +210,10 @@ class WanCausalConv3d(nn.Conv3d):
             padding[4] -= cache_x.shape[2]
         x = F.pad(x, padding)
         x = (
-            x.to(self.weight.dtype) if current_platform.is_mps() else x
-        )  # casting needed for mps since amp isn't supported
+            x
+            if current_platform.is_amp_supported()
+            else x.to(self.weight.dtype)
+        )  # casting needed if amp isn't supported
 
         # TileLang path: faster implicit GEMM for 3x3x3 stride=1 convolutions
         if (

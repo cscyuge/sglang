@@ -81,6 +81,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         request_id,
         prompt=request.prompt,
         size=request.size,
+        width=request.width,
+        height=request.height,
         num_frames=num_frames,
         fps=fps,
         image_path=request.input_reference,
@@ -104,6 +106,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         output_quality=request.output_quality,
         audio_path=getattr(request, "audio_path", None),
         audio_encode_mode=getattr(request, "audio_encode_mode", None),
+        perf_dump_path=request.perf_dump_path,
     )
 
 

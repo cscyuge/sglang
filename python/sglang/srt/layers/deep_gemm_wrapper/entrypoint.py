@@ -126,7 +126,7 @@ def set_deep_gemm_m_list(m_list: list[int], gpu_id: int = 0) -> None:
 
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
-    if num_sms is None:
+    if num_sms is None or not ENABLE_JIT_DEEPGEMM:
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()
