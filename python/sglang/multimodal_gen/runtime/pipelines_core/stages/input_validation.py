@@ -198,34 +198,11 @@ class InputValidationStage(PipelineStage):
                     0
                 ]  # not support multi image input yet.
 
+            max_area = server_args.pipeline_config.max_area
+            aspect_ratio = condition_image_height / condition_image_width
             mod_value = (
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
-            )
-
-            # User-specified width/height controls the target area (scale),
-            # capped by max_area. Aspect ratio always comes from the
-            # condition image for I2V.
-            if batch.width is not None or batch.height is not None:
-                # If one dimension is provided, calculate the other based on the image's aspect ratio.
-                if batch.width is None:
-                    batch.width = round(batch.height / aspect_ratio)
-                elif batch.height is None:
-                    batch.height = round(batch.width * aspect_ratio)
-
-                target_area = min(batch.width * batch.height, max_area)
-                if batch.width * batch.height > max_area:
-                    logger.warning(
-                        "Requested resolution %dx%d exceeds max_area %d, "
-                        "clamping to max_area",
-                        batch.width,
-                        batch.height,
-                        max_area,
-                    )
-            else:
-                target_area = max_area
-            width, height = self._calculate_dimensions_from_area(
-                target_area, aspect_ratio, mod_value
             )
 
             # Use user-specified dimensions if provided and valid,
@@ -244,10 +221,30 @@ class InputValidationStage(PipelineStage):
             if user_provided:
                 width, height = user_w, user_h
             else:
-                max_area = server_args.pipeline_config.max_area
-                aspect_ratio = condition_image_height / condition_image_width
+                # Allow one-sided width/height overrides to control target scale
+                # while preserving the condition image aspect ratio.
+                req_w = getattr(batch, "width", None)
+                req_h = getattr(batch, "height", None)
+                if req_w is not None or req_h is not None:
+                    if req_w is None:
+                        req_w = round(req_h / aspect_ratio)
+                    elif req_h is None:
+                        req_h = round(req_w * aspect_ratio)
+
+                    requested_area = req_w * req_h
+                    target_area = min(requested_area, max_area)
+                    if requested_area > max_area:
+                        logger.warning(
+                            "Requested resolution %dx%d exceeds max_area %d, clamping to max_area",
+                            req_w,
+                            req_h,
+                            max_area,
+                        )
+                else:
+                    target_area = max_area
+
                 width, height = self._calculate_dimensions_from_area(
-                    max_area, aspect_ratio, mod_value
+                    target_area, aspect_ratio, mod_value
                 )
 
             logger.info(
