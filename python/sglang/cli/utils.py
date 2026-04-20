@@ -75,6 +75,8 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if os.path.isdir(model_path):
         if _is_diffusers_model_dir(model_path):
             return True
+        if _is_registered_diffusion_model(model_path):
+            return True
         return is_known_non_diffusers_diffusion_model(model_path)
 
     if is_known_non_diffusers_diffusion_model(model_path):
