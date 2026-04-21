@@ -1618,9 +1618,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 )
         if frames_np is not None and rtmp_pusher is not None and not rtmp_pusher.failed:
             try:
+                if not rtmp_pusher.start_requested:
+                    rtmp_pusher.start_async()
+                    logger.info("Stream pusher async startup launched on first chunk")
                 if not rtmp_pusher._started:
-                    rtmp_pusher.start()
-                    logger.info("Stream pusher connected on first chunk")
+                    logger.info(
+                        "Stream pusher not ready yet; queueing chunk %d while ARTC startup completes",
+                        chunk_idx,
+                    )
                 rtmp_pusher.push_chunk(frames_np, chunk_audio_data)
             except Exception as e:
                 logger.warning(
@@ -2229,7 +2234,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             height=batch.height,
                             fps=batch.fps or 25,
                         )
-                        logger.info("ARTC pusher ready (lazy) for channel %s", _artc_channel)
+                        _stream_pusher.start_async()
+                        logger.info(
+                            "ARTC pusher ready; async prestart launched for channel %s",
+                            _artc_channel,
+                        )
                     except Exception as e:
                         logger.warning("Failed to create ARTC pusher: %s", e)
                         _stream_pusher = None
@@ -2353,6 +2362,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _used_silence = True
 
                 chunk_start = time.time()
+                _stage_start = time.perf_counter()
+                _timing_parts = []
                 if _used_silence:
                     logger.info(
                         "Session: generating chunk %d (silence, "
@@ -2413,15 +2424,26 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         and _wav2vec_graph_runner is None
                     ):
                         audio_encoder.to("cpu", non_blocking=True)
+                _timing_parts.append(
+                    ("audio", time.perf_counter() - _stage_start)
+                )
 
                 # b. Fresh noise latents
+                _stage_start = time.perf_counter()
                 batch.latents = torch.randn(
                     latent_shape, dtype=dit_dtype, device=device, generator=gen
                 )
+                _timing_parts.append(
+                    ("noise", time.perf_counter() - _stage_start)
+                )
 
                 # c. Denoise
+                _stage_start = time.perf_counter()
                 batch.timesteps = None
                 batch = denoising_stage.forward(batch, server_args)
+                _timing_parts.append(
+                    ("denoise", time.perf_counter() - _stage_start)
+                )
 
                 # d. VAE decode + color correct + motion carry
                 # Launch audio prefetch for next chunk on secondary stream.
@@ -2456,11 +2478,15 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _after_denoise_event,
                     )
 
+                _stage_start = time.perf_counter()
                 chunk_frames, batch = self._vae_decode_color_correct_motion_carry(
                     batch, vae, vae_dtype, sc_dev, sf_dev,
                     use_vae_cuda_graph, _vae_decode_runner, _vae_decode_temporal_trim,
                     color_correction_stage, motion_frames_num, server_args, device,
                     skip_vae_offload,
+                )
+                _timing_parts.append(
+                    ("vae+cc+motion", time.perf_counter() - _stage_start)
                 )
                 # Session mode: frames are already streamed via fMP4,
                 # skip accumulating on GPU to avoid OOM on long sessions.
@@ -2474,10 +2500,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             _pf.write(f"{chunk_idx + 1} -1")
                     except Exception:
                         pass
+                _stage_start = time.perf_counter()
                 self._save_streaming_frames(
                     chunk_frames, chunk_idx, _frame_dir, _frame_executor,
                     _frame_futures, _frames_per_chunk,
                     rtmp_pusher=_stream_pusher, chunk_audio_data=chunk_audio_data,
+                )
+                _timing_parts.append(
+                    ("stream", time.perf_counter() - _stage_start)
                 )
                 del chunk_frames
 
@@ -2495,7 +2525,19 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _prefetched_result = None
                     _audio_prefetch_future = None
 
+                _stage_start = time.perf_counter()
                 _t_chunk = time.time() - chunk_start
+                _timing_parts.append(
+                    ("post", time.perf_counter() - _stage_start)
+                )
+                logger.info(
+                    "Session chunk %d breakdown: %s",
+                    chunk_idx,
+                    ", ".join(
+                        f"{name}={duration:.3f}s"
+                        for name, duration in _timing_parts
+                    ),
+                )
                 logger.info("Session chunk %d: %.3fs", chunk_idx, _t_chunk)
                 chunk_idx += 1
 

@@ -118,8 +118,12 @@ class ArtcPusher:
         self._started = False
         self._failed = False
         self._thread: Optional[threading.Thread] = None
+        self._start_thread: Optional[threading.Thread] = None
         self._engine = None
         self._sdk_path = sdk_path or _SDK_DIR
+        self._start_lock = threading.Lock()
+        self._start_done = threading.Event()
+        self._start_requested = False
 
         # Synchronisation events
         self._joined = threading.Event()
@@ -136,6 +140,26 @@ class ArtcPusher:
     def failed(self) -> bool:
         return self._failed
 
+    @property
+    def start_requested(self) -> bool:
+        return self._start_requested
+
+    @property
+    def start_in_progress(self) -> bool:
+        return self._start_requested and not self._start_done.is_set()
+
+    def wait_until_started(self, timeout: float | None = None) -> bool:
+        """Wait for async startup to finish.
+
+        Returns True if the drain thread is ready to accept frames.
+        """
+        if self._started:
+            return True
+        if not self._start_requested:
+            return False
+        finished = self._start_done.wait(timeout=timeout)
+        return finished and self._started and not self._failed
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -143,20 +167,53 @@ class ArtcPusher:
     def start(self) -> None:
         """Create engine, join channel, and start the drain thread."""
         if self._started:
+            self._start_done.set()
             return
 
-        try:
-            self._init_engine()
-        except Exception as exc:
-            logger.error("ARTC engine init failed: %s", exc)
-            self._failed = True
-            return
+        with self._start_lock:
+            if self._started:
+                self._start_done.set()
+                return
+            self._start_requested = True
+            self._start_done.clear()
+            t0 = time.perf_counter()
+            try:
+                self._init_engine()
+            except Exception as exc:
+                logger.error("ARTC engine init failed: %s", exc)
+                self._failed = True
+                self._start_done.set()
+                return
 
-        self._thread = threading.Thread(
-            target=self._drain_loop, daemon=True, name="artc-push"
-        )
-        self._thread.start()
-        self._started = True
+            self._thread = threading.Thread(
+                target=self._drain_loop, daemon=True, name="artc-push"
+            )
+            self._thread.start()
+            self._started = True
+            self._start_done.set()
+            logger.info(
+                "ARTC start() finished in %.3fs for channel=%s",
+                time.perf_counter() - t0,
+                self._channel,
+            )
+
+    def start_async(self) -> None:
+        """Launch startup in the background so chunk generation can overlap it."""
+        if self._started:
+            self._start_done.set()
+            return
+        with self._start_lock:
+            if self._started:
+                self._start_done.set()
+                return
+            self._start_requested = True
+            if self._start_thread is not None and self._start_thread.is_alive():
+                return
+            self._start_done.clear()
+            self._start_thread = threading.Thread(
+                target=self.start, daemon=True, name="artc-start"
+            )
+            self._start_thread.start()
 
     def push_chunk(
         self,
@@ -172,7 +229,9 @@ class ArtcPusher:
         audio_16k : np.ndarray or None
             Float32 mono 16 kHz PCM audio for this chunk.
         """
-        if self._failed or not self._started:
+        if self._failed:
+            return
+        if not self._started and not self._start_requested:
             return
 
         # Convert audio float32 → int16
@@ -199,26 +258,36 @@ class ArtcPusher:
 
     def stop(self, timeout: float = 10.0) -> None:
         """Drain queue, leave channel, release engine."""
-        if not self._started:
+        if not self._started and not self._start_requested:
             return
 
-        # Drain the queue to make room for sentinel
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
-        self._queue.put_nowait(None)
-
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            if self._thread.is_alive():
+        if self._start_thread is not None and self._start_thread.is_alive():
+            self._start_thread.join(timeout=timeout)
+            if self._start_thread.is_alive():
                 logger.warning(
-                    "ARTC pusher thread did not exit within %.1fs", timeout
+                    "ARTC start thread did not exit within %.1fs", timeout
                 )
+
+        if self._started:
+            # Drain the queue to make room for sentinel
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._queue.put_nowait(None)
+
+            if self._thread is not None:
+                self._thread.join(timeout=timeout)
+                if self._thread.is_alive():
+                    logger.warning(
+                        "ARTC pusher thread did not exit within %.1fs", timeout
+                    )
 
         self._cleanup_engine()
         self._started = False
+        self._start_requested = False
+        self._start_done.set()
 
     # ------------------------------------------------------------------
     # Engine lifecycle
