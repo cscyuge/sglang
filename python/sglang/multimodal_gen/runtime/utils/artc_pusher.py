@@ -209,12 +209,15 @@ class _ArtcEngineManager:
             if self._active_owner is not owner:
                 return
             engine = self._engine
+            handler = self._handler
 
+        left_completed = False
         if engine is not None:
             owner._left.clear()
             try:
                 engine.LeaveChannel()
-                if not owner._left.wait(timeout=timeout):
+                left_completed = owner._left.wait(timeout=timeout)
+                if not left_completed:
                     logger.warning(
                         "ARTC LeaveChannel did not complete within %.1fs for channel=%s",
                         timeout,
@@ -227,8 +230,14 @@ class _ArtcEngineManager:
 
         with self._cond:
             if release_on_error and self._engine is not None:
-                self._release_engine_locked()
-            self._handler.set_pusher(None)
+                self._retire_engine_locked(
+                    engine=engine,
+                    handler=handler,
+                    owner=owner,
+                    left_completed=left_completed,
+                )
+            else:
+                self._handler.set_pusher(None)
             if self._active_owner is owner:
                 self._active_owner = None
             self._cond.notify_all()
@@ -387,6 +396,43 @@ class _ArtcEngineManager:
         self._handler = _ReusableEventHandler()
         self._sdk_path = None
         self._sdk_defs = None
+
+    def _retire_engine_locked(
+        self,
+        engine,
+        handler: _ReusableEventHandler,
+        owner: "ArtcPusher",
+        left_completed: bool,
+    ) -> None:
+        """Detach a suspect engine without synchronously destroying it."""
+        if engine is None or self._engine is not engine:
+            return
+
+        self._engine = None
+        self._handler = _ReusableEventHandler()
+        self._sdk_path = None
+        self._sdk_defs = None
+
+        def _release_after_leave() -> None:
+            if not left_completed and not owner._left.wait(timeout=60.0):
+                logger.warning(
+                    "ARTC retired engine did not leave channel=%s within 60s; "
+                    "skipping Release to avoid blocking cleanup",
+                    owner._channel,
+                )
+                handler.set_pusher(None)
+                return
+            handler.set_pusher(None)
+            try:
+                engine.Release()
+            except Exception as exc:
+                logger.warning("ARTC retired engine Release error: %s", exc)
+
+        threading.Thread(
+            target=_release_after_leave,
+            daemon=True,
+            name="artc-retired-release",
+        ).start()
 
 
 _ENGINE_MANAGER = _ArtcEngineManager()
@@ -636,7 +682,11 @@ class ArtcPusher:
                     self._thread.join(timeout=1.0)
                     release_on_error = self._thread.is_alive()
 
-        _ENGINE_MANAGER.end_session(self, release_on_error=release_on_error)
+        _ENGINE_MANAGER.end_session(
+            self,
+            timeout=min(2.0, timeout),
+            release_on_error=release_on_error,
+        )
         self._started = False
         self._start_requested = False
         self._start_done.set()
