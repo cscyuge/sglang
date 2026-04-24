@@ -8,6 +8,7 @@ Audio is accepted as float32 16 kHz mono and converted to int16 in-place
 (no resampling required, unlike the old RTMP/SRT path).
 """
 
+import atexit
 import logging
 import os
 import queue
@@ -25,43 +26,72 @@ _SDK_DIR = os.path.join(os.path.dirname(__file__), "alirtc")
 _SDK_LIB_DIR = os.path.join(_SDK_DIR, "Release", "lib")
 
 
-class _EventHandler:
-    """Minimal AliRTC event handler that tracks publish-readiness and errors."""
+class _ArtcStartCancelled(RuntimeError):
+    pass
 
-    def __init__(self, pusher: "ArtcPusher"):
-        self._pusher = pusher
 
-    # -- publish state ---------------------------------------------------
+def _ensure_sdk_importable(sdk_path: str) -> str:
+    """Make AliRTC Python and native libraries discoverable."""
+    if sdk_path not in sys.path:
+        sys.path.insert(0, sdk_path)
+
+    lib_dir = os.path.join(sdk_path, "Release", "lib")
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if lib_dir not in ld_path:
+        os.environ["LD_LIBRARY_PATH"] = lib_dir + ":" + ld_path
+    return lib_dir
+
+
+class _ReusableEventHandler:
+    """AliRTC event handler whose callbacks are routed to the active pusher."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pusher: Optional["ArtcPusher"] = None
+
+    def set_pusher(self, pusher: Optional["ArtcPusher"]) -> None:
+        with self._lock:
+            self._pusher = pusher
+
+    def _get_pusher(self) -> Optional["ArtcPusher"]:
+        with self._lock:
+            return self._pusher
+
     def OnAudioPublishStateChanged(self, oldState, newState, elapsed, channel):
         logger.debug(
             "ARTC audio publish: %s -> %s (ch=%s)", oldState, newState, channel
         )
-        # AliEnginePublishState: Published = 2
-        if getattr(newState, "value", newState) == 2:
-            self._pusher._audio_published.set()
+        pusher = self._get_pusher()
+        if pusher is not None and getattr(newState, "value", newState) == 2:
+            pusher._audio_published.set()
 
     def OnVideoPublishStateChanged(self, oldState, newState, elapsed, channel):
         logger.debug(
             "ARTC video publish: %s -> %s (ch=%s)", oldState, newState, channel
         )
-        if getattr(newState, "value", newState) == 2:
-            self._pusher._video_published.set()
+        pusher = self._get_pusher()
+        if pusher is not None and getattr(newState, "value", newState) == 2:
+            pusher._video_published.set()
 
-    # -- buffer full flags -----------------------------------------------
     def OnPushAudioFrameBufferFull(self, isFull):
-        self._pusher._push_audio_full = isFull
+        pusher = self._get_pusher()
+        if pusher is not None:
+            pusher._push_audio_full = isFull
         if isFull:
             logger.debug("ARTC audio buffer full")
 
     def OnPushVideoFrameBufferFull(self, isFull):
-        self._pusher._push_video_full = isFull
+        pusher = self._get_pusher()
+        if pusher is not None:
+            pusher._push_video_full = isFull
         if isFull:
             logger.debug("ARTC video buffer full")
 
-    # -- error / connection ----------------------------------------------
     def OnError(self, error_code):
         logger.error("ARTC SDK error: %s", error_code)
-        self._pusher._failed = True
+        pusher = self._get_pusher()
+        if pusher is not None:
+            pusher._failed = True
 
     def OnConnectionStatusChanged(self, status, reason):
         logger.info("ARTC connection: status=%s reason=%s", status, reason)
@@ -71,20 +101,296 @@ class _EventHandler:
             "ARTC JoinChannel result=%s channel=%s user=%s",
             result, channel, userId,
         )
+        pusher = self._get_pusher()
+        if pusher is None:
+            return
         if result == 0:
-            self._pusher._joined.set()
+            pusher._joined.set()
         else:
             logger.error("ARTC JoinChannel failed: %s", result)
-            self._pusher._failed = True
+            pusher._failed = True
+            pusher._joined.set()
 
     def OnLeaveChannelResult(self, result):
         logger.info("ARTC LeaveChannel result=%s", result)
+        pusher = self._get_pusher()
+        if pusher is not None:
+            pusher._left.set()
 
-    # Catch-all for callbacks we don't handle
     def __getattr__(self, name):
         def _noop(*args, **kwargs):
             pass
         return _noop
+
+
+class _ArtcEngineManager:
+    """Process-local single-engine ARTC manager.
+
+    The AliRTC SDK startup path can degrade when repeatedly creating and
+    releasing engines. This manager serializes sessions and reuses one engine
+    across channels, while still leaving the channel at session boundaries.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._engine = None
+        self._handler = _ReusableEventHandler()
+        self._active_owner: Optional["ArtcPusher"] = None
+        self._sdk_path: Optional[str] = None
+        self._sdk_defs = None
+        self._create_count = 0
+        self._session_count = 0
+
+    def start_session(self, owner: "ArtcPusher"):
+        """Create/reuse the engine, configure it, and join owner's channel."""
+        t_wait = time.perf_counter()
+        with self._cond:
+            while self._active_owner is not None and self._active_owner is not owner:
+                if owner._stop_requested.is_set():
+                    raise _ArtcStartCancelled(
+                        "ARTC start cancelled before engine acquisition"
+                    )
+                self._cond.wait(timeout=1.0)
+            if owner._stop_requested.is_set():
+                raise _ArtcStartCancelled(
+                    "ARTC start cancelled before engine acquisition"
+                )
+            wait_s = time.perf_counter() - t_wait
+            if wait_s > 0.01:
+                logger.info("ARTC engine manager waited %.3fs for previous session", wait_s)
+            self._active_owner = owner
+            self._handler.set_pusher(owner)
+
+        try:
+            t0 = time.perf_counter()
+            engine = self._get_or_create_engine(owner._sdk_path)
+            create_or_reuse_s = time.perf_counter() - t0
+            self._handler.set_pusher(owner)
+
+            owner._reset_session_events()
+            owner._engine = engine
+
+            t_cfg = time.perf_counter()
+            self._configure_engine(owner)
+            config_s = time.perf_counter() - t_cfg
+
+            t_join = time.perf_counter()
+            self._join_channel(owner)
+            join_s = time.perf_counter() - t_join
+
+            with self._cond:
+                self._session_count += 1
+                session_count = self._session_count
+                create_count = self._create_count
+            logger.info(
+                "ARTC engine session ready: channel=%s reused=%s sessions=%d creates=%d "
+                "engine=%.3fs config=%.3fs join=%.3fs",
+                owner._channel,
+                create_count < session_count,
+                session_count,
+                create_count,
+                create_or_reuse_s,
+                config_s,
+                join_s,
+            )
+            return engine
+        except Exception:
+            self.end_session(owner, release_on_error=True)
+            raise
+
+    def end_session(
+        self,
+        owner: "ArtcPusher",
+        timeout: float = 2.0,
+        release_on_error: bool = False,
+    ) -> None:
+        """Leave the current channel and make the reusable engine available."""
+        with self._cond:
+            if self._active_owner is not owner:
+                return
+            engine = self._engine
+
+        if engine is not None:
+            owner._left.clear()
+            try:
+                engine.LeaveChannel()
+                if not owner._left.wait(timeout=timeout):
+                    logger.warning(
+                        "ARTC LeaveChannel did not complete within %.1fs for channel=%s",
+                        timeout,
+                        owner._channel,
+                    )
+                    release_on_error = True
+            except Exception as exc:
+                logger.warning("ARTC LeaveChannel error: %s", exc)
+                release_on_error = True
+
+        with self._cond:
+            if release_on_error and self._engine is not None:
+                self._release_engine_locked()
+            self._handler.set_pusher(None)
+            if self._active_owner is owner:
+                self._active_owner = None
+            self._cond.notify_all()
+        owner._engine = None
+
+    def release(self) -> None:
+        with self._cond:
+            self._handler.set_pusher(None)
+            self._active_owner = None
+            self._release_engine_locked()
+            self._cond.notify_all()
+
+    def _get_or_create_engine(self, sdk_path: str):
+        with self._cond:
+            if self._engine is not None and self._sdk_path == sdk_path:
+                return self._engine
+            if self._engine is not None:
+                logger.info("ARTC SDK path changed; releasing reusable engine")
+                self._release_engine_locked()
+
+            lib_dir = _ensure_sdk_importable(sdk_path)
+            core_service = os.path.join(lib_dir, "AliRtcCoreService")
+
+            from AliRTCEngine import CreateAliRTCEngine  # noqa: E402
+
+            log_path = os.environ.get("SGLANG_ARTC_LOG_PATH", "/tmp/artc_sdk_logs")
+            os.makedirs(log_path, exist_ok=True)
+
+            t0 = time.perf_counter()
+            self._engine = CreateAliRTCEngine(
+                eventHandler=self._handler,
+                lowPort=int(os.environ.get("SGLANG_ARTC_LOW_PORT", "40000")),
+                highPort=int(os.environ.get("SGLANG_ARTC_HIGH_PORT", "40100")),
+                logPath=log_path,
+                coreServicePath=core_service,
+                h5mode=False,
+                extra="{}",
+            )
+            self._sdk_path = sdk_path
+            self._sdk_defs = None
+            self._create_count += 1
+            logger.info(
+                "ARTC CreateAliRTCEngine finished in %.3fs (creates=%d)",
+                time.perf_counter() - t0,
+                self._create_count,
+            )
+            return self._engine
+
+    def _defs(self, sdk_path: str):
+        if self._sdk_defs is not None:
+            return self._sdk_defs
+
+        _ensure_sdk_importable(sdk_path)
+        from AliRTCLinuxSdkDefine import (  # noqa: E402
+            AliEngineClientRole,
+            AliEngineFrameRate,
+            AliEngineRotationMode,
+            AliEngineVideoEncoderConfiguration,
+            AliEngineVideoEncoderOrientationMode,
+            AliEngineVideoMirrorMode,
+            JoinChannelConfig,
+            PublishAvsyncMode,
+            PublishMode,
+            RenderMode,
+            VideoSource,
+        )
+
+        self._sdk_defs = {
+            "AliEngineClientRole": AliEngineClientRole,
+            "AliEngineFrameRate": AliEngineFrameRate,
+            "AliEngineRotationMode": AliEngineRotationMode,
+            "AliEngineVideoEncoderConfiguration": AliEngineVideoEncoderConfiguration,
+            "AliEngineVideoEncoderOrientationMode": AliEngineVideoEncoderOrientationMode,
+            "AliEngineVideoMirrorMode": AliEngineVideoMirrorMode,
+            "JoinChannelConfig": JoinChannelConfig,
+            "PublishAvsyncMode": PublishAvsyncMode,
+            "PublishMode": PublishMode,
+            "RenderMode": RenderMode,
+            "VideoSource": VideoSource,
+        }
+        return self._sdk_defs
+
+    def _configure_engine(self, owner: "ArtcPusher") -> None:
+        d = self._defs(owner._sdk_path)
+        frame_rate_enum = {
+            5: d["AliEngineFrameRate"].AliEngineFrameRateFps5,
+            10: d["AliEngineFrameRate"].AliEngineFrameRateFps10,
+            15: d["AliEngineFrameRate"].AliEngineFrameRateFps15,
+            20: d["AliEngineFrameRate"].AliEngineFrameRateFps20,
+            25: d["AliEngineFrameRate"].AliEngineFrameRateFps25,
+            30: d["AliEngineFrameRate"].AliEngineFrameRateFps30,
+            60: d["AliEngineFrameRate"].AliEngineFrameRateFps60,
+        }.get(owner._fps, d["AliEngineFrameRate"].AliEngineFrameRateFps25)
+
+        video_cfg = d["AliEngineVideoEncoderConfiguration"](
+            width=owner._width,
+            height=owner._height,
+            f=frame_rate_enum,
+            b=2000,
+            ori=d[
+                "AliEngineVideoEncoderOrientationMode"
+            ].AliEngineVideoEncoderOrientationModeAdaptive,
+            mr=d["AliEngineVideoMirrorMode"].AliEngineVideoMirrorModeDisabled,
+            rotation=d["AliEngineRotationMode"].AliEngineRotationMode_0,
+        )
+        engine = self._engine
+        engine.SetVideoEncoderConfiguration(video_cfg)
+        engine.SetExternalVideoSource(
+            True,
+            d["VideoSource"].VideoSourceCamera,
+            d["RenderMode"].RenderModeFill,
+        )
+        engine.SetExternalAudioSource(True, 16000, 1)
+        engine.PublishLocalVideoStream(True)
+        engine.PublishLocalAudioStream(True)
+        engine.SetClientRole(d["AliEngineClientRole"].AliEngineClientRoleInteractive)
+
+    def _join_channel(self, owner: "ArtcPusher") -> None:
+        d = self._defs(owner._sdk_path)
+        join_cfg = d["JoinChannelConfig"]()
+        join_cfg.publishAvsyncMode = d["PublishAvsyncMode"].PublishAvsyncWithPts
+        join_cfg.publishMode = d["PublishMode"].PublishAutomatically
+        self._engine.JoinChannel(
+            owner._token,
+            owner._channel,
+            owner._userid,
+            owner._userid,
+            join_cfg,
+        )
+
+        if not owner._joined.wait(timeout=10.0):
+            raise RuntimeError("ARTC JoinChannel timed out")
+        if owner._failed:
+            raise RuntimeError("ARTC JoinChannel failed")
+
+        owner._audio_published.wait(timeout=5.0)
+        owner._video_published.wait(timeout=5.0)
+        logger.info(
+            "ARTC engine ready: channel=%s user=%s %dx%d@%dfps",
+            owner._channel,
+            owner._userid,
+            owner._width,
+            owner._height,
+            owner._fps,
+        )
+
+    def _release_engine_locked(self) -> None:
+        if self._engine is None:
+            return
+        self._handler.set_pusher(None)
+        try:
+            self._engine.Release()
+        except Exception as exc:
+            logger.warning("ARTC Release error: %s", exc)
+        self._engine = None
+        self._handler = _ReusableEventHandler()
+        self._sdk_path = None
+        self._sdk_defs = None
+
+
+_ENGINE_MANAGER = _ArtcEngineManager()
+atexit.register(_ENGINE_MANAGER.release)
 
 
 class ArtcPusher:
@@ -124,9 +430,11 @@ class ArtcPusher:
         self._start_lock = threading.Lock()
         self._start_done = threading.Event()
         self._start_requested = False
+        self._stop_requested = threading.Event()
 
         # Synchronisation events
         self._joined = threading.Event()
+        self._left = threading.Event()
         self._audio_published = threading.Event()
         self._video_published = threading.Event()
         self._push_video_full = False
@@ -135,6 +443,14 @@ class ArtcPusher:
         # Monotonic PTS counters (milliseconds)
         self._v_ts = 0
         self._a_ts = 0
+
+    def _reset_session_events(self) -> None:
+        self._joined.clear()
+        self._left.clear()
+        self._audio_published.clear()
+        self._video_published.clear()
+        self._push_video_full = False
+        self._push_audio_full = False
 
     @property
     def failed(self) -> bool:
@@ -176,13 +492,36 @@ class ArtcPusher:
                 return
             self._start_requested = True
             self._start_done.clear()
+            if self._stop_requested.is_set():
+                self._start_done.set()
+                self._start_requested = False
+                return
+            self._failed = False
+            self._v_ts = 0
+            self._a_ts = 0
             t0 = time.perf_counter()
             try:
-                self._init_engine()
+                _ENGINE_MANAGER.start_session(self)
+            except _ArtcStartCancelled:
+                self._start_done.set()
+                self._start_requested = False
+                return
             except Exception as exc:
                 logger.error("ARTC engine init failed: %s", exc)
                 self._failed = True
                 self._start_done.set()
+                self._start_requested = False
+                return
+
+            if self._stop_requested.is_set():
+                _ENGINE_MANAGER.end_session(self)
+                self._start_done.set()
+                self._start_requested = False
+                logger.info(
+                    "ARTC start() finished after stop request in %.3fs for channel=%s",
+                    time.perf_counter() - t0,
+                    self._channel,
+                )
                 return
 
             self._thread = threading.Thread(
@@ -207,6 +546,7 @@ class ArtcPusher:
                 self._start_done.set()
                 return
             self._start_requested = True
+            self._stop_requested.clear()
             if self._start_thread is not None and self._start_thread.is_alive():
                 return
             self._start_done.clear()
@@ -257,9 +597,16 @@ class ArtcPusher:
             logger.warning("ARTC pusher queue full — dropped oldest chunk")
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Drain queue, leave channel, release engine."""
+        """Drain queue and leave channel.
+
+        If async startup is still running, this method never races it by
+        releasing the engine concurrently. On timeout, the start thread observes
+        ``_stop_requested`` and performs the leave once startup returns.
+        """
         if not self._started and not self._start_requested:
             return
+
+        self._stop_requested.set()
 
         if self._start_thread is not None and self._start_thread.is_alive():
             self._start_thread.join(timeout=timeout)
@@ -267,7 +614,9 @@ class ArtcPusher:
                 logger.warning(
                     "ARTC start thread did not exit within %.1fs", timeout
                 )
+                return
 
+        release_on_error = False
         if self._started:
             # Drain the queue to make room for sentinel
             while True:
@@ -283,133 +632,14 @@ class ArtcPusher:
                     logger.warning(
                         "ARTC pusher thread did not exit within %.1fs", timeout
                     )
+                    self._failed = True
+                    self._thread.join(timeout=1.0)
+                    release_on_error = self._thread.is_alive()
 
-        self._cleanup_engine()
+        _ENGINE_MANAGER.end_session(self, release_on_error=release_on_error)
         self._started = False
         self._start_requested = False
         self._start_done.set()
-
-    # ------------------------------------------------------------------
-    # Engine lifecycle
-    # ------------------------------------------------------------------
-
-    def _init_engine(self) -> None:
-        """Initialise AliRTC engine and join the channel."""
-        # Ensure SDK Python modules are importable
-        sdk_py = self._sdk_path
-        if sdk_py not in sys.path:
-            sys.path.insert(0, sdk_py)
-
-        # Ensure native libs are on LD_LIBRARY_PATH / can be found
-        lib_dir = os.path.join(self._sdk_path, "Release", "lib")
-        ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-        if lib_dir not in ld_path:
-            os.environ["LD_LIBRARY_PATH"] = lib_dir + ":" + ld_path
-
-        core_service = os.path.join(lib_dir, "AliRtcCoreService")
-
-        from AliRTCEngine import CreateAliRTCEngine  # noqa: E402
-        from AliRTCLinuxSdkDefine import (  # noqa: E402
-            AliEngineClientRole,
-            AliEngineFrameRate,
-            AliEngineRotationMode,
-            AliEngineVideoEncoderConfiguration,
-            AliEngineVideoEncoderOrientationMode,
-            AliEngineVideoMirrorMode,
-            JoinChannelConfig,
-            PublishAvsyncMode,
-            PublishMode,
-            RenderMode,
-            VideoSource,
-        )
-
-        handler = _EventHandler(self)
-        log_path = "/tmp/artc_sdk_logs"
-        os.makedirs(log_path, exist_ok=True)
-
-        self._engine = CreateAliRTCEngine(
-            eventHandler=handler,
-            lowPort=40000,
-            highPort=40100,
-            logPath=log_path,
-            coreServicePath=core_service,
-            h5mode=False,
-            extra="{}",
-        )
-
-        # Configure video encoder — constructor requires all positional args
-        # Map fps int to SDK enum (default to 25fps if no exact match)
-        _fps_map = {
-            5: AliEngineFrameRate.AliEngineFrameRateFps5,
-            10: AliEngineFrameRate.AliEngineFrameRateFps10,
-            15: AliEngineFrameRate.AliEngineFrameRateFps15,
-            20: AliEngineFrameRate.AliEngineFrameRateFps20,
-            25: AliEngineFrameRate.AliEngineFrameRateFps25,
-            30: AliEngineFrameRate.AliEngineFrameRateFps30,
-            60: AliEngineFrameRate.AliEngineFrameRateFps60,
-        }
-        frame_rate_enum = _fps_map.get(
-            self._fps, AliEngineFrameRate.AliEngineFrameRateFps25
-        )
-        video_cfg = AliEngineVideoEncoderConfiguration(
-            width=self._width,
-            height=self._height,
-            f=frame_rate_enum,
-            b=2000,
-            ori=AliEngineVideoEncoderOrientationMode.AliEngineVideoEncoderOrientationModeAdaptive,
-            mr=AliEngineVideoMirrorMode.AliEngineVideoMirrorModeDisabled,
-            rotation=AliEngineRotationMode.AliEngineRotationMode_0,
-        )
-        self._engine.SetVideoEncoderConfiguration(video_cfg)
-
-        # External video/audio sources
-        self._engine.SetExternalVideoSource(
-            True, VideoSource.VideoSourceCamera, RenderMode.RenderModeFill
-        )
-        self._engine.SetExternalAudioSource(True, 16000, 1)
-
-        # Publish streams
-        self._engine.PublishLocalVideoStream(True)
-        self._engine.PublishLocalAudioStream(True)
-
-        # Set interactive role (broadcaster)
-        self._engine.SetClientRole(AliEngineClientRole.AliEngineClientRoleInteractive)
-
-        # Join channel
-        join_cfg = JoinChannelConfig()
-        join_cfg.publishAvsyncMode = PublishAvsyncMode.PublishAvsyncWithPts
-        join_cfg.publishMode = PublishMode.PublishAutomatically
-        self._engine.JoinChannel(
-            self._token, self._channel, self._userid, self._userid, join_cfg
-        )
-
-        # Wait for join + publish readiness
-        if not self._joined.wait(timeout=10.0):
-            raise RuntimeError("ARTC JoinChannel timed out")
-        if self._failed:
-            raise RuntimeError("ARTC JoinChannel failed")
-
-        # Give publish callbacks a moment (they may arrive shortly after join)
-        self._audio_published.wait(timeout=5.0)
-        self._video_published.wait(timeout=5.0)
-        logger.info(
-            "ARTC engine ready: channel=%s user=%s %dx%d@%dfps",
-            self._channel, self._userid, self._width, self._height, self._fps,
-        )
-
-    def _cleanup_engine(self) -> None:
-        """Leave channel and release engine resources."""
-        if self._engine is None:
-            return
-        try:
-            self._engine.LeaveChannel()
-        except Exception as exc:
-            logger.warning("ARTC LeaveChannel error: %s", exc)
-        try:
-            self._engine.Release()
-        except Exception as exc:
-            logger.warning("ARTC Release error: %s", exc)
-        self._engine = None
 
     # ------------------------------------------------------------------
     # Background drain thread
