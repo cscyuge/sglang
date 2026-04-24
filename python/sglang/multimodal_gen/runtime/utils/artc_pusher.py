@@ -140,6 +140,10 @@ class _ArtcEngineManager:
         self._sdk_defs = None
         self._create_count = 0
         self._session_count = 0
+        self._reuse_disabled = os.environ.get(
+            "SGLANG_ARTC_DISABLE_ENGINE_REUSE", ""
+        ).lower() in ("1", "true", "yes")
+        self._retired_engine_count = 0
 
     def start_session(self, owner: "ArtcPusher"):
         """Create/reuse the engine, configure it, and join owner's channel."""
@@ -229,7 +233,8 @@ class _ArtcEngineManager:
                 release_on_error = True
 
         with self._cond:
-            if release_on_error and self._engine is not None:
+            detach_engine = release_on_error or self._reuse_disabled
+            if detach_engine and self._engine is not None:
                 self._retire_engine_locked(
                     engine=engine,
                     handler=handler,
@@ -252,7 +257,11 @@ class _ArtcEngineManager:
 
     def _get_or_create_engine(self, sdk_path: str):
         with self._cond:
-            if self._engine is not None and self._sdk_path == sdk_path:
+            if (
+                not self._reuse_disabled
+                and self._engine is not None
+                and self._sdk_path == sdk_path
+            ):
                 return self._engine
             if self._engine is not None:
                 logger.info("ARTC SDK path changed; releasing reusable engine")
@@ -280,9 +289,11 @@ class _ArtcEngineManager:
             self._sdk_defs = None
             self._create_count += 1
             logger.info(
-                "ARTC CreateAliRTCEngine finished in %.3fs (creates=%d)",
+                "ARTC CreateAliRTCEngine finished in %.3fs "
+                "(creates=%d, reuse_disabled=%s)",
                 time.perf_counter() - t0,
                 self._create_count,
+                self._reuse_disabled,
             )
             return self._engine
 
@@ -412,19 +423,36 @@ class _ArtcEngineManager:
         self._handler = _ReusableEventHandler()
         self._sdk_path = None
         self._sdk_defs = None
+        self._retired_engine_count += 1
+        retired_count = self._retired_engine_count
+        if not left_completed:
+            self._reuse_disabled = True
+            logger.warning(
+                "Disabling ARTC engine reuse after LeaveChannel timeout "
+                "(retired_engines=%d)",
+                retired_count,
+            )
 
         def _release_after_leave() -> None:
             if not left_completed and not owner._left.wait(timeout=60.0):
                 logger.warning(
                     "ARTC retired engine did not leave channel=%s within 60s; "
-                    "skipping Release to avoid blocking cleanup",
+                    "skipping Release to avoid blocking cleanup "
+                    "(retired_engines=%d)",
                     owner._channel,
+                    retired_count,
                 )
                 handler.set_pusher(None)
                 return
             handler.set_pusher(None)
             try:
                 engine.Release()
+                logger.info(
+                    "ARTC retired engine released for channel=%s "
+                    "(retired_engines=%d)",
+                    owner._channel,
+                    retired_count,
+                )
             except Exception as exc:
                 logger.warning("ARTC retired engine Release error: %s", exc)
 
