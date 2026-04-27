@@ -17,6 +17,7 @@ import logging
 import ctypes
 import shutil
 import threading
+import time
 from queue import Queue
 
 class AliRtcEngineImpl(AliRTCEngineInterface):
@@ -886,6 +887,23 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
         resource.setrlimit(resource.RLIMIT_CORE,(resource.RLIM_INFINITY, resource.RLIM_INFINITY))
         self.__logger.info(f"[Python] DidSetCoreUnlimited")
 
+    def __cleanup_startup_process(self) -> None:
+        self.__didCallRelease = True
+        if self.__subProcess and self.__subProcess.poll() is None:
+            try:
+                self.__subProcess.kill()
+            except Exception:
+                pass
+        if self.__subProcess:
+            try:
+                self.__subProcess.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        if self.__stdoutThread:
+            self.__stdoutThread.join(timeout=1)
+        if self.__stderrThread:
+            self.__stderrThread.join(timeout=1)
+
     def ReadStdOut(self):
         if self.__subProcess and self.__subProcess.stdout:
             for line in iter(self.__subProcess.stdout.readline, ''):
@@ -921,6 +939,11 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
         self.__audio_queue = Queue()
         self.__push_thread = None
         self.__thread_running = False
+        self.__socketPort = -1
+        self.__subProcess = None
+        self.__stdoutThread = None
+        self.__stderrThread = None
+        self.__didCallRelease = False
         self.__eventHandler = eventHandler
         serverPort = 0
         portTryCnt = 0
@@ -958,9 +981,25 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             self.__stderrThread = threading.Thread(target=self.ReadStdErr)
             self.__stderrThread.daemon = True
             self.__stderrThread.start()
+            startup_timeout = float(os.environ.get(
+                "SGLANG_ARTC_CORE_SERVICE_START_TIMEOUT", "5.0"
+            ))
+            startup_deadline = time.monotonic() + startup_timeout
             while True:
                 if self.__socketPort != -1:
                     break
+                if self.__subProcess.poll() is not None:
+                    self.__cleanup_startup_process()
+                    raise RuntimeError(
+                        "[Python] AliRtcCoreService exited before Bind port"
+                    )
+                if time.monotonic() >= startup_deadline:
+                    self.__cleanup_startup_process()
+                    raise TimeoutError(
+                        "[Python] Timed out waiting for AliRtcCoreService "
+                        f"Bind port on {serverPort}"
+                    )
+                time.sleep(0.01)
         else:
             raise ValueError("[Python] Parameter error, cannot create RTC instance")
 
@@ -1050,7 +1089,18 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
             }
             jobj_str = json.dumps(jobj)
             await self.__writeData(writer, jobj_str.encode('utf-8'))
-            exit_code = self.__subProcess.wait()
+            stop_timeout = float(os.environ.get(
+                "SGLANG_ARTC_CORE_SERVICE_STOP_TIMEOUT", "10.0"
+            ))
+            try:
+                exit_code = self.__subProcess.wait(timeout=stop_timeout)
+            except subprocess.TimeoutExpired:
+                self.__logger.error(
+                    "[Python] AliRtcCoreService did not exit within "
+                    f"{stop_timeout}s; killing"
+                )
+                self.__subProcess.kill()
+                exit_code = self.__subProcess.wait(timeout=1)
             self.__logger.info(f"[Python] sub Process did close with exit code:{exit_code}")
             if self.__stdoutThread:
                 self.__stdoutThread.join(timeout=1)
@@ -1079,8 +1129,20 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
                     print(f"[Python] Unable to destroy, please leave channel first")
                     return -1
             self.__didCallRelease = True
-            asyncio.run_coroutine_threadsafe(self.__UninitializeEngine(self.__socketWriter), loop).result()       
-            # loop.close()
+            asyncio.run_coroutine_threadsafe(
+                self.__UninitializeEngine(self.__socketWriter), loop
+            ).result()
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+            if (
+                self._artc_thread is not None
+                and self._artc_thread is not threading.current_thread()
+            ):
+                self._artc_thread.join(timeout=1)
+            if loop is not None and not loop.is_running() and not loop.is_closed():
+                loop.close()
+            self._artc_loop = None
+            self._artc_thread = None
             return 0            
 
 

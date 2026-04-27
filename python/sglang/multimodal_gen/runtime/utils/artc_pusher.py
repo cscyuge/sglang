@@ -140,9 +140,6 @@ class _ArtcEngineManager:
         self._sdk_defs = None
         self._create_count = 0
         self._session_count = 0
-        self._reuse_disabled = os.environ.get(
-            "SGLANG_ARTC_DISABLE_ENGINE_REUSE", ""
-        ).lower() in ("1", "true", "yes")
         self._retired_engine_count = 0
 
     def start_session(self, owner: "ArtcPusher"):
@@ -219,6 +216,11 @@ class _ArtcEngineManager:
         if engine is not None:
             owner._left.clear()
             try:
+                try:
+                    engine.PublishLocalVideoStream(False)
+                    engine.PublishLocalAudioStream(False)
+                except Exception as exc:
+                    logger.warning("ARTC stop publishing before leave error: %s", exc)
                 engine.LeaveChannel()
                 left_completed = owner._left.wait(timeout=timeout)
                 if not left_completed:
@@ -233,8 +235,7 @@ class _ArtcEngineManager:
                 release_on_error = True
 
         with self._cond:
-            detach_engine = release_on_error or self._reuse_disabled
-            if detach_engine and self._engine is not None:
+            if release_on_error and self._engine is not None:
                 self._retire_engine_locked(
                     engine=engine,
                     handler=handler,
@@ -258,8 +259,7 @@ class _ArtcEngineManager:
     def _get_or_create_engine(self, sdk_path: str):
         with self._cond:
             if (
-                not self._reuse_disabled
-                and self._engine is not None
+                self._engine is not None
                 and self._sdk_path == sdk_path
             ):
                 return self._engine
@@ -276,24 +276,29 @@ class _ArtcEngineManager:
             os.makedirs(log_path, exist_ok=True)
 
             t0 = time.perf_counter()
-            self._engine = CreateAliRTCEngine(
-                eventHandler=self._handler,
-                lowPort=int(os.environ.get("SGLANG_ARTC_LOW_PORT", "40000")),
-                highPort=int(os.environ.get("SGLANG_ARTC_HIGH_PORT", "40100")),
-                logPath=log_path,
-                coreServicePath=core_service,
-                h5mode=False,
-                extra="{}",
-            )
+            try:
+                engine = CreateAliRTCEngine(
+                    eventHandler=self._handler,
+                    lowPort=int(os.environ.get("SGLANG_ARTC_LOW_PORT", "42000")),
+                    highPort=int(os.environ.get("SGLANG_ARTC_HIGH_PORT", "45000")),
+                    logPath=log_path,
+                    coreServicePath=core_service,
+                    h5mode=False,
+                    extra="{}",
+                )
+            except Exception:
+                self._engine = None
+                self._sdk_path = None
+                self._sdk_defs = None
+                raise
+            self._engine = engine
             self._sdk_path = sdk_path
             self._sdk_defs = None
             self._create_count += 1
             logger.info(
-                "ARTC CreateAliRTCEngine finished in %.3fs "
-                "(creates=%d, reuse_disabled=%s)",
+                "ARTC CreateAliRTCEngine finished in %.3fs (creates=%d)",
                 time.perf_counter() - t0,
                 self._create_count,
-                self._reuse_disabled,
             )
             return self._engine
 
@@ -425,13 +430,6 @@ class _ArtcEngineManager:
         self._sdk_defs = None
         self._retired_engine_count += 1
         retired_count = self._retired_engine_count
-        if not left_completed:
-            self._reuse_disabled = True
-            logger.warning(
-                "Disabling ARTC engine reuse after LeaveChannel timeout "
-                "(retired_engines=%d)",
-                retired_count,
-            )
 
         def _release_after_leave() -> None:
             if not left_completed and not owner._left.wait(timeout=60.0):

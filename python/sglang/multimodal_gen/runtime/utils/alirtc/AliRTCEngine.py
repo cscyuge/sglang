@@ -1346,7 +1346,8 @@ def CreateAliRTCEngine(eventHandler:EngineEventHandlerInterface, lowPort:int, hi
     t = threading.Thread(target=_run_loop, daemon=True, name="artc-loop")
     t.start()
 
-    init_done.wait(timeout=15.0)
+    if not init_done.wait(timeout=15.0):
+        raise TimeoutError("[Python] Timed out initializing AliRTCEngine")
     if init_error[0] is not None:
         raise init_error[0]
 
