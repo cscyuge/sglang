@@ -1,17 +1,16 @@
 """Push video/audio via AliRTC SDK (ARTC protocol).
 
-Provides ``ArtcPusher``, a queue-based background thread that accepts raw
-RGB video frames and PCM audio, and pushes them through the AliRTC SDK.
-The SDK handles H.264 encoding internally — no PyAV dependency needed.
-
-Audio is accepted as float32 16 kHz mono and converted to int16 in-place
-(no resampling required, unlike the old RTMP/SRT path).
+The AliRTC Python wrapper and native CoreService run in a dedicated worker
+process. The main process only owns lifecycle control and chunk delivery. This
+keeps SDK hangs, wrapper thread state, and CoreService cleanup isolated from the
+model-serving process.
 """
 
-import atexit
 import logging
+import multiprocessing as mp
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -21,13 +20,9 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# AliRTC SDK root — sibling ``alirtc/`` package
 _SDK_DIR = os.path.join(os.path.dirname(__file__), "alirtc")
-_SDK_LIB_DIR = os.path.join(_SDK_DIR, "Release", "lib")
-
-
-class _ArtcStartCancelled(RuntimeError):
-    pass
+_CHUNK = "chunk"
+_STOP = "stop"
 
 
 def _ensure_sdk_importable(sdk_path: str) -> str:
@@ -42,56 +37,55 @@ def _ensure_sdk_importable(sdk_path: str) -> str:
     return lib_dir
 
 
-class _ReusableEventHandler:
-    """AliRTC event handler whose callbacks are routed to the active pusher."""
+def _put_status(status_queue, kind: str, message: str = "") -> None:
+    try:
+        status_queue.put_nowait((kind, message))
+    except Exception:
+        pass
 
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._pusher: Optional["ArtcPusher"] = None
 
-    def set_pusher(self, pusher: Optional["ArtcPusher"]) -> None:
-        with self._lock:
-            self._pusher = pusher
+class _WorkerEventHandler:
+    """AliRTC callbacks scoped to one worker process and one channel."""
 
-    def _get_pusher(self) -> Optional["ArtcPusher"]:
-        with self._lock:
-            return self._pusher
+    def __init__(self, status_queue):
+        self._status_queue = status_queue
+        self.joined = threading.Event()
+        self.left = threading.Event()
+        self.audio_published = threading.Event()
+        self.video_published = threading.Event()
+        self.failed = False
+        self.push_video_full = False
+        self.push_audio_full = False
 
     def OnAudioPublishStateChanged(self, oldState, newState, elapsed, channel):
         logger.debug(
             "ARTC audio publish: %s -> %s (ch=%s)", oldState, newState, channel
         )
-        pusher = self._get_pusher()
-        if pusher is not None and getattr(newState, "value", newState) == 2:
-            pusher._audio_published.set()
+        if getattr(newState, "value", newState) == 2:
+            self.audio_published.set()
 
     def OnVideoPublishStateChanged(self, oldState, newState, elapsed, channel):
         logger.debug(
             "ARTC video publish: %s -> %s (ch=%s)", oldState, newState, channel
         )
-        pusher = self._get_pusher()
-        if pusher is not None and getattr(newState, "value", newState) == 2:
-            pusher._video_published.set()
+        if getattr(newState, "value", newState) == 2:
+            self.video_published.set()
 
     def OnPushAudioFrameBufferFull(self, isFull):
-        pusher = self._get_pusher()
-        if pusher is not None:
-            pusher._push_audio_full = isFull
+        self.push_audio_full = isFull
         if isFull:
             logger.debug("ARTC audio buffer full")
 
     def OnPushVideoFrameBufferFull(self, isFull):
-        pusher = self._get_pusher()
-        if pusher is not None:
-            pusher._push_video_full = isFull
+        self.push_video_full = isFull
         if isFull:
             logger.debug("ARTC video buffer full")
 
     def OnError(self, error_code):
-        logger.error("ARTC SDK error: %s", error_code)
-        pusher = self._get_pusher()
-        if pusher is not None:
-            pusher._failed = True
+        self.failed = True
+        msg = f"ARTC SDK error: {error_code}"
+        logger.error(msg)
+        _put_status(self._status_queue, "failed", msg)
 
     def OnConnectionStatusChanged(self, status, reason):
         logger.info("ARTC connection: status=%s reason=%s", status, reason)
@@ -99,365 +93,298 @@ class _ReusableEventHandler:
     def OnJoinChannelResult(self, result, channel, userId):
         logger.info(
             "ARTC JoinChannel result=%s channel=%s user=%s",
-            result, channel, userId,
+            result,
+            channel,
+            userId,
         )
-        pusher = self._get_pusher()
-        if pusher is None:
-            return
-        if result == 0:
-            pusher._joined.set()
-        else:
-            logger.error("ARTC JoinChannel failed: %s", result)
-            pusher._failed = True
-            pusher._joined.set()
+        if result != 0:
+            self.failed = True
+            _put_status(
+                self._status_queue,
+                "failed",
+                f"ARTC JoinChannel failed: {result}",
+            )
+        self.joined.set()
 
     def OnLeaveChannelResult(self, result):
         logger.info("ARTC LeaveChannel result=%s", result)
-        pusher = self._get_pusher()
-        if pusher is not None:
-            pusher._left.set()
+        self.left.set()
 
     def __getattr__(self, name):
         def _noop(*args, **kwargs):
             pass
+
         return _noop
 
 
-class _ArtcEngineManager:
-    """Process-local single-engine ARTC manager.
+def _create_engine(config: dict, handler: _WorkerEventHandler):
+    lib_dir = _ensure_sdk_importable(config["sdk_path"])
+    core_service = os.path.join(lib_dir, "AliRtcCoreService")
 
-    The AliRTC SDK startup path can degrade when repeatedly creating and
-    releasing engines. This manager serializes sessions and reuses one engine
-    across channels, while still leaving the channel at session boundaries.
-    """
+    from AliRTCEngine import CreateAliRTCEngine  # noqa: E402
 
-    def __init__(self):
-        self._cond = threading.Condition()
-        self._engine = None
-        self._handler = _ReusableEventHandler()
-        self._active_owner: Optional["ArtcPusher"] = None
-        self._sdk_path: Optional[str] = None
-        self._sdk_defs = None
-        self._create_count = 0
-        self._session_count = 0
-        self._retired_engine_count = 0
+    log_path = os.environ.get("SGLANG_ARTC_LOG_PATH", "/tmp/artc_sdk_logs")
+    os.makedirs(log_path, exist_ok=True)
 
-    def start_session(self, owner: "ArtcPusher"):
-        """Create/reuse the engine, configure it, and join owner's channel."""
-        t_wait = time.perf_counter()
-        with self._cond:
-            while self._active_owner is not None and self._active_owner is not owner:
-                if owner._stop_requested.is_set():
-                    raise _ArtcStartCancelled(
-                        "ARTC start cancelled before engine acquisition"
-                    )
-                self._cond.wait(timeout=1.0)
-            if owner._stop_requested.is_set():
-                raise _ArtcStartCancelled(
-                    "ARTC start cancelled before engine acquisition"
-                )
-            wait_s = time.perf_counter() - t_wait
-            if wait_s > 0.01:
-                logger.info("ARTC engine manager waited %.3fs for previous session", wait_s)
-            self._active_owner = owner
-            self._handler.set_pusher(owner)
+    t0 = time.perf_counter()
+    engine = CreateAliRTCEngine(
+        eventHandler=handler,
+        lowPort=int(os.environ.get("SGLANG_ARTC_LOW_PORT", "42000")),
+        highPort=int(os.environ.get("SGLANG_ARTC_HIGH_PORT", "45000")),
+        logPath=log_path,
+        coreServicePath=core_service,
+        h5mode=False,
+        extra="{}",
+    )
+    logger.info(
+        "ARTC worker CreateAliRTCEngine finished in %.3fs",
+        time.perf_counter() - t0,
+    )
+    return engine
+
+
+def _configure_engine(engine, config: dict) -> None:
+    from AliRTCLinuxSdkDefine import (  # noqa: E402
+        AliEngineClientRole,
+        AliEngineFrameRate,
+        AliEngineRotationMode,
+        AliEngineVideoEncoderConfiguration,
+        AliEngineVideoEncoderOrientationMode,
+        AliEngineVideoMirrorMode,
+        RenderMode,
+        VideoSource,
+    )
+
+    frame_rate_enum = {
+        5: AliEngineFrameRate.AliEngineFrameRateFps5,
+        10: AliEngineFrameRate.AliEngineFrameRateFps10,
+        15: AliEngineFrameRate.AliEngineFrameRateFps15,
+        20: AliEngineFrameRate.AliEngineFrameRateFps20,
+        25: AliEngineFrameRate.AliEngineFrameRateFps25,
+        30: AliEngineFrameRate.AliEngineFrameRateFps30,
+        60: AliEngineFrameRate.AliEngineFrameRateFps60,
+    }.get(config["fps"], AliEngineFrameRate.AliEngineFrameRateFps25)
+
+    video_cfg = AliEngineVideoEncoderConfiguration(
+        width=config["width"],
+        height=config["height"],
+        f=frame_rate_enum,
+        b=2000,
+        ori=AliEngineVideoEncoderOrientationMode.AliEngineVideoEncoderOrientationModeAdaptive,
+        mr=AliEngineVideoMirrorMode.AliEngineVideoMirrorModeDisabled,
+        rotation=AliEngineRotationMode.AliEngineRotationMode_0,
+    )
+    engine.SetVideoEncoderConfiguration(video_cfg)
+    engine.SetExternalVideoSource(
+        True,
+        VideoSource.VideoSourceCamera,
+        RenderMode.RenderModeFill,
+    )
+    engine.SetExternalAudioSource(True, 16000, 1)
+    engine.PublishLocalVideoStream(True)
+    engine.PublishLocalAudioStream(True)
+    engine.SetClientRole(AliEngineClientRole.AliEngineClientRoleInteractive)
+
+
+def _join_channel(engine, handler: _WorkerEventHandler, config: dict) -> None:
+    from AliRTCLinuxSdkDefine import (  # noqa: E402
+        JoinChannelConfig,
+        PublishAvsyncMode,
+        PublishMode,
+    )
+
+    join_cfg = JoinChannelConfig()
+    join_cfg.publishAvsyncMode = PublishAvsyncMode.PublishAvsyncWithPts
+    join_cfg.publishMode = PublishMode.PublishAutomatically
+    engine.JoinChannel(
+        config["token"],
+        config["channel"],
+        config["userid"],
+        config["userid"],
+        join_cfg,
+    )
+
+    if not handler.joined.wait(timeout=float(config["join_timeout"])):
+        raise RuntimeError("ARTC JoinChannel timed out")
+    if handler.failed:
+        raise RuntimeError("ARTC JoinChannel failed")
+
+    handler.audio_published.wait(timeout=5.0)
+    handler.video_published.wait(timeout=5.0)
+    logger.info(
+        "ARTC worker ready: channel=%s user=%s %dx%d@%dfps",
+        config["channel"],
+        config["userid"],
+        config["width"],
+        config["height"],
+        config["fps"],
+    )
+
+
+def _drain_worker_queue(
+    engine, handler: _WorkerEventHandler, config: dict, command_queue
+):
+    from AliRTCLinuxSdkDefine import (  # noqa: E402
+        VideoBufferType,
+        VideoDataFormat,
+        VideoDataSample,
+        VideoSource,
+    )
+
+    fps = int(config["fps"])
+    width = int(config["width"])
+    height = int(config["height"])
+    queue_maxsize = int(config["queue_maxsize"])
+    ms_per_frame = 1000 // fps
+    samples_per_frame = 16000 // fps
+    v_ts = 0
+    a_ts = 0
+
+    while True:
+        try:
+            item = command_queue.get(timeout=2.0)
+        except queue.Empty:
+            if handler.failed:
+                raise RuntimeError("ARTC SDK failed during push loop")
+            continue
+
+        if item is None or item[0] == _STOP:
+            break
+        if item[0] != _CHUNK:
+            continue
+
+        frames_np, audio_int16 = item[1], item[2]
 
         try:
-            t0 = time.perf_counter()
-            engine = self._get_or_create_engine(owner._sdk_path)
-            create_or_reuse_s = time.perf_counter() - t0
-            self._handler.set_pusher(owner)
+            qsize = command_queue.qsize()
+        except (NotImplementedError, OSError):
+            qsize = 0
 
-            owner._reset_session_events()
-            owner._engine = engine
+        if qsize >= queue_maxsize - 2:
+            skipped = 0
+            skipped_frames = 0
+            while True:
+                try:
+                    newer = command_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if newer is None or newer[0] == _STOP:
+                    return
+                if newer[0] != _CHUNK:
+                    continue
+                skipped += 1
+                skipped_frames += frames_np.shape[0]
+                frames_np, audio_int16 = newer[1], newer[2]
+            if skipped > 0:
+                v_ts += skipped_frames * ms_per_frame
+                a_ts += skipped_frames * ms_per_frame
+                logger.info("ARTC worker skipped %d queued chunk(s)", skipped)
 
-            t_cfg = time.perf_counter()
-            self._configure_engine(owner)
-            config_s = time.perf_counter() - t_cfg
+        num_frames = frames_np.shape[0]
+        for i in range(num_frames):
+            if handler.failed:
+                raise RuntimeError("ARTC SDK failed during frame push")
 
-            t_join = time.perf_counter()
-            self._join_channel(owner)
-            join_s = time.perf_counter() - t_join
+            while handler.push_video_full:
+                time.sleep(0.001)
+                if handler.failed:
+                    raise RuntimeError("ARTC SDK failed while video buffer full")
 
-            with self._cond:
-                self._session_count += 1
-                session_count = self._session_count
-                create_count = self._create_count
-            logger.info(
-                "ARTC engine session ready: channel=%s reused=%s sessions=%d creates=%d "
-                "engine=%.3fs config=%.3fs join=%.3fs",
-                owner._channel,
-                create_count < session_count,
-                session_count,
-                create_count,
-                create_or_reuse_s,
-                config_s,
-                join_s,
-            )
-            return engine
-        except Exception:
-            self.end_session(owner, release_on_error=True)
-            raise
+            frame = frames_np[i]
+            video_sample = VideoDataSample()
+            video_sample.width = width
+            video_sample.height = height
+            video_sample.format = VideoDataFormat.VideoDataFormatRGB24
+            video_sample.bufferType = VideoBufferType.VideoBufferTypeRawData
+            video_sample.data = frame.tobytes()
+            video_sample.dataLen = width * height * 3
+            video_sample.timeStamp = v_ts
+            video_sample.strideY = 0
+            video_sample.strideU = 0
+            video_sample.strideV = 0
+            video_sample.rotation = 0
+            engine.PushExternalVideoFrame(video_sample, VideoSource.VideoSourceCamera)
+            v_ts += ms_per_frame
 
-    def end_session(
-        self,
-        owner: "ArtcPusher",
-        timeout: float = 2.0,
-        release_on_error: bool = False,
-    ) -> None:
-        """Leave the current channel and make the reusable engine available."""
-        with self._cond:
-            if self._active_owner is not owner:
-                return
-            engine = self._engine
-            handler = self._handler
+            if audio_int16 is not None:
+                while handler.push_audio_full:
+                    time.sleep(0.001)
+                    if handler.failed:
+                        raise RuntimeError("ARTC SDK failed while audio buffer full")
 
-        left_completed = False
-        if engine is not None:
-            owner._left.clear()
-            try:
-                engine.LeaveChannel()
-                left_completed = owner._left.wait(timeout=timeout)
-                if not left_completed:
-                    logger.warning(
-                        "ARTC LeaveChannel did not complete within %.1fs for channel=%s",
-                        timeout,
-                        owner._channel,
+                start = i * samples_per_frame
+                end = min(start + samples_per_frame, len(audio_int16))
+                audio_slice = audio_int16[start:end]
+                if len(audio_slice) < samples_per_frame:
+                    audio_slice = np.pad(
+                        audio_slice,
+                        (0, samples_per_frame - len(audio_slice)),
                     )
-                    release_on_error = True
-            except Exception as exc:
-                logger.warning("ARTC LeaveChannel error: %s", exc)
-                release_on_error = True
-
-        with self._cond:
-            if release_on_error and self._engine is not None:
-                self._retire_engine_locked(
-                    engine=engine,
-                    handler=handler,
-                    owner=owner,
-                    left_completed=left_completed,
+                audio_bytes = audio_slice.tobytes()
+                engine.PushExternalAudioFrameRawData(
+                    audio_bytes, len(audio_bytes), a_ts
                 )
-            else:
-                self._handler.set_pusher(None)
-            if self._active_owner is owner:
-                self._active_owner = None
-            self._cond.notify_all()
-        owner._engine = None
+                a_ts += ms_per_frame
 
-    def release(self) -> None:
-        with self._cond:
-            self._handler.set_pusher(None)
-            self._active_owner = None
-            self._release_engine_locked()
-            self._cond.notify_all()
 
-    def _get_or_create_engine(self, sdk_path: str):
-        with self._cond:
-            if (
-                self._engine is not None
-                and self._sdk_path == sdk_path
-            ):
-                return self._engine
-            if self._engine is not None:
-                logger.info("ARTC SDK path changed; releasing reusable engine")
-                self._release_engine_locked()
+def _leave_and_release(engine, handler: _WorkerEventHandler, config: dict) -> None:
+    if engine is None:
+        return
 
-            lib_dir = _ensure_sdk_importable(sdk_path)
-            core_service = os.path.join(lib_dir, "AliRtcCoreService")
-
-            from AliRTCEngine import CreateAliRTCEngine  # noqa: E402
-
-            log_path = os.environ.get("SGLANG_ARTC_LOG_PATH", "/tmp/artc_sdk_logs")
-            os.makedirs(log_path, exist_ok=True)
-
-            t0 = time.perf_counter()
-            try:
-                engine = CreateAliRTCEngine(
-                    eventHandler=self._handler,
-                    lowPort=int(os.environ.get("SGLANG_ARTC_LOW_PORT", "42000")),
-                    highPort=int(os.environ.get("SGLANG_ARTC_HIGH_PORT", "45000")),
-                    logPath=log_path,
-                    coreServicePath=core_service,
-                    h5mode=False,
-                    extra="{}",
-                )
-            except Exception:
-                self._engine = None
-                self._sdk_path = None
-                self._sdk_defs = None
-                raise
-            self._engine = engine
-            self._sdk_path = sdk_path
-            self._sdk_defs = None
-            self._create_count += 1
-            logger.info(
-                "ARTC CreateAliRTCEngine finished in %.3fs (creates=%d)",
-                time.perf_counter() - t0,
-                self._create_count,
+    left_completed = False
+    try:
+        handler.left.clear()
+        engine.LeaveChannel()
+        left_timeout = float(config["leave_timeout"])
+        left_completed = handler.left.wait(timeout=left_timeout)
+        if not left_completed:
+            logger.warning(
+                "ARTC worker LeaveChannel did not complete within %.1fs for channel=%s",
+                left_timeout,
+                config["channel"],
             )
-            return self._engine
+    except Exception as exc:
+        logger.warning("ARTC worker LeaveChannel error: %s", exc)
 
-    def _defs(self, sdk_path: str):
-        if self._sdk_defs is not None:
-            return self._sdk_defs
+    if not left_completed:
+        logger.warning(
+            "ARTC worker skipping Release after leave timeout; parent may kill process group"
+        )
+        return
 
-        _ensure_sdk_importable(sdk_path)
-        from AliRTCLinuxSdkDefine import (  # noqa: E402
-            AliEngineClientRole,
-            AliEngineFrameRate,
-            AliEngineRotationMode,
-            AliEngineVideoEncoderConfiguration,
-            AliEngineVideoEncoderOrientationMode,
-            AliEngineVideoMirrorMode,
-            JoinChannelConfig,
-            PublishAvsyncMode,
-            PublishMode,
-            RenderMode,
-            VideoSource,
+    try:
+        engine.Release()
+    except Exception as exc:
+        logger.warning("ARTC worker Release error: %s", exc)
+
+
+def _artc_worker_main(config: dict, command_queue, status_queue) -> None:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="[%(asctime)s] %(levelname)s: %(message)s",
+            datefmt="%m-%d %H:%M:%S",
         )
 
-        self._sdk_defs = {
-            "AliEngineClientRole": AliEngineClientRole,
-            "AliEngineFrameRate": AliEngineFrameRate,
-            "AliEngineRotationMode": AliEngineRotationMode,
-            "AliEngineVideoEncoderConfiguration": AliEngineVideoEncoderConfiguration,
-            "AliEngineVideoEncoderOrientationMode": AliEngineVideoEncoderOrientationMode,
-            "AliEngineVideoMirrorMode": AliEngineVideoMirrorMode,
-            "JoinChannelConfig": JoinChannelConfig,
-            "PublishAvsyncMode": PublishAvsyncMode,
-            "PublishMode": PublishMode,
-            "RenderMode": RenderMode,
-            "VideoSource": VideoSource,
-        }
-        return self._sdk_defs
+    try:
+        os.setsid()
+    except Exception:
+        pass
 
-    def _configure_engine(self, owner: "ArtcPusher") -> None:
-        d = self._defs(owner._sdk_path)
-        frame_rate_enum = {
-            5: d["AliEngineFrameRate"].AliEngineFrameRateFps5,
-            10: d["AliEngineFrameRate"].AliEngineFrameRateFps10,
-            15: d["AliEngineFrameRate"].AliEngineFrameRateFps15,
-            20: d["AliEngineFrameRate"].AliEngineFrameRateFps20,
-            25: d["AliEngineFrameRate"].AliEngineFrameRateFps25,
-            30: d["AliEngineFrameRate"].AliEngineFrameRateFps30,
-            60: d["AliEngineFrameRate"].AliEngineFrameRateFps60,
-        }.get(owner._fps, d["AliEngineFrameRate"].AliEngineFrameRateFps25)
-
-        video_cfg = d["AliEngineVideoEncoderConfiguration"](
-            width=owner._width,
-            height=owner._height,
-            f=frame_rate_enum,
-            b=2000,
-            ori=d[
-                "AliEngineVideoEncoderOrientationMode"
-            ].AliEngineVideoEncoderOrientationModeAdaptive,
-            mr=d["AliEngineVideoMirrorMode"].AliEngineVideoMirrorModeDisabled,
-            rotation=d["AliEngineRotationMode"].AliEngineRotationMode_0,
-        )
-        engine = self._engine
-        engine.SetVideoEncoderConfiguration(video_cfg)
-        engine.SetExternalVideoSource(
-            True,
-            d["VideoSource"].VideoSourceCamera,
-            d["RenderMode"].RenderModeFill,
-        )
-        engine.SetExternalAudioSource(True, 16000, 1)
-        engine.PublishLocalVideoStream(True)
-        engine.PublishLocalAudioStream(True)
-        engine.SetClientRole(d["AliEngineClientRole"].AliEngineClientRoleInteractive)
-
-    def _join_channel(self, owner: "ArtcPusher") -> None:
-        d = self._defs(owner._sdk_path)
-        join_cfg = d["JoinChannelConfig"]()
-        join_cfg.publishAvsyncMode = d["PublishAvsyncMode"].PublishAvsyncWithPts
-        join_cfg.publishMode = d["PublishMode"].PublishAutomatically
-        self._engine.JoinChannel(
-            owner._token,
-            owner._channel,
-            owner._userid,
-            owner._userid,
-            join_cfg,
-        )
-
-        if not owner._joined.wait(timeout=10.0):
-            raise RuntimeError("ARTC JoinChannel timed out")
-        if owner._failed:
-            raise RuntimeError("ARTC JoinChannel failed")
-
-        owner._audio_published.wait(timeout=5.0)
-        owner._video_published.wait(timeout=5.0)
-        logger.info(
-            "ARTC engine ready: channel=%s user=%s %dx%d@%dfps",
-            owner._channel,
-            owner._userid,
-            owner._width,
-            owner._height,
-            owner._fps,
-        )
-
-    def _release_engine_locked(self) -> None:
-        if self._engine is None:
-            return
-        self._handler.set_pusher(None)
-        try:
-            self._engine.Release()
-        except Exception as exc:
-            logger.warning("ARTC Release error: %s", exc)
-        self._engine = None
-        self._handler = _ReusableEventHandler()
-        self._sdk_path = None
-        self._sdk_defs = None
-
-    def _retire_engine_locked(
-        self,
-        engine,
-        handler: _ReusableEventHandler,
-        owner: "ArtcPusher",
-        left_completed: bool,
-    ) -> None:
-        """Detach a suspect engine without synchronously destroying it."""
-        if engine is None or self._engine is not engine:
-            return
-
-        self._engine = None
-        self._handler = _ReusableEventHandler()
-        self._sdk_path = None
-        self._sdk_defs = None
-        self._retired_engine_count += 1
-        retired_count = self._retired_engine_count
-
-        def _release_after_leave() -> None:
-            if not left_completed and not owner._left.wait(timeout=60.0):
-                logger.warning(
-                    "ARTC retired engine did not leave channel=%s within 60s; "
-                    "skipping Release to avoid blocking cleanup "
-                    "(retired_engines=%d)",
-                    owner._channel,
-                    retired_count,
-                )
-                handler.set_pusher(None)
-                return
-            handler.set_pusher(None)
-            try:
-                engine.Release()
-                logger.info(
-                    "ARTC retired engine released for channel=%s "
-                    "(retired_engines=%d)",
-                    owner._channel,
-                    retired_count,
-                )
-            except Exception as exc:
-                logger.warning("ARTC retired engine Release error: %s", exc)
-
-        threading.Thread(
-            target=_release_after_leave,
-            daemon=True,
-            name="artc-retired-release",
-        ).start()
-
-
-_ENGINE_MANAGER = _ArtcEngineManager()
-atexit.register(_ENGINE_MANAGER.release)
+    handler = _WorkerEventHandler(status_queue)
+    engine = None
+    try:
+        engine = _create_engine(config, handler)
+        _configure_engine(engine, config)
+        _join_channel(engine, handler, config)
+        _put_status(status_queue, "ready", config["channel"])
+        _drain_worker_queue(engine, handler, config, command_queue)
+    except Exception as exc:
+        logger.exception("ARTC worker failed for channel=%s", config["channel"])
+        _put_status(status_queue, "failed", str(exc))
+    finally:
+        _leave_and_release(engine, handler, config)
+        _put_status(status_queue, "stopped", config["channel"])
 
 
 class ArtcPusher:
@@ -486,41 +413,25 @@ class ArtcPusher:
         self._width = width
         self._height = height
         self._fps = fps
+        self._queue_maxsize = queue_maxsize
+        self._sdk_path = sdk_path or _SDK_DIR
 
-        self._queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+        self._mp_ctx = mp.get_context("spawn")
+        self._command_queue = None
+        self._status_queue = None
+        self._process: Optional[mp.Process] = None
+
         self._started = False
         self._failed = False
-        self._thread: Optional[threading.Thread] = None
         self._start_thread: Optional[threading.Thread] = None
-        self._engine = None
-        self._sdk_path = sdk_path or _SDK_DIR
         self._start_lock = threading.Lock()
         self._start_done = threading.Event()
         self._start_requested = False
         self._stop_requested = threading.Event()
 
-        # Synchronisation events
-        self._joined = threading.Event()
-        self._left = threading.Event()
-        self._audio_published = threading.Event()
-        self._video_published = threading.Event()
-        self._push_video_full = False
-        self._push_audio_full = False
-
-        # Monotonic PTS counters (milliseconds)
-        self._v_ts = 0
-        self._a_ts = 0
-
-    def _reset_session_events(self) -> None:
-        self._joined.clear()
-        self._left.clear()
-        self._audio_published.clear()
-        self._video_published.clear()
-        self._push_video_full = False
-        self._push_audio_full = False
-
     @property
     def failed(self) -> bool:
+        self._poll_status()
         return self._failed
 
     @property
@@ -532,23 +443,17 @@ class ArtcPusher:
         return self._start_requested and not self._start_done.is_set()
 
     def wait_until_started(self, timeout: float | None = None) -> bool:
-        """Wait for async startup to finish.
-
-        Returns True if the drain thread is ready to accept frames.
-        """
+        """Wait for async startup to finish."""
         if self._started:
             return True
         if not self._start_requested:
             return False
         finished = self._start_done.wait(timeout=timeout)
+        self._poll_status()
         return finished and self._started and not self._failed
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def start(self) -> None:
-        """Create engine, join channel, and start the drain thread."""
+        """Start the dedicated AliRTC worker process and wait until it joins."""
         if self._started:
             self._start_done.set()
             return
@@ -557,54 +462,97 @@ class ArtcPusher:
             if self._started:
                 self._start_done.set()
                 return
+
+            already_requested = self._start_requested
             self._start_requested = True
+            if not already_requested:
+                self._stop_requested.clear()
             self._start_done.clear()
-            if self._stop_requested.is_set():
-                self._start_done.set()
-                self._start_requested = False
-                return
             self._failed = False
-            self._v_ts = 0
-            self._a_ts = 0
-            t0 = time.perf_counter()
-            try:
-                _ENGINE_MANAGER.start_session(self)
-            except _ArtcStartCancelled:
-                self._start_done.set()
-                self._start_requested = False
-                return
-            except Exception as exc:
-                logger.error("ARTC engine init failed: %s", exc)
-                self._failed = True
-                self._start_done.set()
-                self._start_requested = False
-                return
 
-            if self._stop_requested.is_set():
-                _ENGINE_MANAGER.end_session(self)
-                self._start_done.set()
-                self._start_requested = False
-                logger.info(
-                    "ARTC start() finished after stop request in %.3fs for channel=%s",
-                    time.perf_counter() - t0,
-                    self._channel,
+            self._ensure_queues()
+            process = self._process
+            if process is not None and not process.is_alive():
+                self._close_queues()
+                self._ensure_queues()
+                process = None
+            if process is None or not process.is_alive():
+                self._process = self._mp_ctx.Process(
+                    target=_artc_worker_main,
+                    args=(
+                        self._worker_config(),
+                        self._command_queue,
+                        self._status_queue,
+                    ),
+                    name=f"artc-worker-{self._channel}",
                 )
-                return
+                self._process.start()
+                process = self._process
 
-            self._thread = threading.Thread(
-                target=self._drain_loop, daemon=True, name="artc-push"
-            )
-            self._thread.start()
-            self._started = True
-            self._start_done.set()
-            logger.info(
-                "ARTC start() finished in %.3fs for channel=%s",
-                time.perf_counter() - t0,
+            start_timeout = float(os.environ.get("SGLANG_ARTC_START_TIMEOUT", "15.0"))
+            deadline = time.monotonic() + start_timeout
+            t0 = time.perf_counter()
+            while time.monotonic() < deadline:
+                if self._started:
+                    self._start_done.set()
+                    return
+                if self._failed:
+                    self._terminate_worker(timeout=2.0)
+                    self._start_requested = False
+                    self._start_done.set()
+                    return
+                if self._stop_requested.is_set():
+                    self._send_stop()
+                    self._terminate_worker(timeout=2.0)
+                    self._start_requested = False
+                    self._start_done.set()
+                    return
+
+                event = self._get_status_event(timeout=0.1)
+                if event is None:
+                    if process.exitcode is not None:
+                        self._failed = True
+                        logger.error(
+                            "ARTC worker exited before ready: channel=%s exitcode=%s",
+                            self._channel,
+                            process.exitcode,
+                        )
+                        self._start_requested = False
+                        self._start_done.set()
+                        return
+                    continue
+
+                kind, message = event
+                if kind == "ready":
+                    self._started = True
+                    self._start_done.set()
+                    logger.info(
+                        "ARTC start() finished in %.3fs for channel=%s worker_pid=%s",
+                        time.perf_counter() - t0,
+                        self._channel,
+                        process.pid,
+                    )
+                    return
+                if kind == "failed":
+                    self._failed = True
+                    self._terminate_worker(timeout=2.0)
+                    logger.error("ARTC worker init failed: %s", message)
+                    self._start_requested = False
+                    self._start_done.set()
+                    return
+
+            self._failed = True
+            self._terminate_worker(timeout=2.0)
+            logger.error(
+                "ARTC worker did not become ready within %.1fs for channel=%s",
+                start_timeout,
                 self._channel,
             )
+            self._start_requested = False
+            self._start_done.set()
 
     def start_async(self) -> None:
-        """Launch startup in the background so chunk generation can overlap it."""
+        """Launch worker startup in the background."""
         if self._started:
             self._start_done.set()
             return
@@ -614,6 +562,7 @@ class ArtcPusher:
                 return
             self._start_requested = True
             self._stop_requested.clear()
+            self._ensure_queues()
             if self._start_thread is not None and self._start_thread.is_alive():
                 return
             self._start_done.clear()
@@ -627,208 +576,163 @@ class ArtcPusher:
         frames_np: np.ndarray,
         audio_16k: Optional[np.ndarray] = None,
     ) -> None:
-        """Enqueue a chunk of video frames + audio for pushing.
-
-        Parameters
-        ----------
-        frames_np : np.ndarray
-            Video frames, shape ``(T, H, W, 3)`` dtype ``uint8`` (RGB24).
-        audio_16k : np.ndarray or None
-            Float32 mono 16 kHz PCM audio for this chunk.
-        """
-        if self._failed:
+        """Enqueue a chunk of RGB video frames and optional 16 kHz mono audio."""
+        if self.failed:
             return
         if not self._started and not self._start_requested:
             return
 
-        # Convert audio float32 → int16
         audio_int16 = None
         if audio_16k is not None and len(audio_16k) > 0:
-            audio_int16 = np.clip(
-                audio_16k * 32767, -32768, 32767
-            ).astype(np.int16)
+            audio_int16 = np.clip(audio_16k * 32767, -32768, 32767).astype(np.int16)
 
-        item = (frames_np, audio_int16)
+        self._ensure_queues()
+        item = (_CHUNK, frames_np, audio_int16)
         try:
-            self._queue.put_nowait(item)
+            self._command_queue.put_nowait(item)
         except queue.Full:
-            # Drop oldest to make room
             try:
-                self._queue.get_nowait()
+                self._command_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._queue.put_nowait(item)
+                self._command_queue.put_nowait(item)
             except queue.Full:
                 pass
-            logger.warning("ARTC pusher queue full — dropped oldest chunk")
+            logger.warning("ARTC pusher queue full, dropped oldest chunk")
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Drain queue and leave channel.
-
-        If async startup is still running, this method never races it by
-        releasing the engine concurrently. On timeout, the start thread observes
-        ``_stop_requested`` and performs the leave once startup returns.
-        """
-        if not self._started and not self._start_requested:
+        """Stop the worker process; kill its process group on timeout."""
+        if not self._started and not self._start_requested and self._process is None:
             return
 
         self._stop_requested.set()
+        self._send_stop()
 
         if self._start_thread is not None and self._start_thread.is_alive():
             self._start_thread.join(timeout=timeout)
             if self._start_thread.is_alive():
+                logger.warning("ARTC start thread did not exit within %.1fs", timeout)
+
+        process = self._process
+        if process is not None:
+            process.join(timeout=timeout)
+            if process.is_alive():
                 logger.warning(
-                    "ARTC start thread did not exit within %.1fs", timeout
+                    "ARTC worker did not exit within %.1fs for channel=%s",
+                    timeout,
+                    self._channel,
                 )
-                return
+                self._terminate_worker(timeout=2.0)
 
-        release_on_error = False
-        if self._started:
-            # Drain the queue to make room for sentinel
-            while True:
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
-            self._queue.put_nowait(None)
-
-            if self._thread is not None:
-                self._thread.join(timeout=timeout)
-                if self._thread.is_alive():
-                    logger.warning(
-                        "ARTC pusher thread did not exit within %.1fs", timeout
-                    )
-                    self._failed = True
-                    self._thread.join(timeout=1.0)
-                    release_on_error = self._thread.is_alive()
-
-        _ENGINE_MANAGER.end_session(
-            self,
-            timeout=min(2.0, timeout),
-            release_on_error=release_on_error,
-        )
+        self._poll_status()
         self._started = False
         self._start_requested = False
         self._start_done.set()
+        self._close_queues()
 
-    # ------------------------------------------------------------------
-    # Background drain thread
-    # ------------------------------------------------------------------
+    def _worker_config(self) -> dict:
+        return {
+            "token": self._token,
+            "channel": self._channel,
+            "userid": self._userid,
+            "width": self._width,
+            "height": self._height,
+            "fps": self._fps,
+            "queue_maxsize": self._queue_maxsize,
+            "sdk_path": self._sdk_path,
+            "join_timeout": float(os.environ.get("SGLANG_ARTC_JOIN_TIMEOUT", "10.0")),
+            "leave_timeout": float(os.environ.get("SGLANG_ARTC_LEAVE_TIMEOUT", "2.0")),
+        }
 
-    def _drain_loop(self) -> None:
-        """Drain the queue and push frames/audio to AliRTC SDK.
+    def _ensure_queues(self) -> None:
+        if self._command_queue is None:
+            self._command_queue = self._mp_ctx.Queue(maxsize=self._queue_maxsize)
+        if self._status_queue is None:
+            self._status_queue = self._mp_ctx.Queue()
 
-        Uses a "skip-to-latest" strategy: before pushing a chunk, drain
-        any accumulated items from the queue and keep only the newest one.
-        This bounds latency to ~1 chunk (~1.12s) while still pushing all
-        28 frames of each selected chunk (no intra-chunk frame drops).
-        Intermediate chunks are skipped only when the queue accumulates
-        (generation outpacing real-time), roughly 1 skip per 9 chunks.
-        """
-        try:
-            from AliRTCLinuxSdkDefine import (
-                VideoBufferType,
-                VideoDataFormat,
-                VideoDataSample,
-                VideoSource,
-            )
-        except ImportError:
-            logger.error("Failed to import AliRTC SDK defines in drain thread")
-            self._failed = True
+    def _send_stop(self) -> None:
+        if self._command_queue is None:
             return
-
-        ms_per_frame = 1000 // self._fps  # 40ms @ 25fps
-        samples_per_frame = 16000 // self._fps  # 640 @ 25fps
-
-        while True:
+        try:
+            self._command_queue.put_nowait((_STOP,))
+        except queue.Full:
             try:
-                item = self._queue.get(timeout=2.0)
+                self._command_queue.get_nowait()
             except queue.Empty:
+                pass
+            try:
+                self._command_queue.put_nowait((_STOP,))
+            except queue.Full:
+                pass
+
+    def _get_status_event(self, timeout: float):
+        if self._status_queue is None:
+            return None
+        try:
+            return self._status_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def _poll_status(self) -> None:
+        if self._status_queue is not None:
+            while True:
+                try:
+                    kind, message = self._status_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "failed":
+                    self._failed = True
+                    logger.error("ARTC worker reported failure: %s", message)
+                elif kind == "ready":
+                    self._started = True
+                    self._start_done.set()
+                elif kind == "stopped":
+                    self._started = False
+
+        process = self._process
+        if (
+            process is not None
+            and process.exitcode is not None
+            and self._started
+            and not self._stop_requested.is_set()
+        ):
+            self._failed = True
+            logger.error(
+                "ARTC worker exited unexpectedly: channel=%s exitcode=%s",
+                self._channel,
+                process.exitcode,
+            )
+
+    def _terminate_worker(self, timeout: float) -> None:
+        process = self._process
+        if process is None:
+            return
+        if process.is_alive():
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except Exception:
+                process.terminate()
+            process.join(timeout=timeout)
+        if process.is_alive():
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except Exception:
+                process.kill()
+            process.join(timeout=timeout)
+
+    def _close_queues(self) -> None:
+        for q in (self._command_queue, self._status_queue):
+            if q is None:
                 continue
-
-            if item is None:
-                break  # sentinel
-
-            # --- Skip to latest when queue is near-full ---
-            # Only skip when the queue is severely backed up (>= 6/8).
-            # During normal catch-up (1-2 pending), push all chunks to
-            # avoid dropping valid audio/video content.
-            _qsize = self._queue.qsize()
-            if _qsize >= self._queue.maxsize - 2:
-                _skipped = 0
-                _skipped_frames = 0
-                while True:
-                    try:
-                        newer = self._queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if newer is None:
-                        # Sentinel — put it back so outer loop sees it
-                        self._queue.put(None)
-                        break
-                    _skipped += 1
-                    _skipped_frames += item[0].shape[0]
-                    item = newer
-                if _skipped > 0:
-                    # Advance timestamps for skipped chunks to keep A/V sync
-                    self._v_ts += _skipped_frames * ms_per_frame
-                    self._a_ts += _skipped_frames * ms_per_frame
-                    logger.info(
-                        "ARTC drain: queue near-full, skipped %d chunk(s)",
-                        _skipped,
-                    )
-
-            frames_np, audio_int16 = item
-            num_frames = frames_np.shape[0]
-
-            for i in range(num_frames):
-                if self._failed:
-                    return
-
-                # --- Push video frame ---
-                # Wait if SDK buffer is full
-                while self._push_video_full:
-                    time.sleep(0.001)
-                    if self._failed:
-                        return
-
-                frame = frames_np[i]
-                video_sample = VideoDataSample()
-                video_sample.width = self._width
-                video_sample.height = self._height
-                video_sample.format = VideoDataFormat.VideoDataFormatRGB24
-                video_sample.bufferType = VideoBufferType.VideoBufferTypeRawData
-                video_sample.data = frame.tobytes()
-                video_sample.dataLen = self._width * self._height * 3
-                video_sample.timeStamp = self._v_ts
-                video_sample.strideY = 0
-                video_sample.strideU = 0
-                video_sample.strideV = 0
-                video_sample.rotation = 0
-                self._engine.PushExternalVideoFrame(
-                    video_sample, VideoSource.VideoSourceCamera
-                )
-                self._v_ts += ms_per_frame
-
-                # --- Push corresponding audio slice ---
-                if audio_int16 is not None:
-                    while self._push_audio_full:
-                        time.sleep(0.001)
-                        if self._failed:
-                            return
-
-                    start = i * samples_per_frame
-                    end = min(start + samples_per_frame, len(audio_int16))
-                    audio_slice = audio_int16[start:end]
-                    # Pad if short
-                    if len(audio_slice) < samples_per_frame:
-                        audio_slice = np.pad(
-                            audio_slice,
-                            (0, samples_per_frame - len(audio_slice)),
-                        )
-                    audio_bytes = audio_slice.tobytes()
-                    self._engine.PushExternalAudioFrameRawData(
-                        audio_bytes, len(audio_bytes), self._a_ts
-                    )
-                    self._a_ts += ms_per_frame
+            try:
+                q.close()
+            except Exception:
+                pass
+            try:
+                q.join_thread()
+            except Exception:
+                pass
+        self._command_queue = None
+        self._status_queue = None
+        self._process = None
