@@ -348,14 +348,28 @@ def _leave_and_release(engine, handler: _WorkerEventHandler, config: dict) -> No
 
     if not left_completed:
         logger.warning(
-            "ARTC worker skipping Release after leave timeout; parent may kill process group"
+            "ARTC worker killing its process group after leave timeout to avoid "
+            "orphaned AliRtcCoreService"
         )
+        _kill_own_process_group_if_isolated(config)
         return
 
     try:
         engine.Release()
     except Exception as exc:
         logger.warning("ARTC worker Release error: %s", exc)
+
+
+def _kill_own_process_group_if_isolated(config: dict) -> None:
+    if not config.get("process_group_isolated"):
+        logger.error(
+            "ARTC worker process group is not isolated; refusing to kill process group"
+        )
+        return
+    try:
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    except Exception as exc:
+        logger.error("ARTC worker failed to kill process group: %s", exc)
 
 
 def _artc_worker_main(config: dict, command_queue, status_queue) -> None:
@@ -368,7 +382,9 @@ def _artc_worker_main(config: dict, command_queue, status_queue) -> None:
 
     try:
         os.setsid()
+        config["process_group_isolated"] = True
     except Exception:
+        config["process_group_isolated"] = False
         pass
 
     handler = _WorkerEventHandler(status_queue)
@@ -726,11 +742,11 @@ class ArtcPusher:
             if q is None:
                 continue
             try:
-                q.close()
+                q.cancel_join_thread()
             except Exception:
                 pass
             try:
-                q.join_thread()
+                q.close()
             except Exception:
                 pass
         self._command_queue = None
