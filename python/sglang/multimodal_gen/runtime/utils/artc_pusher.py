@@ -216,11 +216,6 @@ class _ArtcEngineManager:
         if engine is not None:
             owner._left.clear()
             try:
-                try:
-                    engine.PublishLocalVideoStream(False)
-                    engine.PublishLocalAudioStream(False)
-                except Exception as exc:
-                    logger.warning("ARTC stop publishing before leave error: %s", exc)
                 engine.LeaveChannel()
                 left_completed = owner._left.wait(timeout=timeout)
                 if not left_completed:

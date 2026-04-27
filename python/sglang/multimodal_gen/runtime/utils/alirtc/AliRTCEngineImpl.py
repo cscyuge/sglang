@@ -974,7 +974,17 @@ class AliRtcEngineImpl(AliRTCEngineInterface):
                 ld_library_path = parent_directory
             os.environ['LD_LIBRARY_PATH'] = ld_library_path
             print(f"serverPort is {serverPort}")
-            self.__subProcess = subprocess.Popen([coreServicePath, str(serverPort)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=self.SetCoreUnlimited)
+            # preexec_fn can deadlock in multi-threaded Python processes.
+            # Set the core limit in the parent before spawning instead.
+            try:
+                self.SetCoreUnlimited()
+            except Exception as exc:
+                self.__logger.warning(f"[Python] SetCoreUnlimited failed: {exc}")
+            self.__subProcess = subprocess.Popen(
+                [coreServicePath, str(serverPort)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
             self.__stdoutThread = threading.Thread(target=self.ReadStdOut)
             self.__stdoutThread.daemon = True
             self.__stdoutThread.start()
