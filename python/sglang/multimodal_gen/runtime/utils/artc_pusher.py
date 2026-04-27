@@ -7,10 +7,13 @@ model-serving process.
 """
 
 import logging
-import multiprocessing as mp
 import os
+import pickle
 import queue
+import select
 import signal
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -37,9 +40,48 @@ def _ensure_sdk_importable(sdk_path: str) -> str:
     return lib_dir
 
 
-def _put_status(status_queue, kind: str, message: str = "") -> None:
+class _IpcTimeout(TimeoutError):
+    pass
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def _send_message(fd: int, message) -> None:
+    data = pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)
+    _write_all(fd, struct.pack("!I", len(data)))
+    _write_all(fd, data)
+
+
+def _recv_exact(fd: int, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            raise EOFError("ARTC worker pipe closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _recv_message(fd: int, timeout: Optional[float] = None):
+    if timeout is not None:
+        readable, _, _ = select.select([fd], [], [], timeout)
+        if not readable:
+            raise _IpcTimeout()
+    header = _recv_exact(fd, 4)
+    size = struct.unpack("!I", header)[0]
+    return pickle.loads(_recv_exact(fd, size))
+
+
+def _put_status(status_fd: int, kind: str, message: str = "") -> None:
     try:
-        status_queue.put_nowait((kind, message))
+        _send_message(status_fd, (kind, message))
     except Exception:
         pass
 
@@ -47,8 +89,8 @@ def _put_status(status_queue, kind: str, message: str = "") -> None:
 class _WorkerEventHandler:
     """AliRTC callbacks scoped to one worker process and one channel."""
 
-    def __init__(self, status_queue):
-        self._status_queue = status_queue
+    def __init__(self, status_fd: int):
+        self._status_fd = status_fd
         self.joined = threading.Event()
         self.left = threading.Event()
         self.audio_published = threading.Event()
@@ -85,7 +127,7 @@ class _WorkerEventHandler:
         self.failed = True
         msg = f"ARTC SDK error: {error_code}"
         logger.error(msg)
-        _put_status(self._status_queue, "failed", msg)
+        _put_status(self._status_fd, "failed", msg)
 
     def OnConnectionStatusChanged(self, status, reason):
         logger.info("ARTC connection: status=%s reason=%s", status, reason)
@@ -100,7 +142,7 @@ class _WorkerEventHandler:
         if result != 0:
             self.failed = True
             _put_status(
-                self._status_queue,
+                self._status_fd,
                 "failed",
                 f"ARTC JoinChannel failed: {result}",
             )
@@ -222,7 +264,7 @@ def _join_channel(engine, handler: _WorkerEventHandler, config: dict) -> None:
 
 
 def _drain_worker_queue(
-    engine, handler: _WorkerEventHandler, config: dict, command_queue
+    engine, handler: _WorkerEventHandler, config: dict, command_fd: int
 ):
     from AliRTCLinuxSdkDefine import (  # noqa: E402
         VideoBufferType,
@@ -234,7 +276,6 @@ def _drain_worker_queue(
     fps = int(config["fps"])
     width = int(config["width"])
     height = int(config["height"])
-    queue_maxsize = int(config["queue_maxsize"])
     ms_per_frame = 1000 // fps
     samples_per_frame = 16000 // fps
     v_ts = 0
@@ -242,11 +283,13 @@ def _drain_worker_queue(
 
     while True:
         try:
-            item = command_queue.get(timeout=2.0)
-        except queue.Empty:
+            item = _recv_message(command_fd, timeout=2.0)
+        except _IpcTimeout:
             if handler.failed:
                 raise RuntimeError("ARTC SDK failed during push loop")
             continue
+        except EOFError:
+            break
 
         if item is None or item[0] == _STOP:
             break
@@ -254,32 +297,6 @@ def _drain_worker_queue(
             continue
 
         frames_np, audio_int16 = item[1], item[2]
-
-        try:
-            qsize = command_queue.qsize()
-        except (NotImplementedError, OSError):
-            qsize = 0
-
-        if qsize >= queue_maxsize - 2:
-            skipped = 0
-            skipped_frames = 0
-            while True:
-                try:
-                    newer = command_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if newer is None or newer[0] == _STOP:
-                    return
-                if newer[0] != _CHUNK:
-                    continue
-                skipped += 1
-                skipped_frames += frames_np.shape[0]
-                frames_np, audio_int16 = newer[1], newer[2]
-            if skipped > 0:
-                v_ts += skipped_frames * ms_per_frame
-                a_ts += skipped_frames * ms_per_frame
-                logger.info("ARTC worker skipped %d queued chunk(s)", skipped)
-
         num_frames = frames_np.shape[0]
         for i in range(num_frames):
             if handler.failed:
@@ -372,7 +389,7 @@ def _kill_own_process_group_if_isolated(config: dict) -> None:
         logger.error("ARTC worker failed to kill process group: %s", exc)
 
 
-def _artc_worker_main(config: dict, command_queue, status_queue) -> None:
+def _artc_worker_main(config: dict, command_fd: int, status_fd: int) -> None:
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=logging.INFO,
@@ -380,27 +397,47 @@ def _artc_worker_main(config: dict, command_queue, status_queue) -> None:
             datefmt="%m-%d %H:%M:%S",
         )
 
-    try:
-        os.setsid()
-        config["process_group_isolated"] = True
-    except Exception:
-        config["process_group_isolated"] = False
-        pass
-
-    handler = _WorkerEventHandler(status_queue)
+    handler = _WorkerEventHandler(status_fd)
     engine = None
     try:
         engine = _create_engine(config, handler)
         _configure_engine(engine, config)
         _join_channel(engine, handler, config)
-        _put_status(status_queue, "ready", config["channel"])
-        _drain_worker_queue(engine, handler, config, command_queue)
+        _put_status(status_fd, "ready", config["channel"])
+        _drain_worker_queue(engine, handler, config, command_fd)
     except Exception as exc:
         logger.exception("ARTC worker failed for channel=%s", config["channel"])
-        _put_status(status_queue, "failed", str(exc))
+        _put_status(status_fd, "failed", str(exc))
     finally:
         _leave_and_release(engine, handler, config)
-        _put_status(status_queue, "stopped", config["channel"])
+        _put_status(status_fd, "stopped", config["channel"])
+
+
+def _artc_worker_subprocess_main(command_fd: int, status_fd: int) -> None:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="[%(asctime)s] %(levelname)s: %(message)s",
+            datefmt="%m-%d %H:%M:%S",
+        )
+
+    process_group_isolated = False
+    try:
+        os.setsid()
+        process_group_isolated = True
+    except Exception:
+        pass
+
+    try:
+        config = _recv_message(command_fd, timeout=10.0)
+        config["process_group_isolated"] = process_group_isolated
+        _artc_worker_main(config, command_fd, status_fd)
+    finally:
+        for fd in (command_fd, status_fd):
+            try:
+                os.close(fd)
+            except Exception:
+                pass
 
 
 class ArtcPusher:
@@ -432,10 +469,11 @@ class ArtcPusher:
         self._queue_maxsize = queue_maxsize
         self._sdk_path = sdk_path or _SDK_DIR
 
-        self._mp_ctx = mp.get_context("spawn")
-        self._command_queue = None
-        self._status_queue = None
-        self._process: Optional[mp.Process] = None
+        self._command_queue: Optional[queue.Queue] = None
+        self._command_write_fd: Optional[int] = None
+        self._status_read_fd: Optional[int] = None
+        self._process: Optional[subprocess.Popen] = None
+        self._sender_thread: Optional[threading.Thread] = None
 
         self._started = False
         self._failed = False
@@ -488,21 +526,21 @@ class ArtcPusher:
 
             self._ensure_queues()
             process = self._process
-            if process is not None and not process.is_alive():
+            if process is not None and process.poll() is not None:
                 self._close_queues()
                 self._ensure_queues()
                 process = None
-            if process is None or not process.is_alive():
-                self._process = self._mp_ctx.Process(
-                    target=_artc_worker_main,
-                    args=(
-                        self._worker_config(),
-                        self._command_queue,
-                        self._status_queue,
-                    ),
-                    name=f"artc-worker-{self._channel}",
-                )
-                self._process.start()
+            if process is None or process.poll() is not None:
+                try:
+                    self._start_subprocess_worker()
+                except Exception as exc:
+                    logger.error("ARTC worker subprocess start failed: %s", exc)
+                    self._failed = True
+                    self._terminate_worker(timeout=2.0)
+                    self._start_requested = False
+                    self._start_done.set()
+                    self._close_queues()
+                    return
                 process = self._process
 
             start_timeout = float(os.environ.get("SGLANG_ARTC_START_TIMEOUT", "15.0"))
@@ -526,12 +564,12 @@ class ArtcPusher:
 
                 event = self._get_status_event(timeout=0.1)
                 if event is None:
-                    if process.exitcode is not None:
+                    if process.poll() is not None:
                         self._failed = True
                         logger.error(
                             "ARTC worker exited before ready: channel=%s exitcode=%s",
                             self._channel,
-                            process.exitcode,
+                            process.returncode,
                         )
                         self._start_requested = False
                         self._start_done.set()
@@ -632,8 +670,9 @@ class ArtcPusher:
 
         process = self._process
         if process is not None:
-            process.join(timeout=timeout)
-            if process.is_alive():
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
                 logger.warning(
                     "ARTC worker did not exit within %.1fs for channel=%s",
                     timeout,
@@ -663,9 +702,33 @@ class ArtcPusher:
 
     def _ensure_queues(self) -> None:
         if self._command_queue is None:
-            self._command_queue = self._mp_ctx.Queue(maxsize=self._queue_maxsize)
-        if self._status_queue is None:
-            self._status_queue = self._mp_ctx.Queue()
+            self._command_queue = queue.Queue(maxsize=self._queue_maxsize)
+
+    def _start_subprocess_worker(self) -> None:
+        command_read_fd, self._command_write_fd = os.pipe()
+        self._status_read_fd, status_write_fd = os.pipe()
+
+        self._process = subprocess.Popen(
+            [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--artc-worker",
+                str(command_read_fd),
+                str(status_write_fd),
+            ],
+            stdin=subprocess.DEVNULL,
+            pass_fds=(command_read_fd, status_write_fd),
+            close_fds=True,
+        )
+        os.close(command_read_fd)
+        os.close(status_write_fd)
+        _send_message(self._command_write_fd, self._worker_config())
+        self._sender_thread = threading.Thread(
+            target=self._sender_loop,
+            daemon=True,
+            name="artc-sender",
+        )
+        self._sender_thread.start()
 
     def _send_stop(self) -> None:
         if self._command_queue is None:
@@ -683,19 +746,31 @@ class ArtcPusher:
                 pass
 
     def _get_status_event(self, timeout: float):
-        if self._status_queue is None:
+        if self._status_read_fd is None:
             return None
         try:
-            return self._status_queue.get(timeout=timeout)
+            return _recv_message(self._status_read_fd, timeout=timeout)
         except queue.Empty:
             return None
+        except _IpcTimeout:
+            return None
+        except EOFError:
+            return ("failed", "ARTC worker status pipe closed")
 
     def _poll_status(self) -> None:
-        if self._status_queue is not None:
+        if self._status_read_fd is not None:
             while True:
+                readable, _, _ = select.select([self._status_read_fd], [], [], 0)
+                if not readable:
+                    break
                 try:
-                    kind, message = self._status_queue.get_nowait()
-                except queue.Empty:
+                    kind, message = _recv_message(self._status_read_fd, timeout=0.1)
+                except _IpcTimeout:
+                    break
+                except EOFError:
+                    if self._started and not self._stop_requested.is_set():
+                        self._failed = True
+                        logger.error("ARTC worker status pipe closed")
                     break
                 if kind == "failed":
                     self._failed = True
@@ -709,7 +784,7 @@ class ArtcPusher:
         process = self._process
         if (
             process is not None
-            and process.exitcode is not None
+            and process.poll() is not None
             and self._started
             and not self._stop_requested.is_set()
         ):
@@ -717,38 +792,74 @@ class ArtcPusher:
             logger.error(
                 "ARTC worker exited unexpectedly: channel=%s exitcode=%s",
                 self._channel,
-                process.exitcode,
+                process.returncode,
             )
 
     def _terminate_worker(self, timeout: float) -> None:
         process = self._process
         if process is None:
             return
-        if process.is_alive():
+        if process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except Exception:
                 process.terminate()
-            process.join(timeout=timeout)
-        if process.is_alive():
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+        if process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except Exception:
                 process.kill()
-            process.join(timeout=timeout)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _sender_loop(self) -> None:
+        while True:
+            try:
+                item = self._command_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._stop_requested.is_set():
+                    return
+                continue
+
+            command_fd = self._command_write_fd
+            if command_fd is None:
+                return
+            try:
+                _send_message(command_fd, item)
+            except Exception:
+                if item[0] != _STOP:
+                    self._failed = True
+                return
+            if item[0] == _STOP:
+                return
 
     def _close_queues(self) -> None:
-        for q in (self._command_queue, self._status_queue):
-            if q is None:
+        for fd in (self._command_write_fd, self._status_read_fd):
+            if fd is None:
                 continue
             try:
-                q.cancel_join_thread()
-            except Exception:
-                pass
-            try:
-                q.close()
-            except Exception:
+                os.close(fd)
+            except OSError:
                 pass
         self._command_queue = None
-        self._status_queue = None
+        self._command_write_fd = None
+        self._status_read_fd = None
         self._process = None
+        self._sender_thread = None
+
+
+def _main() -> None:
+    if len(sys.argv) == 4 and sys.argv[1] == "--artc-worker":
+        _artc_worker_subprocess_main(int(sys.argv[2]), int(sys.argv[3]))
+        return
+    raise SystemExit("artc_pusher.py is an internal worker module")
+
+
+if __name__ == "__main__":
+    _main()
