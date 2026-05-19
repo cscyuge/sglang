@@ -2,7 +2,24 @@
 
 ## Status
 
-Design draft.
+Implementation in progress.
+
+Implemented so far:
+
+- SGLang-native Wan2.2-Remix workflow presets and `/v1/workflows` endpoints.
+- Workflow run dispatch through the existing video generation scheduler path.
+- Workflow effective-parameter reporting, including sampler and expert metadata.
+- Runtime parsing for explicit high/low denoising expert step ranges.
+- Fallback to existing `boundary_ratio` behavior when presets do not define
+  explicit step ranges.
+- Comfy-derived Wan2.2-Remix preset metadata marked as unsupported until sampler
+  compatibility is implemented.
+
+Not implemented yet:
+
+- ComfyUI `KSamplerAdvanced` Euler/simple sampler compatibility.
+- Executable `*-comfy-v1` presets.
+- Pixel-level or node-level equivalence with ComfyUI reference workflows.
 
 This document proposes a SGLang-native workflow execution service for diffusion
 models. The service is intended for callers that are not ComfyUI but still need
@@ -384,8 +401,8 @@ Recommended presets:
 | `wan2.2-remix/nsfw-i2v-comfy-v1` | I2V | selected converted I2V model | Approximate Comfy I2V workflow semantics |
 
 The `*-sglang-v1` presets should use existing SGLang Wan behavior. The
-`*-comfy-v1` presets should encode the Comfy workflow-derived sampler settings
-where SGLang supports them.
+`*-comfy-v1` presets encode the Comfy workflow-derived sampler settings and are
+currently marked unsupported until SGLang can execute the required sampler.
 
 Known Wan2.2-Remix reference workflow differences that a preset should record:
 
@@ -510,12 +527,14 @@ For Comfy-derived presets, it should dispatch to workflow-aware pipeline stages.
 Add workflow-aware denoising support without breaking existing pipelines:
 
 - Keep current `DenoisingStage` behavior for normal requests.
-- Add optional `batch.workflow_plan`.
+- Add optional workflow denoising plan metadata under `batch.extra["workflow"]`.
 - If `workflow_plan` is present:
-  - use `workflow_plan.sampler`
   - use explicit expert ranges if present
   - use per-expert guidance scales
   - record effective parameters in output metrics
+
+The current implementation preserves existing scheduler behavior. Workflow
+sampler selection beyond `boundary_ratio` is deferred to Milestone 3.
 
 Implementation candidates:
 
@@ -610,6 +629,8 @@ OpenAI-compatible API.
 This milestone gives non-Comfy callers a stable workflow API without changing
 the denoising loop.
 
+Status: implemented.
+
 ### Milestone 2: Workflow-Aware Expert Selection
 
 - Add `WorkflowExecutionPlan` to runtime requests.
@@ -618,6 +639,8 @@ the denoising loop.
 - Add tests for expert selection.
 
 This milestone makes dual-transformer workflows explicit.
+
+Status: implemented for explicit expert ranges stored in workflow metadata.
 
 ### Milestone 3: Comfy-Derived Sampler Compatibility
 

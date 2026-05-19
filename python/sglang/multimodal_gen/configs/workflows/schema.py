@@ -148,6 +148,8 @@ class WorkflowPreset:
     override_policy: WorkflowOverridePolicy = field(
         default_factory=WorkflowOverridePolicy
     )
+    execution_status: str = "ready"
+    unsupported_reason: str | None = None
     description: str | None = None
 
     @classmethod
@@ -171,6 +173,12 @@ class WorkflowPreset:
             for item in _as_list(data.get("experts"), "experts")
         )
         cls._validate_experts(experts)
+        execution_status = str(data.get("execution_status", "ready"))
+        if execution_status not in {"ready", "unsupported"}:
+            raise ValueError(
+                f"workflow preset {name!r} has invalid execution_status: "
+                f"{execution_status!r}"
+            )
 
         return cls(
             schema_version=int(data.get("schema_version", 1)),
@@ -191,6 +199,8 @@ class WorkflowPreset:
             override_policy=WorkflowOverridePolicy.from_dict(
                 data.get("override_policy")
             ),
+            execution_status=execution_status,
+            unsupported_reason=data.get("unsupported_reason"),
             description=data.get("description"),
         )
 
@@ -261,6 +271,9 @@ class WorkflowPreset:
             "description": self.description,
             "defaults": self.defaults,
             "sampler": self.sampler.to_effective_parameters(),
+            "experts": [expert.to_dict() for expert in self.experts],
+            "execution_status": self.execution_status,
+            "unsupported_reason": self.unsupported_reason,
         }
 
 

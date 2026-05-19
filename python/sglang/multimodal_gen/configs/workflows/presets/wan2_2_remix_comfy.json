@@ -1,0 +1,182 @@
+{
+  "presets": [
+    {
+      "schema_version": 1,
+      "name": "wan2.2-remix/nsfw-t2v-comfy-v1",
+      "description": "Wan2.2-Remix NSFW T2V ComfyUI reference semantics. Metadata only until Euler/simple sampler compatibility is implemented.",
+      "execution_status": "unsupported",
+      "unsupported_reason": "Requires ComfyUI KSamplerAdvanced Euler/simple sampler compatibility, which is not implemented in SGLang yet.",
+      "task": "t2v",
+      "model_family": "wan2.2-remix",
+      "pipeline": "WanPipeline",
+      "base_model_id": "Wan2.2-T2V-A14B-Diffusers",
+      "components": {
+        "transformer": "transformer",
+        "transformer_2": "transformer_2",
+        "text_encoder": "text_encoder",
+        "tokenizer": "tokenizer",
+        "vae": "vae"
+      },
+      "defaults": {
+        "width": 1280,
+        "height": 720,
+        "num_frames": 81,
+        "fps": 16,
+        "num_inference_steps": 12,
+        "guidance_scale": 1.0,
+        "guidance_scale_2": 1.0
+      },
+      "sampler": {
+        "type": "euler",
+        "schedule": "simple",
+        "flow_shift": 5.0
+      },
+      "experts": [
+        {
+          "name": "high_noise",
+          "component": "transformer",
+          "start_step": 0,
+          "end_step": 10,
+          "guidance_param": "guidance_scale"
+        },
+        {
+          "name": "low_noise",
+          "component": "transformer_2",
+          "start_step": 10,
+          "end_step": null,
+          "guidance_param": "guidance_scale_2"
+        }
+      ],
+      "decode": {
+        "vae": "vae",
+        "tiling": "auto"
+      },
+      "output": {
+        "format": "mp4",
+        "response_format": "url"
+      },
+      "override_policy": {
+        "allow": [
+          "prompt",
+          "negative_prompt",
+          "seed",
+          "width",
+          "height",
+          "num_frames",
+          "fps",
+          "num_inference_steps",
+          "guidance_scale",
+          "guidance_scale_2",
+          "enable_teacache",
+          "enable_frame_interpolation",
+          "frame_interpolation_exp",
+          "frame_interpolation_scale",
+          "frame_interpolation_model_path",
+          "enable_upscaling",
+          "upscaling_model_path",
+          "upscaling_scale",
+          "output_quality",
+          "output_compression",
+          "output.format",
+          "output.response_format"
+        ],
+        "deny": [
+          "components",
+          "pipeline",
+          "model_family"
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "name": "wan2.2-remix/nsfw-i2v-comfy-v1",
+      "description": "Wan2.2-Remix NSFW I2V ComfyUI reference semantics. Metadata only until Euler/simple sampler compatibility is implemented.",
+      "execution_status": "unsupported",
+      "unsupported_reason": "Requires ComfyUI KSamplerAdvanced Euler/simple sampler compatibility, which is not implemented in SGLang yet.",
+      "task": "i2v",
+      "model_family": "wan2.2-remix",
+      "pipeline": "WanImageToVideoPipeline",
+      "base_model_id": "Wan2.2-I2V-A14B-Diffusers",
+      "components": {
+        "transformer": "transformer",
+        "transformer_2": "transformer_2",
+        "text_encoder": "text_encoder",
+        "tokenizer": "tokenizer",
+        "vae": "vae"
+      },
+      "defaults": {
+        "width": 1280,
+        "height": 720,
+        "num_frames": 33,
+        "fps": 16,
+        "num_inference_steps": 12,
+        "guidance_scale": 1.0,
+        "guidance_scale_2": 1.0
+      },
+      "sampler": {
+        "type": "euler",
+        "schedule": "simple",
+        "flow_shift": 8.0
+      },
+      "experts": [
+        {
+          "name": "high_noise",
+          "component": "transformer",
+          "start_step": 0,
+          "end_step": 10,
+          "guidance_param": "guidance_scale"
+        },
+        {
+          "name": "low_noise",
+          "component": "transformer_2",
+          "start_step": 10,
+          "end_step": null,
+          "guidance_param": "guidance_scale_2"
+        }
+      ],
+      "decode": {
+        "vae": "vae",
+        "tiling": "auto"
+      },
+      "output": {
+        "format": "mp4",
+        "response_format": "url"
+      },
+      "override_policy": {
+        "allow": [
+          "prompt",
+          "negative_prompt",
+          "image",
+          "image_url",
+          "input_reference",
+          "reference_url",
+          "seed",
+          "width",
+          "height",
+          "num_frames",
+          "fps",
+          "num_inference_steps",
+          "guidance_scale",
+          "guidance_scale_2",
+          "enable_teacache",
+          "enable_frame_interpolation",
+          "frame_interpolation_exp",
+          "frame_interpolation_scale",
+          "frame_interpolation_model_path",
+          "enable_upscaling",
+          "upscaling_model_path",
+          "upscaling_scale",
+          "output_quality",
+          "output_compression",
+          "output.format",
+          "output.response_format"
+        ],
+        "deny": [
+          "components",
+          "pipeline",
+          "model_family"
+        ]
+      }
+    }
+  ]
+}

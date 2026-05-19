@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.workflow_runtime import (
+    WorkflowDenoisingPlan,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -71,6 +74,7 @@ class DmdDenoisingStage(DenoisingStage):
         latents = prepared_vars["latents"]
         video_raw_latent_shape = latents.shape
         scheduler = self.scheduler
+        workflow_plan = prepared_vars.get("workflow_plan")
 
         timesteps = torch.tensor(
             server_args.pipeline_config.dmd_denoising_steps,
@@ -117,6 +121,9 @@ class DmdDenoisingStage(DenoisingStage):
                                 ),
                                 server_args=server_args,
                                 batch=batch,
+                                step_index=i,
+                                total_steps=len(timesteps),
+                                workflow_plan=workflow_plan,
                             )
                         )
                     else:
@@ -231,22 +238,20 @@ class DmdDenoisingStage(DenoisingStage):
         boundary_timestep: float | None,
         server_args: ServerArgs,
         batch: Req,
+        *,
+        step_index: int | None = None,
+        total_steps: int | None = None,
+        workflow_plan: WorkflowDenoisingPlan | None = None,
     ):
-        if boundary_timestep is None or t_int >= boundary_timestep:
-            # High-noise stage
-            current_model = self.transformer
-            current_guidance_scale = batch.guidance_scale
-            current_phase = "transformer"
-        else:
-            # Low-noise stage
-            current_model = self.transformer_2
-            current_guidance_scale = batch.guidance_scale_2
-            current_phase = "transformer_2"
-
-        self._manage_dit_use_site(current_model, current_phase, batch)
-
-        assert current_model is not None, "The model for the current step is not set."
-        return current_model, current_guidance_scale
+        return super()._select_and_manage_model(
+            t_int=t_int,
+            boundary_timestep=boundary_timestep,
+            server_args=server_args,
+            batch=batch,
+            step_index=step_index,
+            total_steps=total_steps,
+            workflow_plan=workflow_plan,
+        )
 
     def _handle_boundary_ratio(
         self,

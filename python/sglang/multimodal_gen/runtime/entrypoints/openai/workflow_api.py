@@ -253,9 +253,13 @@ async def create_workflow_run(
         sampling_params=sampling_params,
         external_trace_header=trace_headers,
     )
+    effective_parameters = plan.effective_parameters()
+    if plan.preset.sampler.boundary_ratio is not None and batch.boundary_ratio is None:
+        batch.boundary_ratio = plan.preset.sampler.boundary_ratio
     batch.extra["workflow"] = {
         "name": plan.workflow_name,
-        "effective_parameters": plan.effective_parameters(),
+        "effective_parameters": effective_parameters,
+        "experts": effective_parameters.get("experts", []),
     }
 
     asyncio.create_task(

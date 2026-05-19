@@ -89,6 +89,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.workflow_runtime import (
+    WorkflowDenoisingPlan,
+    WorkflowStepExpert,
+    workflow_denoising_plan_from_extra,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -128,6 +133,7 @@ class DenoisingContext:
     guidance: torch.Tensor
     is_warmup: bool
     cfg_policy: CFGPolicy | None = None
+    workflow_plan: WorkflowDenoisingPlan | None = None
     trajectory_timesteps: list[torch.Tensor] = field(default_factory=list)
     trajectory_latents: list[torch.Tensor] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -606,11 +612,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         timesteps = batch.timesteps
         num_inference_steps = batch.num_inference_steps
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
+        workflow_plan = workflow_denoising_plan_from_extra(batch.extra)
 
         if self.transformer_2 is not None:
-            assert boundary_timestep is not None, "boundary_timestep must be provided"
-            num_high_noise_steps = (timesteps >= boundary_timestep).sum().item()
-            num_low_noise_steps = num_inference_steps - num_high_noise_steps
+            if workflow_plan is not None:
+                num_high_noise_steps, num_low_noise_steps = (
+                    workflow_plan.count_dual_transformer_steps(len(timesteps))
+                )
+            else:
+                assert (
+                    boundary_timestep is not None
+                ), "boundary_timestep must be provided"
+                num_high_noise_steps = (timesteps >= boundary_timestep).sum().item()
+                num_low_noise_steps = num_inference_steps - num_high_noise_steps
             cache_dit_num_inference_steps = (num_high_noise_steps, num_low_noise_steps)
         else:
             cache_dit_num_inference_steps = num_inference_steps
@@ -788,6 +802,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             guidance=guidance,
             is_warmup=batch.is_warmup,
             cfg_policy=cfg_policy,
+            workflow_plan=workflow_plan,
         )
 
     def _before_denoising_loop(
@@ -852,6 +867,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             boundary_timestep=ctx.boundary_timestep,
             server_args=server_args,
             batch=batch,
+            step_index=step_index,
+            total_steps=len(ctx.timesteps),
+            workflow_plan=ctx.workflow_plan,
         )
         attn_metadata = self._prepare_step_attn_metadata(
             ctx=ctx,
@@ -1175,8 +1193,21 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         boundary_timestep: float | None,
         server_args: ServerArgs,
         batch: Req,
+        *,
+        step_index: int | None = None,
+        total_steps: int | None = None,
+        workflow_plan: WorkflowDenoisingPlan | None = None,
     ):
-        if boundary_timestep is None or t_int >= boundary_timestep:
+        if workflow_plan is not None:
+            if step_index is None or total_steps is None:
+                raise ValueError(
+                    "workflow expert selection requires step_index and total_steps"
+                )
+            expert = workflow_plan.select_expert(step_index, total_steps)
+            current_model, current_guidance_scale, current_phase = (
+                self._resolve_workflow_expert(expert, batch)
+            )
+        elif boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
             current_model = self.transformer
             current_guidance_scale = batch.guidance_scale
@@ -1187,10 +1218,32 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             current_guidance_scale = batch.guidance_scale_2
             current_phase = "transformer_2"
 
-        self._manage_dit_use_site(current_model, current_phase, batch)
-
         assert current_model is not None, "The model for the current step is not set."
+        self._manage_dit_use_site(current_model, current_phase, batch)
         return current_model, current_guidance_scale
+
+    def _resolve_workflow_expert(
+        self, expert: WorkflowStepExpert, batch: Req
+    ) -> tuple[Any, Any, str]:
+        if expert.component == "transformer":
+            current_model = self.transformer
+            default_guidance_param = "guidance_scale"
+        elif expert.component == "transformer_2":
+            current_model = self.transformer_2
+            default_guidance_param = "guidance_scale_2"
+        else:
+            raise ValueError(
+                "Workflow explicit denoising ranges only support transformer and "
+                f"transformer_2 components, got {expert.component!r}"
+            )
+
+        guidance_param = expert.guidance_param or default_guidance_param
+        if not hasattr(batch, guidance_param):
+            raise ValueError(
+                f"Workflow expert {expert.name!r} references unknown guidance "
+                f"parameter {guidance_param!r}"
+            )
+        return current_model, getattr(batch, guidance_param), expert.component
 
     def expand_timestep_before_forward(
         self,

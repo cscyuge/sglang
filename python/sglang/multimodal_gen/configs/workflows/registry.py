@@ -53,6 +53,10 @@ class WorkflowRegistry:
         return sorted(presets, key=lambda preset: preset.name)
 
     def validate_for_server(self, preset: WorkflowPreset, server_args: Any) -> None:
+        if preset.execution_status != "ready":
+            detail = preset.unsupported_reason or preset.execution_status
+            raise ValueError(f"Workflow {preset.name!r} is not executable: {detail}")
+
         pipeline_config = getattr(server_args, "pipeline_config", None)
         task_type = getattr(pipeline_config, "task_type", None)
         if task_type is None:

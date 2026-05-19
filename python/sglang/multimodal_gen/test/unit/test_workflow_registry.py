@@ -15,10 +15,32 @@ def test_builtin_wan2_2_remix_presets_load():
     names = [preset.name for preset in registry.list("wan2.2-remix")]
 
     assert names == [
+        "wan2.2-remix/nsfw-i2v-comfy-v1",
         "wan2.2-remix/nsfw-i2v-sglang-v1",
+        "wan2.2-remix/nsfw-t2v-comfy-v1",
         "wan2.2-remix/nsfw-t2v-sglang-v1",
         "wan2.2-remix/sfw-t2v-sglang-v1",
     ]
+    summary = registry.get("wan2.2-remix/nsfw-i2v-sglang-v1").summary()
+    assert summary["experts"][0]["component"] == "transformer"
+    assert summary["execution_status"] == "ready"
+
+
+def test_comfy_presets_are_discoverable_but_not_executable():
+    registry = get_workflow_registry()
+    preset = registry.get("wan2.2-remix/nsfw-t2v-comfy-v1")
+
+    summary = preset.summary()
+
+    assert summary["execution_status"] == "unsupported"
+    assert "Euler/simple" in summary["unsupported_reason"]
+    assert summary["sampler"] == {
+        "sampler": "euler",
+        "schedule": "simple",
+        "flow_shift": 5.0,
+    }
+    assert summary["experts"][0]["end_step"] == 10
+    assert summary["experts"][1]["start_step"] == 10
 
 
 def test_resolve_t2v_workflow_plan_with_overrides():
@@ -105,6 +127,17 @@ def test_registry_validates_served_task_type():
     )
     registry.validate_for_server(t2v_preset, ti2v_server)
     registry.validate_for_server(i2v_preset, ti2v_server)
+
+
+def test_registry_rejects_unsupported_workflow():
+    registry = get_workflow_registry()
+    comfy_preset = registry.get("wan2.2-remix/nsfw-t2v-comfy-v1")
+    server = SimpleNamespace(
+        pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2V)
+    )
+
+    with pytest.raises(ValueError, match="not executable"):
+        registry.validate_for_server(comfy_preset, server)
 
 
 def test_expert_range_overlap_is_rejected():
