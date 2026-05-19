@@ -8,6 +8,25 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class WorkflowSamplerPlan:
+    workflow_name: str | None
+    sampler: str
+    schedule: str | None = None
+    flow_shift: float | None = None
+    boundary_ratio: float | None = None
+
+    @property
+    def normalized_sampler(self) -> str:
+        return self.sampler.lower()
+
+    @property
+    def normalized_schedule(self) -> str | None:
+        if self.schedule is None:
+            return None
+        return self.schedule.lower()
+
+
+@dataclass(frozen=True)
 class WorkflowStepExpert:
     name: str
     component: str
@@ -101,6 +120,72 @@ def workflow_denoising_plan_from_extra(
     )
 
 
+def workflow_sampler_plan_from_extra(
+    extra: dict[str, Any] | None,
+) -> WorkflowSamplerPlan | None:
+    if not isinstance(extra, dict):
+        return None
+    workflow = extra.get("workflow")
+    if not isinstance(workflow, dict):
+        return None
+
+    effective_parameters = workflow.get("effective_parameters")
+    if not isinstance(effective_parameters, dict):
+        effective_parameters = {}
+
+    sampler = effective_parameters.get("sampler")
+    if not sampler:
+        return None
+
+    return WorkflowSamplerPlan(
+        workflow_name=workflow.get("name"),
+        sampler=str(sampler),
+        schedule=_optional_str(effective_parameters.get("schedule")),
+        flow_shift=_optional_float(
+            effective_parameters.get("flow_shift"), "flow_shift"
+        ),
+        boundary_ratio=_optional_float(
+            effective_parameters.get("boundary_ratio"), "boundary_ratio"
+        ),
+    )
+
+
+def build_workflow_scheduler_override(
+    scheduler_template: Any,
+    sampler_plan: WorkflowSamplerPlan | None,
+) -> Any | None:
+    if sampler_plan is None:
+        return None
+
+    sampler = sampler_plan.normalized_sampler
+    schedule = sampler_plan.normalized_schedule
+    if sampler in {"flow_unipc", "unipc"}:
+        return None
+
+    if sampler == "euler":
+        if schedule not in {None, "simple"}:
+            raise ValueError(
+                f"Workflow {sampler_plan.workflow_name!r} requested Euler sampler "
+                f"with unsupported schedule {sampler_plan.schedule!r}"
+            )
+
+        from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+            FlowMatchEulerDiscreteScheduler,
+        )
+
+        return FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=_get_scheduler_config_value(
+                scheduler_template, "num_train_timesteps", 1000
+            ),
+            shift=_workflow_or_scheduler_shift(scheduler_template, sampler_plan),
+        )
+
+    raise ValueError(
+        f"Workflow {sampler_plan.workflow_name!r} requested unsupported sampler "
+        f"{sampler_plan.sampler!r}"
+    )
+
+
 def _parse_expert(spec: Any) -> WorkflowStepExpert:
     if not isinstance(spec, dict):
         raise ValueError("workflow expert entries must be objects")
@@ -135,3 +220,46 @@ def _optional_non_negative_int(
     if value < 0:
         raise ValueError(f"workflow expert {expert_name!r} has negative {field_name}")
     return value
+
+
+def _optional_float(value: Any, field_name: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"workflow sampler {field_name} must be a number") from exc
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _get_scheduler_config_value(
+    scheduler_template: Any,
+    key: str,
+    default: Any,
+) -> Any:
+    value = getattr(scheduler_template, key, None)
+    if value is not None:
+        return value
+
+    config = getattr(scheduler_template, "config", None)
+    if config is None:
+        return default
+    return getattr(config, key, default)
+
+
+def _workflow_or_scheduler_shift(
+    scheduler_template: Any,
+    sampler_plan: WorkflowSamplerPlan,
+) -> float:
+    if sampler_plan.flow_shift is not None:
+        return sampler_plan.flow_shift
+
+    shift = _get_scheduler_config_value(scheduler_template, "shift", 1.0)
+    if shift is None:
+        return 1.0
+    return float(shift)

@@ -12,13 +12,11 @@ Implemented so far:
 - Runtime parsing for explicit high/low denoising expert step ranges.
 - Fallback to existing `boundary_ratio` behavior when presets do not define
   explicit step ranges.
-- Comfy-derived Wan2.2-Remix preset metadata marked as unsupported until sampler
-  compatibility is implemented.
+- Comfy-derived Wan2.2-Remix presets mapped to SGLang request-local
+  Euler/simple scheduler compatibility.
 
 Not implemented yet:
 
-- ComfyUI `KSamplerAdvanced` Euler/simple sampler compatibility.
-- Executable `*-comfy-v1` presets.
 - Pixel-level or node-level equivalence with ComfyUI reference workflows.
 
 This document proposes a SGLang-native workflow execution service for diffusion
@@ -400,9 +398,10 @@ Recommended presets:
 | `wan2.2-remix/nsfw-t2v-comfy-v1` | T2V | selected converted T2V model | Approximate Comfy T2V workflow semantics |
 | `wan2.2-remix/nsfw-i2v-comfy-v1` | I2V | selected converted I2V model | Approximate Comfy I2V workflow semantics |
 
-The `*-sglang-v1` presets should use existing SGLang Wan behavior. The
-`*-comfy-v1` presets encode the Comfy workflow-derived sampler settings and are
-currently marked unsupported until SGLang can execute the required sampler.
+The `*-sglang-v1` presets use existing SGLang Wan behavior. The `*-comfy-v1`
+presets encode the Comfy workflow-derived sampler settings and execute through
+SGLang-native Euler/simple scheduler compatibility. They do not execute ComfyUI
+nodes directly.
 
 Known Wan2.2-Remix reference workflow differences that a preset should record:
 
@@ -649,6 +648,11 @@ Status: implemented for explicit expert ranges stored in workflow metadata.
 - Add `*-comfy-v1` presets.
 - Compare effective timesteps and generated outputs against ComfyUI reference
   runs on the same weights and seed.
+
+Status: implemented for request-local SGLang `FlowMatchEulerDiscreteScheduler`
+selection from workflow metadata. The Comfy-derived presets are executable, but
+exact ComfyUI node-level equivalence still requires comparison against a
+reference ComfyUI run.
 
 This milestone reduces workflow drift for users who care about Comfy-like
 behavior.

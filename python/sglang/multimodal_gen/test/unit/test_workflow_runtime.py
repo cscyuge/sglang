@@ -2,16 +2,29 @@
 
 import pytest
 
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.workflow_runtime import (
+    build_workflow_scheduler_override,
     workflow_denoising_plan_from_extra,
+    workflow_sampler_plan_from_extra,
 )
 
 
-def _workflow_extra(experts):
+def _workflow_extra(experts=None, sampler=None):
+    effective_parameters = {}
+    if experts is not None:
+        effective_parameters["experts"] = experts
+    if sampler is not None:
+        effective_parameters.update(sampler)
     return {
         "workflow": {
             "name": "test/workflow",
-            "effective_parameters": {"experts": experts},
+            "effective_parameters": effective_parameters,
         }
     }
 
@@ -105,3 +118,62 @@ def test_unknown_component_is_rejected_for_dual_transformer_counts():
     assert plan is not None
     with pytest.raises(ValueError, match="only support transformer"):
         plan.count_dual_transformer_steps(2)
+
+
+def test_sampler_plan_from_workflow_extra():
+    plan = workflow_sampler_plan_from_extra(
+        _workflow_extra(
+            sampler={
+                "sampler": "euler",
+                "schedule": "simple",
+                "flow_shift": 5,
+                "boundary_ratio": 0.875,
+            }
+        )
+    )
+
+    assert plan is not None
+    assert plan.workflow_name == "test/workflow"
+    assert plan.normalized_sampler == "euler"
+    assert plan.normalized_schedule == "simple"
+    assert plan.flow_shift == 5.0
+    assert plan.boundary_ratio == 0.875
+
+
+def test_euler_simple_sampler_builds_request_local_scheduler():
+    template = FlowUniPCMultistepScheduler(shift=12.0)
+    sampler_plan = workflow_sampler_plan_from_extra(
+        _workflow_extra(
+            sampler={
+                "sampler": "euler",
+                "schedule": "simple",
+                "flow_shift": 5.0,
+            }
+        )
+    )
+
+    scheduler = build_workflow_scheduler_override(template, sampler_plan)
+
+    assert isinstance(scheduler, FlowMatchEulerDiscreteScheduler)
+    assert scheduler is not template
+    assert scheduler.config.num_train_timesteps == template.config.num_train_timesteps
+    assert scheduler.shift == 5.0
+
+
+def test_flow_unipc_sampler_keeps_pipeline_scheduler():
+    template = FlowUniPCMultistepScheduler(shift=12.0)
+    sampler_plan = workflow_sampler_plan_from_extra(
+        _workflow_extra(sampler={"sampler": "flow_unipc", "flow_shift": 12.0})
+    )
+
+    assert build_workflow_scheduler_override(template, sampler_plan) is None
+
+
+def test_unsupported_sampler_schedule_is_rejected():
+    template = FlowUniPCMultistepScheduler(shift=12.0)
+    sampler_plan = workflow_sampler_plan_from_extra(
+        _workflow_extra(sampler={"sampler": "euler", "schedule": "karras"})
+    )
+
+    with pytest.raises(ValueError, match="unsupported schedule"):
+        build_workflow_scheduler_override(template, sampler_plan)

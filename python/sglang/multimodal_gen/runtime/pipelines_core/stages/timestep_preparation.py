@@ -28,6 +28,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.workflow_runtime import (
+    WorkflowSamplerPlan,
+    build_workflow_scheduler_override,
+    workflow_sampler_plan_from_extra,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -43,6 +48,7 @@ class TimestepPreparationFingerprint:
     height: int | None
     width: int | None
     num_frames: int | None
+    workflow_sampler: WorkflowSamplerPlan | None
 
 
 class TimestepPreparationStage(PipelineStage):
@@ -89,6 +95,23 @@ class TimestepPreparationStage(PipelineStage):
         """
         if batch.scheduler is not None and batch.timesteps is not None:
             return batch
+
+        sampler_plan = workflow_sampler_plan_from_extra(batch.extra)
+        workflow_scheduler = build_workflow_scheduler_override(
+            self.scheduler, sampler_plan
+        )
+        if workflow_scheduler is not None:
+            assert sampler_plan is not None
+            logger.info(
+                "Workflow %s using scheduler override: %s "
+                "(sampler=%s, schedule=%s, flow_shift=%s)",
+                sampler_plan.workflow_name,
+                workflow_scheduler.__class__.__name__,
+                sampler_plan.sampler,
+                sampler_plan.schedule,
+                sampler_plan.flow_shift,
+            )
+            batch.scheduler = workflow_scheduler
 
         scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = get_local_torch_device()
@@ -171,6 +194,7 @@ class TimestepPreparationStage(PipelineStage):
             height=batch.height,
             width=batch.width,
             num_frames=batch.num_frames,
+            workflow_sampler=workflow_sampler_plan_from_extra(batch.extra),
         )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

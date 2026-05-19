@@ -3,9 +3,8 @@
     {
       "schema_version": 1,
       "name": "wan2.2-remix/nsfw-t2v-comfy-v1",
-      "description": "Wan2.2-Remix NSFW T2V ComfyUI reference semantics. Metadata only until Euler/simple sampler compatibility is implemented.",
-      "execution_status": "unsupported",
-      "unsupported_reason": "Requires ComfyUI KSamplerAdvanced Euler/simple sampler compatibility, which is not implemented in SGLang yet.",
+      "description": "Wan2.2-Remix NSFW T2V ComfyUI-derived semantics using SGLang Euler/simple scheduler compatibility.",
+      "execution_status": "ready",
       "task": "t2v",
       "model_family": "wan2.2-remix",
       "pipeline": "WanPipeline",
@@ -90,9 +89,8 @@
     {
       "schema_version": 1,
       "name": "wan2.2-remix/nsfw-i2v-comfy-v1",
-      "description": "Wan2.2-Remix NSFW I2V ComfyUI reference semantics. Metadata only until Euler/simple sampler compatibility is implemented.",
-      "execution_status": "unsupported",
-      "unsupported_reason": "Requires ComfyUI KSamplerAdvanced Euler/simple sampler compatibility, which is not implemented in SGLang yet.",
+      "description": "Wan2.2-Remix NSFW I2V ComfyUI-derived semantics using SGLang Euler/simple scheduler compatibility.",
+      "execution_status": "ready",
       "task": "i2v",
       "model_family": "wan2.2-remix",
       "pipeline": "WanImageToVideoPipeline",

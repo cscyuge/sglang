@@ -26,14 +26,14 @@ def test_builtin_wan2_2_remix_presets_load():
     assert summary["execution_status"] == "ready"
 
 
-def test_comfy_presets_are_discoverable_but_not_executable():
+def test_comfy_presets_are_discoverable_and_executable():
     registry = get_workflow_registry()
     preset = registry.get("wan2.2-remix/nsfw-t2v-comfy-v1")
 
     summary = preset.summary()
 
-    assert summary["execution_status"] == "unsupported"
-    assert "Euler/simple" in summary["unsupported_reason"]
+    assert summary["execution_status"] == "ready"
+    assert summary["unsupported_reason"] is None
     assert summary["sampler"] == {
         "sampler": "euler",
         "schedule": "simple",
@@ -129,15 +129,14 @@ def test_registry_validates_served_task_type():
     registry.validate_for_server(i2v_preset, ti2v_server)
 
 
-def test_registry_rejects_unsupported_workflow():
+def test_registry_accepts_ready_comfy_workflow():
     registry = get_workflow_registry()
     comfy_preset = registry.get("wan2.2-remix/nsfw-t2v-comfy-v1")
     server = SimpleNamespace(
         pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2V)
     )
 
-    with pytest.raises(ValueError, match="not executable"):
-        registry.validate_for_server(comfy_preset, server)
+    registry.validate_for_server(comfy_preset, server)
 
 
 def test_expert_range_overlap_is_rejected():
