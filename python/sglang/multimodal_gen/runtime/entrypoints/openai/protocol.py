@@ -128,6 +128,57 @@ class VideoListResponse(BaseModel):
     object: str = "list"
 
 
+class WorkflowRunInput(BaseModel):
+    prompt: str
+    negative_prompt: Optional[str] = None
+    image: Optional[str] = None
+    image_url: Optional[str] = None
+    input_reference: Optional[str] = None
+    reference_url: Optional[str] = None
+
+
+class WorkflowRunRequest(BaseModel):
+    workflow: str
+    input: WorkflowRunInput
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    output: Dict[str, Any] = Field(default_factory=dict)
+    model: Optional[str] = None
+
+
+class WorkflowOutputResponse(BaseModel):
+    type: str = "video"
+    url: Optional[str] = None
+    format: Optional[str] = "mp4"
+    file_path: Optional[str] = None
+    file_paths: Optional[List[str]] = None
+
+
+class WorkflowRunResponse(BaseModel):
+    id: str
+    object: str = "workflow.run"
+    status: str = "queued"
+    progress: int = 0
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    workflow: str
+    model: Optional[str] = None
+    output: Optional[WorkflowOutputResponse] = None
+    effective_parameters: Dict[str, Any] = Field(default_factory=dict)
+    completed_at: Optional[int] = None
+    error: Optional[Dict[str, Any]] = None
+    peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
+
+
+class WorkflowListResponse(BaseModel):
+    data: List[Dict[str, Any]]
+    object: str = "list"
+
+
+class WorkflowRunListResponse(BaseModel):
+    data: List[WorkflowRunResponse]
+    object: str = "list"
+
+
 class VideoRemixRequest(BaseModel):
     prompt: str
 

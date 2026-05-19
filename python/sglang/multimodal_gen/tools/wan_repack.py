@@ -94,6 +94,23 @@ def update_dict_(d: Dict[str, Any], old_key: str, new_key: str) -> None:
     d[new_key] = d.pop(old_key)
 
 
+def convert_transformer_key(
+    key: str,
+    rename_dict: Dict[str, str] | None = None,
+    source_prefix: str | None = None,
+) -> str:
+    """Convert original Wan transformer parameter names to Diffusers names."""
+    if source_prefix and key.startswith(source_prefix):
+        key = key[len(source_prefix) :]
+
+    new_key = key
+    for replace_key, rename_key in (
+        rename_dict or TRANSFORMER_KEYS_RENAME_DICT
+    ).items():
+        new_key = new_key.replace(replace_key, rename_key)
+    return new_key
+
+
 def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
     candidates = sorted(directory.glob(pattern))
     if not candidates:
@@ -128,9 +145,7 @@ def convert_transformer(
         quant_config = json.load(f)
 
     for key in list(state_dict.keys()):
-        new_key = key[:]
-        for replace_key, rename_key in RENAME_DICT.items():
-            new_key = new_key.replace(replace_key, rename_key)
+        new_key = convert_transformer_key(key, RENAME_DICT)
         if new_key != key:
             update_dict_(state_dict, key, new_key)
             # The quant JSON only covers quantized layers, not all model keys

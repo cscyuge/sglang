@@ -46,3 +46,4 @@ class AsyncDictStore:
 VIDEO_STORE = AsyncDictStore()
 IMAGE_STORE = AsyncDictStore()
 MESH_STORE = AsyncDictStore()
+WORKFLOW_STORE = AsyncDictStore()

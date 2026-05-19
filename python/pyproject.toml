@@ -176,7 +176,8 @@ killall_sglang = "sglang.cli.killall:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*"
+  "jit_kernel/**/*",
+  "multimodal_gen/configs/workflows/presets/*.json"
 ]
 
 [tool.setuptools.packages.find]

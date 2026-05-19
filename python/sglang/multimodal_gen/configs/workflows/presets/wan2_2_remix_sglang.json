@@ -1,0 +1,251 @@
+{
+  "presets": [
+    {
+      "schema_version": 1,
+      "name": "wan2.2-remix/sfw-t2v-sglang-v1",
+      "description": "Wan2.2-Remix SFW T2V using SGLang-native Wan2.2 defaults.",
+      "task": "t2v",
+      "model_family": "wan2.2-remix",
+      "pipeline": "WanPipeline",
+      "base_model_id": "Wan2.2-T2V-A14B-Diffusers",
+      "components": {
+        "transformer": "transformer",
+        "transformer_2": "transformer_2",
+        "text_encoder": "text_encoder",
+        "tokenizer": "tokenizer",
+        "vae": "vae"
+      },
+      "defaults": {
+        "width": 1280,
+        "height": 720,
+        "num_frames": 81,
+        "fps": 16,
+        "num_inference_steps": 40,
+        "guidance_scale": 4.0,
+        "guidance_scale_2": 3.0
+      },
+      "sampler": {
+        "type": "flow_unipc",
+        "flow_shift": 12.0,
+        "boundary_ratio": 0.875
+      },
+      "experts": [
+        {
+          "name": "high_noise",
+          "component": "transformer",
+          "guidance_param": "guidance_scale"
+        },
+        {
+          "name": "low_noise",
+          "component": "transformer_2",
+          "guidance_param": "guidance_scale_2"
+        }
+      ],
+      "decode": {
+        "vae": "vae",
+        "tiling": "auto"
+      },
+      "output": {
+        "format": "mp4",
+        "response_format": "url"
+      },
+      "override_policy": {
+        "allow": [
+          "prompt",
+          "negative_prompt",
+          "seed",
+          "width",
+          "height",
+          "num_frames",
+          "fps",
+          "num_inference_steps",
+          "guidance_scale",
+          "guidance_scale_2",
+          "enable_teacache",
+          "enable_frame_interpolation",
+          "frame_interpolation_exp",
+          "frame_interpolation_scale",
+          "frame_interpolation_model_path",
+          "enable_upscaling",
+          "upscaling_model_path",
+          "upscaling_scale",
+          "output_quality",
+          "output_compression",
+          "output.format",
+          "output.response_format"
+        ],
+        "deny": [
+          "components",
+          "pipeline",
+          "model_family"
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "name": "wan2.2-remix/nsfw-t2v-sglang-v1",
+      "description": "Wan2.2-Remix NSFW T2V using SGLang-native Wan2.2 defaults.",
+      "task": "t2v",
+      "model_family": "wan2.2-remix",
+      "pipeline": "WanPipeline",
+      "base_model_id": "Wan2.2-T2V-A14B-Diffusers",
+      "components": {
+        "transformer": "transformer",
+        "transformer_2": "transformer_2",
+        "text_encoder": "text_encoder",
+        "tokenizer": "tokenizer",
+        "vae": "vae"
+      },
+      "defaults": {
+        "width": 1280,
+        "height": 720,
+        "num_frames": 81,
+        "fps": 16,
+        "num_inference_steps": 40,
+        "guidance_scale": 4.0,
+        "guidance_scale_2": 3.0
+      },
+      "sampler": {
+        "type": "flow_unipc",
+        "flow_shift": 12.0,
+        "boundary_ratio": 0.875
+      },
+      "experts": [
+        {
+          "name": "high_noise",
+          "component": "transformer",
+          "guidance_param": "guidance_scale"
+        },
+        {
+          "name": "low_noise",
+          "component": "transformer_2",
+          "guidance_param": "guidance_scale_2"
+        }
+      ],
+      "decode": {
+        "vae": "vae",
+        "tiling": "auto"
+      },
+      "output": {
+        "format": "mp4",
+        "response_format": "url"
+      },
+      "override_policy": {
+        "allow": [
+          "prompt",
+          "negative_prompt",
+          "seed",
+          "width",
+          "height",
+          "num_frames",
+          "fps",
+          "num_inference_steps",
+          "guidance_scale",
+          "guidance_scale_2",
+          "enable_teacache",
+          "enable_frame_interpolation",
+          "frame_interpolation_exp",
+          "frame_interpolation_scale",
+          "frame_interpolation_model_path",
+          "enable_upscaling",
+          "upscaling_model_path",
+          "upscaling_scale",
+          "output_quality",
+          "output_compression",
+          "output.format",
+          "output.response_format"
+        ],
+        "deny": [
+          "components",
+          "pipeline",
+          "model_family"
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "name": "wan2.2-remix/nsfw-i2v-sglang-v1",
+      "description": "Wan2.2-Remix NSFW I2V using SGLang-native Wan2.2 defaults.",
+      "task": "i2v",
+      "model_family": "wan2.2-remix",
+      "pipeline": "WanImageToVideoPipeline",
+      "base_model_id": "Wan2.2-I2V-A14B-Diffusers",
+      "components": {
+        "transformer": "transformer",
+        "transformer_2": "transformer_2",
+        "text_encoder": "text_encoder",
+        "tokenizer": "tokenizer",
+        "vae": "vae"
+      },
+      "defaults": {
+        "width": 1280,
+        "height": 720,
+        "num_frames": 81,
+        "fps": 16,
+        "num_inference_steps": 40,
+        "guidance_scale": 3.5,
+        "guidance_scale_2": 3.5
+      },
+      "sampler": {
+        "type": "flow_unipc",
+        "flow_shift": 5.0,
+        "boundary_ratio": 0.9
+      },
+      "experts": [
+        {
+          "name": "high_noise",
+          "component": "transformer",
+          "guidance_param": "guidance_scale"
+        },
+        {
+          "name": "low_noise",
+          "component": "transformer_2",
+          "guidance_param": "guidance_scale_2"
+        }
+      ],
+      "decode": {
+        "vae": "vae",
+        "tiling": "auto"
+      },
+      "output": {
+        "format": "mp4",
+        "response_format": "url"
+      },
+      "override_policy": {
+        "allow": [
+          "prompt",
+          "negative_prompt",
+          "image",
+          "image_url",
+          "input_reference",
+          "reference_url",
+          "seed",
+          "width",
+          "height",
+          "num_frames",
+          "fps",
+          "num_inference_steps",
+          "guidance_scale",
+          "guidance_scale_2",
+          "enable_teacache",
+          "enable_frame_interpolation",
+          "frame_interpolation_exp",
+          "frame_interpolation_scale",
+          "frame_interpolation_model_path",
+          "enable_upscaling",
+          "upscaling_model_path",
+          "upscaling_scale",
+          "output_quality",
+          "output_compression",
+          "output.format",
+          "output.response_format"
+        ],
+        "deny": [
+          "components",
+          "pipeline",
+          "model_family"
+        ]
+      }
+    }
+  ]
+}
