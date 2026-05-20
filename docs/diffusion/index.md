@@ -42,6 +42,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 - [Performance Overview](performance/index.md): overview of attention, caching, and profiling
 - [Environment Variables](environment_variables.md): platform, caching, storage, and debugging configuration
 - [Support New Models](support_new_models.md): implementation guide for new diffusion pipelines
+- [Wan2.2-Remix Workflows](wan2_2_remix_workflows.md): serve converted Wan2.2-Remix models through `/v1/workflows`
 - [Wan2.2-Remix Comfy Alignment](wan2_2_remix_comfy_alignment.md): static mapping from ComfyUI workflow JSON to SGLang workflow presets
 - [CI Performance](ci_perf.md): performance baseline generation
 

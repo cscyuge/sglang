@@ -263,6 +263,58 @@ curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
 
 ---
 
+### Workflow Runs
+
+The server also exposes `/v1/workflows` for preset-based diffusion workflows
+that need more explicit generation semantics than `/v1/videos`, such as
+Wan2.2-Remix high/low transformer step ranges.
+
+**List workflow presets**
+
+**Endpoint:** `GET /v1/workflows`
+
+```bash
+curl -sS "http://localhost:30010/v1/workflows?model_family=wan2.2-remix"
+```
+
+**Create a workflow run**
+
+**Endpoint:** `POST /v1/workflows/runs`
+
+```bash
+curl -sS "http://localhost:30010/v1/workflows/runs" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow": "wan2.2-remix/nsfw-t2v-comfy-v1",
+    "model": "Wan2.2-T2V-A14B-Diffusers",
+    "input": {
+      "prompt": "a calm cinematic shot of clouds moving over a mountain lake"
+    },
+    "parameters": {
+      "width": 1280,
+      "height": 720,
+      "num_frames": 81,
+      "num_inference_steps": 12
+    },
+    "output": {
+      "response_format": "url"
+    }
+  }'
+```
+
+**Poll and download**
+
+```bash
+curl -sS "http://localhost:30010/v1/workflows/runs/<RUN_ID>"
+curl -sS -L "http://localhost:30010/v1/workflows/runs/<RUN_ID>/content" \
+  -o output.mp4
+```
+
+For Wan2.2-Remix-specific serving commands and preset behavior, see
+[Wan2.2-Remix Workflows](../wan2_2_remix_workflows.md).
+
+---
+
 ### LoRA Management
 
 The server supports dynamic loading, merging, and unmerging of LoRA adapters.

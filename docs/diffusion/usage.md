@@ -4,6 +4,7 @@ Use this section for day-to-day inference workflows with SGLang Diffusion.
 
 - [CLI](api/cli.md): run one-off jobs with `sglang generate` or start a server with `sglang serve`
 - [OpenAI-Compatible API](api/openai_api.md): request format, endpoints, and SDK examples
+- [Wan2.2-Remix Workflows](wan2_2_remix_workflows.md): serve converted Wan2.2-Remix models through `/v1/workflows`
 - [Post-Processing](api/post_processing.md): frame interpolation and upscaling
 - [Quantization](quantization.md): quantized transformer checkpoints and supported quantization families
 
@@ -12,6 +13,7 @@ Use this section for day-to-day inference workflows with SGLang Diffusion.
 
 api/cli
 api/openai_api
+wan2_2_remix_workflows
 api/post_processing
 quantization
 ```
