@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import math
 import os
 import shutil
 import tempfile
@@ -9,7 +10,9 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import FileResponse
+from PIL import Image
 
+from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.configs.workflows import get_workflow_registry
 from sglang.multimodal_gen.configs.workflows.schema import WorkflowExecutionPlan
@@ -76,6 +79,7 @@ def _workflow_job_from_sampling(
     workflow_request: WorkflowRunRequest,
     plan: WorkflowExecutionPlan,
     sampling,
+    effective_parameters: dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     output_format = str(plan.output.get("format") or "mp4")
     return {
@@ -93,8 +97,66 @@ def _workflow_job_from_sampling(
             "file_path": os.path.abspath(sampling.output_file_path()),
             "file_paths": None,
         },
-        "effective_parameters": plan.effective_parameters(),
+        "effective_parameters": effective_parameters or plan.effective_parameters(),
     }
+
+
+def _resolve_effective_workflow_parameters(
+    plan: WorkflowExecutionPlan,
+    server_args,
+    input_path: str | None,
+) -> dict[str, Any]:
+    effective_parameters = plan.effective_parameters()
+    resolved_dimensions = _resolve_i2v_output_dimensions(
+        plan, server_args, input_path, effective_parameters
+    )
+    if resolved_dimensions is not None:
+        output_width, output_height = resolved_dimensions
+        effective_parameters["output_width"] = output_width
+        effective_parameters["output_height"] = output_height
+    elif "width" in effective_parameters and "height" in effective_parameters:
+        effective_parameters["output_width"] = effective_parameters["width"]
+        effective_parameters["output_height"] = effective_parameters["height"]
+    return effective_parameters
+
+
+def _resolve_i2v_output_dimensions(
+    plan: WorkflowExecutionPlan,
+    server_args,
+    input_path: str | None,
+    effective_parameters: dict[str, Any],
+) -> tuple[int, int] | None:
+    if plan.task != "i2v" or input_path is None:
+        return None
+
+    pipeline_config = getattr(server_args, "pipeline_config", None)
+    if not isinstance(pipeline_config, WanI2V480PConfig):
+        return None
+
+    with Image.open(input_path) as image:
+        condition_image_width, condition_image_height = image.size
+
+    aspect_ratio = condition_image_height / condition_image_width
+    width = effective_parameters.get("width")
+    height = effective_parameters.get("height")
+    if width is not None or height is not None:
+        if width is None:
+            width = round(int(height) / aspect_ratio)
+        elif height is None:
+            height = round(int(width) * aspect_ratio)
+        target_area = min(int(width) * int(height), pipeline_config.max_area)
+    else:
+        target_area = pipeline_config.max_area
+
+    mod_value = (
+        pipeline_config.vae_config.arch_config.scale_factor_spatial
+        * pipeline_config.dit_config.arch_config.patch_size[1]
+    )
+    output_height = (
+        round(math.sqrt(target_area * aspect_ratio)) // mod_value * mod_value
+    )
+    output_width = round(math.sqrt(target_area / aspect_ratio)) // mod_value * mod_value
+    return int(output_width), int(output_height)
 
 
 def _cleanup_temp_dirs(temp_dirs: list[str]) -> None:
@@ -229,6 +291,16 @@ async def create_workflow_run(
         effective_output_path = output_tmp
         output_persistent = False
 
+    try:
+        effective_parameters = _resolve_effective_workflow_parameters(
+            plan, server_args, input_path
+        )
+    except (OSError, TypeError, ValueError) as e:
+        _cleanup_temp_dirs(temp_dirs)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to resolve workflow output dimensions: {str(e)}",
+        )
     video_kwargs = plan.to_video_request_kwargs(input_reference=input_path)
     video_kwargs["model"] = workflow_request.model
     video_kwargs["output_path"] = effective_output_path
@@ -241,7 +313,7 @@ async def create_workflow_run(
         raise HTTPException(status_code=400, detail=str(e))
 
     job = _workflow_job_from_sampling(
-        request_id, workflow_request, plan, sampling_params
+        request_id, workflow_request, plan, sampling_params, effective_parameters
     )
     if not output_persistent and job.get("output"):
         job["output"]["file_path"] = None
@@ -253,7 +325,6 @@ async def create_workflow_run(
         sampling_params=sampling_params,
         external_trace_header=trace_headers,
     )
-    effective_parameters = plan.effective_parameters()
     if plan.preset.sampler.boundary_ratio is not None and batch.boundary_ratio is None:
         batch.boundary_ratio = plan.preset.sampler.boundary_ratio
     batch.extra["workflow"] = {

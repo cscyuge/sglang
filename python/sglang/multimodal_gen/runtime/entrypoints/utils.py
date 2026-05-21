@@ -419,6 +419,7 @@ def prepare_request(
         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    _ensure_cfg_parallel_request_uses_cfg(server_args, req)
     diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
     if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
         req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
@@ -445,6 +446,29 @@ def prepare_request(
         req.trace_ctx = trace_ctx
 
     return req
+
+
+def _ensure_cfg_parallel_request_uses_cfg(server_args: ServerArgs, req: Req) -> None:
+    """Keep cfg-parallel ranks active for scale-1 CFG workflows.
+
+    Some workflows, including Wan2.2-Remix Comfy-derived presets, explicitly set
+    CFG scale to 1.0. That is mathematically equivalent to the conditional
+    branch after CFG combine, but a cfg-parallel server still needs both
+    cond/uncond branches to run so every rank participates.
+    """
+
+    if not server_args.enable_cfg_parallel or req.do_classifier_free_guidance:
+        return
+    has_negative_condition = (
+        req.negative_prompt is not None or req.negative_prompt_embeds not in (None, [])
+    )
+    if not has_negative_condition:
+        return
+    cfg_scale = (
+        req.true_cfg_scale if req.true_cfg_scale is not None else req.guidance_scale
+    )
+    if cfg_scale == 1.0:
+        req.do_classifier_free_guidance = True
 
 
 def attach_audio_to_video_sample(

@@ -14,6 +14,9 @@ from collections import deque
 from unittest.mock import MagicMock, patch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    _ensure_cfg_parallel_request_uses_cfg,
+)
 from sglang.multimodal_gen.runtime.managers.scheduler import (
     DEFAULT_PLACEHOLDER_PROMPT,
     Scheduler,
@@ -178,6 +181,31 @@ class TestInputValidationCfgParallelGuard(unittest.TestCase):
                 stage.forward(req, server_args)
             except ValueError as e:
                 self.fail(f"forward() raised ValueError on a valid CFG request: {e}")
+
+    def test_scale_one_request_can_force_cfg_for_cfg_parallel(self):
+        req = Req(
+            prompt="test",
+            negative_prompt="bad",
+            guidance_scale=1.0,
+            true_cfg_scale=None,
+            num_inference_steps=4,
+            num_outputs_per_prompt=1,
+            width=512,
+            height=512,
+        )
+        self.assertIs(req.do_classifier_free_guidance, False)
+
+        server_args = _make_validation_server_args(enable_cfg_parallel=True)
+        _ensure_cfg_parallel_request_uses_cfg(server_args, req)
+
+        self.assertIs(req.do_classifier_free_guidance, True)
+
+        stage = _make_input_validation_stage()
+        with patch.object(InputValidationStage, "_generate_seeds"):
+            try:
+                stage.forward(req, server_args)
+            except ValueError as e:
+                self.fail(f"forward() rejected a cfg-parallel scale-1 request: {e}")
 
 
 if __name__ == "__main__":

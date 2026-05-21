@@ -27,41 +27,65 @@ regular Wan2.2 SGLang defaults.
 Serve a converted T2V model tree:
 
 ```bash
+export CUDA_VISIBLE_DEVICES=0,1
+
 sglang serve \
   --model-type diffusion \
   --model-path /path/to/Wan2p2_T2V_A14B_Remix_NSFW_v2.0_SGLang \
   --model-id Wan2.2-T2V-A14B-Diffusers \
-  --num-gpus 8 \
-  --ulysses-degree 4 \
-  --ring-degree 2 \
-  --text-encoder-cpu-offload \
+  --performance-mode speed \
+  --num-gpus 2 \
+  --sp-degree 1 \
+  --ulysses-degree 1 \
+  --ring-degree 1 \
+  --enable-cfg-parallel \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false \
+  --image-encoder-cpu-offload false \
+  --vae-cpu-offload false \
+  --use-fsdp-inference false \
   --pin-cpu-memory \
   --host 0.0.0.0 \
   --port 30010 \
+  --master-port 30005 \
+  --scheduler-port 5581 \
   --output-path /path/to/outputs \
   --input-save-path /path/to/inputs
 ```
 
-For lower memory smoke tests, reduce `--num-gpus`, resolution, frame count, or
-step count. The full Comfy-derived T2V reference settings are `1280x720`,
-`81` frames, and `12` inference steps.
+Current verified Wan2.2-Remix deployment uses CFG parallel only. Do not enable
+SP/Ulysses for this model path unless you have revalidated quality; on the
+tested H200 setup, SP/Ulysses produced mosaic-like videos. For smoke tests,
+reduce resolution, frame count, or step count. The full Comfy-derived T2V
+reference settings are `1280x720`, `81` frames, and `12` inference steps.
 
 ## Start An I2V Server
 
 Serve a converted I2V model tree:
 
 ```bash
+export CUDA_VISIBLE_DEVICES=4,5
+
 sglang serve \
   --model-type diffusion \
   --model-path /path/to/Wan2p2_I2V_A14B_Remix_NSFW_v3.0_fp8_SGLang \
   --model-id Wan2.2-I2V-A14B-Diffusers \
-  --num-gpus 8 \
-  --ulysses-degree 4 \
-  --ring-degree 2 \
-  --text-encoder-cpu-offload \
+  --performance-mode speed \
+  --num-gpus 2 \
+  --sp-degree 1 \
+  --ulysses-degree 1 \
+  --ring-degree 1 \
+  --enable-cfg-parallel \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false \
+  --image-encoder-cpu-offload false \
+  --vae-cpu-offload false \
+  --use-fsdp-inference false \
   --pin-cpu-memory \
   --host 0.0.0.0 \
-  --port 30010 \
+  --port 30020 \
+  --master-port 30015 \
+  --scheduler-port 5582 \
   --output-path /path/to/outputs \
   --input-save-path /path/to/inputs
 ```
@@ -72,18 +96,23 @@ The full Comfy-derived I2V reference settings are `1280x720`, `33` frames, and
 ## List Workflows
 
 ```bash
-curl -sS "http://localhost:30010/v1/workflows?model_family=wan2.2-remix"
+curl --noproxy '*' -sS "http://localhost:30010/v1/workflows?model_family=wan2.2-remix"
+curl --noproxy '*' -sS "http://localhost:30020/v1/workflows?model_family=wan2.2-remix"
 ```
 
 Each item includes the preset name, task, defaults, sampler metadata, expert
 ranges, and execution status.
+
+Use the T2V server port for T2V presets and the I2V server port for I2V
+presets. In environments with `HTTP_PROXY` or `HTTPS_PROXY` set, add
+`--noproxy '*'` for localhost requests so they do not go through an HTTP proxy.
 
 ## Text To Video
 
 Submit a T2V workflow run:
 
 ```bash
-curl -sS "http://localhost:30010/v1/workflows/runs" \
+curl --noproxy '*' -sS "http://localhost:30010/v1/workflows/runs" \
   -H "Content-Type: application/json" \
   -d '{
     "workflow": "wan2.2-remix/nsfw-t2v-comfy-v1",
@@ -110,6 +139,8 @@ curl -sS "http://localhost:30010/v1/workflows/runs" \
 
 The response contains a workflow run ID, the output path, and the effective
 parameters. The request returns immediately with `status: queued`.
+`effective_parameters.output_width` and `effective_parameters.output_height`
+show the resolved video size.
 
 ## Image To Video
 
@@ -117,7 +148,7 @@ Submit an I2V workflow run. `input_reference` may be a local path visible to the
 server, a remote URL, or a data image.
 
 ```bash
-curl -sS "http://localhost:30010/v1/workflows/runs" \
+curl --noproxy '*' -sS "http://localhost:30020/v1/workflows/runs" \
   -H "Content-Type: application/json" \
   -d '{
     "workflow": "wan2.2-remix/nsfw-i2v-comfy-v1",
@@ -143,18 +174,24 @@ curl -sS "http://localhost:30010/v1/workflows/runs" \
   }'
 ```
 
+For I2V, `width` and `height` define the target output area. The final aspect
+ratio follows the input image and is rounded to the model grid, so it may differ
+from the requested pair. Read `effective_parameters.output_width` and
+`effective_parameters.output_height` from the run response for the actual video
+size.
+
 ## Poll And Download
 
 Poll a run:
 
 ```bash
-curl -sS "http://localhost:30010/v1/workflows/runs/<RUN_ID>"
+curl --noproxy '*' -sS "http://localhost:<PORT>/v1/workflows/runs/<RUN_ID>"
 ```
 
 When `status` is `completed`, download the video:
 
 ```bash
-curl -sS -L "http://localhost:30010/v1/workflows/runs/<RUN_ID>/content" \
+curl --noproxy '*' -sS -L "http://localhost:<PORT>/v1/workflows/runs/<RUN_ID>/content" \
   -o output.mp4
 ```
 
