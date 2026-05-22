@@ -1,3 +1,4 @@
+import os
 import pickle
 import time
 from typing import Any
@@ -11,6 +12,34 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_DEFAULT_GENERATION_TIMEOUT_MS = 4 * 60 * 60 * 1000
+_GENERATION_TIMEOUT_ENV = "SGLANG_DIFFUSION_SCHEDULER_CLIENT_TIMEOUT_MS"
+
+
+def _generation_recv_timeout_ms() -> int:
+    value = os.getenv(_GENERATION_TIMEOUT_ENV)
+    if value is None:
+        return _DEFAULT_GENERATION_TIMEOUT_MS
+    try:
+        timeout_ms = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r, using default %d ms",
+            _GENERATION_TIMEOUT_ENV,
+            value,
+            _DEFAULT_GENERATION_TIMEOUT_MS,
+        )
+        return _DEFAULT_GENERATION_TIMEOUT_MS
+    if timeout_ms < -1:
+        logger.warning(
+            "Invalid %s=%r, using default %d ms",
+            _GENERATION_TIMEOUT_ENV,
+            value,
+            _DEFAULT_GENERATION_TIMEOUT_MS,
+        )
+        return _DEFAULT_GENERATION_TIMEOUT_MS
+    return timeout_ms
 
 
 async def run_zeromq_broker(server_args: ServerArgs):
@@ -69,13 +98,16 @@ class SchedulerClient:
         # Set socket options for the main communication socket
         self.scheduler_socket.setsockopt(zmq.LINGER, 0)
 
-        # 100 minute timeout for generation
-        self.scheduler_socket.setsockopt(zmq.RCVTIMEO, 6000000)
+        generation_timeout_ms = _generation_recv_timeout_ms()
+        self.scheduler_socket.setsockopt(zmq.RCVTIMEO, generation_timeout_ms)
 
         scheduler_endpoint = self.server_args.scheduler_endpoint
         self.scheduler_socket.connect(scheduler_endpoint)
         logger.debug(
-            f"SchedulerClient connected to backend scheduler at {scheduler_endpoint}"
+            "SchedulerClient connected to backend scheduler at %s "
+            "with generation timeout %d ms",
+            scheduler_endpoint,
+            generation_timeout_ms,
         )
 
     def forward(self, batch: Any) -> Any:
@@ -157,8 +189,7 @@ class AsyncSchedulerClient:
         # Create a temporary REQ socket for this request to allow concurrency
         socket = self.context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
-        # 100 minute timeout
-        socket.setsockopt(zmq.RCVTIMEO, 6000000)
+        socket.setsockopt(zmq.RCVTIMEO, _generation_recv_timeout_ms())
 
         endpoint = self.server_args.scheduler_endpoint
         socket.connect(endpoint)
