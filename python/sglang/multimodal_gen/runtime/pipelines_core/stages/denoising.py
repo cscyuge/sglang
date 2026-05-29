@@ -811,6 +811,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """Prepare scheduler state before entering the shared denoising loop."""
         self._reset_scheduler_loop_state(ctx.scheduler)
         ctx.scheduler.set_begin_index(0)
+        if ctx.workflow_plan is None or not batch.workflow_schedulers:
+            return
+
+        seen_scheduler_ids: set[int] = set()
+        for expert in ctx.workflow_plan.experts:
+            scheduler = batch.workflow_schedulers.get(expert.name)
+            if scheduler is None:
+                raise ValueError(
+                    f"Workflow {ctx.workflow_plan.workflow_name!r} has no scheduler "
+                    f"for expert {expert.name!r}"
+                )
+            scheduler_id = id(scheduler)
+            if scheduler_id in seen_scheduler_ids:
+                continue
+            seen_scheduler_ids.add(scheduler_id)
+            self._reset_scheduler_loop_state(scheduler)
+            begin_index = 0 if expert.start_step is None else expert.start_step
+            scheduler.set_begin_index(begin_index)
 
     def _reset_scheduler_loop_state(self, scheduler) -> None:
         if hasattr(scheduler, "_step_index"):
@@ -862,6 +880,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """Build the per-step state shared by the loop and model-specific hooks."""
         t_int = int(t_host.item())
         t_device = ctx.timesteps[step_index]
+        ctx.scheduler = self._select_scheduler_for_step(
+            ctx=ctx,
+            batch=batch,
+            step_index=step_index,
+            total_steps=len(ctx.timesteps),
+        )
         current_model, current_guidance_scale = self._select_and_manage_model(
             t_int=t_int,
             boundary_timestep=ctx.boundary_timestep,
@@ -888,6 +912,25 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             current_guidance_scale=current_guidance_scale,
             attn_metadata=attn_metadata,
         )
+
+    def _select_scheduler_for_step(
+        self,
+        *,
+        ctx: DenoisingContext,
+        batch: Req,
+        step_index: int,
+        total_steps: int,
+    ) -> Any:
+        if ctx.workflow_plan is None or not batch.workflow_schedulers:
+            return ctx.scheduler
+        expert = ctx.workflow_plan.select_expert(step_index, total_steps)
+        try:
+            return batch.workflow_schedulers[expert.name]
+        except KeyError as exc:
+            raise ValueError(
+                f"Workflow {ctx.workflow_plan.workflow_name!r} has no scheduler "
+                f"for expert {expert.name!r}"
+            ) from exc
 
     def _prepare_step_attn_metadata(
         self,

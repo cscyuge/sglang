@@ -33,6 +33,7 @@ class WorkflowStepExpert:
     start_step: int | None = None
     end_step: int | None = None
     guidance_param: str | None = None
+    flow_shift: float | None = None
 
     @property
     def has_step_range(self) -> bool:
@@ -83,6 +84,10 @@ class WorkflowDenoisingPlan:
                 f"transformer_2 components, got: {', '.join(sorted(unsupported))}"
             )
         return counts["transformer"], counts["transformer_2"]
+
+    @property
+    def has_expert_flow_shifts(self) -> bool:
+        return any(expert.flow_shift is not None for expert in self.experts)
 
 
 def workflow_denoising_plan_from_extra(
@@ -208,6 +213,7 @@ def _parse_expert(spec: Any) -> WorkflowStepExpert:
         start_step=start_step,
         end_step=end_step,
         guidance_param=spec.get("guidance_param"),
+        flow_shift=_optional_float(spec.get("flow_shift"), "flow_shift"),
     )
 
 

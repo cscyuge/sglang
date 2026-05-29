@@ -15,6 +15,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    clone_scheduler_runtime,
     get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -31,6 +32,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.workflow_runtime import (
     WorkflowSamplerPlan,
     build_workflow_scheduler_override,
+    workflow_denoising_plan_from_extra,
     workflow_sampler_plan_from_extra,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -60,7 +62,7 @@ class TimestepPreparationStage(PipelineStage):
     """
 
     deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
-    deduplicated_deepcopy_output_fields = ("scheduler",)
+    deduplicated_deepcopy_output_fields = ("scheduler", "workflow_schedulers")
     deduplicated_extra_tensor_tree_output_keys = ("mu",)
 
     def __init__(
@@ -118,6 +120,8 @@ class TimestepPreparationStage(PipelineStage):
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps
         sigmas = batch.sigmas
+        custom_timesteps_requested = timesteps is not None
+        custom_sigmas_requested = sigmas is not None
         n_tokens = batch.n_tokens
 
         sigmas = server_args.pipeline_config.prepare_sigmas(sigmas, num_inference_steps)
@@ -176,12 +180,92 @@ class TimestepPreparationStage(PipelineStage):
             )
             timesteps = scheduler.timesteps
 
+        workflow_plan = workflow_denoising_plan_from_extra(batch.extra)
+        if workflow_plan is not None and workflow_plan.has_expert_flow_shifts:
+            if custom_timesteps_requested or custom_sigmas_requested:
+                raise ValueError(
+                    "Workflow per-expert flow_shift is incompatible with custom "
+                    "timesteps or sigmas"
+                )
+            workflow_schedulers = self._prepare_workflow_expert_schedulers(
+                scheduler=scheduler,
+                sampler_plan=sampler_plan,
+                workflow_plan=workflow_plan,
+                num_inference_steps=num_inference_steps,
+                device=device,
+                extra_set_timesteps_kwargs=extra_set_timesteps_kwargs,
+            )
+            batch.workflow_schedulers = workflow_schedulers
+            timesteps = self._compose_workflow_timesteps(
+                workflow_plan=workflow_plan,
+                workflow_schedulers=workflow_schedulers,
+                num_inference_steps=num_inference_steps,
+            )
+            logger.info(
+                "Workflow %s using per-expert flow shifts: %s",
+                workflow_plan.workflow_name,
+                {
+                    expert.name: expert.flow_shift
+                    for expert in workflow_plan.experts
+                    if expert.flow_shift is not None
+                },
+            )
+
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
         batch.scheduler = scheduler
         if not batch.is_warmup:
             self.log_debug("timesteps: %s", timesteps)
         return batch
+
+    def _prepare_workflow_expert_schedulers(
+        self,
+        *,
+        scheduler,
+        sampler_plan: WorkflowSamplerPlan | None,
+        workflow_plan,
+        num_inference_steps: int,
+        device: torch.device,
+        extra_set_timesteps_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        if sampler_plan is None or sampler_plan.normalized_sampler != "euler":
+            raise ValueError(
+                "Workflow per-expert flow_shift currently requires Euler sampler"
+            )
+        if sampler_plan.normalized_schedule not in {None, "simple"}:
+            raise ValueError(
+                "Workflow per-expert flow_shift currently requires simple schedule"
+            )
+
+        workflow_schedulers = {}
+        for expert in workflow_plan.experts:
+            expert_scheduler = clone_scheduler_runtime(scheduler)
+            if expert.flow_shift is not None:
+                if not hasattr(expert_scheduler, "set_shift"):
+                    raise ValueError(
+                        "Workflow per-expert flow_shift requires a scheduler with "
+                        "set_shift()"
+                    )
+                expert_scheduler.set_shift(expert.flow_shift)
+            expert_scheduler.set_timesteps(
+                num_inference_steps, device=device, **extra_set_timesteps_kwargs
+            )
+            workflow_schedulers[expert.name] = expert_scheduler
+        return workflow_schedulers
+
+    def _compose_workflow_timesteps(
+        self,
+        *,
+        workflow_plan,
+        workflow_schedulers: dict[str, Any],
+        num_inference_steps: int,
+    ) -> torch.Tensor:
+        step_timesteps = []
+        for step_index in range(num_inference_steps):
+            expert = workflow_plan.select_expert(step_index, num_inference_steps)
+            scheduler = workflow_schedulers[expert.name]
+            step_timesteps.append(scheduler.timesteps[step_index])
+        return torch.stack(step_timesteps)
 
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs

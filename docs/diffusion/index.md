@@ -45,6 +45,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 - [Wan2.2-Remix Client Guide](wan2_2_remix_client_guide.md): concise HTTP workflow guide for service callers
 - [Wan2.2-Remix Workflows](wan2_2_remix_workflows.md): serve converted Wan2.2-Remix models through `/v1/workflows`
 - [Wan2.2-Remix Comfy Alignment](wan2_2_remix_comfy_alignment.md): static mapping from ComfyUI workflow JSON to SGLang workflow presets
+- [Wan2.2 Lightning Workflows](wan2_2_lightning_workflows.md): run the Lightning I2V Comfy-derived preset through `/v1/workflows`
 - [CI Performance](ci_perf.md): performance baseline generation
 
 ## References

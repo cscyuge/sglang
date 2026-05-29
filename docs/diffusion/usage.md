@@ -6,6 +6,7 @@ Use this section for day-to-day inference workflows with SGLang Diffusion.
 - [OpenAI-Compatible API](api/openai_api.md): request format, endpoints, and SDK examples
 - [Wan2.2-Remix Client Guide](wan2_2_remix_client_guide.md): concise HTTP workflow guide for service callers
 - [Wan2.2-Remix Workflows](wan2_2_remix_workflows.md): serve converted Wan2.2-Remix models through `/v1/workflows`
+- [Wan2.2 Lightning Workflows](wan2_2_lightning_workflows.md): run the Lightning I2V Comfy-derived preset through `/v1/workflows`
 - [Post-Processing](api/post_processing.md): frame interpolation and upscaling
 - [Quantization](quantization.md): quantized transformer checkpoints and supported quantization families
 
@@ -16,6 +17,7 @@ api/cli
 api/openai_api
 wan2_2_remix_client_guide
 wan2_2_remix_workflows
+wan2_2_lightning_workflows
 api/post_processing
 quantization
 ```

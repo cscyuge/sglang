@@ -1,0 +1,180 @@
+{
+  "presets": [
+    {
+      "schema_version": 1,
+      "name": "wan2.2-lightning/nsfw-i2v-comfy-v1",
+      "description": "Wan2.2 Lightning Edition I2V preset for the active first-segment path in wan2.2_LIGHTNING-EDITION_long-video_FP8GGUF.json. The Comfy graph's later long-video continuation subgraphs are disabled in the source workflow.",
+      "execution_status": "ready",
+      "task": "i2v",
+      "model_family": "wan2.2-lightning",
+      "pipeline": "WanImageToVideoPipeline",
+      "base_model_id": "Wan2.2-I2V-A14B-Diffusers",
+      "components": {
+        "transformer": "transformer",
+        "transformer_2": "transformer_2",
+        "text_encoder": "text_encoder",
+        "tokenizer": "tokenizer",
+        "vae": "vae"
+      },
+      "defaults": {
+        "width": 832,
+        "height": 480,
+        "num_frames": 81,
+        "fps": 16,
+        "num_inference_steps": 4,
+        "guidance_scale": 1.0,
+        "guidance_scale_2": 1.0,
+        "negative_prompt": "\u8272\u8c03\u8273\u4e3d\uff0c\u8fc7\u66dd\uff0c\u9759\u6001\uff0c\u7ec6\u8282\u6a21\u7cca\u4e0d\u6e05\uff0c\u5b57\u5e55\uff0c\u98ce\u683c\uff0c\u4f5c\u54c1\uff0c\u753b\u4f5c\uff0c\u753b\u9762\uff0c\u9759\u6b62\uff0c\u6574\u4f53\u53d1\u7070\uff0c\u6700\u5dee\u8d28\u91cf\uff0c\u4f4e\u8d28\u91cf\uff0cJPEG\u538b\u7f29\u6b8b\u7559\uff0c\u4e11\u964b\u7684\uff0c\u6b8b\u7f3a\u7684\uff0c\u591a\u4f59\u7684\u624b\u6307\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u624b\u90e8\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u8138\u90e8\uff0c\u7578\u5f62\u7684\uff0c\u6bc1\u5bb9\u7684\uff0c\u5f62\u6001\u7578\u5f62\u7684\u80a2\u4f53\uff0c\u624b\u6307\u878d\u5408\uff0c\u9759\u6b62\u4e0d\u52a8\u7684\u753b\u9762\uff0c\u6742\u4e71\u7684\u80cc\u666f\uff0c\u4e09\u6761\u817f\uff0c\u80cc\u666f\u4eba\u5f88\u591a\uff0c\u5012\u7740\u8d70"
+      },
+      "sampler": {
+        "type": "euler",
+        "schedule": "simple",
+        "flow_shift": 5.0
+      },
+      "experts": [
+        {
+          "name": "high_noise",
+          "component": "transformer",
+          "start_step": 0,
+          "end_step": 2,
+          "guidance_param": "guidance_scale",
+          "flow_shift": 5.0
+        },
+        {
+          "name": "low_noise",
+          "component": "transformer_2",
+          "start_step": 2,
+          "end_step": null,
+          "guidance_param": "guidance_scale_2",
+          "flow_shift": 8.0
+        }
+      ],
+      "decode": {
+        "vae": "vae",
+        "tiling": "auto"
+      },
+      "output": {
+        "format": "mp4",
+        "response_format": "url"
+      },
+      "override_policy": {
+        "allow": [
+          "prompt",
+          "negative_prompt",
+          "image",
+          "image_url",
+          "input_reference",
+          "reference_url",
+          "seed",
+          "width",
+          "height",
+          "num_frames",
+          "fps",
+          "num_inference_steps",
+          "guidance_scale",
+          "guidance_scale_2",
+          "enable_teacache",
+          "enable_frame_interpolation",
+          "frame_interpolation_exp",
+          "frame_interpolation_scale",
+          "frame_interpolation_model_path",
+          "enable_upscaling",
+          "upscaling_model_path",
+          "upscaling_scale",
+          "output_quality",
+          "output_compression",
+          "output.format",
+          "output.response_format"
+        ],
+        "deny": [
+          "components",
+          "pipeline",
+          "model_family"
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "name": "wan2.2-lightning/nsfw-long-video-comfy-v1",
+      "description": "Full multi-segment long-video interpretation of wan2.2_LIGHTNING-EDITION_long-video_FP8GGUF.json.",
+      "execution_status": "unsupported",
+      "unsupported_reason": "The source ComfyUI workflow has long-video continuation subgraphs disabled. Executing them as a single SGLang workflow would require PainterLongVideo segment chaining and latent/image handoff across multiple subgraphs.",
+      "task": "i2v",
+      "model_family": "wan2.2-lightning",
+      "pipeline": "WanImageToVideoPipeline",
+      "base_model_id": "Wan2.2-I2V-A14B-Diffusers",
+      "components": {
+        "transformer": "transformer",
+        "transformer_2": "transformer_2",
+        "text_encoder": "text_encoder",
+        "tokenizer": "tokenizer",
+        "vae": "vae"
+      },
+      "defaults": {
+        "width": 832,
+        "height": 480,
+        "num_frames": 81,
+        "fps": 16,
+        "num_inference_steps": 4,
+        "guidance_scale": 1.0,
+        "guidance_scale_2": 1.0
+      },
+      "sampler": {
+        "type": "euler",
+        "schedule": "simple",
+        "flow_shift": 5.0
+      },
+      "experts": [
+        {
+          "name": "high_noise",
+          "component": "transformer",
+          "start_step": 0,
+          "end_step": 2,
+          "guidance_param": "guidance_scale",
+          "flow_shift": 5.0
+        },
+        {
+          "name": "low_noise",
+          "component": "transformer_2",
+          "start_step": 2,
+          "end_step": null,
+          "guidance_param": "guidance_scale_2",
+          "flow_shift": 8.0
+        }
+      ],
+      "decode": {
+        "vae": "vae",
+        "tiling": "auto"
+      },
+      "output": {
+        "format": "mp4",
+        "response_format": "url"
+      },
+      "override_policy": {
+        "allow": [
+          "prompt",
+          "negative_prompt",
+          "image",
+          "image_url",
+          "input_reference",
+          "reference_url",
+          "seed",
+          "width",
+          "height",
+          "num_frames",
+          "fps",
+          "num_inference_steps",
+          "guidance_scale",
+          "guidance_scale_2",
+          "output.format",
+          "output.response_format"
+        ],
+        "deny": [
+          "components",
+          "pipeline",
+          "model_family"
+        ]
+      }
+    }
+  ]
+}

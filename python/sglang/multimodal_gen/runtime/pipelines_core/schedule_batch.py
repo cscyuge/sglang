@@ -159,6 +159,7 @@ class Req:
     # concurrently with another request or outlive the stage-local scheduler
     # state, such as grouped execution or disaggregation.
     scheduler: Any | None = None
+    workflow_schedulers: dict[str, Any] | None = None
 
     eta: float = 0.0
     sigmas: list[float] | None = None

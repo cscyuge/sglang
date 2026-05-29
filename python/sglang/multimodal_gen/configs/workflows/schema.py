@@ -62,6 +62,7 @@ class WorkflowExpertRange:
     start_step: int | None = None
     end_step: int | None = None
     guidance_param: str | None = None
+    flow_shift: float | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WorkflowExpertRange":
@@ -90,6 +91,11 @@ class WorkflowExpertRange:
             start_step=int(start_step) if start_step is not None else None,
             end_step=int(end_step) if end_step is not None else None,
             guidance_param=data.get("guidance_param"),
+            flow_shift=(
+                float(data["flow_shift"])
+                if data.get("flow_shift") is not None
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -99,6 +105,7 @@ class WorkflowExpertRange:
             "start_step": self.start_step,
             "end_step": self.end_step,
             "guidance_param": self.guidance_param,
+            "flow_shift": self.flow_shift,
         }
 
 
@@ -252,10 +259,14 @@ class WorkflowPreset:
                 image_reference = input_values[key]
                 break
 
+        negative_prompt = input_values.get("negative_prompt")
+        if negative_prompt is None:
+            negative_prompt = effective_parameters.get("negative_prompt")
+
         return WorkflowExecutionPlan(
             preset=self,
             prompt=str(prompt),
-            negative_prompt=input_values.get("negative_prompt"),
+            negative_prompt=negative_prompt,
             image_reference=image_reference,
             parameters=effective_parameters,
             output=effective_output,
@@ -296,6 +307,8 @@ class WorkflowExecutionPlan:
 
     def effective_parameters(self) -> dict[str, Any]:
         effective = dict(self.parameters)
+        if self.negative_prompt is not None:
+            effective["negative_prompt"] = self.negative_prompt
         effective.update(self.preset.sampler.to_effective_parameters())
         if self.preset.experts:
             effective["experts"] = [expert.to_dict() for expert in self.preset.experts]
@@ -306,7 +319,7 @@ class WorkflowExecutionPlan:
     ) -> dict[str, Any]:
         kwargs = dict(self.parameters)
         kwargs["prompt"] = self.prompt
-        if self.negative_prompt:
+        if self.negative_prompt is not None:
             kwargs["negative_prompt"] = self.negative_prompt
         if input_reference:
             kwargs["input_reference"] = input_reference

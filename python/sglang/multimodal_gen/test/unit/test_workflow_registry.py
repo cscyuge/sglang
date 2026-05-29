@@ -26,6 +26,37 @@ def test_builtin_wan2_2_remix_presets_load():
     assert summary["execution_status"] == "ready"
 
 
+def test_builtin_wan2_2_lightning_presets_load():
+    registry = get_workflow_registry()
+
+    names = [preset.name for preset in registry.list("wan2.2-lightning")]
+
+    assert names == [
+        "wan2.2-lightning/nsfw-i2v-comfy-v1",
+        "wan2.2-lightning/nsfw-long-video-comfy-v1",
+    ]
+
+    ready = registry.get("wan2.2-lightning/nsfw-i2v-comfy-v1").summary()
+    assert ready["execution_status"] == "ready"
+    assert ready["defaults"]["width"] == 832
+    assert ready["defaults"]["height"] == 480
+    assert ready["defaults"]["num_frames"] == 81
+    assert ready["defaults"]["num_inference_steps"] == 4
+    assert ready["sampler"] == {
+        "sampler": "euler",
+        "schedule": "simple",
+        "flow_shift": 5.0,
+    }
+    assert ready["experts"][0]["end_step"] == 2
+    assert ready["experts"][0]["flow_shift"] == 5.0
+    assert ready["experts"][1]["start_step"] == 2
+    assert ready["experts"][1]["flow_shift"] == 8.0
+
+    unsupported = registry.get("wan2.2-lightning/nsfw-long-video-comfy-v1")
+    assert unsupported.execution_status == "unsupported"
+    assert "PainterLongVideo" in (unsupported.unsupported_reason or "")
+
+
 def test_comfy_presets_are_discoverable_and_executable():
     registry = get_workflow_registry()
     preset = registry.get("wan2.2-remix/nsfw-t2v-comfy-v1")
@@ -41,6 +72,54 @@ def test_comfy_presets_are_discoverable_and_executable():
     }
     assert summary["experts"][0]["end_step"] == 10
     assert summary["experts"][1]["start_step"] == 10
+
+
+def test_lightning_i2v_workflow_uses_default_negative_prompt():
+    preset = get_workflow_registry().get("wan2.2-lightning/nsfw-i2v-comfy-v1")
+
+    plan = preset.resolve(
+        input_values={
+            "prompt": "animate this image",
+            "input_reference": "/tmp/input.png",
+        },
+        parameters={"seed": 1234},
+    )
+
+    assert plan.task == "i2v"
+    assert plan.negative_prompt is not None
+    assert plan.negative_prompt.startswith("\u8272\u8c03\u8273\u4e3d")
+    assert plan.parameters["num_inference_steps"] == 4
+    assert plan.effective_parameters()["negative_prompt"] == plan.negative_prompt
+    assert plan.effective_parameters()["experts"][0]["end_step"] == 2
+
+    video_kwargs = plan.to_video_request_kwargs(input_reference="/tmp/input.png")
+    assert video_kwargs["negative_prompt"] == plan.negative_prompt
+    assert video_kwargs["guidance_scale"] == 1.0
+    assert video_kwargs["guidance_scale_2"] == 1.0
+
+
+def test_lightning_i2v_workflow_allows_negative_prompt_override():
+    preset = get_workflow_registry().get("wan2.2-lightning/nsfw-i2v-comfy-v1")
+
+    plan = preset.resolve(
+        input_values={
+            "prompt": "animate this image",
+            "negative_prompt": "custom negative",
+            "input_reference": "/tmp/input.png",
+        },
+    )
+
+    assert plan.negative_prompt == "custom negative"
+    assert plan.effective_parameters()["negative_prompt"] == "custom negative"
+
+    cleared = preset.resolve(
+        input_values={
+            "prompt": "animate this image",
+            "negative_prompt": "",
+            "input_reference": "/tmp/input.png",
+        },
+    )
+    assert cleared.to_video_request_kwargs()["negative_prompt"] == ""
 
 
 def test_resolve_t2v_workflow_plan_with_overrides():
@@ -137,6 +216,17 @@ def test_registry_accepts_ready_comfy_workflow():
     )
 
     registry.validate_for_server(comfy_preset, server)
+
+
+def test_registry_rejects_unsupported_lightning_long_video_workflow():
+    registry = get_workflow_registry()
+    preset = registry.get("wan2.2-lightning/nsfw-long-video-comfy-v1")
+    server = SimpleNamespace(
+        pipeline_config=SimpleNamespace(task_type=ModelTaskType.I2V)
+    )
+
+    with pytest.raises(ValueError, match="not executable"):
+        registry.validate_for_server(preset, server)
 
 
 def test_expert_range_overlap_is_rejected():
