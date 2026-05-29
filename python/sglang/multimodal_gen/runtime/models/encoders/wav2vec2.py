@@ -34,6 +34,7 @@ class Wav2Vec2AudioEncoder(nn.Module):
         target_fps: int = 25,
         sample_rate: int = 16000,
         freeze_feature_extractor: bool = True,
+        include_embedding_layer: bool = False,
     ):
         super().__init__()
         from transformers import Wav2Vec2Model
@@ -43,6 +44,7 @@ class Wav2Vec2AudioEncoder(nn.Module):
         self.num_hidden_layers = num_hidden_layers
         self.target_fps = target_fps
         self.sample_rate = sample_rate
+        self.include_embedding_layer = include_embedding_layer
 
         if freeze_feature_extractor:
             self.wav2vec2.feature_extractor._freeze_parameters()
@@ -112,9 +114,11 @@ class Wav2Vec2AudioEncoder(nn.Module):
             return_dict=True,
         )
 
-        # Collect hidden states: skip embedding layer (index 0),
-        # take encoder layers 1..num_hidden_layers
-        all_hidden = encoder_outputs.hidden_states[1 : self.num_hidden_layers + 1]
+        if self.include_embedding_layer:
+            all_hidden = encoder_outputs.hidden_states[: self.num_hidden_layers]
+        else:
+            # Skip embedding layer (index 0), take encoder layers 1..num_hidden_layers.
+            all_hidden = encoder_outputs.hidden_states[1 : self.num_hidden_layers + 1]
 
         # Stack to (B, T, num_layers, D)
         all_layer_features = torch.stack(all_hidden, dim=2)

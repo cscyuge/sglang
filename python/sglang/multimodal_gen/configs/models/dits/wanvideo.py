@@ -200,3 +200,66 @@ class FlashTalkWanVideoConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=FlashTalkWanVideoArchConfig)
 
     prefix: str = "Wan"
+
+
+@dataclass
+class WanS2VArchConfig(WanVideoArchConfig):
+    """Wan2.2-S2V DiT config using the official WanModel_S2V checkpoint names."""
+
+    cond_dim: int = 16
+    audio_dim: int = 1024
+    num_audio_token: int = 4
+    enable_adain: bool = True
+    adain_mode: str = "attn_norm"
+    audio_inject_layers: list[int] = field(
+        default_factory=lambda: [0, 4, 8, 12, 16, 20, 24, 27, 30, 33, 36, 39]
+    )
+    zero_timestep: bool = True
+    add_last_motion: bool = True
+    enable_motioner: bool = False
+    enable_framepack: bool = True
+    framepack_drop_mode: str = "padd"
+    motion_frames: int = 73
+
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^patch_embedding\.(.*)$": r"patch_embedding.proj.\1",
+            r"^cond_encoder\.(.*)$": r"cond_encoder.proj.\1",
+            r"^time_embedding\.0\.(.*)$": r"condition_embedder.time_embedder.mlp.fc_in.\1",
+            r"^time_embedding\.2\.(.*)$": r"condition_embedder.time_embedder.mlp.fc_out.\1",
+            r"^time_projection\.1\.(.*)$": r"condition_embedder.time_modulation.linear.\1",
+            r"^text_embedding\.0\.(.*)$": r"condition_embedder.text_embedder.fc_in.\1",
+            r"^text_embedding\.2\.(.*)$": r"condition_embedder.text_embedder.fc_out.\1",
+            r"^head\.head\.(.*)$": r"proj_out.\1",
+            r"^head\.modulation$": r"scale_shift_table",
+            r"^blocks\.(\d+)\.self_attn\.q\.(.*)$": r"blocks.\1.to_q.\2",
+            r"^blocks\.(\d+)\.self_attn\.k\.(.*)$": r"blocks.\1.to_k.\2",
+            r"^blocks\.(\d+)\.self_attn\.v\.(.*)$": r"blocks.\1.to_v.\2",
+            r"^blocks\.(\d+)\.self_attn\.o\.(.*)$": r"blocks.\1.to_out.\2",
+            r"^blocks\.(\d+)\.self_attn\.norm_q\.(.*)$": r"blocks.\1.norm_q.\2",
+            r"^blocks\.(\d+)\.self_attn\.norm_k\.(.*)$": r"blocks.\1.norm_k.\2",
+            r"^blocks\.(\d+)\.cross_attn\.q\.(.*)$": r"blocks.\1.attn2.to_q.\2",
+            r"^blocks\.(\d+)\.cross_attn\.k\.(.*)$": r"blocks.\1.attn2.to_k.\2",
+            r"^blocks\.(\d+)\.cross_attn\.v\.(.*)$": r"blocks.\1.attn2.to_v.\2",
+            r"^blocks\.(\d+)\.cross_attn\.o\.(.*)$": r"blocks.\1.attn2.to_out.\2",
+            r"^blocks\.(\d+)\.cross_attn\.norm_q\.(.*)$": r"blocks.\1.attn2.norm_q.\2",
+            r"^blocks\.(\d+)\.cross_attn\.norm_k\.(.*)$": r"blocks.\1.attn2.norm_k.\2",
+            r"^blocks\.(\d+)\.ffn\.0\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
+            r"^blocks\.(\d+)\.ffn\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",
+            r"^blocks\.(\d+)\.modulation$": r"blocks.\1.scale_shift_table",
+            r"^blocks\.(\d+)\.norm3\.(.*)$": r"blocks.\1.self_attn_residual_norm.norm.\2",
+            r"^audio_injector\.injector\.(\d+)\.q\.(.*)$": r"audio_injector.injector.\1.to_q.\2",
+            r"^audio_injector\.injector\.(\d+)\.k\.(.*)$": r"audio_injector.injector.\1.to_k.\2",
+            r"^audio_injector\.injector\.(\d+)\.v\.(.*)$": r"audio_injector.injector.\1.to_v.\2",
+            r"^audio_injector\.injector\.(\d+)\.o\.(.*)$": r"audio_injector.injector.\1.to_out.\2",
+            r"^audio_injector\.injector\.(\d+)\.norm_q\.(.*)$": r"audio_injector.injector.\1.norm_q.\2",
+            r"^audio_injector\.injector\.(\d+)\.norm_k\.(.*)$": r"audio_injector.injector.\1.norm_k.\2",
+        }
+    )
+
+
+@dataclass
+class WanS2VConfig(DiTConfig):
+    arch_config: DiTArchConfig = field(default_factory=WanS2VArchConfig)
+
+    prefix: str = "Wan"

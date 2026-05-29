@@ -84,7 +84,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import (
+    WanS2VPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.flashtalk import FlashTalkSamplingParams
+from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
@@ -914,6 +918,19 @@ def _register_configs():
         hf_model_paths=["SoulX-FlashTalk-14B"],
         model_detectors=[lambda hf_id: "flashtalk" in hf_id.lower()],
         pipeline_name="FlashTalkPipeline",
+    )
+
+    # Wan2.2-S2V / D_human
+    register_configs(
+        sampling_param_cls=WanS2VSamplingParams,
+        pipeline_config_cls=WanS2VPipelineConfig,
+        hf_model_paths=["Wan-AI/Wan2.2-S2V-14B", "colorful101/D_human"],
+        model_detectors=[
+            lambda hf_id: "wan2.2-s2v" in hf_id.lower()
+            or "s2v-14b" in hf_id.lower()
+            or "d_human" in hf_id.lower()
+        ],
+        pipeline_name="WanS2VPipeline",
     )
 
     # Helios

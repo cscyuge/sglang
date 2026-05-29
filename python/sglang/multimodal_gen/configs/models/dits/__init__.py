@@ -7,6 +7,7 @@ from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
 from sglang.multimodal_gen.configs.models.dits.wanvideo import (
     FlashTalkWanVideoConfig,
+    WanS2VConfig,
     WanVideoConfig,
 )
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
@@ -15,6 +16,7 @@ from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
 
 __all__ = [
     "FlashTalkWanVideoConfig",
+    "WanS2VConfig",
     "HeliosConfig",
     "HunyuanVideoConfig",
     "WanVideoConfig",
