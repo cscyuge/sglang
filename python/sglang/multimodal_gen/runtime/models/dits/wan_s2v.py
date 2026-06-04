@@ -81,6 +81,33 @@ def _as_list_4d(x: torch.Tensor | list[torch.Tensor]) -> list[torch.Tensor]:
     raise ValueError(f"Expected 4D/5D tensor or list, got shape {tuple(x.shape)}")
 
 
+def _build_s2v_noisy_rope_grid_sizes(
+    grid_sizes: torch.Tensor,
+    *,
+    stream_r1_mode: bool = False,
+    current_start: int = 0,
+    frame_seq_length: int = 0,
+) -> list[list[torch.Tensor]]:
+    if not stream_r1_mode:
+        return [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
+
+    current_start = int(current_start)
+    frame_seq_length = int(frame_seq_length)
+    if frame_seq_length <= 0:
+        raise ValueError("frame_seq_length must be positive")
+    if current_start < 0:
+        raise ValueError("current_start must be non-negative")
+    if current_start % frame_seq_length != 0:
+        raise ValueError("current_start must be frame-aligned")
+
+    frame_offset = current_start // frame_seq_length
+    start = torch.zeros_like(grid_sizes)
+    start[:, 0] = frame_offset
+    end = grid_sizes.clone()
+    end[:, 0] += frame_offset
+    return [[start, end, grid_sizes]]
+
+
 def _sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
     assert dim % 2 == 0
     half = dim // 2
@@ -886,7 +913,12 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         original_grid_sizes = deepcopy(grid_sizes)
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long, device=x[0].device)
-        grid_sizes_rope = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
+        grid_sizes_rope = _build_s2v_noisy_rope_grid_sizes(
+            grid_sizes,
+            stream_r1_mode=stream_r1_mode,
+            current_start=current_start,
+            frame_seq_length=frame_seq_length,
+        )
 
         ref = [self.patch_embedding(r.unsqueeze(0)) for r in ref_list]
         batch_size = len(ref)

@@ -6,6 +6,9 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import WanS2VPipelineConfig
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
+from sglang.multimodal_gen.runtime.models.dits.wan_s2v import (
+    _build_s2v_noisy_rope_grid_sizes,
+)
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VStreamR1AttentionLayout,
     WanS2VStreamR1MixedKVView,
@@ -27,6 +30,67 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     WanS2VStreamR1DenoisingStage,
     _has_negative_prompt_embeds,
 )
+
+
+class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
+    def test_legacy_grid_has_zero_start_and_current_values(self):
+        grid_sizes = torch.tensor([[2, 3, 4], [5, 6, 7]], dtype=torch.long)
+
+        rope_grid = _build_s2v_noisy_rope_grid_sizes(
+            grid_sizes,
+            stream_r1_mode=False,
+            current_start=11,
+            frame_seq_length=0,
+        )
+
+        self.assertEqual(len(rope_grid), 1)
+        self.assertEqual(len(rope_grid[0]), 3)
+        start, end, span = rope_grid[0]
+        self.assertEqual(start.shape, grid_sizes.shape)
+        self.assertEqual(end.shape, grid_sizes.shape)
+        self.assertEqual(span.shape, grid_sizes.shape)
+        torch.testing.assert_close(start, torch.zeros_like(grid_sizes))
+        torch.testing.assert_close(end, grid_sizes)
+        torch.testing.assert_close(span, grid_sizes)
+
+    def test_stream_r1_grid_offsets_temporal_start_and_end(self):
+        grid_sizes = torch.tensor([[3, 4, 5]], dtype=torch.long)
+
+        rope_grid = _build_s2v_noisy_rope_grid_sizes(
+            grid_sizes,
+            stream_r1_mode=True,
+            current_start=24,
+            frame_seq_length=12,
+        )
+
+        start, end, span = rope_grid[0]
+        torch.testing.assert_close(
+            start, torch.tensor([[2, 0, 0]], dtype=torch.long)
+        )
+        torch.testing.assert_close(
+            end, torch.tensor([[5, 4, 5]], dtype=torch.long)
+        )
+        torch.testing.assert_close(span, grid_sizes)
+        torch.testing.assert_close(end - start, span)
+
+    def test_stream_r1_grid_rejects_invalid_current_start(self):
+        grid_sizes = torch.tensor([[3, 4, 5]], dtype=torch.long)
+
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            _build_s2v_noisy_rope_grid_sizes(
+                grid_sizes,
+                stream_r1_mode=True,
+                current_start=-12,
+                frame_seq_length=12,
+            )
+
+        with self.assertRaisesRegex(ValueError, "frame-aligned"):
+            _build_s2v_noisy_rope_grid_sizes(
+                grid_sizes,
+                stream_r1_mode=True,
+                current_start=5,
+                frame_seq_length=12,
+            )
 
 
 class TestWanS2VSamplingParams(unittest.TestCase):
