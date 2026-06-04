@@ -40,6 +40,9 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanTransformer3DModel,
     WanTransformerBlock,
 )
+from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
+    WanS2VStreamR1AttentionLayout,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -414,6 +417,7 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         encoder_hidden_states: torch.Tensor,
         temb: list[torch.Tensor | int],
         freqs_cis: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -439,7 +443,7 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         query = _rope_apply_precomputed(query, freqs_cis).to(orig_dtype)
         key = _rope_apply_precomputed(key, freqs_cis).to(orig_dtype)
-        attn_output = self.attn1(query, key, value).flatten(2)
+        attn_output = self.attn1(query, key, value, attn_mask=attn_mask).flatten(2)
         attn_output, _ = self.to_out(attn_output)
         hidden_states = hidden_states + _segment_gate(attn_output.squeeze(1), gate_msa, seg_idx)
         hidden_states = hidden_states.to(orig_dtype)
@@ -625,6 +629,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         self.cnt = 0
         self.stream_r1_local_attn_size: int | None = None
         self.stream_r1_sink_size: int | None = None
+        self.stream_r1_num_frame_per_block: int | None = None
         self.stream_r1_kv_cache_requested = False
         self.__post_init__()
 
@@ -723,7 +728,12 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         return hidden_states
 
     def set_stream_r1_attention(
-        self, local_attn_size: int, sink_size: int, *, kv_cache: bool = False
+        self,
+        local_attn_size: int,
+        sink_size: int,
+        *,
+        num_frame_per_block: int | None = None,
+        kv_cache: bool = False,
     ) -> None:
         if local_attn_size <= 0:
             raise ValueError("local_attn_size must be positive")
@@ -731,8 +741,13 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             raise ValueError("sink_size must be non-negative")
         if sink_size >= local_attn_size:
             raise ValueError("sink_size must be smaller than local_attn_size")
+        if num_frame_per_block is not None and num_frame_per_block <= 0:
+            raise ValueError("num_frame_per_block must be positive")
         self.stream_r1_local_attn_size = int(local_attn_size)
         self.stream_r1_sink_size = int(sink_size)
+        self.stream_r1_num_frame_per_block = (
+            int(num_frame_per_block) if num_frame_per_block is not None else None
+        )
         self.stream_r1_kv_cache_requested = bool(kv_cache)
 
     def forward(
@@ -754,11 +769,18 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         motion_frames: list[int] | tuple[int, int] = (73, 19),
         add_last_motion: int = 2,
         drop_motion_frames: bool = False,
+        stream_r1_mode: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         timestep = timestep if timestep is not None else t
         if timestep is None:
             raise ValueError("WanS2VTransformer3DModel.forward requires timestep/t")
+        if stream_r1_mode and self.stream_r1_kv_cache_requested and kv_cache is None:
+            raise NotImplementedError(
+                "Stream-R1 S2V KV cache was configured, but no KV cache was "
+                "provided to the transformer. S2V attention-kernel cache "
+                "mutation is not implemented in this phase."
+            )
         if kv_cache is not None or crossattn_cache is not None:
             raise NotImplementedError(
                 "Stream-R1 S2V KV attention metadata is accepted by the pipeline, "
@@ -934,6 +956,25 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             and self.sp_size > 1
         )
         self.use_context_parallel = sequence_shard_enabled
+        stream_r1_attn_mask = None
+        if stream_r1_mode and self.stream_r1_local_attn_size is not None:
+            if sequence_shard_enabled:
+                raise NotImplementedError(
+                    "Stream-R1 S2V local/sink self-attention masks are "
+                    "incompatible with sequence/context parallelism in this phase."
+                )
+            layout = WanS2VStreamR1AttentionLayout(
+                noisy_seq_len=int(self.original_seq_len),
+                total_seq_len=int(x.shape[1]),
+                frame_seq_length=frame_seq_length,
+                num_frame_per_block=(
+                    self.stream_r1_num_frame_per_block or latent_frames
+                ),
+                local_attn_size=self.stream_r1_local_attn_size,
+                sink_size=self.stream_r1_sink_size or 0,
+                current_start=int(current_start),
+            )
+            stream_r1_attn_mask = layout.build_no_kv_attention_mask(x.device)
         if sequence_shard_enabled:
             sp_rank = get_sp_group().rank_in_group
             chunks = torch.chunk(x, get_sp_world_size(), dim=1)
@@ -944,7 +985,13 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             pre_compute_freqs = torch.chunk(pre_compute_freqs, get_sp_world_size(), dim=1)[sp_rank]
 
         for idx, block in enumerate(self.blocks):
-            x = block(x, context, timestep_proj, pre_compute_freqs)
+            x = block(
+                x,
+                context,
+                timestep_proj,
+                pre_compute_freqs,
+                attn_mask=stream_r1_attn_mask,
+            )
             x = self._after_transformer_block(idx, x)
 
         if sequence_shard_enabled:

@@ -791,11 +791,17 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             setter(
                 request.local_attn_size,
                 request.sink_size,
+                num_frame_per_block=request.num_frame_per_block,
                 kv_cache=request.stream_r1_kv_cache,
             )
             return
         setattr(self.transformer, "stream_r1_local_attn_size", request.local_attn_size)
         setattr(self.transformer, "stream_r1_sink_size", request.sink_size)
+        setattr(
+            self.transformer,
+            "stream_r1_num_frame_per_block",
+            request.num_frame_per_block,
+        )
         setattr(
             self.transformer,
             "stream_r1_kv_cache_requested",
@@ -1021,6 +1027,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                             crossattn_cache=None,
                             current_start=block_start * frame_seq_length,
                             cache_start=None,
+                            stream_r1_mode=True,
                         )
                     noise_pred_btchw = noise_pred_bcthw.permute(0, 2, 1, 3, 4)
                     pred_video_btchw = pred_noise_to_pred_video(

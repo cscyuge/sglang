@@ -6,6 +6,9 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import WanS2VPipelineConfig
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
+from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
+    WanS2VStreamR1AttentionLayout,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_s2v import (
     WanS2VConditionBundle,
     WanS2VStreamR1AttentionRequest,
@@ -109,6 +112,61 @@ class TestWanS2VConditionBundle(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "frames"):
             bundle.slice(start=0, frames=0)
+
+
+class TestWanS2VStreamR1AttentionLayout(unittest.TestCase):
+    def test_no_kv_mask_limits_noisy_tokens_to_sink_local_and_condition(self):
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=8,
+            total_seq_len=10,
+            frame_seq_length=2,
+            num_frame_per_block=2,
+            local_attn_size=2,
+            sink_size=1,
+        )
+
+        mask = layout.build_no_kv_attention_mask(torch.device("cpu"))[0]
+
+        self.assertEqual(mask.shape, (10, 10))
+        self.assertEqual(
+            torch.nonzero(mask[0], as_tuple=False).flatten().tolist(),
+            [0, 1, 2, 3, 8, 9],
+        )
+        self.assertEqual(
+            torch.nonzero(mask[4], as_tuple=False).flatten().tolist(),
+            [0, 1, 4, 5, 6, 7, 8, 9],
+        )
+        self.assertTrue(mask[8].all())
+
+    def test_no_kv_mask_uses_global_current_start_for_later_chunks(self):
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=4,
+            total_seq_len=6,
+            frame_seq_length=2,
+            num_frame_per_block=2,
+            local_attn_size=2,
+            sink_size=1,
+            current_start=4,
+        )
+
+        mask = layout.build_no_kv_attention_mask(torch.device("cpu"))[0]
+
+        self.assertEqual(
+            torch.nonzero(mask[0], as_tuple=False).flatten().tolist(),
+            [0, 1, 2, 3, 4, 5],
+        )
+
+    def test_layout_rejects_unaligned_current_start(self):
+        with self.assertRaisesRegex(ValueError, "frame-aligned"):
+            WanS2VStreamR1AttentionLayout(
+                noisy_seq_len=4,
+                total_seq_len=4,
+                frame_seq_length=2,
+                num_frame_per_block=2,
+                local_attn_size=2,
+                sink_size=0,
+                current_start=1,
+            )
 
 
 class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
@@ -222,6 +280,27 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(state.metadata.local_num_attention_heads, 3)
         with self.assertRaisesRegex(NotImplementedError, "not implemented yet"):
             stage._guard_cache_runtime(state)
+
+    def test_configure_transformer_attention_passes_block_adapter_fields(self):
+        stage = self._stage()
+        calls = []
+        stage.transformer.set_stream_r1_attention = (
+            lambda *args, **kwargs: calls.append((args, kwargs))
+        )
+        request = WanS2VStreamR1AttentionRequest(
+            stream_r1_kv_cache=False,
+            num_frame_per_block=4,
+            local_attn_size=6,
+            sink_size=1,
+            context_noise=0,
+        )
+
+        stage._configure_transformer_attention(request)
+
+        self.assertEqual(
+            calls,
+            [((6, 1), {"num_frame_per_block": 4, "kv_cache": False})],
+        )
 
     def test_kv_cache_rejects_context_parallel(self):
         stage = self._stage()
