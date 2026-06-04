@@ -2,7 +2,7 @@
 """Wan2.2-S2V specific pipeline stages."""
 
 from dataclasses import dataclass, field
-from typing import Any, TypedDict
+from typing import Any
 
 import numpy as np
 import torch
@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
+    WanS2VKVCacheBlock,
+)
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.audio_encoding import (
@@ -24,13 +27,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
-
-
-class WanS2VKVCacheBlock(TypedDict):
-    k: torch.Tensor
-    v: torch.Tensor
-    global_end_index: torch.Tensor
-    local_end_index: torch.Tensor
 
 
 @dataclass(frozen=True)

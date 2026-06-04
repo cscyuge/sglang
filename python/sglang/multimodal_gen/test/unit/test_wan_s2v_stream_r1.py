@@ -8,6 +8,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import WanS2VPipelin
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VStreamR1AttentionLayout,
+    WanS2VStreamR1NoisyKVCacheUpdate,
+    update_wan_s2v_stream_r1_noisy_kv_cache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_s2v import (
     WanS2VConditionBundle,
@@ -166,6 +168,196 @@ class TestWanS2VStreamR1AttentionLayout(unittest.TestCase):
                 local_attn_size=2,
                 sink_size=0,
                 current_start=1,
+            )
+
+    def test_layout_derives_noisy_kv_update_capacity(self):
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=4,
+            total_seq_len=6,
+            frame_seq_length=2,
+            num_frame_per_block=2,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=4,
+        )
+
+        update = layout.to_noisy_kv_cache_update(cache_start=0)
+
+        self.assertEqual(layout.noisy_cache_tokens, 6)
+        self.assertEqual(update.required_cache_tokens, 6)
+        self.assertEqual(update.rolling_tokens, 4)
+        self.assertEqual(update.current_start, 4)
+        self.assertEqual(update.current_end, 8)
+
+
+class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
+    def _cache(self, tokens: int):
+        return {
+            "k": torch.zeros(1, tokens, 1, 1),
+            "v": torch.zeros(1, tokens, 1, 1),
+            "global_end_index": torch.zeros(1, dtype=torch.long),
+            "local_end_index": torch.zeros(1, dtype=torch.long),
+        }
+
+    def _kv(self, start: int, length: int):
+        key = torch.arange(start, start + length, dtype=torch.float32).view(
+            1, length, 1, 1
+        )
+        value = key + 100
+        return key, value
+
+    def test_update_appends_then_replaces_same_noisy_block(self):
+        cache = self._cache(tokens=6)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=2,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=0,
+        )
+        key, value = self._kv(0, 4)
+
+        view = update_wan_s2v_stream_r1_noisy_kv_cache(
+            cache, key, value, update
+        )
+
+        self.assertEqual(view.global_end_index, 4)
+        self.assertEqual(view.local_end_index, 4)
+        torch.testing.assert_close(
+            cache["k"][:, :4, 0, 0], torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+        )
+        torch.testing.assert_close(
+            cache["v"][:, :4, 0, 0], torch.tensor([[100.0, 101.0, 102.0, 103.0]])
+        )
+
+        replacement_key = -key - 1
+        replacement_value = replacement_key - 100
+        view = update_wan_s2v_stream_r1_noisy_kv_cache(
+            cache, replacement_key, replacement_value, update
+        )
+
+        self.assertEqual(view.global_end_index, 4)
+        self.assertEqual(view.local_end_index, 4)
+        torch.testing.assert_close(
+            view.key[:, :, 0, 0], torch.tensor([[-1.0, -2.0, -3.0, -4.0]])
+        )
+        torch.testing.assert_close(
+            view.value[:, :, 0, 0],
+            torch.tensor([[-101.0, -102.0, -103.0, -104.0]]),
+        )
+
+    def test_update_preserves_sink_and_rolls_local_window(self):
+        cache = self._cache(tokens=4)
+
+        for current_start in (0, 3, 6):
+            key, value = self._kv(current_start, 3)
+            update = WanS2VStreamR1NoisyKVCacheUpdate(
+                noisy_seq_len=3,
+                frame_seq_length=1,
+                local_attn_size=4,
+                sink_size=2,
+                current_start=current_start,
+            )
+            view = update_wan_s2v_stream_r1_noisy_kv_cache(
+                cache, key, value, update
+            )
+
+        self.assertEqual(view.global_end_index, 9)
+        self.assertEqual(view.local_end_index, 4)
+        self.assertEqual(view.local_start, 7)
+        torch.testing.assert_close(
+            view.key[:, :, 0, 0],
+            torch.tensor([[0.0, 1.0, 7.0, 8.0]]),
+        )
+        torch.testing.assert_close(
+            view.value[:, :, 0, 0],
+            torch.tensor([[100.0, 101.0, 107.0, 108.0]]),
+        )
+
+    def test_update_supports_cache_start_offset(self):
+        cache = self._cache(tokens=4)
+        key, value = self._kv(4, 4)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=2,
+            local_attn_size=2,
+            sink_size=1,
+            current_start=4,
+            cache_start=4,
+        )
+
+        view = update_wan_s2v_stream_r1_noisy_kv_cache(
+            cache, key, value, update
+        )
+
+        self.assertEqual(view.global_end_index, 8)
+        self.assertEqual(view.local_end_index, 4)
+        torch.testing.assert_close(
+            view.key[:, :, 0, 0], torch.tensor([[4.0, 5.0, 6.0, 7.0]])
+        )
+
+        key, value = self._kv(8, 4)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=2,
+            local_attn_size=2,
+            sink_size=1,
+            current_start=8,
+            cache_start=4,
+        )
+        view = update_wan_s2v_stream_r1_noisy_kv_cache(
+            cache, key, value, update
+        )
+
+        self.assertEqual(view.global_end_index, 12)
+        self.assertEqual(view.local_end_index, 4)
+        self.assertEqual(view.local_start, 10)
+        torch.testing.assert_close(
+            view.key[:, :, 0, 0],
+            torch.tensor([[4.0, 5.0, 10.0, 11.0]]),
+        )
+
+    def test_update_rejects_gaps_backwards_and_small_cache(self):
+        cache = self._cache(tokens=3)
+        key, value = self._kv(0, 2)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=2,
+            frame_seq_length=1,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=0,
+        )
+        update_wan_s2v_stream_r1_noisy_kv_cache(cache, key, value, update)
+
+        gap_key, gap_value = self._kv(4, 2)
+        gap_update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=2,
+            frame_seq_length=1,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=4,
+        )
+        with self.assertRaisesRegex(ValueError, "skip"):
+            update_wan_s2v_stream_r1_noisy_kv_cache(
+                cache, gap_key, gap_value, gap_update
+            )
+
+        backward_update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=1,
+            frame_seq_length=1,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=0,
+        )
+        with self.assertRaisesRegex(ValueError, "backwards"):
+            update_wan_s2v_stream_r1_noisy_kv_cache(
+                cache, key[:, :1], value[:, :1], backward_update
+            )
+
+        small_cache = self._cache(tokens=2)
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            update_wan_s2v_stream_r1_noisy_kv_cache(
+                small_cache, key, value, update
             )
 
 
