@@ -8,7 +8,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import WanS2VPipelin
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VStreamR1AttentionLayout,
+    WanS2VStreamR1NoisyKVCacheView,
     WanS2VStreamR1NoisyKVCacheUpdate,
+    compose_wan_s2v_stream_r1_mixed_kv_view,
+    split_wan_s2v_stream_r1_projected_kv,
     update_wan_s2v_stream_r1_noisy_kv_cache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_s2v import (
@@ -188,6 +191,115 @@ class TestWanS2VStreamR1AttentionLayout(unittest.TestCase):
         self.assertEqual(update.rolling_tokens, 4)
         self.assertEqual(update.current_start, 4)
         self.assertEqual(update.current_end, 8)
+
+
+class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
+    def _kv(self, seq_len: int, heads: int = 2):
+        key = torch.arange(seq_len * heads, dtype=torch.float32).view(
+            1, seq_len, heads, 1
+        )
+        value = key + 100
+        return key, value
+
+    def test_split_projected_kv_separates_noisy_and_condition_ranges(self):
+        key, value = self._kv(seq_len=5)
+
+        split = split_wan_s2v_stream_r1_projected_kv(
+            key, value, noisy_seq_len=3
+        )
+
+        self.assertEqual(split.noisy_seq_len, 3)
+        self.assertEqual(split.condition_seq_len, 2)
+        self.assertEqual(split.total_seq_len, 5)
+        torch.testing.assert_close(split.noisy_key, key[:, :3])
+        torch.testing.assert_close(split.noisy_value, value[:, :3])
+        torch.testing.assert_close(split.condition_key, key[:, 3:])
+        torch.testing.assert_close(split.condition_value, value[:, 3:])
+
+    def test_split_projected_kv_validates_shapes_and_noisy_range(self):
+        key, value = self._kv(seq_len=5)
+
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            split_wan_s2v_stream_r1_projected_kv(
+                key, value[:, :4], noisy_seq_len=3
+            )
+
+        with self.assertRaisesRegex(ValueError, "positive"):
+            split_wan_s2v_stream_r1_projected_kv(
+                key, value, noisy_seq_len=0
+            )
+
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            split_wan_s2v_stream_r1_projected_kv(
+                key, value, noisy_seq_len=6
+            )
+
+    def test_compose_mixed_kv_appends_current_condition_after_cached_noisy(self):
+        key, value = self._kv(seq_len=5)
+        split = split_wan_s2v_stream_r1_projected_kv(
+            key, value, noisy_seq_len=3
+        )
+        cached_key = torch.full((1, 4, 2, 1), -1.0)
+        cached_value = torch.full((1, 4, 2, 1), -2.0)
+        noisy_view = WanS2VStreamR1NoisyKVCacheView(
+            key=cached_key,
+            value=cached_value,
+            global_end_index=7,
+            local_end_index=4,
+            local_start=3,
+            local_end=7,
+        )
+
+        mixed = compose_wan_s2v_stream_r1_mixed_kv_view(noisy_view, split)
+
+        self.assertEqual(mixed.key.shape, (1, 6, 2, 1))
+        self.assertEqual(mixed.value.shape, (1, 6, 2, 1))
+        self.assertEqual(mixed.cached_noisy_seq_len, 4)
+        self.assertEqual(mixed.condition_seq_len, 2)
+        self.assertEqual(mixed.condition_start_index, 4)
+        self.assertEqual(mixed.total_seq_len, 6)
+        self.assertEqual(mixed.global_end_index, 7)
+        torch.testing.assert_close(mixed.key[:, :4], cached_key)
+        torch.testing.assert_close(mixed.value[:, :4], cached_value)
+        torch.testing.assert_close(mixed.key[:, 4:], split.condition_key)
+        torch.testing.assert_close(mixed.value[:, 4:], split.condition_value)
+
+    def test_compose_mixed_kv_accepts_no_condition_tokens(self):
+        key, value = self._kv(seq_len=3)
+        split = split_wan_s2v_stream_r1_projected_kv(
+            key, value, noisy_seq_len=3
+        )
+        noisy_view = WanS2VStreamR1NoisyKVCacheView(
+            key=key,
+            value=value,
+            global_end_index=3,
+            local_end_index=3,
+            local_start=0,
+            local_end=3,
+        )
+
+        mixed = compose_wan_s2v_stream_r1_mixed_kv_view(noisy_view, split)
+
+        self.assertIs(mixed.key, noisy_view.key)
+        self.assertIs(mixed.value, noisy_view.value)
+        self.assertEqual(mixed.condition_seq_len, 0)
+
+    def test_compose_mixed_kv_validates_cached_and_current_dimensions(self):
+        key, value = self._kv(seq_len=4)
+        split = split_wan_s2v_stream_r1_projected_kv(
+            key, value, noisy_seq_len=2
+        )
+        noisy_view = WanS2VStreamR1NoisyKVCacheView(
+            key=torch.zeros(1, 2, 1, 1),
+            value=torch.zeros(1, 2, 1, 1),
+            global_end_index=2,
+            local_end_index=2,
+            local_start=0,
+            local_end=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "batch/head"):
+            compose_wan_s2v_stream_r1_mixed_kv_view(noisy_view, split)
 
 
 class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):

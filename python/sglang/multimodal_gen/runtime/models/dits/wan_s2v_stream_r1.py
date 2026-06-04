@@ -183,6 +183,43 @@ class WanS2VStreamR1NoisyKVCacheView:
 
 
 @dataclass(frozen=True)
+class WanS2VStreamR1ProjectedKVSplit:
+    noisy_key: torch.Tensor
+    noisy_value: torch.Tensor
+    condition_key: torch.Tensor
+    condition_value: torch.Tensor
+    noisy_seq_len: int
+
+    @property
+    def condition_seq_len(self) -> int:
+        return self.condition_key.shape[1]
+
+    @property
+    def total_seq_len(self) -> int:
+        return self.noisy_seq_len + self.condition_seq_len
+
+
+@dataclass(frozen=True)
+class WanS2VStreamR1MixedKVView:
+    key: torch.Tensor
+    value: torch.Tensor
+    cached_noisy_seq_len: int
+    condition_seq_len: int
+    global_end_index: int
+    local_end_index: int
+    local_start: int
+    local_end: int
+
+    @property
+    def condition_start_index(self) -> int:
+        return self.cached_noisy_seq_len
+
+    @property
+    def total_seq_len(self) -> int:
+        return self.cached_noisy_seq_len + self.condition_seq_len
+
+
+@dataclass(frozen=True)
 class _KVSegment:
     start: int
     end: int
@@ -273,16 +310,77 @@ def update_wan_s2v_stream_r1_noisy_kv_cache(
     )
 
 
+def split_wan_s2v_stream_r1_projected_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    noisy_seq_len: int,
+) -> WanS2VStreamR1ProjectedKVSplit:
+    """Split projected mixed S2V self-attention K/V into noisy and condition spans."""
+
+    _validate_key_value_pair(key, value, name="projected key/value")
+    if noisy_seq_len <= 0:
+        raise ValueError("noisy_seq_len must be positive")
+    if noisy_seq_len > key.shape[1]:
+        raise ValueError(
+            "noisy_seq_len must not exceed projected sequence length: "
+            f"noisy_seq_len={noisy_seq_len}, seq_len={key.shape[1]}"
+        )
+    return WanS2VStreamR1ProjectedKVSplit(
+        noisy_key=key[:, :noisy_seq_len],
+        noisy_value=value[:, :noisy_seq_len],
+        condition_key=key[:, noisy_seq_len:],
+        condition_value=value[:, noisy_seq_len:],
+        noisy_seq_len=noisy_seq_len,
+    )
+
+
+def compose_wan_s2v_stream_r1_mixed_kv_view(
+    noisy_view: WanS2VStreamR1NoisyKVCacheView,
+    current_kv: WanS2VStreamR1ProjectedKVSplit,
+) -> WanS2VStreamR1MixedKVView:
+    """Compose cached noisy K/V with current condition K/V for S2V attention."""
+
+    _validate_key_value_pair(noisy_view.key, noisy_view.value, name="cached noisy K/V")
+    _validate_key_value_pair(
+        current_kv.noisy_key,
+        current_kv.noisy_value,
+        name="current noisy K/V",
+    )
+    _validate_key_value_pair(
+        current_kv.condition_key,
+        current_kv.condition_value,
+        name="current condition K/V",
+    )
+    _validate_compatible_kv_prefix(noisy_view.key, current_kv.noisy_key)
+    _validate_compatible_kv_prefix(noisy_view.key, current_kv.condition_key)
+
+    if current_kv.condition_seq_len > 0:
+        key = torch.cat([noisy_view.key, current_kv.condition_key], dim=1)
+        value = torch.cat([noisy_view.value, current_kv.condition_value], dim=1)
+    else:
+        key = noisy_view.key
+        value = noisy_view.value
+
+    return WanS2VStreamR1MixedKVView(
+        key=key,
+        value=value,
+        cached_noisy_seq_len=noisy_view.key.shape[1],
+        condition_seq_len=current_kv.condition_seq_len,
+        global_end_index=noisy_view.global_end_index,
+        local_end_index=noisy_view.local_end_index,
+        local_start=noisy_view.local_start,
+        local_end=noisy_view.local_end,
+    )
+
+
 def _validate_noisy_kv_update_inputs(
     kv_cache: WanS2VKVCacheBlock,
     key: torch.Tensor,
     value: torch.Tensor,
     update: WanS2VStreamR1NoisyKVCacheUpdate,
 ) -> None:
-    if key.shape != value.shape:
-        raise ValueError("key and value must have the same shape")
-    if key.dim() != 4:
-        raise ValueError("key/value must have shape [B, S, H, D]")
+    _validate_key_value_pair(key, value, name="key/value")
     if key.shape[1] != update.noisy_seq_len:
         raise ValueError(
             "key/value sequence length must match update.noisy_seq_len"
@@ -304,6 +402,36 @@ def _validate_noisy_kv_update_inputs(
             "KV cache capacity is smaller than the Stream-R1 local window: "
             f"capacity={cache_k.shape[1]}, required={update.required_cache_tokens}"
         )
+
+
+def _validate_key_value_pair(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    name: str,
+) -> None:
+    if key.shape != value.shape:
+        raise ValueError(f"{name} tensors must have the same shape")
+    if key.dim() != 4:
+        raise ValueError(f"{name} tensors must have shape [B, S, H, D]")
+    if key.device != value.device:
+        raise ValueError(f"{name} tensors must be on the same device")
+    if key.dtype != value.dtype:
+        raise ValueError(f"{name} tensors must use the same dtype")
+
+
+def _validate_compatible_kv_prefix(
+    expected: torch.Tensor,
+    actual: torch.Tensor,
+) -> None:
+    if expected.shape[0] != actual.shape[0] or expected.shape[2:] != actual.shape[2:]:
+        raise ValueError(
+            "cached noisy K/V and current K/V batch/head dimensions must match"
+        )
+    if expected.device != actual.device:
+        raise ValueError("cached noisy K/V and current K/V must be on the same device")
+    if expected.dtype != actual.dtype:
+        raise ValueError("cached noisy K/V and current K/V must use the same dtype")
 
 
 def _collect_old_kv_segments(

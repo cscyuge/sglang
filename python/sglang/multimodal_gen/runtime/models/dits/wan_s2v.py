@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanTransformerBlock,
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
+    WanS2VKVCacheBlock,
     WanS2VStreamR1AttentionLayout,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -418,7 +419,16 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         temb: list[torch.Tensor | int],
         freqs_cis: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        stream_r1_kv_cache: WanS2VKVCacheBlock | None = None,
+        stream_r1_attention_layout: WanS2VStreamR1AttentionLayout | None = None,
+        cache_start: int | None = None,
     ) -> torch.Tensor:
+        if stream_r1_kv_cache is not None or stream_r1_attention_layout is not None:
+            raise NotImplementedError(
+                "Stream-R1 S2V self-attention KV cache adapter is plumbed, "
+                "but runtime cache mutation is still guarded in this phase."
+            )
+        del cache_start
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         orig_dtype = hidden_states.dtype
@@ -957,13 +967,14 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         )
         self.use_context_parallel = sequence_shard_enabled
         stream_r1_attn_mask = None
+        stream_r1_attention_layout = None
         if stream_r1_mode and self.stream_r1_local_attn_size is not None:
             if sequence_shard_enabled:
                 raise NotImplementedError(
                     "Stream-R1 S2V local/sink self-attention masks are "
                     "incompatible with sequence/context parallelism in this phase."
                 )
-            layout = WanS2VStreamR1AttentionLayout(
+            stream_r1_attention_layout = WanS2VStreamR1AttentionLayout(
                 noisy_seq_len=int(self.original_seq_len),
                 total_seq_len=int(x.shape[1]),
                 frame_seq_length=frame_seq_length,
@@ -974,7 +985,9 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                 sink_size=self.stream_r1_sink_size or 0,
                 current_start=int(current_start),
             )
-            stream_r1_attn_mask = layout.build_no_kv_attention_mask(x.device)
+            stream_r1_attn_mask = stream_r1_attention_layout.build_no_kv_attention_mask(
+                x.device
+            )
         if sequence_shard_enabled:
             sp_rank = get_sp_group().rank_in_group
             chunks = torch.chunk(x, get_sp_world_size(), dim=1)
@@ -991,6 +1004,15 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                 timestep_proj,
                 pre_compute_freqs,
                 attn_mask=stream_r1_attn_mask,
+                stream_r1_kv_cache=(
+                    kv_cache[idx] if stream_r1_mode and kv_cache is not None else None
+                ),
+                stream_r1_attention_layout=(
+                    stream_r1_attention_layout
+                    if stream_r1_mode and kv_cache is not None
+                    else None
+                ),
+                cache_start=cache_start,
             )
             x = self._after_transformer_block(idx, x)
 
