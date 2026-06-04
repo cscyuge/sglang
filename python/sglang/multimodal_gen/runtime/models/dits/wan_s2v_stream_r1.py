@@ -374,6 +374,103 @@ def compose_wan_s2v_stream_r1_mixed_kv_view(
     )
 
 
+def build_wan_s2v_stream_r1_cached_noisy_kv_index(
+    noisy_view: WanS2VStreamR1NoisyKVCacheView,
+    update: WanS2VStreamR1NoisyKVCacheUpdate,
+    *,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Return absolute noisy-token positions for a cached noisy-KV view.
+
+    The view order mirrors the fixed-budget cache layout: an optional sink
+    prefix followed by the rolling local suffix. The returned index is intended
+    for attention-mask construction only; it is not wired into runtime KV
+    mutation in this phase.
+    """
+
+    _validate_noisy_view_for_update(noisy_view, update)
+
+    device = device or noisy_view.key.device
+    local_len = _noisy_view_local_len(noisy_view)
+    sink_len = noisy_view.local_end_index - local_len
+    parts = []
+    if sink_len > 0:
+        parts.append(
+            torch.arange(
+                update.cache_start,
+                update.cache_start + sink_len,
+                dtype=torch.long,
+                device=device,
+            )
+        )
+    if local_len > 0:
+        parts.append(
+            torch.arange(
+                noisy_view.local_start,
+                noisy_view.local_end,
+                dtype=torch.long,
+                device=device,
+            )
+        )
+    if not parts:
+        return torch.empty((0,), dtype=torch.long, device=device)
+    return torch.cat(parts)
+
+
+def build_wan_s2v_stream_r1_mixed_kv_attention_mask(
+    noisy_view: WanS2VStreamR1NoisyKVCacheView,
+    mixed_view: WanS2VStreamR1MixedKVView,
+    update: WanS2VStreamR1NoisyKVCacheUpdate,
+    *,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Build cached mixed-KV attention mask for Stream-R1 S2V.
+
+    Query order is ``[current noisy tokens + current condition tokens]``.
+    KV order is ``[cached noisy tokens + current condition tokens]``. Noisy
+    queries may attend to cached sink noisy tokens, cached local noisy tokens
+    for their block, and all current condition tokens. Condition queries keep
+    dense attention over the composed cached-mixed KV view.
+    """
+
+    _validate_mixed_view_for_noisy_view(noisy_view, mixed_view)
+    cached_noisy_index = build_wan_s2v_stream_r1_cached_noisy_kv_index(
+        noisy_view,
+        update,
+        device=device or mixed_view.key.device,
+    )
+    device = cached_noisy_index.device
+
+    query_seq_len = update.noisy_seq_len + mixed_view.condition_seq_len
+    q_idx = torch.arange(query_seq_len, device=device).view(-1, 1)
+    noisy_q = q_idx < update.noisy_seq_len
+    q_abs = update.current_start + q_idx
+    block_end = (
+        torch.div(q_abs, update.noisy_seq_len, rounding_mode="floor") + 1
+    ) * update.noisy_seq_len
+    local_start = block_end - update.local_tokens
+
+    cached_noisy_abs = cached_noisy_index.view(1, -1)
+    sink_visible = cached_noisy_abs < update.sink_end
+    local_visible = (cached_noisy_abs >= local_start) & (cached_noisy_abs < block_end)
+    noisy_kv_visible = sink_visible | local_visible
+    condition_kv_visible = torch.ones(
+        (query_seq_len, mixed_view.condition_seq_len),
+        dtype=torch.bool,
+        device=device,
+    )
+    noisy_query_visible = torch.cat(
+        [noisy_kv_visible.expand(query_seq_len, -1), condition_kv_visible],
+        dim=1,
+    )
+
+    return torch.where(
+        noisy_q,
+        noisy_query_visible,
+        torch.ones_like(noisy_query_visible),
+    ).unsqueeze(0)
+
+
 def _validate_noisy_kv_update_inputs(
     kv_cache: WanS2VKVCacheBlock,
     key: torch.Tensor,
@@ -432,6 +529,67 @@ def _validate_compatible_kv_prefix(
         raise ValueError("cached noisy K/V and current K/V must be on the same device")
     if expected.dtype != actual.dtype:
         raise ValueError("cached noisy K/V and current K/V must use the same dtype")
+
+
+def _validate_noisy_view_for_update(
+    noisy_view: WanS2VStreamR1NoisyKVCacheView,
+    update: WanS2VStreamR1NoisyKVCacheUpdate,
+) -> None:
+    _validate_key_value_pair(noisy_view.key, noisy_view.value, name="cached noisy K/V")
+    if noisy_view.local_end_index != noisy_view.key.shape[1]:
+        raise ValueError("cached noisy K/V view length must match local_end_index")
+    if noisy_view.local_end_index < 0:
+        raise ValueError("cached noisy K/V local_end_index must be non-negative")
+    if noisy_view.global_end_index != update.current_end:
+        raise ValueError(
+            "cached noisy K/V global_end_index must match update.current_end"
+        )
+    if noisy_view.local_end != noisy_view.global_end_index:
+        raise ValueError("cached noisy K/V local_end must match global_end_index")
+
+    local_len = _noisy_view_local_len(noisy_view)
+    if local_len > update.rolling_tokens:
+        raise ValueError("cached noisy K/V local suffix exceeds rolling budget")
+    if local_len > noisy_view.local_end_index:
+        raise ValueError("cached noisy K/V local suffix exceeds view length")
+    sink_len = noisy_view.local_end_index - local_len
+    if sink_len > update.sink_tokens:
+        raise ValueError("cached noisy K/V sink prefix exceeds sink budget")
+    if sink_len > max(0, update.current_end - update.cache_start):
+        raise ValueError("cached noisy K/V sink prefix exceeds available history")
+    if local_len > 0 and noisy_view.local_start < update.sink_end:
+        raise ValueError("cached noisy K/V local suffix overlaps sink prefix")
+
+
+def _validate_mixed_view_for_noisy_view(
+    noisy_view: WanS2VStreamR1NoisyKVCacheView,
+    mixed_view: WanS2VStreamR1MixedKVView,
+) -> None:
+    _validate_key_value_pair(mixed_view.key, mixed_view.value, name="mixed K/V")
+    if mixed_view.cached_noisy_seq_len != noisy_view.key.shape[1]:
+        raise ValueError(
+            "mixed K/V cached_noisy_seq_len must match the noisy view length"
+        )
+    if mixed_view.condition_seq_len < 0:
+        raise ValueError("mixed K/V condition_seq_len must be non-negative")
+    if mixed_view.total_seq_len != mixed_view.key.shape[1]:
+        raise ValueError("mixed K/V metadata must match key/value sequence length")
+    if mixed_view.global_end_index != noisy_view.global_end_index:
+        raise ValueError("mixed K/V global_end_index must match the noisy view")
+    if mixed_view.local_end_index != noisy_view.local_end_index:
+        raise ValueError("mixed K/V local_end_index must match the noisy view")
+    if mixed_view.local_start != noisy_view.local_start:
+        raise ValueError("mixed K/V local_start must match the noisy view")
+    if mixed_view.local_end != noisy_view.local_end:
+        raise ValueError("mixed K/V local_end must match the noisy view")
+    _validate_compatible_kv_prefix(
+        mixed_view.key[:, : mixed_view.cached_noisy_seq_len],
+        noisy_view.key,
+    )
+
+
+def _noisy_view_local_len(noisy_view: WanS2VStreamR1NoisyKVCacheView) -> int:
+    return max(0, noisy_view.local_end - noisy_view.local_start)
 
 
 def _collect_old_kv_segments(
