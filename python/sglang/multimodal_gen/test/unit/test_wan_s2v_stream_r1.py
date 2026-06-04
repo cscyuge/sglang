@@ -858,6 +858,14 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             self.calls.append(kwargs)
             return kwargs["hidden_states"]
 
+    class _RecordingAudioEncoder:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, audio_input):
+            self.calls.append(audio_input.detach().clone())
+            return {"encoded_call": len(self.calls)}
+
     def _stage(self) -> WanS2VStreamR1DenoisingStage:
         stage = WanS2VStreamR1DenoisingStage.__new__(WanS2VStreamR1DenoisingStage)
         stage.transformer = SimpleNamespace(
@@ -917,6 +925,25 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             motion_frames=(73, 19),
             add_last_motion=2,
             drop_motion_frames=False,
+        )
+
+    def _audio_cache_bundle(
+        self,
+        *,
+        cache_audio_embeddings: bool = True,
+        audio_emb=None,
+    ) -> WanS2VConditionBundle:
+        return WanS2VConditionBundle(
+            prompt_embeds=torch.zeros(1, 3, 4),
+            ref_latents=torch.ones(1, 3, 1, 2, 2),
+            motion_latents=torch.full((1, 3, 2, 2, 2), 2.0),
+            cond_states=torch.full((1, 3, 4, 2, 2), 3.0),
+            audio_input=torch.arange(24, dtype=torch.float32).reshape(1, 2, 3, 4),
+            audio_emb=audio_emb,
+            motion_frames=(3, 1),
+            add_last_motion=2,
+            drop_motion_frames=False,
+            audio_metadata={"cache_audio_embeddings": cache_audio_embeddings},
         )
 
     def test_negative_prompt_embeds_presence_avoids_tensor_truthiness(self):
@@ -1106,6 +1133,52 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(call["current_start"], 15)
         self.assertIsNone(call["cache_start"])
         self.assertTrue(call["stream_r1_mode"])
+
+    def test_audio_embedding_cache_precomputes_encoder_once_with_motion_prefix(self):
+        stage = self._stage()
+        encoder = self._RecordingAudioEncoder()
+        stage.transformer = SimpleNamespace(casual_audio_encoder=encoder)
+        bundle = self._audio_cache_bundle()
+        audio_input = bundle.audio_input
+
+        stage._maybe_cache_audio_embeddings(bundle)
+        cached_emb = bundle.audio_emb
+        stage._maybe_cache_audio_embeddings(bundle)
+
+        self.assertEqual(len(encoder.calls), 1)
+        self.assertEqual(cached_emb, {"encoded_call": 1})
+        self.assertIs(bundle.audio_emb, cached_emb)
+        self.assertIs(bundle.slice(0, 1).audio_emb, cached_emb)
+        cached_audio = encoder.calls[0]
+        self.assertEqual(cached_audio.shape, (1, 2, 3, 7))
+        torch.testing.assert_close(
+            cached_audio[..., :3],
+            audio_input[..., 0:1].repeat(1, 1, 1, 3),
+        )
+        torch.testing.assert_close(cached_audio[..., 3:], audio_input)
+
+    def test_audio_embedding_cache_skips_when_disabled(self):
+        stage = self._stage()
+        encoder = self._RecordingAudioEncoder()
+        stage.transformer = SimpleNamespace(casual_audio_encoder=encoder)
+        bundle = self._audio_cache_bundle(cache_audio_embeddings=False)
+
+        stage._maybe_cache_audio_embeddings(bundle)
+
+        self.assertEqual(encoder.calls, [])
+        self.assertIsNone(bundle.audio_emb)
+
+    def test_audio_embedding_cache_skips_when_prefilled(self):
+        stage = self._stage()
+        encoder = self._RecordingAudioEncoder()
+        stage.transformer = SimpleNamespace(casual_audio_encoder=encoder)
+        prefilled_audio_emb = {"audio": "prefilled"}
+        bundle = self._audio_cache_bundle(audio_emb=prefilled_audio_emb)
+
+        stage._maybe_cache_audio_embeddings(bundle)
+
+        self.assertEqual(encoder.calls, [])
+        self.assertIs(bundle.audio_emb, prefilled_audio_emb)
 
     def test_configure_transformer_attention_passes_block_adapter_fields(self):
         stage = self._stage()

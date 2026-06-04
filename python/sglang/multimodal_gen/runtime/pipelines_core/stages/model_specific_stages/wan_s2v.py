@@ -916,6 +916,45 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         if not cache_state.allocated:
             raise RuntimeError("Stream-R1 S2V KV cache state was not allocated")
 
+    @staticmethod
+    def _prepend_motion_audio_frames(
+        audio_input: torch.Tensor,
+        motion_frames: list[int] | tuple[int, int],
+    ) -> torch.Tensor:
+        return torch.cat(
+            [
+                audio_input[..., 0:1].repeat(1, 1, 1, int(motion_frames[0])),
+                audio_input,
+            ],
+            dim=-1,
+        )
+
+    def _maybe_cache_audio_embeddings(
+        self,
+        bundle: WanS2VConditionBundle,
+        *,
+        dtype: torch.dtype | None = None,
+        autocast_enabled: bool = False,
+    ) -> None:
+        if not bool(bundle.audio_metadata.get("cache_audio_embeddings", False)):
+            return
+        if bundle.audio_emb is not None or bundle.audio_input is None:
+            return
+
+        audio_input = self._prepend_motion_audio_frames(
+            bundle.audio_input, bundle.motion_frames
+        )
+        if dtype is None:
+            bundle.audio_emb = self.transformer.casual_audio_encoder(audio_input)
+            return
+
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=dtype,
+            enabled=autocast_enabled,
+        ):
+            bundle.audio_emb = self.transformer.casual_audio_encoder(audio_input)
+
     def _clean_context_refresh(
         self,
         *,
@@ -1008,6 +1047,11 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
 
         self.load_model()
         try:
+            self._maybe_cache_audio_embeddings(
+                bundle,
+                dtype=dit_dtype,
+                autocast_enabled=autocast_enabled,
+            )
             for block_start in range(0, latent_frames, num_frame_per_block):
                 block_end = block_start + num_frame_per_block
                 block_bundle = bundle.slice(
