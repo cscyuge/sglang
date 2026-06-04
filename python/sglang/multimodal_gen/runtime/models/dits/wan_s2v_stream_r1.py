@@ -522,6 +522,35 @@ def run_wan_s2v_stream_r1_cached_self_attention(
     return attention(query, mixed_view.key, mixed_view.value, attn_mask=mixed_mask)
 
 
+def validate_wan_s2v_stream_r1_forward_cache(
+    *,
+    kv_cache: list[WanS2VKVCacheBlock] | None,
+    crossattn_cache: list | None,
+    stream_r1_mode: bool,
+    num_transformer_blocks: int,
+) -> None:
+    """Validate cache arguments accepted by Wan S2V transformer forward."""
+
+    if crossattn_cache is not None:
+        raise NotImplementedError("Wan S2V crossattn_cache is not supported")
+    if kv_cache is None:
+        return
+    if not stream_r1_mode:
+        raise ValueError(
+            "Wan S2V kv_cache is only supported when stream_r1_mode=True"
+        )
+    if not isinstance(kv_cache, list):
+        raise ValueError(
+            "Wan S2V kv_cache must be a list of per-block cache entries"
+        )
+    if len(kv_cache) != num_transformer_blocks:
+        raise ValueError(
+            "Wan S2V kv_cache length must match the number of transformer "
+            f"blocks: kv_cache length={len(kv_cache)}, "
+            f"blocks={num_transformer_blocks}"
+        )
+
+
 def _validate_noisy_kv_update_inputs(
     kv_cache: WanS2VKVCacheBlock,
     key: torch.Tensor,

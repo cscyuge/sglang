@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     run_wan_s2v_stream_r1_cached_self_attention,
     split_wan_s2v_stream_r1_projected_kv,
     update_wan_s2v_stream_r1_noisy_kv_cache,
+    validate_wan_s2v_stream_r1_forward_cache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_s2v import (
     WanS2VConditionBundle,
@@ -556,6 +557,60 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
                 kv_cache=self._cache(tokens=2),
                 layout=None,
                 cache_start=None,
+            )
+
+
+class TestWanS2VStreamR1ForwardCacheValidation(unittest.TestCase):
+    def test_forward_cache_accepts_matching_stream_r1_self_cache(self):
+        validate_wan_s2v_stream_r1_forward_cache(
+            kv_cache=[{}, {}],
+            crossattn_cache=None,
+            stream_r1_mode=True,
+            num_transformer_blocks=2,
+        )
+
+    def test_forward_cache_allows_legacy_no_cache_arguments(self):
+        validate_wan_s2v_stream_r1_forward_cache(
+            kv_cache=None,
+            crossattn_cache=None,
+            stream_r1_mode=False,
+            num_transformer_blocks=2,
+        )
+
+    def test_forward_cache_rejects_self_cache_outside_stream_r1_mode(self):
+        with self.assertRaisesRegex(ValueError, "stream_r1_mode=True"):
+            validate_wan_s2v_stream_r1_forward_cache(
+                kv_cache=[{}],
+                crossattn_cache=None,
+                stream_r1_mode=False,
+                num_transformer_blocks=1,
+            )
+
+    def test_forward_cache_rejects_non_list_self_cache(self):
+        with self.assertRaisesRegex(ValueError, "must be a list"):
+            validate_wan_s2v_stream_r1_forward_cache(
+                kv_cache=({},),
+                crossattn_cache=None,
+                stream_r1_mode=True,
+                num_transformer_blocks=1,
+            )
+
+    def test_forward_cache_rejects_self_cache_length_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "kv_cache length"):
+            validate_wan_s2v_stream_r1_forward_cache(
+                kv_cache=[{}],
+                crossattn_cache=None,
+                stream_r1_mode=True,
+                num_transformer_blocks=2,
+            )
+
+    def test_forward_cache_keeps_crossattn_cache_unsupported(self):
+        with self.assertRaisesRegex(NotImplementedError, "crossattn_cache"):
+            validate_wan_s2v_stream_r1_forward_cache(
+                kv_cache=[{}],
+                crossattn_cache=[{}],
+                stream_r1_mode=True,
+                num_transformer_blocks=1,
             )
 
 

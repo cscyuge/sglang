@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VKVCacheBlock,
     WanS2VStreamR1AttentionLayout,
     run_wan_s2v_stream_r1_cached_self_attention,
+    validate_wan_s2v_stream_r1_forward_cache,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -791,18 +792,19 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         timestep = timestep if timestep is not None else t
         if timestep is None:
             raise ValueError("WanS2VTransformer3DModel.forward requires timestep/t")
+        validate_wan_s2v_stream_r1_forward_cache(
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            stream_r1_mode=stream_r1_mode,
+            num_transformer_blocks=len(self.blocks),
+        )
         if stream_r1_mode and self.stream_r1_kv_cache_requested and kv_cache is None:
             raise NotImplementedError(
                 "Stream-R1 S2V KV cache was configured, but no KV cache was "
                 "provided to the transformer. S2V attention-kernel cache "
                 "mutation is not implemented in this phase."
             )
-        if kv_cache is not None or crossattn_cache is not None:
-            raise NotImplementedError(
-                "Stream-R1 S2V KV attention metadata is accepted by the pipeline, "
-                "but attention-kernel cache mutation is not implemented in this phase"
-            )
-        if cache_start is not None:
+        if cache_start is not None and kv_cache is None:
             logger.debug("Wan S2V cache_start is ignored while KV cache is disabled")
         if audio_input is None and audio_emb is None:
             raise ValueError("Wan S2V requires audio_input or audio_emb")
