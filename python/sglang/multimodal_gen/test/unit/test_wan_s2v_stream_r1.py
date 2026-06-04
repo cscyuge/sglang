@@ -1,11 +1,17 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import WanS2VPipelineConfig
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_s2v import (
     WanS2VConditionBundle,
+    WanS2VStreamR1AttentionRequest,
+    WanS2VStreamR1CacheMetadata,
+    WanS2VStreamR1CacheState,
+    WanS2VStreamR1DenoisingStage,
     _has_negative_prompt_embeds,
 )
 
@@ -25,6 +31,39 @@ class TestWanS2VSamplingParams(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "denoising_steps"):
             WanS2VSamplingParams(denoising_steps=[])
+
+    def test_stream_r1_kv_cache_is_forwarded_in_extra(self):
+        params = WanS2VSamplingParams(
+            stream_r1_kv_cache=True,
+            num_frame_per_block=7,
+            local_attn_size=9,
+            sink_size=3,
+        )
+
+        extra = params.build_request_extra()
+
+        self.assertTrue(extra["stream_r1_kv_cache"])
+        self.assertEqual(extra["local_attn_size"], 9)
+        self.assertEqual(extra["sink_size"], 3)
+
+    def test_stream_r1_attention_values_are_cross_validated(self):
+        with self.assertRaisesRegex(ValueError, "local_attn_size"):
+            WanS2VSamplingParams(
+                stream_r1_kv_cache=True,
+                num_frame_per_block=7,
+                local_attn_size=3,
+            )
+
+        with self.assertRaisesRegex(ValueError, "sink_size"):
+            WanS2VSamplingParams(local_attn_size=3, sink_size=3)
+
+    def test_pipeline_config_validates_kv_attention_shape(self):
+        with self.assertRaisesRegex(ValueError, "local_attn_size"):
+            WanS2VPipelineConfig(
+                stream_r1_kv_cache=True,
+                num_frame_per_block=7,
+                local_attn_size=3,
+            )
 
 
 class TestWanS2VConditionBundle(unittest.TestCase):
@@ -73,6 +112,27 @@ class TestWanS2VConditionBundle(unittest.TestCase):
 
 
 class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
+    def _stage(self) -> WanS2VStreamR1DenoisingStage:
+        stage = WanS2VStreamR1DenoisingStage.__new__(WanS2VStreamR1DenoisingStage)
+        stage.transformer = SimpleNamespace(
+            config=SimpleNamespace(arch_config=SimpleNamespace(num_layers=2)),
+            blocks=[
+                SimpleNamespace(local_num_heads=3, dim_head=8),
+                SimpleNamespace(local_num_heads=3, dim_head=8),
+            ],
+            hidden_size=48,
+            num_attention_heads=6,
+            use_context_parallel=False,
+            set_stream_r1_attention=lambda *args, **kwargs: None,
+        )
+        stage.scheduler = SimpleNamespace(
+            config=SimpleNamespace(num_train_timesteps=1000)
+        )
+        stage.cache_state = WanS2VStreamR1CacheState.disabled()
+        stage.log_info = lambda *args, **kwargs: None
+        stage._s2v_kv_attention_kernel_supported = False
+        return stage
+
     def test_negative_prompt_embeds_presence_avoids_tensor_truthiness(self):
         self.assertTrue(
             _has_negative_prompt_embeds(
@@ -90,6 +150,122 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertFalse(
             _has_negative_prompt_embeds(SimpleNamespace(negative_prompt_embeds=None))
         )
+
+    def test_attention_request_validates_block_local_sink_and_context(self):
+        request = WanS2VStreamR1AttentionRequest(
+            stream_r1_kv_cache=False,
+            num_frame_per_block=4,
+            local_attn_size=4,
+            sink_size=1,
+            context_noise=1001,
+        )
+
+        with self.assertRaisesRegex(ValueError, "context_noise"):
+            request.validate(latent_frames=8, train_timesteps=1000)
+
+        request = WanS2VStreamR1AttentionRequest(
+            stream_r1_kv_cache=False,
+            num_frame_per_block=4,
+            local_attn_size=3,
+            sink_size=1,
+            context_noise=0,
+        )
+        with self.assertRaisesRegex(ValueError, "local_attn_size"):
+            request.validate(latent_frames=8, train_timesteps=1000)
+
+    def test_kv_cache_state_allocates_and_resets_typed_blocks(self):
+        metadata = WanS2VStreamR1CacheMetadata(
+            batch_size=2,
+            num_layers=2,
+            frame_seq_length=5,
+            local_num_attention_heads=3,
+            attention_head_dim=8,
+            local_attn_size=4,
+            sink_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        state = WanS2VStreamR1CacheState.allocate(metadata)
+        state.kv_cache[0]["global_end_index"].fill_(7)
+        state.kv_cache[1]["local_end_index"].fill_(9)
+        state.reset()
+
+        self.assertTrue(state.enabled)
+        self.assertTrue(state.allocated)
+        self.assertEqual(state.kv_cache[0]["k"].shape, (2, 20, 3, 8))
+        self.assertEqual(state.kv_cache[0]["v"].shape, (2, 20, 3, 8))
+        self.assertEqual(state.kv_cache[0]["global_end_index"].item(), 0)
+        self.assertEqual(state.kv_cache[1]["local_end_index"].item(), 0)
+
+    def test_stage_prepares_metadata_but_guards_unimplemented_kv(self):
+        stage = self._stage()
+        request = WanS2VStreamR1AttentionRequest(
+            stream_r1_kv_cache=True,
+            num_frame_per_block=4,
+            local_attn_size=6,
+            sink_size=1,
+            context_noise=0,
+        )
+
+        state = stage._prepare_cache_state(
+            request=request,
+            batch_size=1,
+            frame_seq_length=10,
+            dtype=torch.float16,
+            device=torch.device("cpu"),
+        )
+
+        self.assertTrue(state.enabled)
+        self.assertFalse(state.allocated)
+        self.assertEqual(state.metadata.cache_tokens, 60)
+        self.assertEqual(state.metadata.local_num_attention_heads, 3)
+        with self.assertRaisesRegex(NotImplementedError, "not implemented yet"):
+            stage._guard_cache_runtime(state)
+
+    def test_kv_cache_rejects_context_parallel(self):
+        stage = self._stage()
+        stage.transformer.use_context_parallel = True
+        request = WanS2VStreamR1AttentionRequest(
+            stream_r1_kv_cache=True,
+            num_frame_per_block=4,
+            local_attn_size=6,
+            sink_size=1,
+            context_noise=0,
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "sequence/context"):
+            stage._validate_stream_r1_parallel_compatibility(
+                request,
+                SimpleNamespace(
+                    did_sp_shard_latents=False,
+                    enable_sequence_shard=False,
+                ),
+            )
+
+    def test_kv_cache_rejects_sequence_parallel_world_size(self):
+        stage = self._stage()
+        request = WanS2VStreamR1AttentionRequest(
+            stream_r1_kv_cache=True,
+            num_frame_per_block=4,
+            local_attn_size=6,
+            sink_size=1,
+            context_noise=0,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.wan_s2v._safe_sp_world_size",
+            return_value=2,
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "sequence/context"):
+                stage._validate_stream_r1_parallel_compatibility(
+                    request,
+                    SimpleNamespace(
+                        did_sp_shard_latents=False,
+                        enable_sequence_shard=False,
+                    ),
+                )
 
 
 if __name__ == "__main__":

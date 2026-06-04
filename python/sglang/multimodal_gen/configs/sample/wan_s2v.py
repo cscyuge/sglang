@@ -18,6 +18,7 @@ class WanS2VSamplingParams(SamplingParams):
     pose_video_path: str | None = None
     pose_video_tensor: Any | None = None
     stream_r1_mode: bool | None = None
+    stream_r1_kv_cache: bool | None = None
     num_output_latent_frames: int | None = None
     num_frame_per_block: int | None = None
     local_attn_size: int | None = None
@@ -45,6 +46,22 @@ class WanS2VSamplingParams(SamplingParams):
             raise ValueError("local_attn_size must be positive")
         if self.sink_size is not None and self.sink_size < 0:
             raise ValueError("sink_size must be non-negative")
+        if (
+            self.local_attn_size is not None
+            and self.sink_size is not None
+            and self.sink_size >= self.local_attn_size
+        ):
+            raise ValueError("sink_size must be smaller than local_attn_size")
+        if (
+            self.stream_r1_kv_cache
+            and self.local_attn_size is not None
+            and self.num_frame_per_block is not None
+            and self.local_attn_size < self.num_frame_per_block
+        ):
+            raise ValueError(
+                "local_attn_size must be at least num_frame_per_block when "
+                "stream_r1_kv_cache is enabled"
+            )
         if self.context_noise is not None and self.context_noise < 0:
             raise ValueError("context_noise must be non-negative")
         if self.audio_lookahead_frames is not None and self.audio_lookahead_frames < 0:
@@ -62,6 +79,7 @@ class WanS2VSamplingParams(SamplingParams):
             "pose_video_path",
             "pose_video_tensor",
             "stream_r1_mode",
+            "stream_r1_kv_cache",
             "num_output_latent_frames",
             "num_frame_per_block",
             "local_attn_size",

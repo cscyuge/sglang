@@ -25,6 +25,7 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     audio_encoder_path: str | None = None
     max_area: int = 1024 * 704
     stream_r1_mode: bool = False
+    stream_r1_kv_cache: bool = False
     num_frame_per_block: int = 7
     local_attn_size: int = 9
     sink_size: int = 3
@@ -47,6 +48,13 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
             raise ValueError("local_attn_size must be positive")
         if self.sink_size < 0:
             raise ValueError("sink_size must be non-negative")
+        if self.sink_size >= self.local_attn_size:
+            raise ValueError("sink_size must be smaller than local_attn_size")
+        if self.stream_r1_kv_cache and self.local_attn_size < self.num_frame_per_block:
+            raise ValueError(
+                "local_attn_size must be at least num_frame_per_block when "
+                "stream_r1_kv_cache is enabled"
+            )
         if self.context_noise < 0:
             raise ValueError("context_noise must be non-negative")
         if self.s2v_audio_lookahead_frames < 0:

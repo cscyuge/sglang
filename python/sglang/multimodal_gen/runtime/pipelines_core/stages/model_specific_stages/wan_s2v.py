@@ -2,12 +2,15 @@
 """Wan2.2-S2V specific pipeline stages."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -21,6 +24,153 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+
+class WanS2VKVCacheBlock(TypedDict):
+    k: torch.Tensor
+    v: torch.Tensor
+    global_end_index: torch.Tensor
+    local_end_index: torch.Tensor
+
+
+@dataclass(frozen=True)
+class WanS2VStreamR1AttentionRequest:
+    stream_r1_kv_cache: bool
+    num_frame_per_block: int
+    local_attn_size: int
+    sink_size: int
+    context_noise: int
+
+    def validate(self, *, latent_frames: int, train_timesteps: int) -> None:
+        if self.num_frame_per_block <= 0:
+            raise ValueError("num_frame_per_block must be positive")
+        if latent_frames % self.num_frame_per_block != 0:
+            raise ValueError(
+                "Stream-R1 S2V requires latent frames to be divisible by "
+                f"num_frame_per_block, got latent_frames={latent_frames}, "
+                f"num_frame_per_block={self.num_frame_per_block}"
+            )
+        if self.local_attn_size <= 0:
+            raise ValueError("local_attn_size must be positive")
+        if self.local_attn_size < self.num_frame_per_block:
+            raise ValueError(
+                "local_attn_size must be at least num_frame_per_block for "
+                "Stream-R1 S2V local/KV attention"
+            )
+        if self.sink_size < 0:
+            raise ValueError("sink_size must be non-negative")
+        if self.sink_size >= self.local_attn_size:
+            raise ValueError("sink_size must be smaller than local_attn_size")
+        if self.context_noise < 0:
+            raise ValueError("context_noise must be non-negative")
+        if self.context_noise > train_timesteps:
+            raise ValueError(
+                f"context_noise must be in [0, {train_timesteps}], "
+                f"got {self.context_noise}"
+            )
+
+
+@dataclass(frozen=True)
+class WanS2VStreamR1CacheMetadata:
+    batch_size: int
+    num_layers: int
+    frame_seq_length: int
+    local_num_attention_heads: int
+    attention_head_dim: int
+    local_attn_size: int
+    sink_size: int
+    dtype: torch.dtype
+    device: torch.device
+
+    @property
+    def cache_tokens(self) -> int:
+        return self.local_attn_size * self.frame_seq_length
+
+    @property
+    def sink_tokens(self) -> int:
+        return self.sink_size * self.frame_seq_length
+
+    @property
+    def bytes_per_kv_cache(self) -> int:
+        itemsize = torch.empty((), dtype=self.dtype).element_size()
+        return (
+            self.num_layers
+            * self.batch_size
+            * self.cache_tokens
+            * self.local_num_attention_heads
+            * self.attention_head_dim
+            * 2
+            * itemsize
+        )
+
+
+@dataclass
+class WanS2VStreamR1CacheState:
+    metadata: WanS2VStreamR1CacheMetadata | None = None
+    kv_cache: list[WanS2VKVCacheBlock] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.metadata is not None
+
+    @property
+    def allocated(self) -> bool:
+        return self.kv_cache is not None
+
+    @classmethod
+    def disabled(cls) -> "WanS2VStreamR1CacheState":
+        return cls()
+
+    @classmethod
+    def metadata_only(
+        cls, metadata: WanS2VStreamR1CacheMetadata
+    ) -> "WanS2VStreamR1CacheState":
+        return cls(metadata=metadata)
+
+    @classmethod
+    def allocate(
+        cls, metadata: WanS2VStreamR1CacheMetadata
+    ) -> "WanS2VStreamR1CacheState":
+        kv_cache: list[WanS2VKVCacheBlock] = []
+        for _ in range(metadata.num_layers):
+            kv_cache.append(
+                {
+                    "k": torch.zeros(
+                        (
+                            metadata.batch_size,
+                            metadata.cache_tokens,
+                            metadata.local_num_attention_heads,
+                            metadata.attention_head_dim,
+                        ),
+                        dtype=metadata.dtype,
+                        device=metadata.device,
+                    ),
+                    "v": torch.zeros(
+                        (
+                            metadata.batch_size,
+                            metadata.cache_tokens,
+                            metadata.local_num_attention_heads,
+                            metadata.attention_head_dim,
+                        ),
+                        dtype=metadata.dtype,
+                        device=metadata.device,
+                    ),
+                    "global_end_index": torch.zeros(
+                        (1,), dtype=torch.long, device=metadata.device
+                    ),
+                    "local_end_index": torch.zeros(
+                        (1,), dtype=torch.long, device=metadata.device
+                    ),
+                }
+            )
+        return cls(metadata=metadata, kv_cache=kv_cache)
+
+    def reset(self) -> None:
+        if self.kv_cache is None:
+            return
+        for block_cache in self.kv_cache:
+            block_cache["global_end_index"].zero_()
+            block_cache["local_end_index"].zero_()
 
 
 @dataclass
@@ -258,6 +408,13 @@ def _resolve_request_value(
     return getattr(server_args.pipeline_config, config_key, default)
 
 
+def _safe_sp_world_size() -> int:
+    try:
+        return get_sp_world_size()
+    except AssertionError:
+        return 1
+
+
 def _coerce_timestep_list(value: Any, field_name: str) -> list[int] | None:
     if value is None:
         return None
@@ -463,8 +620,15 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
     """No-KV Stream-R1 S2V block-wise denoising.
 
     This implements the Phase 2 block loop and fixed timestep handling. S2V KV
-    attention and clean-context cache mutation are intentionally left disabled.
+    attention metadata and lifecycle hooks are wired for Phase 3, but attention
+    kernel cache mutation remains explicitly guarded until implemented.
     """
+
+    _s2v_kv_attention_kernel_supported = False
+
+    def __init__(self, transformer, scheduler) -> None:
+        super().__init__(transformer, scheduler)
+        self.cache_state = WanS2VStreamR1CacheState.disabled()
 
     def _prepare_timesteps(
         self,
@@ -536,54 +700,232 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         self.log_info("Using Stream-R1 S2V timesteps: %s", timesteps)
         return timesteps
 
-    def _validate_block_options(
+    def _train_timesteps(self) -> int:
+        scheduler_config = getattr(self.scheduler, "config", None)
+        return int(getattr(scheduler_config, "num_train_timesteps", 1000))
+
+    def _resolve_attention_request(
         self,
         batch: Req,
         server_args: ServerArgs,
         latent_frames: int,
-    ) -> int:
-        num_frame_per_block = int(
-            _resolve_request_value(
-                batch,
-                server_args,
-                "num_frame_per_block",
-                "num_frame_per_block",
-                7,
-            )
+    ) -> WanS2VStreamR1AttentionRequest:
+        request = WanS2VStreamR1AttentionRequest(
+            stream_r1_kv_cache=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "stream_r1_kv_cache",
+                    "stream_r1_kv_cache",
+                    False,
+                )
+            ),
+            num_frame_per_block=int(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "num_frame_per_block",
+                    "num_frame_per_block",
+                    7,
+                )
+            ),
+            local_attn_size=int(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "local_attn_size",
+                    "local_attn_size",
+                    9,
+                )
+            ),
+            sink_size=int(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "sink_size",
+                    "sink_size",
+                    3,
+                )
+            ),
+            context_noise=int(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "context_noise",
+                    "context_noise",
+                    0,
+                )
+            ),
         )
-        if num_frame_per_block <= 0:
-            raise ValueError("num_frame_per_block must be positive")
-        if latent_frames % num_frame_per_block != 0:
-            raise ValueError(
-                "Stream-R1 S2V requires latent frames to be divisible by "
-                f"num_frame_per_block, got latent_frames={latent_frames}, "
-                f"num_frame_per_block={num_frame_per_block}"
+        request.validate(
+            latent_frames=latent_frames, train_timesteps=self._train_timesteps()
+        )
+        self._validate_stream_r1_parallel_compatibility(request, batch)
+        return request
+
+    def _validate_stream_r1_parallel_compatibility(
+        self, request: WanS2VStreamR1AttentionRequest, batch: Req
+    ) -> None:
+        if not request.stream_r1_kv_cache:
+            return
+        sp_world_size = _safe_sp_world_size()
+        context_parallel_enabled = bool(
+            getattr(self.transformer, "use_context_parallel", False)
+        )
+        sequence_parallel_enabled = bool(
+            getattr(batch, "did_sp_shard_latents", False)
+            or (sp_world_size > 1 and getattr(batch, "enable_sequence_shard", False))
+        )
+        if context_parallel_enabled or sequence_parallel_enabled or sp_world_size > 1:
+            raise NotImplementedError(
+                "Stream-R1 S2V KV cache is incompatible with sequence/context "
+                "parallelism in this phase; disable SP/CP or set "
+                "stream_r1_kv_cache=false."
             )
 
-        use_kv_cache = bool(
-            _resolve_request_value(
-                batch,
-                server_args,
-                "stream_r1_kv_cache",
-                "stream_r1_kv_cache",
-                False,
+    def _configure_transformer_attention(
+        self, request: WanS2VStreamR1AttentionRequest
+    ) -> None:
+        setter = getattr(self.transformer, "set_stream_r1_attention", None)
+        if callable(setter):
+            setter(
+                request.local_attn_size,
+                request.sink_size,
+                kv_cache=request.stream_r1_kv_cache,
+            )
+            return
+        setattr(self.transformer, "stream_r1_local_attn_size", request.local_attn_size)
+        setattr(self.transformer, "stream_r1_sink_size", request.sink_size)
+        setattr(
+            self.transformer,
+            "stream_r1_kv_cache_requested",
+            request.stream_r1_kv_cache,
+        )
+
+    def _build_cache_metadata(
+        self,
+        *,
+        request: WanS2VStreamR1AttentionRequest,
+        batch_size: int,
+        frame_seq_length: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> WanS2VStreamR1CacheMetadata:
+        blocks = getattr(self.transformer, "blocks", None)
+        first_block = blocks[0] if blocks is not None and len(blocks) > 0 else None
+        arch_config = getattr(
+            getattr(self.transformer, "config", None), "arch_config", None
+        )
+        num_layers = int(
+            getattr(
+                arch_config,
+                "num_layers",
+                len(blocks) if blocks is not None else 0,
             )
         )
-        if use_kv_cache:
-            raise NotImplementedError(
-                "Stream-R1 S2V KV attention is not implemented in this phase"
+        if num_layers <= 0:
+            raise ValueError("Wan S2V Stream-R1 cache metadata requires num_layers")
+        global_heads = int(getattr(self.transformer, "num_attention_heads", 1))
+        hidden_size = int(getattr(self.transformer, "hidden_size", global_heads))
+        local_num_heads = int(
+            getattr(
+                first_block,
+                "local_num_heads",
+                getattr(self.transformer, "local_num_heads", global_heads),
             )
-        return num_frame_per_block
+        )
+        attention_head_dim = int(
+            getattr(
+                first_block,
+                "dim_head",
+                getattr(
+                    self.transformer,
+                    "attention_head_dim",
+                    hidden_size // global_heads,
+                ),
+            )
+        )
+        return WanS2VStreamR1CacheMetadata(
+            batch_size=batch_size,
+            num_layers=num_layers,
+            frame_seq_length=frame_seq_length,
+            local_num_attention_heads=local_num_heads,
+            attention_head_dim=attention_head_dim,
+            local_attn_size=request.local_attn_size,
+            sink_size=request.sink_size,
+            dtype=dtype,
+            device=torch.device(device),
+        )
+
+    def _prepare_cache_state(
+        self,
+        *,
+        request: WanS2VStreamR1AttentionRequest,
+        batch_size: int,
+        frame_seq_length: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> WanS2VStreamR1CacheState:
+        if not request.stream_r1_kv_cache:
+            self.cache_state = WanS2VStreamR1CacheState.disabled()
+            return self.cache_state
+
+        metadata = self._build_cache_metadata(
+            request=request,
+            batch_size=batch_size,
+            frame_seq_length=frame_seq_length,
+            dtype=dtype,
+            device=device,
+        )
+        if not self._s2v_kv_attention_kernel_supported:
+            self.cache_state = WanS2VStreamR1CacheState.metadata_only(metadata)
+        elif not self.cache_state.allocated or self.cache_state.metadata != metadata:
+            self.cache_state = WanS2VStreamR1CacheState.allocate(metadata)
+        else:
+            self.cache_state.reset()
+
+        self.log_info(
+            "Prepared Stream-R1 S2V KV cache metadata: layers=%s, tokens=%s, "
+            "local_heads=%s, head_dim=%s, sink_tokens=%s, estimated_kv_cache=%.2f MiB",
+            metadata.num_layers,
+            metadata.cache_tokens,
+            metadata.local_num_attention_heads,
+            metadata.attention_head_dim,
+            metadata.sink_tokens,
+            metadata.bytes_per_kv_cache / (1024**2),
+        )
+        return self.cache_state
+
+    def _guard_cache_runtime(self, cache_state: WanS2VStreamR1CacheState) -> None:
+        if not cache_state.enabled:
+            return
+        if not self._s2v_kv_attention_kernel_supported:
+            assert cache_state.metadata is not None
+            metadata = cache_state.metadata
+            raise NotImplementedError(
+                "Stream-R1 S2V KV cache was requested and validated, but S2V "
+                "attention-kernel cache mutation is not implemented yet. "
+                "Set stream_r1_kv_cache=false to run the current block-wise "
+                "Stream-R1 path without KV cache. "
+                f"local_attn_size={metadata.local_attn_size}, "
+                f"sink_size={metadata.sink_size}, "
+                f"cache_tokens={metadata.cache_tokens}."
+            )
+        if not cache_state.allocated:
+            raise RuntimeError("Stream-R1 S2V KV cache state was not allocated")
 
     def _clean_context_refresh(
         self,
         *,
         block_latents: torch.Tensor,
-        context_noise: int,
+        cache_state: WanS2VStreamR1CacheState,
     ) -> None:
-        # Phase 2 keeps kv_cache=None, so there is no cache state to refresh.
-        # The method remains as the explicit lifecycle hook for Phase 3.
-        del block_latents, context_noise
+        # Phase 3 will re-run the transformer on clean block latents here to
+        # advance the S2V KV cache at context_noise. Keep the guard explicit so
+        # requests never appear to have KV support before the attention kernel
+        # mutation path exists.
+        del block_latents
+        self._guard_cache_runtime(cache_state)
         return None
 
     @torch.no_grad()
@@ -592,9 +934,10 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
         latents = batch.latents.to(device=device, dtype=dit_dtype)
         latent_frames = latents.shape[2]
-        num_frame_per_block = self._validate_block_options(
+        attention_request = self._resolve_attention_request(
             batch, server_args, latent_frames
         )
+        num_frame_per_block = attention_request.num_frame_per_block
         timesteps = self._prepare_timesteps(batch, server_args, device)
         if timesteps.numel() == 0:
             raise ValueError("Stream-R1 S2V requires at least one timestep")
@@ -619,20 +962,20 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
         _, _, _, latent_h, latent_w = latents.shape
         frame_seq_length = (latent_h // patch_size[1]) * (latent_w // patch_size[2])
+        self._configure_transformer_attention(attention_request)
+        cache_state = self._prepare_cache_state(
+            request=attention_request,
+            batch_size=latents.shape[0],
+            frame_seq_length=frame_seq_length,
+            dtype=dit_dtype,
+            device=device,
+        )
+        self._guard_cache_runtime(cache_state)
         generator = (
             batch.generator[0] if isinstance(batch.generator, list) else batch.generator
         )
         autocast_enabled = (
             dit_dtype != torch.float32 and not server_args.disable_autocast
-        )
-        context_noise = int(
-            _resolve_request_value(
-                batch,
-                server_args,
-                "context_noise",
-                "context_noise",
-                0,
-            )
         )
 
         self.load_model()
@@ -674,7 +1017,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                             motion_frames=block_bundle.motion_frames,
                             add_last_motion=block_bundle.add_last_motion,
                             drop_motion_frames=block_bundle.drop_motion_frames,
-                            kv_cache=None,
+                            kv_cache=cache_state.kv_cache,
                             crossattn_cache=None,
                             current_start=block_start * frame_seq_length,
                             cache_start=None,
@@ -707,7 +1050,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 latents[:, :, block_start:block_end, :, :] = current_latents
                 self._clean_context_refresh(
                     block_latents=current_latents,
-                    context_noise=context_noise,
+                    cache_state=cache_state,
                 )
         finally:
             self.offload_model()

@@ -522,6 +522,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         inner_dim = arch.num_attention_heads * arch.attention_head_dim
         self.hidden_size = inner_dim
         self.num_attention_heads = arch.num_attention_heads
+        self.attention_head_dim = arch.attention_head_dim
         self.in_channels = arch.in_channels
         self.out_channels = arch.out_channels
         self.num_channels_latents = arch.out_channels
@@ -622,6 +623,9 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         )
         self.layer_names = ["blocks"]
         self.cnt = 0
+        self.stream_r1_local_attn_size: int | None = None
+        self.stream_r1_sink_size: int | None = None
+        self.stream_r1_kv_cache_requested = False
         self.__post_init__()
 
     def _process_motion_frame_pack(
@@ -718,6 +722,19 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             hidden_states = torch.chunk(hidden_states, get_sp_world_size(), dim=1)[sp_rank]
         return hidden_states
 
+    def set_stream_r1_attention(
+        self, local_attn_size: int, sink_size: int, *, kv_cache: bool = False
+    ) -> None:
+        if local_attn_size <= 0:
+            raise ValueError("local_attn_size must be positive")
+        if sink_size < 0:
+            raise ValueError("sink_size must be non-negative")
+        if sink_size >= local_attn_size:
+            raise ValueError("sink_size must be smaller than local_attn_size")
+        self.stream_r1_local_attn_size = int(local_attn_size)
+        self.stream_r1_sink_size = int(sink_size)
+        self.stream_r1_kv_cache_requested = bool(kv_cache)
+
     def forward(
         self,
         hidden_states: torch.Tensor | list[torch.Tensor],
@@ -744,7 +761,8 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             raise ValueError("WanS2VTransformer3DModel.forward requires timestep/t")
         if kv_cache is not None or crossattn_cache is not None:
             raise NotImplementedError(
-                "Stream-R1 S2V KV attention is not implemented in this phase"
+                "Stream-R1 S2V KV attention metadata is accepted by the pipeline, "
+                "but attention-kernel cache mutation is not implemented in this phase"
             )
         if cache_start is not None:
             logger.debug("Wan S2V cache_start is ignored while KV cache is disabled")
