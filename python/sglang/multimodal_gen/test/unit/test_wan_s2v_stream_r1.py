@@ -1036,6 +1036,53 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "not implemented yet"):
             stage._guard_cache_runtime(state)
 
+    def test_stage_test_flag_allocates_and_forwards_kv_cache(self):
+        self.assertFalse(
+            WanS2VStreamR1DenoisingStage._s2v_kv_attention_kernel_supported
+        )
+        stage = self._stage()
+        stage._s2v_kv_attention_kernel_supported = True
+        request = self._attention_request(stream_r1_kv_cache=True)
+
+        state = stage._prepare_cache_state(
+            request=request,
+            batch_size=2,
+            frame_seq_length=5,
+            dtype=torch.float16,
+            device=torch.device("cpu"),
+        )
+
+        self.assertIs(stage.cache_state, state)
+        self.assertTrue(state.enabled)
+        self.assertTrue(state.allocated)
+        self.assertEqual(state.metadata.cache_tokens, 20)
+        self.assertEqual(state.metadata.local_num_attention_heads, 3)
+        self.assertEqual(len(state.kv_cache), 2)
+        for block_cache in state.kv_cache:
+            self.assertEqual(block_cache["k"].shape, (2, 20, 3, 8))
+            self.assertEqual(block_cache["v"].shape, (2, 20, 3, 8))
+            self.assertEqual(block_cache["k"].dtype, torch.float16)
+            self.assertEqual(block_cache["v"].dtype, torch.float16)
+            self.assertEqual(block_cache["k"].device, torch.device("cpu"))
+            self.assertEqual(block_cache["global_end_index"].dtype, torch.long)
+            self.assertEqual(block_cache["local_end_index"].dtype, torch.long)
+
+        stage._guard_cache_runtime(state)
+
+        recorder = self._RecordingTransformer()
+        stage.transformer = recorder
+        stage._clean_context_refresh(
+            block_latents=torch.ones(2, 3, 4, 2, 2),
+            prompt_embeds=torch.zeros(2, 3, 4),
+            block_bundle=self._block_bundle(),
+            current_start=15,
+            attention_request=request,
+            cache_state=state,
+        )
+
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertIs(recorder.calls[0]["kv_cache"], state.kv_cache)
+
     def test_clean_context_refresh_noops_when_cache_disabled(self):
         stage = self._stage()
         recorder = self._RecordingTransformer()
