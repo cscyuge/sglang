@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wan2.2-S2V specific pipeline stages."""
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -613,14 +614,14 @@ class WanS2VDenoisingStage(PipelineStage):
 
 
 class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
-    """No-KV Stream-R1 S2V block-wise denoising.
+    """Stream-R1 S2V block-wise denoising.
 
-    This implements the Phase 2 block loop and fixed timestep handling. S2V KV
-    attention metadata and lifecycle hooks are wired for Phase 3, but attention
-    kernel cache mutation remains explicitly guarded until implemented.
+    The KV path is enabled only when the loaded transformer exposes the S2V
+    cached-attention interfaces. Tests and emergency rollbacks may still set
+    ``_s2v_kv_attention_kernel_supported`` to a bool override.
     """
 
-    _s2v_kv_attention_kernel_supported = False
+    _s2v_kv_attention_kernel_supported: bool | None = None
 
     def __init__(self, transformer, scheduler) -> None:
         super().__init__(transformer, scheduler)
@@ -804,6 +805,47 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             request.stream_r1_kv_cache,
         )
 
+    @staticmethod
+    def _callable_accepts_parameters(
+        fn: Any,
+        required_parameters: set[str],
+    ) -> bool:
+        if not callable(fn):
+            return False
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        return required_parameters.issubset(signature.parameters)
+
+    def _supports_s2v_kv_attention_kernel(self) -> bool:
+        override = self._s2v_kv_attention_kernel_supported
+        if override is not None:
+            return bool(override)
+
+        if not callable(getattr(self.transformer, "set_stream_r1_attention", None)):
+            return False
+        if not self._callable_accepts_parameters(
+            getattr(self.transformer, "forward", None),
+            {"kv_cache", "current_start", "cache_start", "stream_r1_mode"},
+        ):
+            return False
+
+        blocks = getattr(self.transformer, "blocks", None)
+        if blocks is None or len(blocks) == 0:
+            return False
+        return all(
+            self._callable_accepts_parameters(
+                getattr(block, "forward", None),
+                {
+                    "stream_r1_kv_cache",
+                    "stream_r1_attention_layout",
+                    "cache_start",
+                },
+            )
+            for block in blocks
+        )
+
     def _build_cache_metadata(
         self,
         *,
@@ -879,7 +921,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             dtype=dtype,
             device=device,
         )
-        if not self._s2v_kv_attention_kernel_supported:
+        if not self._supports_s2v_kv_attention_kernel():
             self.cache_state = WanS2VStreamR1CacheState.metadata_only(metadata)
         elif not self.cache_state.allocated or self.cache_state.metadata != metadata:
             self.cache_state = WanS2VStreamR1CacheState.allocate(metadata)
@@ -901,12 +943,13 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
     def _guard_cache_runtime(self, cache_state: WanS2VStreamR1CacheState) -> None:
         if not cache_state.enabled:
             return
-        if not self._s2v_kv_attention_kernel_supported:
+        if not self._supports_s2v_kv_attention_kernel():
             assert cache_state.metadata is not None
             metadata = cache_state.metadata
             raise NotImplementedError(
-                "Stream-R1 S2V KV cache was requested and validated, but S2V "
-                "attention-kernel cache mutation is not implemented yet. "
+                "Stream-R1 S2V KV cache was requested and validated, but the "
+                "loaded transformer does not expose the required S2V KV "
+                "attention runtime. "
                 "Set stream_r1_kv_cache=false to run the current block-wise "
                 "Stream-R1 path without KV cache. "
                 f"local_attn_size={metadata.local_attn_size}, "

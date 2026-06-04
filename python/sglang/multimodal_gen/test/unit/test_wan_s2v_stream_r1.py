@@ -869,6 +869,62 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             self.forward_batch = get_forward_context().forward_batch
             return kwargs["hidden_states"]
 
+    class _KVCapableBlock:
+        local_num_heads = 3
+        dim_head = 8
+
+        def forward(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            freqs_cis,
+            attn_mask=None,
+            stream_r1_kv_cache=None,
+            stream_r1_attention_layout=None,
+            cache_start=None,
+        ):
+            return hidden_states
+
+    class _KVCapableTransformer:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                arch_config=SimpleNamespace(num_layers=2)
+            )
+            self.blocks = [
+                TestWanS2VStreamR1DenoisingStage._KVCapableBlock(),
+                TestWanS2VStreamR1DenoisingStage._KVCapableBlock(),
+            ]
+            self.hidden_size = 48
+            self.num_attention_heads = 6
+            self.use_context_parallel = False
+
+        def set_stream_r1_attention(
+            self,
+            local_attn_size,
+            sink_size,
+            *,
+            num_frame_per_block=None,
+            kv_cache=False,
+        ):
+            self.stream_r1_local_attn_size = local_attn_size
+            self.stream_r1_sink_size = sink_size
+            self.stream_r1_num_frame_per_block = num_frame_per_block
+            self.stream_r1_kv_cache_requested = kv_cache
+
+        def forward(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            timestep=None,
+            kv_cache=None,
+            current_start=0,
+            cache_start=None,
+            stream_r1_mode=False,
+            **kwargs,
+        ):
+            return hidden_states
+
     class _RecordingAudioEncoder:
         def __init__(self):
             self.calls = []
@@ -1022,7 +1078,7 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(state.kv_cache[0]["global_end_index"].item(), 0)
         self.assertEqual(state.kv_cache[1]["local_end_index"].item(), 0)
 
-    def test_stage_prepares_metadata_but_guards_unimplemented_kv(self):
+    def test_stage_prepares_metadata_but_guards_unsupported_kv(self):
         stage = self._stage()
         request = WanS2VStreamR1AttentionRequest(
             stream_r1_kv_cache=True,
@@ -1044,15 +1100,16 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertFalse(state.allocated)
         self.assertEqual(state.metadata.cache_tokens, 60)
         self.assertEqual(state.metadata.local_num_attention_heads, 3)
-        with self.assertRaisesRegex(NotImplementedError, "not implemented yet"):
+        with self.assertRaisesRegex(NotImplementedError, "does not expose"):
             stage._guard_cache_runtime(state)
 
-    def test_stage_test_flag_allocates_and_forwards_kv_cache(self):
-        self.assertFalse(
+    def test_stage_auto_detects_and_allocates_kv_cache(self):
+        self.assertIsNone(
             WanS2VStreamR1DenoisingStage._s2v_kv_attention_kernel_supported
         )
         stage = self._stage()
-        stage._s2v_kv_attention_kernel_supported = True
+        stage._s2v_kv_attention_kernel_supported = None
+        stage.transformer = self._KVCapableTransformer()
         request = self._attention_request(stream_r1_kv_cache=True)
 
         state = stage._prepare_cache_state(
@@ -1078,6 +1135,24 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             self.assertEqual(block_cache["global_end_index"].dtype, torch.long)
             self.assertEqual(block_cache["local_end_index"].dtype, torch.long)
 
+        stage._guard_cache_runtime(state)
+
+    def test_stage_override_allocates_and_forwards_kv_cache(self):
+        stage = self._stage()
+        stage._s2v_kv_attention_kernel_supported = True
+        request = self._attention_request(stream_r1_kv_cache=True)
+
+        state = stage._prepare_cache_state(
+            request=request,
+            batch_size=2,
+            frame_seq_length=5,
+            dtype=torch.float16,
+            device=torch.device("cpu"),
+        )
+
+        self.assertIs(stage.cache_state, state)
+        self.assertTrue(state.enabled)
+        self.assertTrue(state.allocated)
         stage._guard_cache_runtime(state)
 
         recorder = self._RecordingTransformer()
@@ -1117,7 +1192,7 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         stage.transformer = recorder
         state = WanS2VStreamR1CacheState.metadata_only(self._metadata())
 
-        with self.assertRaisesRegex(NotImplementedError, "not implemented yet"):
+        with self.assertRaisesRegex(NotImplementedError, "does not expose"):
             stage._clean_context_refresh(
                 block_latents=torch.ones(2, 3, 4, 2, 2),
                 prompt_embeds=torch.zeros(2, 3, 4),
