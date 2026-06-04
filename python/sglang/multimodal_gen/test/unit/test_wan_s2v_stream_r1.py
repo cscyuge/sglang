@@ -786,6 +786,14 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
 
 
 class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
+    class _RecordingTransformer:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            return kwargs["hidden_states"]
+
     def _stage(self) -> WanS2VStreamR1DenoisingStage:
         stage = WanS2VStreamR1DenoisingStage.__new__(WanS2VStreamR1DenoisingStage)
         stage.transformer = SimpleNamespace(
@@ -806,6 +814,46 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         stage.log_info = lambda *args, **kwargs: None
         stage._s2v_kv_attention_kernel_supported = False
         return stage
+
+    def _metadata(self) -> WanS2VStreamR1CacheMetadata:
+        return WanS2VStreamR1CacheMetadata(
+            batch_size=2,
+            num_layers=2,
+            frame_seq_length=5,
+            local_num_attention_heads=3,
+            attention_head_dim=8,
+            local_attn_size=4,
+            sink_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+    def _attention_request(
+        self,
+        *,
+        stream_r1_kv_cache: bool,
+        context_noise: int = 0,
+    ) -> WanS2VStreamR1AttentionRequest:
+        return WanS2VStreamR1AttentionRequest(
+            stream_r1_kv_cache=stream_r1_kv_cache,
+            num_frame_per_block=4,
+            local_attn_size=4,
+            sink_size=1,
+            context_noise=context_noise,
+        )
+
+    def _block_bundle(self) -> WanS2VConditionBundle:
+        return WanS2VConditionBundle(
+            prompt_embeds=torch.zeros(2, 3, 4),
+            ref_latents=torch.ones(2, 3, 1, 2, 2),
+            motion_latents=torch.full((2, 3, 2, 2, 2), 2.0),
+            cond_states=torch.full((2, 3, 4, 2, 2), 3.0),
+            audio_input=torch.full((2, 4, 5, 16), 4.0),
+            audio_emb={"audio": "cached"},
+            motion_frames=(73, 19),
+            add_last_motion=2,
+            drop_motion_frames=False,
+        )
 
     def test_negative_prompt_embeds_presence_avoids_tensor_truthiness(self):
         self.assertTrue(
@@ -896,6 +944,104 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(state.metadata.local_num_attention_heads, 3)
         with self.assertRaisesRegex(NotImplementedError, "not implemented yet"):
             stage._guard_cache_runtime(state)
+
+    def test_clean_context_refresh_noops_when_cache_disabled(self):
+        stage = self._stage()
+        recorder = self._RecordingTransformer()
+        stage.transformer = recorder
+        block_latents = torch.ones(2, 3, 4, 2, 2)
+
+        stage._clean_context_refresh(
+            block_latents=block_latents,
+            prompt_embeds=torch.zeros(2, 3, 4),
+            block_bundle=self._block_bundle(),
+            current_start=10,
+            attention_request=self._attention_request(stream_r1_kv_cache=False),
+            cache_state=WanS2VStreamR1CacheState.disabled(),
+        )
+
+        self.assertEqual(recorder.calls, [])
+
+    def test_clean_context_refresh_keeps_unsupported_guard(self):
+        stage = self._stage()
+        recorder = self._RecordingTransformer()
+        stage.transformer = recorder
+        state = WanS2VStreamR1CacheState.metadata_only(self._metadata())
+
+        with self.assertRaisesRegex(NotImplementedError, "not implemented yet"):
+            stage._clean_context_refresh(
+                block_latents=torch.ones(2, 3, 4, 2, 2),
+                prompt_embeds=torch.zeros(2, 3, 4),
+                block_bundle=self._block_bundle(),
+                current_start=10,
+                attention_request=self._attention_request(stream_r1_kv_cache=True),
+                cache_state=state,
+            )
+
+        self.assertEqual(recorder.calls, [])
+
+    def test_clean_context_refresh_calls_transformer_with_clean_block_kwargs(self):
+        stage = self._stage()
+        stage._s2v_kv_attention_kernel_supported = True
+        recorder = self._RecordingTransformer()
+        stage.transformer = recorder
+        state = WanS2VStreamR1CacheState.allocate(self._metadata())
+        block_latents = torch.ones(2, 3, 4, 2, 2)
+        prompt_embeds = torch.full((2, 3, 4), 5.0)
+        block_bundle = self._block_bundle()
+
+        stage._clean_context_refresh(
+            block_latents=block_latents,
+            prompt_embeds=prompt_embeds,
+            block_bundle=block_bundle,
+            current_start=15,
+            attention_request=self._attention_request(
+                stream_r1_kv_cache=True,
+                context_noise=123,
+            ),
+            cache_state=state,
+        )
+
+        self.assertEqual(len(recorder.calls), 1)
+        call = recorder.calls[0]
+        self.assertEqual(
+            set(call),
+            {
+                "hidden_states",
+                "timestep",
+                "encoder_hidden_states",
+                "ref_latents",
+                "motion_latents",
+                "cond_states",
+                "audio_input",
+                "audio_emb",
+                "motion_frames",
+                "add_last_motion",
+                "drop_motion_frames",
+                "kv_cache",
+                "crossattn_cache",
+                "current_start",
+                "cache_start",
+                "stream_r1_mode",
+            },
+        )
+        self.assertIs(call["hidden_states"], block_latents)
+        self.assertEqual(call["timestep"].dtype, torch.long)
+        self.assertEqual(call["timestep"].tolist(), [123, 123])
+        self.assertIs(call["encoder_hidden_states"], prompt_embeds)
+        self.assertIs(call["ref_latents"], block_bundle.ref_latents)
+        self.assertIs(call["motion_latents"], block_bundle.motion_latents)
+        self.assertIs(call["cond_states"], block_bundle.cond_states)
+        self.assertIs(call["audio_input"], block_bundle.audio_input)
+        self.assertIs(call["audio_emb"], block_bundle.audio_emb)
+        self.assertEqual(call["motion_frames"], (73, 19))
+        self.assertEqual(call["add_last_motion"], 2)
+        self.assertFalse(call["drop_motion_frames"])
+        self.assertIs(call["kv_cache"], state.kv_cache)
+        self.assertIsNone(call["crossattn_cache"])
+        self.assertEqual(call["current_start"], 15)
+        self.assertIsNone(call["cache_start"])
+        self.assertTrue(call["stream_r1_mode"])
 
     def test_configure_transformer_attention_passes_block_adapter_fields(self):
         stage = self._stage()
