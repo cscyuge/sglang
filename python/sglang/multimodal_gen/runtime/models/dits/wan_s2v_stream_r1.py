@@ -2,7 +2,7 @@
 """Lightweight Stream-R1 helpers for Wan S2V attention."""
 
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import Callable, TypedDict
 
 import torch
 
@@ -469,6 +469,57 @@ def build_wan_s2v_stream_r1_mixed_kv_attention_mask(
         noisy_query_visible,
         torch.ones_like(noisy_query_visible),
     ).unsqueeze(0)
+
+
+def run_wan_s2v_stream_r1_cached_self_attention(
+    attention: Callable[..., torch.Tensor],
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: WanS2VKVCacheBlock | None,
+    layout: WanS2VStreamR1AttentionLayout | None,
+    cache_start: int | None,
+) -> torch.Tensor:
+    """Run one guarded Stream-R1 S2V cached self-attention step."""
+
+    if kv_cache is None:
+        raise ValueError("Stream-R1 S2V cached attention requires kv_cache")
+    if layout is None:
+        raise ValueError("Stream-R1 S2V cached attention requires attention layout")
+    if query.dim() != 4:
+        raise ValueError("query tensor must have shape [B, S, H, D]")
+    if query.shape[1] != layout.total_seq_len:
+        raise ValueError(
+            "query sequence length must match the Stream-R1 attention layout"
+        )
+    if key.shape[1] != layout.total_seq_len:
+        raise ValueError(
+            "key/value sequence length must match the Stream-R1 attention layout"
+        )
+    if query.shape[0] != key.shape[0] or query.shape[2:] != key.shape[2:]:
+        raise ValueError("query and key/value batch/head dimensions must match")
+
+    update = layout.to_noisy_kv_cache_update(cache_start=cache_start or 0)
+    current_kv = split_wan_s2v_stream_r1_projected_kv(
+        key,
+        value,
+        noisy_seq_len=layout.noisy_seq_len,
+    )
+    noisy_view = update_wan_s2v_stream_r1_noisy_kv_cache(
+        kv_cache,
+        current_kv.noisy_key,
+        current_kv.noisy_value,
+        update,
+    )
+    mixed_view = compose_wan_s2v_stream_r1_mixed_kv_view(noisy_view, current_kv)
+    mixed_mask = build_wan_s2v_stream_r1_mixed_kv_attention_mask(
+        noisy_view,
+        mixed_view,
+        update,
+        device=query.device,
+    )
+    return attention(query, mixed_view.key, mixed_view.value, attn_mask=mixed_mask)
 
 
 def _validate_noisy_kv_update_inputs(

@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     build_wan_s2v_stream_r1_cached_noisy_kv_index,
     build_wan_s2v_stream_r1_mixed_kv_attention_mask,
     compose_wan_s2v_stream_r1_mixed_kv_view,
+    run_wan_s2v_stream_r1_cached_self_attention,
     split_wan_s2v_stream_r1_projected_kv,
     update_wan_s2v_stream_r1_noisy_kv_cache,
 )
@@ -426,6 +427,135 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cached_noisy_seq_len"):
             build_wan_s2v_stream_r1_mixed_kv_attention_mask(
                 noisy_view, mixed, update
+            )
+
+
+class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
+    def _cache(self, tokens: int):
+        return {
+            "k": torch.zeros(1, tokens, 1, 1),
+            "v": torch.zeros(1, tokens, 1, 1),
+            "global_end_index": torch.zeros(1, dtype=torch.long),
+            "local_end_index": torch.zeros(1, dtype=torch.long),
+        }
+
+    def _indexed_kv(self, positions):
+        key = torch.tensor(list(positions), dtype=torch.float32).view(1, -1, 1, 1)
+        value = key + 100
+        return key, value
+
+    def test_cached_branch_updates_cache_and_calls_attention_with_mixed_kv(self):
+        cache = self._cache(tokens=4)
+        calls = []
+
+        def recording_attention(query, key, value, attn_mask=None):
+            calls.append(
+                {
+                    "query": query.clone(),
+                    "key": key.clone(),
+                    "value": value.clone(),
+                    "attn_mask": attn_mask.clone(),
+                }
+            )
+            return query + 10
+
+        query = torch.zeros(1, 3, 1, 1)
+        key, value = self._indexed_kv([0, 1, 100])
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=2,
+            total_seq_len=3,
+            frame_seq_length=1,
+            num_frame_per_block=2,
+            local_attn_size=4,
+            sink_size=1,
+            current_start=0,
+        )
+
+        output = run_wan_s2v_stream_r1_cached_self_attention(
+            recording_attention,
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=cache,
+            layout=layout,
+            cache_start=None,
+        )
+
+        torch.testing.assert_close(output, query + 10)
+        self.assertEqual(cache["global_end_index"].item(), 2)
+        torch.testing.assert_close(cache["k"][:, :2, 0, 0], torch.tensor([[0.0, 1.0]]))
+        torch.testing.assert_close(
+            calls[-1]["key"][:, :, 0, 0], torch.tensor([[0.0, 1.0, 100.0]])
+        )
+
+        query = torch.ones(1, 3, 1, 1)
+        key, value = self._indexed_kv([2, 3, 200])
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=2,
+            total_seq_len=3,
+            frame_seq_length=1,
+            num_frame_per_block=2,
+            local_attn_size=4,
+            sink_size=1,
+            current_start=2,
+        )
+
+        run_wan_s2v_stream_r1_cached_self_attention(
+            recording_attention,
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=cache,
+            layout=layout,
+            cache_start=None,
+        )
+
+        self.assertEqual(cache["global_end_index"].item(), 4)
+        self.assertEqual(cache["local_end_index"].item(), 4)
+        torch.testing.assert_close(
+            cache["k"][:, :, 0, 0], torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+        )
+        torch.testing.assert_close(
+            calls[-1]["key"][:, :, 0, 0],
+            torch.tensor([[0.0, 1.0, 2.0, 3.0, 200.0]]),
+        )
+        torch.testing.assert_close(
+            calls[-1]["value"][:, :, 0, 0],
+            torch.tensor([[100.0, 101.0, 102.0, 103.0, 300.0]]),
+        )
+        self.assertEqual(calls[-1]["attn_mask"].shape, (1, 3, 5))
+
+    def test_cached_branch_requires_cache_and_layout(self):
+        query = torch.zeros(1, 2, 1, 1)
+        key, value = self._indexed_kv([0, 1])
+
+        with self.assertRaisesRegex(ValueError, "kv_cache"):
+            run_wan_s2v_stream_r1_cached_self_attention(
+                lambda q, k, v, attn_mask=None: q,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=None,
+                layout=WanS2VStreamR1AttentionLayout(
+                    noisy_seq_len=2,
+                    total_seq_len=2,
+                    frame_seq_length=1,
+                    num_frame_per_block=2,
+                    local_attn_size=2,
+                    sink_size=0,
+                ),
+                cache_start=None,
+            )
+
+        with self.assertRaisesRegex(ValueError, "attention layout"):
+            run_wan_s2v_stream_r1_cached_self_attention(
+                lambda q, k, v, attn_mask=None: q,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=self._cache(tokens=2),
+                layout=None,
+                cache_start=None,
             )
 
 

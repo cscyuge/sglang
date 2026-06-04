@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VKVCacheBlock,
     WanS2VStreamR1AttentionLayout,
+    run_wan_s2v_stream_r1_cached_self_attention,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -423,12 +424,6 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         stream_r1_attention_layout: WanS2VStreamR1AttentionLayout | None = None,
         cache_start: int | None = None,
     ) -> torch.Tensor:
-        if stream_r1_kv_cache is not None or stream_r1_attention_layout is not None:
-            raise NotImplementedError(
-                "Stream-R1 S2V self-attention KV cache adapter is plumbed, "
-                "but runtime cache mutation is still guarded in this phase."
-            )
-        del cache_start
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         orig_dtype = hidden_states.dtype
@@ -453,7 +448,18 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         query = _rope_apply_precomputed(query, freqs_cis).to(orig_dtype)
         key = _rope_apply_precomputed(key, freqs_cis).to(orig_dtype)
-        attn_output = self.attn1(query, key, value, attn_mask=attn_mask).flatten(2)
+        if stream_r1_kv_cache is not None or stream_r1_attention_layout is not None:
+            attn_output = run_wan_s2v_stream_r1_cached_self_attention(
+                self.attn1,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=stream_r1_kv_cache,
+                layout=stream_r1_attention_layout,
+                cache_start=cache_start,
+            ).flatten(2)
+        else:
+            attn_output = self.attn1(query, key, value, attn_mask=attn_mask).flatten(2)
         attn_output, _ = self.to_out(attn_output)
         hidden_states = hidden_states + _segment_gate(attn_output.squeeze(1), gate_msa, seg_idx)
         hidden_states = hidden_states.to(orig_dtype)
