@@ -9,6 +9,7 @@ from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v import (
     _build_s2v_noisy_rope_grid_sizes,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VStreamR1AttentionLayout,
     WanS2VStreamR1MixedKVView,
@@ -858,6 +859,16 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             self.calls.append(kwargs)
             return kwargs["hidden_states"]
 
+    class _ForwardContextRecordingTransformer:
+        def __init__(self):
+            self.calls = []
+            self.forward_batch = None
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            self.forward_batch = get_forward_context().forward_batch
+            return kwargs["hidden_states"]
+
     class _RecordingAudioEncoder:
         def __init__(self):
             self.calls = []
@@ -1180,6 +1191,27 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(call["current_start"], 15)
         self.assertIsNone(call["cache_start"])
         self.assertTrue(call["stream_r1_mode"])
+
+    def test_clean_context_refresh_sets_forward_context(self):
+        stage = self._stage()
+        stage._s2v_kv_attention_kernel_supported = True
+        recorder = self._ForwardContextRecordingTransformer()
+        stage.transformer = recorder
+        state = WanS2VStreamR1CacheState.allocate(self._metadata())
+        forward_batch = SimpleNamespace(enable_sequence_shard=False)
+
+        stage._clean_context_refresh(
+            block_latents=torch.ones(2, 3, 4, 2, 2),
+            prompt_embeds=torch.zeros(2, 3, 4),
+            block_bundle=self._block_bundle(),
+            current_start=15,
+            attention_request=self._attention_request(stream_r1_kv_cache=True),
+            cache_state=state,
+            forward_batch=forward_batch,
+        )
+
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertIs(recorder.forward_batch, forward_batch)
 
     def test_audio_embedding_cache_precomputes_encoder_once_with_motion_prefix(self):
         stage = self._stage()

@@ -964,6 +964,9 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         current_start: int,
         attention_request: WanS2VStreamR1AttentionRequest,
         cache_state: WanS2VStreamR1CacheState,
+        dtype: torch.dtype | None = None,
+        autocast_enabled: bool = False,
+        forward_batch: Req | None = None,
     ) -> None:
         if not cache_state.enabled:
             return None
@@ -975,24 +978,56 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             dtype=torch.long,
             device=block_latents.device,
         )
-        self.transformer(
-            hidden_states=block_latents,
-            timestep=timestep,
-            encoder_hidden_states=prompt_embeds,
-            ref_latents=block_bundle.ref_latents,
-            motion_latents=block_bundle.motion_latents,
-            cond_states=block_bundle.cond_states,
-            audio_input=block_bundle.audio_input,
-            audio_emb=block_bundle.audio_emb,
-            motion_frames=block_bundle.motion_frames,
-            add_last_motion=block_bundle.add_last_motion,
-            drop_motion_frames=block_bundle.drop_motion_frames,
-            kv_cache=cache_state.kv_cache,
-            crossattn_cache=None,
-            current_start=current_start,
-            cache_start=None,
-            stream_r1_mode=True,
-        )
+
+        with set_forward_context(
+            current_timestep=0,
+            attn_metadata=None,
+            forward_batch=forward_batch,
+        ):
+            if dtype is None:
+                self.transformer(
+                    hidden_states=block_latents,
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    ref_latents=block_bundle.ref_latents,
+                    motion_latents=block_bundle.motion_latents,
+                    cond_states=block_bundle.cond_states,
+                    audio_input=block_bundle.audio_input,
+                    audio_emb=block_bundle.audio_emb,
+                    motion_frames=block_bundle.motion_frames,
+                    add_last_motion=block_bundle.add_last_motion,
+                    drop_motion_frames=block_bundle.drop_motion_frames,
+                    kv_cache=cache_state.kv_cache,
+                    crossattn_cache=None,
+                    current_start=current_start,
+                    cache_start=None,
+                    stream_r1_mode=True,
+                )
+                return None
+
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=dtype,
+                enabled=autocast_enabled,
+            ):
+                self.transformer(
+                    hidden_states=block_latents,
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    ref_latents=block_bundle.ref_latents,
+                    motion_latents=block_bundle.motion_latents,
+                    cond_states=block_bundle.cond_states,
+                    audio_input=block_bundle.audio_input,
+                    audio_emb=block_bundle.audio_emb,
+                    motion_frames=block_bundle.motion_frames,
+                    add_last_motion=block_bundle.add_last_motion,
+                    drop_motion_frames=block_bundle.drop_motion_frames,
+                    kv_cache=cache_state.kv_cache,
+                    crossattn_cache=None,
+                    current_start=current_start,
+                    cache_start=None,
+                    stream_r1_mode=True,
+                )
         return None
 
     @torch.no_grad()
@@ -1128,6 +1163,9 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     current_start=block_start * frame_seq_length,
                     attention_request=attention_request,
                     cache_state=cache_state,
+                    dtype=dit_dtype,
+                    autocast_enabled=autocast_enabled,
+                    forward_batch=batch,
                 )
         finally:
             self.offload_model()
