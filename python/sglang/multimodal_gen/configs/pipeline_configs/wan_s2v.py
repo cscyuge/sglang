@@ -24,11 +24,35 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     audio_encoder_precision: str = "fp32"
     audio_encoder_path: str | None = None
     max_area: int = 1024 * 704
+    stream_r1_mode: bool = False
+    num_frame_per_block: int = 7
+    local_attn_size: int = 9
+    sink_size: int = 3
+    context_noise: int = 0
+    denoising_step_list: list[int] | None = None
+    warp_denoising_step: bool = True
+    s2v_control_policy: str = "lookahead"
+    s2v_audio_lookahead_frames: int = 2
+    cache_audio_embeddings: bool = True
+    stream_r1_generator_checkpoint_path: str | None = None
+    use_stream_r1_ema: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+        if self.num_frame_per_block <= 0:
+            raise ValueError("num_frame_per_block must be positive")
+        if self.local_attn_size <= 0:
+            raise ValueError("local_attn_size must be positive")
+        if self.sink_size < 0:
+            raise ValueError("sink_size must be non-negative")
+        if self.context_noise < 0:
+            raise ValueError("context_noise must be non-negative")
+        if self.s2v_audio_lookahead_frames < 0:
+            raise ValueError("s2v_audio_lookahead_frames must be non-negative")
+        if self.denoising_step_list is not None and len(self.denoising_step_list) == 0:
+            raise ValueError("denoising_step_list must not be empty")
 
     def postprocess_image_latent(self, latent_condition, batch):
         return latent_condition

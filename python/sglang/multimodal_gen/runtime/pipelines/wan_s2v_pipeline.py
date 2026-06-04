@@ -39,7 +39,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_s2v import (
     WanS2VAudioEncodingStage,
-    WanS2VDenoisingStage,
+    WanS2VDenoisingDispatchStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -197,7 +197,7 @@ class WanS2VPipeline(FlashTalkPipeline):
         )
         self.add_stage(
             stage_name="denoising_stage",
-            stage=WanS2VDenoisingStage(
+            stage=WanS2VDenoisingDispatchStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
             ),

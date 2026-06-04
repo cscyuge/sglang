@@ -728,6 +728,12 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         motion_latents: torch.Tensor | list[torch.Tensor] | None = None,
         cond_states: torch.Tensor | list[torch.Tensor] | None = None,
         audio_input: torch.Tensor | None = None,
+        audio_emb: Any | None = None,
+        audio_emb_global: torch.Tensor | None = None,
+        kv_cache: list | None = None,
+        crossattn_cache: list | None = None,
+        current_start: int = 0,
+        cache_start: int | None = None,
         motion_frames: list[int] | tuple[int, int] = (73, 19),
         add_last_motion: int = 2,
         drop_motion_frames: bool = False,
@@ -736,14 +742,28 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         timestep = timestep if timestep is not None else t
         if timestep is None:
             raise ValueError("WanS2VTransformer3DModel.forward requires timestep/t")
-        if audio_input is None:
-            raise ValueError("Wan S2V requires audio_input with shape [B, L, C, T]")
+        if kv_cache is not None or crossattn_cache is not None:
+            raise NotImplementedError(
+                "Stream-R1 S2V KV attention is not implemented in this phase"
+            )
+        if cache_start is not None:
+            logger.debug("Wan S2V cache_start is ignored while KV cache is disabled")
+        if audio_input is None and audio_emb is None:
+            raise ValueError("Wan S2V requires audio_input or audio_emb")
         if ref_latents is None:
             raise ValueError("Wan S2V requires ref_latents")
         if motion_latents is None:
             raise ValueError("Wan S2V requires motion_latents")
 
         x_list = _as_list_4d(hidden_states)
+        latent_frames = x_list[0].shape[1]
+        latent_h, latent_w = x_list[0].shape[-2:]
+        frame_seq_length = (latent_h // self.patch_size[1]) * (
+            latent_w // self.patch_size[2]
+        )
+        audio_start_frame = (
+            int(current_start) // frame_seq_length if frame_seq_length else 0
+        )
         ref_list = _as_list_4d(ref_latents)
         motion_list = _as_list_4d(motion_latents)
         if cond_states is None:
@@ -756,17 +776,48 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             context_list = encoder_hidden_states
 
         add_last_motion = int(self.add_last_motion) * add_last_motion
-        audio_input = torch.cat(
-            [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
-            dim=-1,
-        )
-        audio_emb_res = self.casual_audio_encoder(audio_input)
+        if audio_emb is None:
+            assert audio_input is not None
+            audio_input = torch.cat(
+                [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
+                dim=-1,
+            )
+            audio_emb_res = self.casual_audio_encoder(audio_input)
+        else:
+            audio_emb_res = audio_emb
         if self.enable_adain:
-            audio_emb_global, audio_emb = audio_emb_res
-            self.audio_emb_global = audio_emb_global[:, motion_frames[1] :].clone()
+            if isinstance(audio_emb_res, tuple):
+                audio_emb_global, audio_emb = audio_emb_res
+            elif audio_emb_global is None:
+                raise ValueError(
+                    "Wan S2V requires audio_emb_global when enable_adain=True "
+                    "and audio_emb is provided without a tuple"
+                )
+            else:
+                audio_emb = audio_emb_res
+            self.audio_emb_global = audio_emb_global[
+                :,
+                motion_frames[1]
+                + audio_start_frame : motion_frames[1]
+                + audio_start_frame
+                + latent_frames,
+            ].clone()
         else:
             audio_emb = audio_emb_res
-        self.merged_audio_emb = audio_emb[:, motion_frames[1] :, :]
+        self.merged_audio_emb = audio_emb[
+            :,
+            motion_frames[1]
+            + audio_start_frame : motion_frames[1]
+            + audio_start_frame
+            + latent_frames,
+            :,
+        ]
+        if self.merged_audio_emb.shape[1] != latent_frames:
+            raise ValueError(
+                "Wan S2V audio embeddings do not cover the requested latent chunk: "
+                f"chunk_start={audio_start_frame}, chunk_frames={latent_frames}, "
+                f"available_audio_frames={audio_emb.shape[1] - motion_frames[1]}"
+            )
 
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x_list]
         cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_list]
