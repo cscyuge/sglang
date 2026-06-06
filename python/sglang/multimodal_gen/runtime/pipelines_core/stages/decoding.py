@@ -237,6 +237,11 @@ class DecodingStage(PipelineStage):
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
 
+        # Propagate audio_path so downstream save_outputs can mux audio
+        # into the final mp4 (e.g. Wan S2V copies input audio into the
+        # generated talking-head video).
+        audio_path = batch.extra.get("audio_path") if batch.extra else None
+
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,
@@ -246,6 +251,7 @@ class DecodingStage(PipelineStage):
             trajectory_decoded=trajectory_decoded,
             metrics=batch.metrics,
             noise_pred=None,
+            audio_path=audio_path,
         )
 
         # Keep VAE resident during warmup; the real request needs it next.
