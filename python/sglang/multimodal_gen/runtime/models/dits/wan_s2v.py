@@ -451,6 +451,7 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         stream_r1_kv_cache: WanS2VKVCacheBlock | None = None,
         stream_r1_attention_layout: WanS2VStreamR1AttentionLayout | None = None,
         cache_start: int | None = None,
+        crossattn_kv_cache: dict | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -492,10 +493,30 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         hidden_states = hidden_states + _segment_gate(attn_output.squeeze(1), gate_msa, seg_idx)
         hidden_states = hidden_states.to(orig_dtype)
 
+        # Populate cross-attn K/V cache on first call so subsequent
+        # forward passes (additional timesteps / clean-context refreshes)
+        # skip the redundant to_k/to_v text projections.
+        if crossattn_kv_cache is not None and "k" not in crossattn_kv_cache:
+            ctx_k, _ = self.attn2.to_k(encoder_hidden_states)
+            if self.attn2.tp_rmsnorm:
+                ctx_k = tensor_parallel_rms_norm(ctx_k, self.attn2.norm_k)
+            else:
+                ctx_k = self.attn2.norm_k(ctx_k)
+            ctx_k = ctx_k.unflatten(
+                2, (self.attn2.local_num_heads, self.attn2.head_dim)
+            )
+            ctx_v, _ = self.attn2.to_v(encoder_hidden_states)
+            ctx_v = ctx_v.unflatten(
+                2, (self.attn2.local_num_heads, self.attn2.head_dim)
+            )
+            crossattn_kv_cache["k"] = ctx_k
+            crossattn_kv_cache["v"] = ctx_v
+
         attn_output = self.attn2(
             self.self_attn_residual_norm.norm(hidden_states),
             context=encoder_hidden_states,
             context_lens=None,
+            cached_kv=crossattn_kv_cache,
         )
         hidden_states = hidden_states + attn_output
         norm_hidden_states = _segment_modulate(
@@ -1053,6 +1074,11 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                     else None
                 ),
                 cache_start=cache_start,
+                crossattn_kv_cache=(
+                    crossattn_cache[idx]
+                    if stream_r1_mode and crossattn_cache is not None
+                    else None
+                ),
             )
             x = self._after_transformer_block(idx, x)
 

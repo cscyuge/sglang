@@ -531,8 +531,6 @@ def validate_wan_s2v_stream_r1_forward_cache(
 ) -> None:
     """Validate cache arguments accepted by Wan S2V transformer forward."""
 
-    if crossattn_cache is not None:
-        raise NotImplementedError("Wan S2V crossattn_cache is not supported")
     if kv_cache is None:
         return
     if not stream_r1_mode:

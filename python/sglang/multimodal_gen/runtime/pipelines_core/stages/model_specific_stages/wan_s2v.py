@@ -1010,6 +1010,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         dtype: torch.dtype | None = None,
         autocast_enabled: bool = False,
         forward_batch: Req | None = None,
+        crossattn_cache: list | None = None,
     ) -> None:
         if not cache_state.enabled:
             return None
@@ -1041,7 +1042,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     add_last_motion=block_bundle.add_last_motion,
                     drop_motion_frames=block_bundle.drop_motion_frames,
                     kv_cache=cache_state.kv_cache,
-                    crossattn_cache=None,
+                    crossattn_cache=crossattn_cache,
                     current_start=current_start,
                     cache_start=None,
                     stream_r1_mode=True,
@@ -1066,7 +1067,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     add_last_motion=block_bundle.add_last_motion,
                     drop_motion_frames=block_bundle.drop_motion_frames,
                     kv_cache=cache_state.kv_cache,
-                    crossattn_cache=None,
+                    crossattn_cache=crossattn_cache,
                     current_start=current_start,
                     cache_start=None,
                     stream_r1_mode=True,
@@ -1130,6 +1131,12 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 dtype=dit_dtype,
                 autocast_enabled=autocast_enabled,
             )
+            # Cross-attn K/V cache: one empty dict per transformer block.
+            # First forward call populates each with {"k": ..., "v": ...};
+            # subsequent passes reuse the cached projections.
+            crossattn_cache: list[dict] = [
+                {} for _ in range(len(self.transformer.blocks))
+            ]
             for block_start in range(0, latent_frames, num_frame_per_block):
                 block_end = block_start + num_frame_per_block
                 block_bundle = bundle.slice(
@@ -1168,7 +1175,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                             add_last_motion=block_bundle.add_last_motion,
                             drop_motion_frames=block_bundle.drop_motion_frames,
                             kv_cache=cache_state.kv_cache,
-                            crossattn_cache=None,
+                            crossattn_cache=crossattn_cache,
                             current_start=block_start * frame_seq_length,
                             cache_start=None,
                             stream_r1_mode=True,
@@ -1209,6 +1216,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     dtype=dit_dtype,
                     autocast_enabled=autocast_enabled,
                     forward_batch=batch,
+                    crossattn_cache=crossattn_cache,
                 )
         finally:
             self.offload_model()
