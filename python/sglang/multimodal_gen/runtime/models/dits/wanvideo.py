@@ -213,12 +213,16 @@ class WanT2VCrossAttention(WanSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, is_cross_attention=True)
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, cached_kv=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
+            cached_kv(dict or None): Pre-computed {"k": ..., "v": ...} from
+                a previous call.  When provided, ``to_k``/``to_v`` on
+                ``context`` are skipped and the cached tensors are used
+                instead — avoids redundant text projection.
         """
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:
@@ -227,15 +231,19 @@ class WanT2VCrossAttention(WanSelfAttention):
             q = self.norm_q(q)
         q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        k, _ = self.to_k(context)
-        if self.tp_rmsnorm:
-            k = tensor_parallel_rms_norm(k, self.norm_k)
+        if cached_kv is not None and "k" in cached_kv and "v" in cached_kv:
+            k = cached_kv["k"]
+            v = cached_kv["v"]
         else:
-            k = self.norm_k(k)
-        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
+            k, _ = self.to_k(context)
+            if self.tp_rmsnorm:
+                k = tensor_parallel_rms_norm(k, self.norm_k)
+            else:
+                k = self.norm_k(k)
+            k = k.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        v, _ = self.to_v(context)
-        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+            v, _ = self.to_v(context)
+            v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
         # compute attention
         x = self.attn(q, k, v)

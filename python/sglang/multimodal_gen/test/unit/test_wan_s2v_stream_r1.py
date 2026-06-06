@@ -1113,11 +1113,46 @@ class TestWanS2VStreamR1ForwardCacheValidation(unittest.TestCase):
                 num_transformer_blocks=2,
             )
 
-    def test_forward_cache_keeps_crossattn_cache_unsupported(self):
-        with self.assertRaisesRegex(NotImplementedError, "crossattn_cache"):
+    def test_forward_cache_accepts_matching_crossattn_cache(self):
+        validate_wan_s2v_stream_r1_forward_cache(
+            kv_cache=None,
+            crossattn_cache=[{}, {}],
+            stream_r1_mode=True,
+            num_transformer_blocks=2,
+        )
+
+    def test_forward_cache_rejects_crossattn_cache_outside_stream_r1_mode(self):
+        with self.assertRaisesRegex(ValueError, "stream_r1_mode=True"):
             validate_wan_s2v_stream_r1_forward_cache(
-                kv_cache=[{}],
+                kv_cache=None,
                 crossattn_cache=[{}],
+                stream_r1_mode=False,
+                num_transformer_blocks=1,
+            )
+
+    def test_forward_cache_rejects_non_list_crossattn_cache(self):
+        with self.assertRaisesRegex(ValueError, "must be a list"):
+            validate_wan_s2v_stream_r1_forward_cache(
+                kv_cache=None,
+                crossattn_cache=({},),
+                stream_r1_mode=True,
+                num_transformer_blocks=1,
+            )
+
+    def test_forward_cache_rejects_crossattn_cache_length_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "crossattn_cache length"):
+            validate_wan_s2v_stream_r1_forward_cache(
+                kv_cache=None,
+                crossattn_cache=[{}],
+                stream_r1_mode=True,
+                num_transformer_blocks=2,
+            )
+
+    def test_forward_cache_rejects_non_dict_crossattn_cache_entry(self):
+        with self.assertRaisesRegex(ValueError, "entries must be dicts"):
+            validate_wan_s2v_stream_r1_forward_cache(
+                kv_cache=None,
+                crossattn_cache=[None],
                 stream_r1_mode=True,
                 num_transformer_blocks=1,
             )
@@ -1329,6 +1364,7 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             cache_start=None,
             stream_r1_sequence_shard_enabled=False,
             stream_r1_sp_pad_tokens=0,
+            crossattn_kv_cache=None,
         ):
             return hidden_states
 
@@ -1743,6 +1779,27 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(call["current_start"], 15)
         self.assertIsNone(call["cache_start"])
         self.assertTrue(call["stream_r1_mode"])
+
+    def test_clean_context_refresh_forwards_crossattn_cache(self):
+        stage = self._stage()
+        stage._s2v_kv_attention_kernel_supported = True
+        recorder = self._RecordingTransformer()
+        stage.transformer = recorder
+        state = WanS2VStreamR1CacheState.allocate(self._metadata())
+        crossattn_cache = [{"k": object()}, {}]
+
+        stage._clean_context_refresh(
+            block_latents=torch.ones(2, 3, 4, 2, 2),
+            prompt_embeds=torch.zeros(2, 3, 4),
+            block_bundle=self._block_bundle(),
+            current_start=15,
+            attention_request=self._attention_request(stream_r1_kv_cache=True),
+            cache_state=state,
+            crossattn_cache=crossattn_cache,
+        )
+
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertIs(recorder.calls[0]["crossattn_cache"], crossattn_cache)
 
     def test_clean_context_refresh_sets_forward_context(self):
         stage = self._stage()
