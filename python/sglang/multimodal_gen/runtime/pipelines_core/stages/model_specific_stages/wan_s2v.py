@@ -1077,6 +1077,12 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
         dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
+        sp_world_size = _safe_sp_world_size()
+        if sp_world_size > 1:
+            # Stream-R1 S2V owns its block-wise loop, so it must opt into the
+            # transformer-internal SP path instead of relying on the generic
+            # denoising stage to shard latents before this stage runs.
+            batch.enable_sequence_shard = True
         latents = batch.latents.to(device=device, dtype=dit_dtype)
         latent_frames = latents.shape[2]
         attention_request = self._resolve_attention_request(

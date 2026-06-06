@@ -675,6 +675,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         self.stream_r1_sink_size: int | None = None
         self.stream_r1_num_frame_per_block: int | None = None
         self.stream_r1_kv_cache_requested = False
+        self._logged_stream_r1_dense_sp_no_kv = False
         self.__post_init__()
 
     def _process_motion_frame_pack(
@@ -1008,34 +1009,79 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         self.use_context_parallel = sequence_shard_enabled
         stream_r1_attn_mask = None
         stream_r1_attention_layout = None
+        seq_len_before_sp_pad = int(x.shape[1])
+        seq_shard_pad = 0
         if stream_r1_mode and self.stream_r1_local_attn_size is not None:
             if sequence_shard_enabled:
-                raise NotImplementedError(
-                    "Stream-R1 S2V local/sink self-attention masks are "
-                    "incompatible with sequence/context parallelism in this phase."
+                if self.stream_r1_kv_cache_requested or kv_cache is not None:
+                    raise NotImplementedError(
+                        "Stream-R1 S2V KV cache is incompatible with "
+                        "sequence/context parallelism in this phase."
+                    )
+                if not self._logged_stream_r1_dense_sp_no_kv:
+                    logger.info(
+                        "Stream-R1 S2V no-KV SP is using dense self-attention; "
+                        "local/sink no-KV masks are disabled until SP-aware "
+                        "window/sink masks are implemented."
+                    )
+                    self._logged_stream_r1_dense_sp_no_kv = True
+            else:
+                stream_r1_attention_layout = WanS2VStreamR1AttentionLayout(
+                    noisy_seq_len=int(self.original_seq_len),
+                    total_seq_len=int(x.shape[1]),
+                    frame_seq_length=frame_seq_length,
+                    num_frame_per_block=(
+                        self.stream_r1_num_frame_per_block or latent_frames
+                    ),
+                    local_attn_size=self.stream_r1_local_attn_size,
+                    sink_size=self.stream_r1_sink_size or 0,
+                    current_start=int(current_start),
                 )
-            stream_r1_attention_layout = WanS2VStreamR1AttentionLayout(
-                noisy_seq_len=int(self.original_seq_len),
-                total_seq_len=int(x.shape[1]),
-                frame_seq_length=frame_seq_length,
-                num_frame_per_block=(
-                    self.stream_r1_num_frame_per_block or latent_frames
-                ),
-                local_attn_size=self.stream_r1_local_attn_size,
-                sink_size=self.stream_r1_sink_size or 0,
-                current_start=int(current_start),
-            )
-            stream_r1_attn_mask = stream_r1_attention_layout.build_no_kv_attention_mask(
-                x.device
-            )
+                stream_r1_attn_mask = (
+                    stream_r1_attention_layout.build_no_kv_attention_mask(x.device)
+                )
         if sequence_shard_enabled:
+            sp_world_size = get_sp_world_size()
+            seq_shard_pad = (-seq_len_before_sp_pad) % sp_world_size
+            if seq_shard_pad:
+                x_pad = torch.zeros(
+                    (x.shape[0], seq_shard_pad, x.shape[2]),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                freq_pad = torch.ones(
+                    (
+                        pre_compute_freqs.shape[0],
+                        seq_shard_pad,
+                        *pre_compute_freqs.shape[2:],
+                    ),
+                    dtype=pre_compute_freqs.dtype,
+                    device=pre_compute_freqs.device,
+                )
+                sp_key_padding_mask = torch.ones(
+                    (x.shape[0], seq_len_before_sp_pad + seq_shard_pad),
+                    dtype=torch.bool,
+                    device=x.device,
+                )
+                sp_key_padding_mask[:, seq_len_before_sp_pad:] = False
+                x = torch.cat([x, x_pad], dim=1)
+                pre_compute_freqs = torch.cat([pre_compute_freqs, freq_pad], dim=1)
+            else:
+                sp_key_padding_mask = None
+
             sp_rank = get_sp_group().rank_in_group
-            chunks = torch.chunk(x, get_sp_world_size(), dim=1)
+            chunks = torch.chunk(x, sp_world_size, dim=1)
             sq_size = [u.shape[1] for u in chunks]
             sq_start_size = sum(sq_size[:sp_rank])
             x = chunks[sp_rank]
             timestep_proj[1] = timestep_proj[1] - sq_start_size
-            pre_compute_freqs = torch.chunk(pre_compute_freqs, get_sp_world_size(), dim=1)[sp_rank]
+            pre_compute_freqs = torch.chunk(pre_compute_freqs, sp_world_size, dim=1)[
+                sp_rank
+            ]
+            if sp_key_padding_mask is not None:
+                stream_r1_attn_mask = torch.chunk(
+                    sp_key_padding_mask, sp_world_size, dim=1
+                )[sp_rank]
 
         for idx, block in enumerate(self.blocks):
             x = block(
@@ -1058,6 +1104,8 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
 
         if sequence_shard_enabled:
             x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
+            if seq_shard_pad:
+                x = x[:, :seq_len_before_sp_pad]
         x = x[:, : self.original_seq_len]
 
         shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
