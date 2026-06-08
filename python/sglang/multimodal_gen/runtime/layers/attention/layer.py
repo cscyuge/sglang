@@ -403,6 +403,7 @@ class USPAttention(nn.Module):
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
         skip_sequence_parallel_override: bool = False,
+        kv_is_replicated: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -489,13 +490,23 @@ class USPAttention(nn.Module):
             sp_size = get_ulysses_parallel_world_size()
             if sp_size > 1:
                 q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+                if kv_is_replicated:
+                    h_local = q.shape[2]
+                    h_start = get_sp_parallel_rank() * h_local
+                    h_end = h_start + h_local
+                    k = k[:, :, h_start:h_end, :].contiguous()
+                    v = v[:, :, h_start:h_end, :].contiguous()
+                else:
+                    k = _usp_input_all_to_all(k, head_dim=2)
+                    v = _usp_input_all_to_all(v, head_dim=2)
 
             if attn_mask.dim() == 2:
-                mask_for_sdpa = sequence_model_parallel_all_gather(
-                    attn_mask.contiguous(), dim=1
-                )
+                if kv_is_replicated:
+                    mask_for_sdpa = attn_mask
+                else:
+                    mask_for_sdpa = sequence_model_parallel_all_gather(
+                        attn_mask.contiguous(), dim=1
+                    )
             else:
                 mask_for_sdpa = attn_mask
             q_ = q.transpose(1, 2)

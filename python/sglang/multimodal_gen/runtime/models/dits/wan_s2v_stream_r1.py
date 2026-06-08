@@ -6,6 +6,11 @@ from typing import Callable, TypedDict
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_world_size,
+    sequence_model_parallel_all_gather,
+)
+
 
 class WanS2VKVCacheBlock(TypedDict):
     k: torch.Tensor
@@ -471,6 +476,31 @@ def build_wan_s2v_stream_r1_mixed_kv_attention_mask(
     ).unsqueeze(0)
 
 
+def pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp(
+    attn_mask: torch.Tensor,
+    original_query_seq_len: int,
+    pad_tokens: int,
+) -> torch.Tensor:
+    if pad_tokens <= 0:
+        return attn_mask
+    if attn_mask.dim() != 3:
+        raise ValueError("Stream-R1 SP mixed-KV attention mask must be [B, S, K]")
+    if attn_mask.shape[-2] != original_query_seq_len:
+        raise ValueError(
+            "Stream-R1 SP mixed-KV attention mask query length does not match "
+            "the unpadded sequence"
+        )
+
+    padded_query_seq_len = original_query_seq_len + pad_tokens
+    padded_mask = torch.ones(
+        (attn_mask.shape[0], padded_query_seq_len, attn_mask.shape[-1]),
+        dtype=attn_mask.dtype,
+        device=attn_mask.device,
+    )
+    padded_mask[:, :original_query_seq_len, :] = attn_mask
+    return padded_mask
+
+
 def run_wan_s2v_stream_r1_cached_self_attention(
     attention: Callable[..., torch.Tensor],
     *,
@@ -480,6 +510,8 @@ def run_wan_s2v_stream_r1_cached_self_attention(
     kv_cache: WanS2VKVCacheBlock | None,
     layout: WanS2VStreamR1AttentionLayout | None,
     cache_start: int | None,
+    sequence_shard_enabled: bool = False,
+    sp_pad_tokens: int = 0,
 ) -> torch.Tensor:
     """Run one guarded Stream-R1 S2V cached self-attention step."""
 
@@ -487,18 +519,40 @@ def run_wan_s2v_stream_r1_cached_self_attention(
         raise ValueError("Stream-R1 S2V cached attention requires kv_cache")
     if layout is None:
         raise ValueError("Stream-R1 S2V cached attention requires attention layout")
+    if sp_pad_tokens < 0:
+        raise ValueError("sp_pad_tokens must be non-negative")
     if query.dim() != 4:
         raise ValueError("query tensor must have shape [B, S, H, D]")
-    if query.shape[1] != layout.total_seq_len:
-        raise ValueError(
-            "query sequence length must match the Stream-R1 attention layout"
-        )
-    if key.shape[1] != layout.total_seq_len:
-        raise ValueError(
-            "key/value sequence length must match the Stream-R1 attention layout"
-        )
     if query.shape[0] != key.shape[0] or query.shape[2:] != key.shape[2:]:
         raise ValueError("query and key/value batch/head dimensions must match")
+    if value.shape[0] != key.shape[0] or value.shape[2:] != key.shape[2:]:
+        raise ValueError("key and value batch/head dimensions must match")
+    if sequence_shard_enabled:
+        sp_world_size = get_sp_world_size()
+        padded_seq_len = layout.total_seq_len + sp_pad_tokens
+        if query.shape[1] * sp_world_size != padded_seq_len:
+            raise ValueError(
+                "local query sequence length does not match the padded "
+                "Stream-R1 SP attention layout"
+            )
+        if key.shape[1] * sp_world_size != padded_seq_len:
+            raise ValueError(
+                "local key/value sequence length does not match the padded "
+                "Stream-R1 SP attention layout"
+            )
+        key = sequence_model_parallel_all_gather(key.contiguous(), dim=1)
+        value = sequence_model_parallel_all_gather(value.contiguous(), dim=1)
+        key = key[:, : layout.total_seq_len].contiguous()
+        value = value[:, : layout.total_seq_len].contiguous()
+    else:
+        if query.shape[1] != layout.total_seq_len:
+            raise ValueError(
+                "query sequence length must match the Stream-R1 attention layout"
+            )
+        if key.shape[1] != layout.total_seq_len:
+            raise ValueError(
+                "key/value sequence length must match the Stream-R1 attention layout"
+            )
 
     update = layout.to_noisy_kv_cache_update(cache_start=cache_start or 0)
     current_kv = split_wan_s2v_stream_r1_projected_kv(
@@ -519,6 +573,19 @@ def run_wan_s2v_stream_r1_cached_self_attention(
         update,
         device=query.device,
     )
+    if sequence_shard_enabled:
+        mixed_mask = pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp(
+            mixed_mask,
+            layout.total_seq_len,
+            sp_pad_tokens,
+        )
+        return attention(
+            query,
+            mixed_view.key,
+            mixed_view.value,
+            attn_mask=mixed_mask,
+            kv_is_replicated=True,
+        )
     return attention(query, mixed_view.key, mixed_view.value, attn_mask=mixed_mask)
 
 

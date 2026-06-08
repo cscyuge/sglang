@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     build_wan_s2v_stream_r1_cached_noisy_kv_index,
     build_wan_s2v_stream_r1_mixed_kv_attention_mask,
     compose_wan_s2v_stream_r1_mixed_kv_view,
+    pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp,
     run_wan_s2v_stream_r1_cached_self_attention,
     split_wan_s2v_stream_r1_projected_kv,
     update_wan_s2v_stream_r1_noisy_kv_cache,
@@ -521,6 +522,18 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
                 noisy_view, mixed, update
             )
 
+    def test_sp_mixed_kv_query_mask_padding_keeps_padded_queries_valid(self):
+        mask = torch.tensor(
+            [[[True, False, True], [False, True, True]]],
+            dtype=torch.bool,
+        )
+
+        padded = pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp(mask, 2, 2)
+
+        self.assertEqual(padded.shape, (1, 4, 3))
+        torch.testing.assert_close(padded[:, :2], mask)
+        self.assertTrue(padded[:, 2:].all().item())
+
 
 class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
     def _cache(self, tokens: int):
@@ -616,6 +629,80 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
             torch.tensor([[100.0, 101.0, 102.0, 103.0, 300.0]]),
         )
         self.assertEqual(calls[-1]["attn_mask"].shape, (1, 3, 5))
+
+    def test_cached_branch_gathers_kv_and_uses_replicated_kv_for_sp(self):
+        cache = self._cache(tokens=4)
+        calls = []
+
+        def recording_attention(query, key, value, attn_mask=None, **kwargs):
+            calls.append(
+                {
+                    "query": query.clone(),
+                    "key": key.clone(),
+                    "value": value.clone(),
+                    "attn_mask": attn_mask.clone(),
+                    "kwargs": dict(kwargs),
+                }
+            )
+            return query + 10
+
+        query = torch.zeros(1, 2, 1, 1)
+        key_local = torch.tensor([0.0, 1.0]).view(1, 2, 1, 1)
+        value_local = key_local + 100
+        key_padded_global = torch.tensor([0.0, 1.0, 100.0, 999.0]).view(
+            1, 4, 1, 1
+        )
+        value_padded_global = key_padded_global + 100
+
+        def fake_all_gather(tensor, dim):
+            self.assertEqual(dim, 1)
+            if torch.equal(tensor, key_local):
+                return key_padded_global
+            if torch.equal(tensor, value_local):
+                return value_padded_global
+            raise AssertionError("unexpected tensor gathered")
+
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=2,
+            total_seq_len=3,
+            frame_seq_length=1,
+            num_frame_per_block=2,
+            local_attn_size=4,
+            sink_size=1,
+            current_start=0,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "get_sp_world_size",
+            return_value=2,
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "sequence_model_parallel_all_gather",
+            side_effect=fake_all_gather,
+        ):
+            output = run_wan_s2v_stream_r1_cached_self_attention(
+                recording_attention,
+                query=query,
+                key=key_local,
+                value=value_local,
+                kv_cache=cache,
+                layout=layout,
+                cache_start=None,
+                sequence_shard_enabled=True,
+                sp_pad_tokens=1,
+            )
+
+        torch.testing.assert_close(output, query + 10)
+        self.assertEqual(calls[-1]["kwargs"], {"kv_is_replicated": True})
+        torch.testing.assert_close(
+            calls[-1]["key"][:, :, 0, 0], torch.tensor([[0.0, 1.0, 100.0]])
+        )
+        torch.testing.assert_close(
+            calls[-1]["value"][:, :, 0, 0], torch.tensor([[100.0, 101.0, 200.0]])
+        )
+        self.assertEqual(calls[-1]["attn_mask"].shape, (1, 4, 3))
+        self.assertTrue(calls[-1]["attn_mask"][:, 3:].all().item())
 
     def test_cached_branch_requires_cache_and_layout(self):
         query = torch.zeros(1, 2, 1, 1)
@@ -909,6 +996,8 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             stream_r1_kv_cache=None,
             stream_r1_attention_layout=None,
             cache_start=None,
+            stream_r1_sequence_shard_enabled=False,
+            stream_r1_sp_pad_tokens=0,
         ):
             return hidden_states
 
@@ -1381,7 +1470,7 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             [((6, 1), {"num_frame_per_block": 4, "kv_cache": False})],
         )
 
-    def test_kv_cache_rejects_context_parallel(self):
+    def test_kv_cache_allows_context_parallel_runtime(self):
         stage = self._stage()
         stage.transformer.use_context_parallel = True
         request = WanS2VStreamR1AttentionRequest(
@@ -1392,16 +1481,15 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             context_noise=0,
         )
 
-        with self.assertRaisesRegex(NotImplementedError, "sequence/context"):
-            stage._validate_stream_r1_parallel_compatibility(
-                request,
-                SimpleNamespace(
-                    did_sp_shard_latents=False,
-                    enable_sequence_shard=False,
-                ),
-            )
+        stage._validate_stream_r1_parallel_compatibility(
+            request,
+            SimpleNamespace(
+                did_sp_shard_latents=False,
+                enable_sequence_shard=False,
+            ),
+        )
 
-    def test_kv_cache_rejects_sequence_parallel_world_size(self):
+    def test_kv_cache_allows_sequence_parallel_world_size(self):
         stage = self._stage()
         request = WanS2VStreamR1AttentionRequest(
             stream_r1_kv_cache=True,
@@ -1411,19 +1499,13 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             context_noise=0,
         )
 
-        with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages."
-            "model_specific_stages.wan_s2v._safe_sp_world_size",
-            return_value=2,
-        ):
-            with self.assertRaisesRegex(NotImplementedError, "sequence/context"):
-                stage._validate_stream_r1_parallel_compatibility(
-                    request,
-                    SimpleNamespace(
-                        did_sp_shard_latents=False,
-                        enable_sequence_shard=False,
-                    ),
-                )
+        stage._validate_stream_r1_parallel_compatibility(
+            request,
+            SimpleNamespace(
+                did_sp_shard_latents=True,
+                enable_sequence_shard=True,
+            ),
+        )
 
 
 if __name__ == "__main__":

@@ -479,6 +479,8 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         stream_r1_kv_cache: WanS2VKVCacheBlock | None = None,
         stream_r1_attention_layout: WanS2VStreamR1AttentionLayout | None = None,
         cache_start: int | None = None,
+        stream_r1_sequence_shard_enabled: bool = False,
+        stream_r1_sp_pad_tokens: int = 0,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -513,6 +515,8 @@ class WanS2VTransformerBlock(WanTransformerBlock):
                 kv_cache=stream_r1_kv_cache,
                 layout=stream_r1_attention_layout,
                 cache_start=cache_start,
+                sequence_shard_enabled=stream_r1_sequence_shard_enabled,
+                sp_pad_tokens=stream_r1_sp_pad_tokens,
             ).flatten(2)
         else:
             attn_output = self.attn1(query, key, value, attn_mask=attn_mask).flatten(2)
@@ -704,6 +708,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         self.stream_r1_num_frame_per_block: int | None = None
         self.stream_r1_kv_cache_requested = False
         self._logged_stream_r1_sp_no_kv_mask = False
+        self._logged_stream_r1_sp_kv_mask = False
         self.__post_init__()
 
     def _process_motion_frame_pack(
@@ -1040,13 +1045,6 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         seq_len_before_sp_pad = int(x.shape[1])
         seq_shard_pad = 0
         if stream_r1_mode and self.stream_r1_local_attn_size is not None:
-            if sequence_shard_enabled and (
-                self.stream_r1_kv_cache_requested or kv_cache is not None
-            ):
-                raise NotImplementedError(
-                    "Stream-R1 S2V KV cache is incompatible with "
-                    "sequence/context parallelism in this phase."
-                )
             stream_r1_attention_layout = WanS2VStreamR1AttentionLayout(
                 noisy_seq_len=int(self.original_seq_len),
                 total_seq_len=int(x.shape[1]),
@@ -1058,15 +1056,22 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                 sink_size=self.stream_r1_sink_size or 0,
                 current_start=int(current_start),
             )
-            stream_r1_attn_mask = (
-                stream_r1_attention_layout.build_no_kv_attention_mask(x.device)
-            )
-            if sequence_shard_enabled and not self._logged_stream_r1_sp_no_kv_mask:
-                logger.info(
-                    "Stream-R1 S2V no-KV SP is using an SP-aware local/sink "
-                    "attention mask."
+            if kv_cache is None:
+                stream_r1_attn_mask = (
+                    stream_r1_attention_layout.build_no_kv_attention_mask(x.device)
                 )
-                self._logged_stream_r1_sp_no_kv_mask = True
+                if sequence_shard_enabled and not self._logged_stream_r1_sp_no_kv_mask:
+                    logger.info(
+                        "Stream-R1 S2V no-KV SP is using an SP-aware local/sink "
+                        "attention mask."
+                    )
+                    self._logged_stream_r1_sp_no_kv_mask = True
+            elif sequence_shard_enabled and not self._logged_stream_r1_sp_kv_mask:
+                logger.info(
+                    "Stream-R1 S2V KV cache SP is using replicated mixed-KV "
+                    "local/sink attention masks."
+                )
+                self._logged_stream_r1_sp_kv_mask = True
         if sequence_shard_enabled:
             sp_world_size = get_sp_world_size()
             seq_shard_pad = (-seq_len_before_sp_pad) % sp_world_size
@@ -1134,6 +1139,12 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                     else None
                 ),
                 cache_start=cache_start,
+                stream_r1_sequence_shard_enabled=(
+                    sequence_shard_enabled
+                    and stream_r1_mode
+                    and kv_cache is not None
+                ),
+                stream_r1_sp_pad_tokens=seq_shard_pad,
             )
             x = self._after_transformer_block(idx, x)
 

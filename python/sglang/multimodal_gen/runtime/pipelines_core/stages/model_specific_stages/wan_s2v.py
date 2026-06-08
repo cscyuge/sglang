@@ -763,22 +763,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
     def _validate_stream_r1_parallel_compatibility(
         self, request: WanS2VStreamR1AttentionRequest, batch: Req
     ) -> None:
-        if not request.stream_r1_kv_cache:
-            return
-        sp_world_size = _safe_sp_world_size()
-        context_parallel_enabled = bool(
-            getattr(self.transformer, "use_context_parallel", False)
-        )
-        sequence_parallel_enabled = bool(
-            getattr(batch, "did_sp_shard_latents", False)
-            or (sp_world_size > 1 and getattr(batch, "enable_sequence_shard", False))
-        )
-        if context_parallel_enabled or sequence_parallel_enabled or sp_world_size > 1:
-            raise NotImplementedError(
-                "Stream-R1 S2V KV cache is incompatible with sequence/context "
-                "parallelism in this phase; disable SP/CP or set "
-                "stream_r1_kv_cache=false."
-            )
+        return
 
     def _configure_transformer_attention(
         self, request: WanS2VStreamR1AttentionRequest
@@ -841,6 +826,8 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     "stream_r1_kv_cache",
                     "stream_r1_attention_layout",
                     "cache_start",
+                    "stream_r1_sequence_shard_enabled",
+                    "stream_r1_sp_pad_tokens",
                 },
             )
             for block in blocks
