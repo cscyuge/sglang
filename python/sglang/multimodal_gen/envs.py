@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
+    SGLANG_DIFFUSION_BROADCAST_SAFETENSORS_LOAD: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
@@ -284,6 +285,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
+    ),
+    # In distributed inference, let rank 0 read safetensors from storage and
+    # broadcast tensors to the other ranks. This avoids N ranks cold-reading the
+    # same large checkpoint from shared storage during startup.
+    "SGLANG_DIFFUSION_BROADCAST_SAFETENSORS_LOAD": _lazy_bool(
+        "SGLANG_DIFFUSION_BROADCAST_SAFETENSORS_LOAD", "true"
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
     # Supported values:

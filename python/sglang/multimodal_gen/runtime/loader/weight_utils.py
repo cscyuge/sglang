@@ -14,6 +14,7 @@ from pathlib import Path
 
 import filelock
 import torch
+import torch.distributed as dist
 from safetensors.torch import safe_open
 from torch.distributed.tensor import DTensor
 from tqdm.auto import tqdm
@@ -179,7 +180,7 @@ def _raise_if_duplicate_safetensors_keys(hf_weights_files: list[str]) -> None:
     )
 
 
-def safetensors_weights_iterator(
+def _local_safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
     use_runai_model_streamer: bool | None = None,
@@ -251,6 +252,134 @@ def safetensors_weights_iterator(
                 for name in f.keys():  # noqa: SIM118
                     param = f.get_tensor(name)
                     yield name, param
+
+
+def _can_broadcast_safetensors_load(use_distributed_broadcast: bool | None) -> bool:
+    if use_distributed_broadcast is None:
+        use_distributed_broadcast = (
+            envs.SGLANG_DIFFUSION_BROADCAST_SAFETENSORS_LOAD
+        )
+    return (
+        use_distributed_broadcast
+        and dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    )
+
+
+def _broadcast_object_from_rank0(obj):
+    obj_list = [obj]
+    try:
+        dist.broadcast_object_list(obj_list, src=0, device=get_local_torch_device())
+    except TypeError:
+        dist.broadcast_object_list(obj_list, src=0)
+    return obj_list[0]
+
+
+def _tensor_as_bytes(tensor: torch.Tensor) -> torch.Tensor:
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    if tensor.dim() == 0:
+        tensor = tensor.reshape(1)
+    return tensor.view(torch.uint8)
+
+
+def _distributed_safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    to_cpu: bool = True,
+    use_runai_model_streamer: bool | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    rank = dist.get_rank()
+    device = get_local_torch_device()
+    if use_runai_model_streamer is None:
+        use_runai_model_streamer = (
+            HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
+        )
+    if use_runai_model_streamer and rank == 0:
+        logger.info(
+            "Disabling RunAI model streamer for rank-0 broadcast safetensors "
+            "loading; rank 0 will stream tensors with safe_open."
+        )
+    local_iterator = (
+        _local_safetensors_weights_iterator(
+            hf_weights_files,
+            to_cpu=True,
+            use_runai_model_streamer=False,
+        )
+        if rank == 0
+        else None
+    )
+    if rank == 0:
+        logger.info(
+            "Using rank-0 broadcast safetensors loading for %d distributed ranks.",
+            dist.get_world_size(),
+        )
+
+    while True:
+        tensor: torch.Tensor | None = None
+        if rank == 0:
+            assert local_iterator is not None
+            try:
+                name, tensor = next(local_iterator)
+                metadata = ("tensor", name, tuple(tensor.shape), tensor.dtype)
+            except StopIteration:
+                metadata = ("done",)
+            except Exception as exc:
+                metadata = ("error", repr(exc))
+        else:
+            metadata = None
+
+        metadata = _broadcast_object_from_rank0(metadata)
+        tag = metadata[0]
+        if tag == "done":
+            break
+        if tag == "error":
+            raise RuntimeError(f"rank-0 safetensors load failed: {metadata[1]}")
+
+        _, name, shape, dtype = metadata
+        if rank == 0:
+            assert tensor is not None
+            broadcast_tensor = tensor.to(device=device, non_blocking=True)
+        else:
+            broadcast_tensor = torch.empty(shape, dtype=dtype, device=device)
+
+        dist.broadcast(_tensor_as_bytes(broadcast_tensor), src=0)
+
+        if to_cpu:
+            if rank == 0:
+                assert tensor is not None
+                yield name, tensor
+            else:
+                yield name, broadcast_tensor.cpu()
+        else:
+            yield name, broadcast_tensor
+
+
+def safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    to_cpu: bool = True,
+    use_runai_model_streamer: bool | None = None,
+    use_distributed_broadcast: bool | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over safetensors weights.
+
+    In distributed inference, rank 0 can read checkpoint tensors from storage and
+    broadcast them to the other ranks. This preserves replicated-weight loading
+    semantics while avoiding N independent cold reads from shared storage.
+    """
+    if _can_broadcast_safetensors_load(use_distributed_broadcast):
+        yield from _distributed_safetensors_weights_iterator(
+            hf_weights_files,
+            to_cpu=to_cpu,
+            use_runai_model_streamer=use_runai_model_streamer,
+        )
+        return
+
+    yield from _local_safetensors_weights_iterator(
+        hf_weights_files,
+        to_cpu=to_cpu,
+        use_runai_model_streamer=use_runai_model_streamer,
+    )
 
 
 def _load_pt_file(bin_file: str, device: str) -> dict:
