@@ -1155,7 +1155,28 @@ def validate_wan_s2v_stream_r1_forward_cache(
     """Validate cache arguments accepted by Wan S2V transformer forward."""
 
     if crossattn_cache is not None:
-        raise NotImplementedError("Wan S2V crossattn_cache is not supported")
+        if not stream_r1_mode:
+            raise ValueError(
+                "Wan S2V crossattn_cache is only supported when "
+                "stream_r1_mode=True"
+            )
+        if not isinstance(crossattn_cache, list):
+            raise ValueError(
+                "Wan S2V crossattn_cache must be a list of per-block cache entries"
+            )
+        if len(crossattn_cache) != num_transformer_blocks:
+            raise ValueError(
+                "Wan S2V crossattn_cache length must match the number of "
+                f"transformer blocks: crossattn_cache length={len(crossattn_cache)}, "
+                f"blocks={num_transformer_blocks}"
+            )
+        for idx, entry in enumerate(crossattn_cache):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    "Wan S2V crossattn_cache entries must be dicts: "
+                    f"index={idx}, type={type(entry).__name__}"
+                )
+
     if kv_cache is None:
         return
     if not stream_r1_mode:
