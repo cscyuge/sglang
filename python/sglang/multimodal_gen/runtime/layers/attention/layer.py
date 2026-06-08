@@ -439,6 +439,12 @@ class USPAttention(nn.Module):
                         mask = mask[:, None, None, :]
                     elif mask.dim() == 3:
                         mask = mask[:, None, :, :]
+                    elif mask.dim() == 4:
+                        pass
+                    else:
+                        raise NotImplementedError(
+                            f"Unsupported attention mask shape {tuple(mask.shape)}"
+                        )
                     return mask
 
                 mask = mask.to(dtype=dtype)
@@ -446,6 +452,12 @@ class USPAttention(nn.Module):
                     mask = mask[:, None, None, :]
                 elif mask.dim() == 3:
                     mask = mask[:, None, :, :]
+                elif mask.dim() == 4:
+                    pass
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported attention mask shape {tuple(mask.shape)}"
+                    )
                 return (mask - 1.0) * torch.finfo(dtype).max
 
             sp_world_size = get_sequence_parallel_world_size()
@@ -468,9 +480,10 @@ class USPAttention(nn.Module):
                 raise NotImplementedError(
                     "USPAttention masked path does not support ring parallelism yet."
                 )
-            if attn_mask.dim() != 2:
+            if attn_mask.dim() not in (2, 3, 4):
                 raise NotImplementedError(
-                    "USPAttention masked SP path currently expects a [B, S_local] key mask."
+                    "USPAttention masked SP path expects a [B, S_local] key "
+                    "mask or a global [B, S, S]/[B, 1, S, S] attention mask."
                 )
 
             sp_size = get_ulysses_parallel_world_size()
@@ -479,13 +492,25 @@ class USPAttention(nn.Module):
                 k = _usp_input_all_to_all(k, head_dim=2)
                 v = _usp_input_all_to_all(v, head_dim=2)
 
-            gathered_mask = sequence_model_parallel_all_gather(
-                attn_mask.contiguous(), dim=1
-            )
+            if attn_mask.dim() == 2:
+                mask_for_sdpa = sequence_model_parallel_all_gather(
+                    attn_mask.contiguous(), dim=1
+                )
+            else:
+                mask_for_sdpa = attn_mask
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
-            mask = _prepare_sdpa_mask(gathered_mask, dtype=q_.dtype, device=q_.device)
+            if mask_for_sdpa.dim() in (3, 4):
+                if (
+                    mask_for_sdpa.shape[-2] != q_.shape[-2]
+                    or mask_for_sdpa.shape[-1] != k_.shape[-2]
+                ):
+                    raise ValueError(
+                        "Global USPAttention mask shape does not match the "
+                        "post-SP query/key sequence lengths"
+                    )
+            mask = _prepare_sdpa_mask(mask_for_sdpa, dtype=q_.dtype, device=q_.device)
             out = torch.nn.functional.scaled_dot_product_attention(
                 q_,
                 k_,

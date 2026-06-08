@@ -217,6 +217,34 @@ def _segment_gate(x: torch.Tensor, gate: torch.Tensor, seg_idx: int) -> torch.Te
     )
 
 
+def _pad_stream_r1_attention_mask_for_sp(
+    attn_mask: torch.Tensor,
+    original_seq_len: int,
+    pad_tokens: int,
+) -> torch.Tensor:
+    if pad_tokens <= 0:
+        return attn_mask
+    if attn_mask.dim() != 3:
+        raise ValueError("Stream-R1 SP attention mask must be [B, S, S]")
+    if (
+        attn_mask.shape[-2] != original_seq_len
+        or attn_mask.shape[-1] != original_seq_len
+    ):
+        raise ValueError(
+            "Stream-R1 SP attention mask shape does not match the unpadded sequence"
+        )
+
+    padded_seq_len = original_seq_len + pad_tokens
+    padded_mask = torch.ones(
+        (attn_mask.shape[0], padded_seq_len, padded_seq_len),
+        dtype=attn_mask.dtype,
+        device=attn_mask.device,
+    )
+    padded_mask[:, :original_seq_len, :original_seq_len] = attn_mask
+    padded_mask[:, :original_seq_len, original_seq_len:] = False
+    return padded_mask
+
+
 class CausalConv1d(nn.Module):
     def __init__(
         self,
@@ -675,7 +703,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         self.stream_r1_sink_size: int | None = None
         self.stream_r1_num_frame_per_block: int | None = None
         self.stream_r1_kv_cache_requested = False
-        self._logged_stream_r1_dense_sp_no_kv = False
+        self._logged_stream_r1_sp_no_kv_mask = False
         self.__post_init__()
 
     def _process_motion_frame_pack(
@@ -1012,34 +1040,33 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         seq_len_before_sp_pad = int(x.shape[1])
         seq_shard_pad = 0
         if stream_r1_mode and self.stream_r1_local_attn_size is not None:
-            if sequence_shard_enabled:
-                if self.stream_r1_kv_cache_requested or kv_cache is not None:
-                    raise NotImplementedError(
-                        "Stream-R1 S2V KV cache is incompatible with "
-                        "sequence/context parallelism in this phase."
-                    )
-                if not self._logged_stream_r1_dense_sp_no_kv:
-                    logger.info(
-                        "Stream-R1 S2V no-KV SP is using dense self-attention; "
-                        "local/sink no-KV masks are disabled until SP-aware "
-                        "window/sink masks are implemented."
-                    )
-                    self._logged_stream_r1_dense_sp_no_kv = True
-            else:
-                stream_r1_attention_layout = WanS2VStreamR1AttentionLayout(
-                    noisy_seq_len=int(self.original_seq_len),
-                    total_seq_len=int(x.shape[1]),
-                    frame_seq_length=frame_seq_length,
-                    num_frame_per_block=(
-                        self.stream_r1_num_frame_per_block or latent_frames
-                    ),
-                    local_attn_size=self.stream_r1_local_attn_size,
-                    sink_size=self.stream_r1_sink_size or 0,
-                    current_start=int(current_start),
+            if sequence_shard_enabled and (
+                self.stream_r1_kv_cache_requested or kv_cache is not None
+            ):
+                raise NotImplementedError(
+                    "Stream-R1 S2V KV cache is incompatible with "
+                    "sequence/context parallelism in this phase."
                 )
-                stream_r1_attn_mask = (
-                    stream_r1_attention_layout.build_no_kv_attention_mask(x.device)
+            stream_r1_attention_layout = WanS2VStreamR1AttentionLayout(
+                noisy_seq_len=int(self.original_seq_len),
+                total_seq_len=int(x.shape[1]),
+                frame_seq_length=frame_seq_length,
+                num_frame_per_block=(
+                    self.stream_r1_num_frame_per_block or latent_frames
+                ),
+                local_attn_size=self.stream_r1_local_attn_size,
+                sink_size=self.stream_r1_sink_size or 0,
+                current_start=int(current_start),
+            )
+            stream_r1_attn_mask = (
+                stream_r1_attention_layout.build_no_kv_attention_mask(x.device)
+            )
+            if sequence_shard_enabled and not self._logged_stream_r1_sp_no_kv_mask:
+                logger.info(
+                    "Stream-R1 S2V no-KV SP is using an SP-aware local/sink "
+                    "attention mask."
                 )
+                self._logged_stream_r1_sp_no_kv_mask = True
         if sequence_shard_enabled:
             sp_world_size = get_sp_world_size()
             seq_shard_pad = (-seq_len_before_sp_pad) % sp_world_size
@@ -1058,12 +1085,20 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                     dtype=pre_compute_freqs.dtype,
                     device=pre_compute_freqs.device,
                 )
-                sp_key_padding_mask = torch.ones(
-                    (x.shape[0], seq_len_before_sp_pad + seq_shard_pad),
-                    dtype=torch.bool,
-                    device=x.device,
-                )
-                sp_key_padding_mask[:, seq_len_before_sp_pad:] = False
+                if stream_r1_attn_mask is not None:
+                    stream_r1_attn_mask = _pad_stream_r1_attention_mask_for_sp(
+                        stream_r1_attn_mask,
+                        seq_len_before_sp_pad,
+                        seq_shard_pad,
+                    )
+                    sp_key_padding_mask = None
+                else:
+                    sp_key_padding_mask = torch.ones(
+                        (x.shape[0], seq_len_before_sp_pad + seq_shard_pad),
+                        dtype=torch.bool,
+                        device=x.device,
+                    )
+                    sp_key_padding_mask[:, seq_len_before_sp_pad:] = False
                 x = torch.cat([x, x_pad], dim=1)
                 pre_compute_freqs = torch.cat([pre_compute_freqs, freq_pad], dim=1)
             else:

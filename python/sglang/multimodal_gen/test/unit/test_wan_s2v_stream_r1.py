@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import WanS2VPipelin
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v import (
     _build_s2v_noisy_rope_grid_sizes,
+    _pad_stream_r1_attention_mask_for_sp,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
@@ -190,6 +191,31 @@ class TestWanS2VConditionBundle(unittest.TestCase):
 
 
 class TestWanS2VStreamR1AttentionLayout(unittest.TestCase):
+    def test_sp_mask_padding_blocks_padded_keys_for_real_queries(self):
+        mask = torch.tensor(
+            [
+                [
+                    [True, False, True],
+                    [False, True, True],
+                    [True, True, False],
+                ]
+            ],
+            dtype=torch.bool,
+        )
+
+        padded = _pad_stream_r1_attention_mask_for_sp(mask, 3, 2)
+
+        self.assertEqual(padded.shape, (1, 5, 5))
+        torch.testing.assert_close(padded[:, :3, :3], mask)
+        self.assertFalse(padded[:, :3, 3:].any().item())
+        self.assertTrue(padded[:, 3:, :].all().item())
+
+    def test_sp_mask_padding_rejects_mismatched_shape(self):
+        mask = torch.ones((1, 3, 4), dtype=torch.bool)
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            _pad_stream_r1_attention_mask_for_sp(mask, 3, 1)
+
     def test_no_kv_mask_limits_noisy_tokens_to_sink_local_and_condition(self):
         layout = WanS2VStreamR1AttentionLayout(
             noisy_seq_len=8,
