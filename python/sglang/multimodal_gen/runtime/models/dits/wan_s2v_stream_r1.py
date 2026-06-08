@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Lightweight Stream-R1 helpers for Wan S2V attention."""
 
+import os
+import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, TypedDict
 
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all_qkv,
+    _usp_output_all_to_all,
 )
 
 
@@ -17,6 +25,471 @@ class WanS2VKVCacheBlock(TypedDict):
     v: torch.Tensor
     global_end_index: torch.Tensor
     local_end_index: torch.Tensor
+
+
+def _stream_r1_profile_enabled() -> bool:
+    value = os.getenv("SGLANG_STREAM_R1_PROFILE", "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _stream_r1_attention_backend() -> str:
+    value = os.getenv("SGLANG_STREAM_R1_ATTENTION_BACKEND", "dense_sdpa").lower()
+    value = value.replace("-", "_")
+    if value in ("", "dense", "dense_sdpa", "sdpa"):
+        return "dense_sdpa"
+    if value in ("packed", "packed_varlen", "varlen"):
+        return "packed_varlen"
+    raise ValueError(
+        "Unsupported SGLANG_STREAM_R1_ATTENTION_BACKEND="
+        f"{value!r}; expected dense_sdpa or packed_varlen"
+    )
+
+
+def wan_s2v_stream_r1_attention_backend() -> str:
+    return _stream_r1_attention_backend()
+
+
+def wan_s2v_stream_r1_uses_head_sharded_sp_kv_cache() -> bool:
+    return _stream_r1_attention_backend() == "packed_varlen" and get_sp_world_size() > 1
+
+
+class _StreamR1ProfileSpan:
+    def __init__(self, profile: "_StreamR1Profile", name: str):
+        self.profile = profile
+        self.name = name
+        self._start_event: torch.cuda.Event | None = None
+        self._end_event: torch.cuda.Event | None = None
+        self._start_time: float | None = None
+
+    def __enter__(self):
+        if self.profile.use_cuda_events:
+            self._start_event = torch.cuda.Event(enable_timing=True)
+            self._end_event = torch.cuda.Event(enable_timing=True)
+            self._start_event.record()
+        else:
+            self._start_time = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.profile.use_cuda_events:
+            assert self._start_event is not None
+            assert self._end_event is not None
+            self._end_event.record()
+            self._end_event.synchronize()
+            elapsed_ms = self._start_event.elapsed_time(self._end_event)
+        else:
+            assert self._start_time is not None
+            elapsed_ms = (time.perf_counter() - self._start_time) * 1000.0
+        self.profile.timings.append((self.name, elapsed_ms))
+        return False
+
+
+class _StreamR1Profile:
+    def __init__(self, *, tag: str, device: torch.device | None):
+        self.enabled = _stream_r1_profile_enabled()
+        self.tag = tag
+        self.timings: list[tuple[str, float]] = []
+        self.use_cuda_events = (
+            self.enabled
+            and device is not None
+            and device.type == "cuda"
+            and torch.cuda.is_available()
+        )
+
+    def span(self, name: str):
+        if not self.enabled:
+            return nullcontext()
+        return _StreamR1ProfileSpan(self, name)
+
+    def log(self, **metadata) -> None:
+        if not self.enabled or not self.timings:
+            return
+        fields = [f"tag={self.tag}"]
+        fields.extend(f"{key}={value}" for key, value in metadata.items())
+        fields.extend(f"{name}={elapsed_ms:.3f}ms" for name, elapsed_ms in self.timings)
+        print("[stream-r1-profile] " + " ".join(fields), flush=True)
+
+
+@dataclass(frozen=True)
+class WanS2VStreamR1AttentionPlan:
+    query_seq_len: int
+    kv_seq_len: int
+    noisy_query_seq_len: int
+    noisy_kv_seq_len: int
+    condition_kv_seq_len: int
+    frame_seq_length: int
+    query_block_tokens: int
+    local_attn_size: int
+    sink_size: int
+    current_start: int = 0
+    cache_start: int = 0
+    noisy_kv_absolute_index: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.query_seq_len <= 0:
+            raise ValueError("query_seq_len must be positive")
+        if self.kv_seq_len <= 0:
+            raise ValueError("kv_seq_len must be positive")
+        if self.noisy_query_seq_len < 0:
+            raise ValueError("noisy_query_seq_len must be non-negative")
+        if self.noisy_query_seq_len > self.query_seq_len:
+            raise ValueError("noisy_query_seq_len must not exceed query_seq_len")
+        if self.noisy_kv_seq_len < 0:
+            raise ValueError("noisy_kv_seq_len must be non-negative")
+        if self.condition_kv_seq_len < 0:
+            raise ValueError("condition_kv_seq_len must be non-negative")
+        if self.noisy_kv_seq_len + self.condition_kv_seq_len != self.kv_seq_len:
+            raise ValueError("noisy and condition KV lengths must add up to kv_seq_len")
+        if self.frame_seq_length <= 0:
+            raise ValueError("frame_seq_length must be positive")
+        if self.query_block_tokens <= 0:
+            raise ValueError("query_block_tokens must be positive")
+        if self.local_attn_size <= 0:
+            raise ValueError("local_attn_size must be positive")
+        if self.sink_size < 0:
+            raise ValueError("sink_size must be non-negative")
+        if self.sink_size >= self.local_attn_size:
+            raise ValueError("sink_size must be smaller than local_attn_size")
+        if self.current_start < 0:
+            raise ValueError("current_start must be non-negative")
+        if self.cache_start < 0:
+            raise ValueError("cache_start must be non-negative")
+        if self.current_start % self.frame_seq_length != 0:
+            raise ValueError("current_start must be frame-aligned")
+        if self.cache_start % self.frame_seq_length != 0:
+            raise ValueError("cache_start must be frame-aligned")
+        if self.noisy_kv_absolute_index is not None:
+            if self.noisy_kv_absolute_index.dim() != 1:
+                raise ValueError("noisy_kv_absolute_index must be 1D")
+            if self.noisy_kv_absolute_index.shape[0] != self.noisy_kv_seq_len:
+                raise ValueError(
+                    "noisy_kv_absolute_index length must match noisy_kv_seq_len"
+                )
+
+    @property
+    def condition_query_seq_len(self) -> int:
+        return self.query_seq_len - self.noisy_query_seq_len
+
+    @property
+    def local_tokens(self) -> int:
+        return self.local_attn_size * self.frame_seq_length
+
+    @property
+    def sink_tokens(self) -> int:
+        return self.sink_size * self.frame_seq_length
+
+    @property
+    def sink_end(self) -> int:
+        return self.cache_start + self.sink_tokens
+
+    def noisy_kv_index(self, device: torch.device) -> torch.Tensor:
+        if self.noisy_kv_absolute_index is not None:
+            return self.noisy_kv_absolute_index.to(device=device)
+        return self.current_start + torch.arange(
+            self.noisy_kv_seq_len,
+            dtype=torch.long,
+            device=device,
+        )
+
+    def query_groups(self, device: torch.device) -> list["WanS2VStreamR1QueryGroup"]:
+        groups: list[WanS2VStreamR1QueryGroup] = []
+        noisy_kv_abs = self.noisy_kv_index(device)
+        condition_indices = torch.arange(
+            self.noisy_kv_seq_len,
+            self.kv_seq_len,
+            dtype=torch.long,
+            device=device,
+        )
+
+        query_start = 0
+        while query_start < self.noisy_query_seq_len:
+            query_abs = self.current_start + query_start
+            block_end = (
+                query_abs // self.query_block_tokens + 1
+            ) * self.query_block_tokens
+            query_end = min(
+                self.noisy_query_seq_len,
+                max(query_start + 1, block_end - self.current_start),
+            )
+            local_start = block_end - self.local_tokens
+            visible_noisy = (noisy_kv_abs < self.sink_end) | (
+                (noisy_kv_abs >= local_start) & (noisy_kv_abs < block_end)
+            )
+            noisy_indices = torch.nonzero(visible_noisy, as_tuple=False).flatten()
+            if condition_indices.numel() > 0:
+                kv_indices = torch.cat([noisy_indices, condition_indices])
+            else:
+                kv_indices = noisy_indices
+            groups.append(
+                WanS2VStreamR1QueryGroup(
+                    query_start=query_start,
+                    query_end=query_end,
+                    kv_indices=kv_indices,
+                )
+            )
+            query_start = query_end
+
+        if self.condition_query_seq_len > 0:
+            groups.append(
+                WanS2VStreamR1QueryGroup(
+                    query_start=self.noisy_query_seq_len,
+                    query_end=self.query_seq_len,
+                    kv_indices=torch.arange(
+                        self.kv_seq_len,
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                )
+            )
+        return groups
+
+    def to_dense_mask(self, device: torch.device) -> torch.Tensor:
+        """Export the compact plan as the current dense bool mask reference."""
+
+        mask = torch.zeros(
+            (self.query_seq_len, self.kv_seq_len),
+            dtype=torch.bool,
+            device=device,
+        )
+        for group in self.query_groups(device):
+            mask[group.query_start : group.query_end, group.kv_indices] = True
+        return mask.unsqueeze(0)
+
+
+@dataclass(frozen=True)
+class WanS2VStreamR1QueryGroup:
+    query_start: int
+    query_end: int
+    kv_indices: torch.Tensor
+
+    @property
+    def query_len(self) -> int:
+        return self.query_end - self.query_start
+
+
+@dataclass(frozen=True)
+class WanS2VStreamR1PackedAttentionSegment:
+    batch_index: int
+    query_start: int
+    query_end: int
+    packed_query_start: int
+    packed_query_end: int
+    packed_kv_start: int
+    packed_kv_end: int
+
+
+@dataclass(frozen=True)
+class WanS2VStreamR1PackedAttentionWorkspace:
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    segments: tuple[WanS2VStreamR1PackedAttentionSegment, ...]
+
+
+def build_wan_s2v_stream_r1_packed_attention_workspace(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    plan: WanS2VStreamR1AttentionPlan,
+) -> WanS2VStreamR1PackedAttentionWorkspace:
+    """Pack Stream-R1 plan-visible K/V ranges as varlen attention segments."""
+
+    _validate_key_value_pair(key, value, name="packed attention key/value")
+    if query.dim() != 4:
+        raise ValueError("packed attention query must have shape [B, S, H, D]")
+    if query.shape[0] != key.shape[0] or query.shape[2:] != key.shape[2:]:
+        raise ValueError("packed attention query/key batch/head dimensions must match")
+    if query.shape[1] != plan.query_seq_len:
+        raise ValueError("packed attention query length must match attention plan")
+    if key.shape[1] != plan.kv_seq_len:
+        raise ValueError("packed attention key length must match attention plan")
+
+    query_parts = []
+    key_parts = []
+    value_parts = []
+    cu_q = [0]
+    cu_k = [0]
+    segments: list[WanS2VStreamR1PackedAttentionSegment] = []
+    max_q = 0
+    max_k = 0
+    query_groups = plan.query_groups(query.device)
+    for batch_index in range(query.shape[0]):
+        for group in query_groups:
+            if group.query_len <= 0:
+                raise ValueError("packed attention query groups must be non-empty")
+            if group.kv_indices.numel() <= 0:
+                raise ValueError("packed attention KV groups must be non-empty")
+            q_part = query[batch_index, group.query_start : group.query_end]
+            k_part = key[batch_index].index_select(0, group.kv_indices)
+            v_part = value[batch_index].index_select(0, group.kv_indices)
+            query_parts.append(q_part)
+            key_parts.append(k_part)
+            value_parts.append(v_part)
+
+            q_start = cu_q[-1]
+            k_start = cu_k[-1]
+            q_end = q_start + q_part.shape[0]
+            k_end = k_start + k_part.shape[0]
+            cu_q.append(q_end)
+            cu_k.append(k_end)
+            max_q = max(max_q, q_part.shape[0])
+            max_k = max(max_k, k_part.shape[0])
+            segments.append(
+                WanS2VStreamR1PackedAttentionSegment(
+                    batch_index=batch_index,
+                    query_start=group.query_start,
+                    query_end=group.query_end,
+                    packed_query_start=q_start,
+                    packed_query_end=q_end,
+                    packed_kv_start=k_start,
+                    packed_kv_end=k_end,
+                )
+            )
+
+    return WanS2VStreamR1PackedAttentionWorkspace(
+        query=torch.cat(query_parts, dim=0).contiguous(),
+        key=torch.cat(key_parts, dim=0).contiguous(),
+        value=torch.cat(value_parts, dim=0).contiguous(),
+        cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=query.device),
+        cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=query.device),
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        segments=tuple(segments),
+    )
+
+
+def _unpack_wan_s2v_stream_r1_packed_attention(
+    packed_output: torch.Tensor,
+    workspace: WanS2VStreamR1PackedAttentionWorkspace,
+    output_shape: torch.Size,
+) -> torch.Tensor:
+    output = packed_output.new_empty(output_shape)
+    for segment in workspace.segments:
+        output[
+            segment.batch_index,
+            segment.query_start : segment.query_end,
+        ] = packed_output[segment.packed_query_start : segment.packed_query_end]
+    return output
+
+
+def _run_wan_s2v_stream_r1_packed_torch_attention(
+    workspace: WanS2VStreamR1PackedAttentionWorkspace,
+    output_shape: torch.Size,
+    *,
+    softmax_scale: float | None,
+) -> torch.Tensor:
+    output = workspace.query.new_empty(output_shape)
+    for segment in workspace.segments:
+        q = workspace.query[
+            segment.packed_query_start : segment.packed_query_end
+        ].transpose(0, 1).unsqueeze(0)
+        k = workspace.key[segment.packed_kv_start : segment.packed_kv_end].transpose(
+            0, 1
+        ).unsqueeze(0)
+        v = workspace.value[segment.packed_kv_start : segment.packed_kv_end].transpose(
+            0, 1
+        ).unsqueeze(0)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=softmax_scale,
+        ).squeeze(0).transpose(0, 1)
+        output[
+            segment.batch_index,
+            segment.query_start : segment.query_end,
+        ] = out
+    return output
+
+
+def stream_r1_packed_varlen_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    plan: WanS2VStreamR1AttentionPlan,
+    *,
+    softmax_scale: float | None,
+    force_torch: bool = False,
+) -> torch.Tensor:
+    """Run Stream-R1 packed varlen attention for one non-SP mixed-KV call."""
+
+    workspace = build_wan_s2v_stream_r1_packed_attention_workspace(
+        query,
+        key,
+        value,
+        plan,
+    )
+    if force_torch or query.device.type != "cuda":
+        return _run_wan_s2v_stream_r1_packed_torch_attention(
+            workspace,
+            query.shape,
+            softmax_scale=softmax_scale,
+        )
+
+    try:
+        from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    except Exception as exc:  # pragma: no cover - depends on optional kernels
+        raise RuntimeError(
+            "SGLANG_STREAM_R1_ATTENTION_BACKEND=packed_varlen requires "
+            "flash_attn_varlen_func on CUDA"
+        ) from exc
+
+    result = flash_attn_varlen_func(
+        workspace.query,
+        workspace.key,
+        workspace.value,
+        workspace.cu_seqlens_q,
+        workspace.cu_seqlens_k,
+        max_seqlen_q=workspace.max_seqlen_q,
+        max_seqlen_k=workspace.max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=False,
+    )
+    packed_output = result[0] if isinstance(result, tuple) else result
+    return _unpack_wan_s2v_stream_r1_packed_attention(
+        packed_output,
+        workspace,
+        query.shape,
+    )
+
+
+def _pad_stream_r1_sp_attention_output(
+    output: torch.Tensor,
+    *,
+    total_seq_len: int,
+    sp_pad_tokens: int,
+) -> torch.Tensor:
+    if sp_pad_tokens <= 0:
+        return output
+    if output.shape[1] != total_seq_len:
+        raise ValueError("Stream-R1 SP attention output length must be unpadded")
+    pad = output.new_zeros(
+        output.shape[0],
+        sp_pad_tokens,
+        output.shape[2],
+        output.shape[3],
+    )
+    return torch.cat([output, pad], dim=1)
+
+
+def _can_use_stream_r1_sp_head_sharded_packed_attention(
+    query: torch.Tensor,
+    kv_cache: WanS2VKVCacheBlock,
+    *,
+    sp_world_size: int,
+) -> bool:
+    if sp_world_size <= 1:
+        return False
+    if query.shape[2] % sp_world_size != 0:
+        return False
+    expected_local_heads = query.shape[2] // sp_world_size
+    return kv_cache["k"].shape[2] == expected_local_heads
 
 
 @dataclass(frozen=True)
@@ -85,6 +558,21 @@ class WanS2VStreamR1AttentionLayout:
             cache_start=cache_start,
         )
 
+    def to_no_kv_attention_plan(self) -> WanS2VStreamR1AttentionPlan:
+        return WanS2VStreamR1AttentionPlan(
+            query_seq_len=self.total_seq_len,
+            kv_seq_len=self.total_seq_len,
+            noisy_query_seq_len=self.noisy_seq_len,
+            noisy_kv_seq_len=self.noisy_seq_len,
+            condition_kv_seq_len=self.condition_seq_len,
+            frame_seq_length=self.frame_seq_length,
+            query_block_tokens=self.block_tokens,
+            local_attn_size=self.local_attn_size,
+            sink_size=self.sink_size,
+            current_start=self.current_start,
+            cache_start=0,
+        )
+
     def build_no_kv_attention_mask(self, device: torch.device) -> torch.Tensor:
         """Build the Stream-R1 no-KV local/sink mask for mixed S2V tokens.
 
@@ -93,28 +581,7 @@ class WanS2VStreamR1AttentionLayout:
         dense attention so reference/motion tokens retain legacy semantics.
         """
 
-        q_idx = torch.arange(self.total_seq_len, device=device).view(-1, 1)
-        kv_idx = torch.arange(self.total_seq_len, device=device).view(1, -1)
-        noisy_q = q_idx < self.noisy_seq_len
-        noisy_kv = kv_idx < self.noisy_seq_len
-        condition_kv = kv_idx >= self.noisy_seq_len
-
-        q_abs = self.current_start + q_idx
-        kv_abs = self.current_start + kv_idx
-        block_end = (
-            torch.div(q_abs, self.block_tokens, rounding_mode="floor") + 1
-        ) * self.block_tokens
-        local_start = block_end - self.local_tokens
-
-        sink_visible = noisy_kv & (kv_abs < self.sink_tokens)
-        local_visible = noisy_kv & (kv_abs >= local_start) & (kv_abs < block_end)
-        noisy_query_visible = condition_kv | sink_visible | local_visible
-
-        return torch.where(
-            noisy_q,
-            noisy_query_visible,
-            torch.ones_like(noisy_query_visible),
-        ).unsqueeze(0)
+        return self.to_no_kv_attention_plan().to_dense_mask(device)
 
 
 @dataclass(frozen=True)
@@ -438,42 +905,44 @@ def build_wan_s2v_stream_r1_mixed_kv_attention_mask(
     dense attention over the composed cached-mixed KV view.
     """
 
+    plan = build_wan_s2v_stream_r1_mixed_kv_attention_plan(
+        noisy_view,
+        mixed_view,
+        update,
+        device=device,
+    )
+    return plan.to_dense_mask(device or mixed_view.key.device)
+
+
+def build_wan_s2v_stream_r1_mixed_kv_attention_plan(
+    noisy_view: WanS2VStreamR1NoisyKVCacheView,
+    mixed_view: WanS2VStreamR1MixedKVView,
+    update: WanS2VStreamR1NoisyKVCacheUpdate,
+    *,
+    device: torch.device | None = None,
+) -> WanS2VStreamR1AttentionPlan:
+    """Build a compact mixed-KV attention plan for Stream-R1 S2V."""
+
     _validate_mixed_view_for_noisy_view(noisy_view, mixed_view)
     cached_noisy_index = build_wan_s2v_stream_r1_cached_noisy_kv_index(
         noisy_view,
         update,
         device=device or mixed_view.key.device,
     )
-    device = cached_noisy_index.device
-
-    query_seq_len = update.noisy_seq_len + mixed_view.condition_seq_len
-    q_idx = torch.arange(query_seq_len, device=device).view(-1, 1)
-    noisy_q = q_idx < update.noisy_seq_len
-    q_abs = update.current_start + q_idx
-    block_end = (
-        torch.div(q_abs, update.noisy_seq_len, rounding_mode="floor") + 1
-    ) * update.noisy_seq_len
-    local_start = block_end - update.local_tokens
-
-    cached_noisy_abs = cached_noisy_index.view(1, -1)
-    sink_visible = cached_noisy_abs < update.sink_end
-    local_visible = (cached_noisy_abs >= local_start) & (cached_noisy_abs < block_end)
-    noisy_kv_visible = sink_visible | local_visible
-    condition_kv_visible = torch.ones(
-        (query_seq_len, mixed_view.condition_seq_len),
-        dtype=torch.bool,
-        device=device,
+    return WanS2VStreamR1AttentionPlan(
+        query_seq_len=update.noisy_seq_len + mixed_view.condition_seq_len,
+        kv_seq_len=mixed_view.total_seq_len,
+        noisy_query_seq_len=update.noisy_seq_len,
+        noisy_kv_seq_len=mixed_view.cached_noisy_seq_len,
+        condition_kv_seq_len=mixed_view.condition_seq_len,
+        frame_seq_length=update.frame_seq_length,
+        query_block_tokens=update.noisy_seq_len,
+        local_attn_size=update.local_attn_size,
+        sink_size=update.sink_size,
+        current_start=update.current_start,
+        cache_start=update.cache_start,
+        noisy_kv_absolute_index=cached_noisy_index,
     )
-    noisy_query_visible = torch.cat(
-        [noisy_kv_visible.expand(query_seq_len, -1), condition_kv_visible],
-        dim=1,
-    )
-
-    return torch.where(
-        noisy_q,
-        noisy_query_visible,
-        torch.ones_like(noisy_query_visible),
-    ).unsqueeze(0)
 
 
 def pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp(
@@ -527,6 +996,13 @@ def run_wan_s2v_stream_r1_cached_self_attention(
         raise ValueError("query and key/value batch/head dimensions must match")
     if value.shape[0] != key.shape[0] or value.shape[2:] != key.shape[2:]:
         raise ValueError("key and value batch/head dimensions must match")
+    profile = _StreamR1Profile(
+        tag="stream_r1_cached_self_attention",
+        device=query.device,
+    )
+    attention_backend = _stream_r1_attention_backend()
+    selected_backend = attention_backend
+    use_sp_head_sharded_packed_attention = False
     if sequence_shard_enabled:
         sp_world_size = get_sp_world_size()
         padded_seq_len = layout.total_seq_len + sp_pad_tokens
@@ -540,10 +1016,36 @@ def run_wan_s2v_stream_r1_cached_self_attention(
                 "local key/value sequence length does not match the padded "
                 "Stream-R1 SP attention layout"
             )
-        key = sequence_model_parallel_all_gather(key.contiguous(), dim=1)
-        value = sequence_model_parallel_all_gather(value.contiguous(), dim=1)
-        key = key[:, : layout.total_seq_len].contiguous()
-        value = value[:, : layout.total_seq_len].contiguous()
+        use_sp_head_sharded_packed_attention = (
+            attention_backend == "packed_varlen"
+            and _can_use_stream_r1_sp_head_sharded_packed_attention(
+                query,
+                kv_cache,
+                sp_world_size=sp_world_size,
+            )
+        )
+        if use_sp_head_sharded_packed_attention:
+            selected_backend = "packed_varlen_sp_head_sharded"
+            with profile.span("usp_qkv_all_to_all"):
+                query_for_attention, key, value = _usp_input_all_to_all_qkv(
+                    query.contiguous(),
+                    key.contiguous(),
+                    value.contiguous(),
+                )
+            query_for_attention = query_for_attention[
+                :, : layout.total_seq_len
+            ].contiguous()
+            key = key[:, : layout.total_seq_len].contiguous()
+            value = value[:, : layout.total_seq_len].contiguous()
+        else:
+            if attention_backend == "packed_varlen":
+                selected_backend = "dense_sdpa_sp_fallback"
+            query_for_attention = query
+            with profile.span("kv_all_gather"):
+                key = sequence_model_parallel_all_gather(key.contiguous(), dim=1)
+                value = sequence_model_parallel_all_gather(value.contiguous(), dim=1)
+            key = key[:, : layout.total_seq_len].contiguous()
+            value = value[:, : layout.total_seq_len].contiguous()
     else:
         if query.shape[1] != layout.total_seq_len:
             raise ValueError(
@@ -553,40 +1055,94 @@ def run_wan_s2v_stream_r1_cached_self_attention(
             raise ValueError(
                 "key/value sequence length must match the Stream-R1 attention layout"
             )
+        query_for_attention = query
 
-    update = layout.to_noisy_kv_cache_update(cache_start=cache_start or 0)
-    current_kv = split_wan_s2v_stream_r1_projected_kv(
-        key,
-        value,
-        noisy_seq_len=layout.noisy_seq_len,
-    )
-    noisy_view = update_wan_s2v_stream_r1_noisy_kv_cache(
-        kv_cache,
-        current_kv.noisy_key,
-        current_kv.noisy_value,
-        update,
-    )
-    mixed_view = compose_wan_s2v_stream_r1_mixed_kv_view(noisy_view, current_kv)
-    mixed_mask = build_wan_s2v_stream_r1_mixed_kv_attention_mask(
-        noisy_view,
-        mixed_view,
-        update,
-        device=query.device,
-    )
-    if sequence_shard_enabled:
-        mixed_mask = pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp(
-            mixed_mask,
-            layout.total_seq_len,
-            sp_pad_tokens,
+    with profile.span("split_current_kv"):
+        update = layout.to_noisy_kv_cache_update(cache_start=cache_start or 0)
+        current_kv = split_wan_s2v_stream_r1_projected_kv(
+            key,
+            value,
+            noisy_seq_len=layout.noisy_seq_len,
         )
-        return attention(
-            query,
-            mixed_view.key,
-            mixed_view.value,
-            attn_mask=mixed_mask,
-            kv_is_replicated=True,
+    with profile.span("cache_update"):
+        noisy_view = update_wan_s2v_stream_r1_noisy_kv_cache(
+            kv_cache,
+            current_kv.noisy_key,
+            current_kv.noisy_value,
+            update,
         )
-    return attention(query, mixed_view.key, mixed_view.value, attn_mask=mixed_mask)
+    with profile.span("mixed_kv_compose"):
+        mixed_view = compose_wan_s2v_stream_r1_mixed_kv_view(noisy_view, current_kv)
+    with profile.span("attention_plan"):
+        mixed_plan = build_wan_s2v_stream_r1_mixed_kv_attention_plan(
+            noisy_view,
+            mixed_view,
+            update,
+            device=query_for_attention.device,
+        )
+    if use_sp_head_sharded_packed_attention:
+        with profile.span("packed_varlen_attention"):
+            output = stream_r1_packed_varlen_attention(
+                query_for_attention,
+                mixed_view.key,
+                mixed_view.value,
+                mixed_plan,
+                softmax_scale=getattr(attention, "softmax_scale", None),
+            )
+        with profile.span("sp_output_pad"):
+            output = _pad_stream_r1_sp_attention_output(
+                output,
+                total_seq_len=layout.total_seq_len,
+                sp_pad_tokens=sp_pad_tokens,
+            )
+        with profile.span("usp_output_all_to_all"):
+            output = _usp_output_all_to_all(output.contiguous(), head_dim=2)
+    elif attention_backend == "packed_varlen" and not sequence_shard_enabled:
+        with profile.span("packed_varlen_attention"):
+            output = stream_r1_packed_varlen_attention(
+                query_for_attention,
+                mixed_view.key,
+                mixed_view.value,
+                mixed_plan,
+                softmax_scale=getattr(attention, "softmax_scale", None),
+            )
+    else:
+        if attention_backend == "packed_varlen" and sequence_shard_enabled:
+            selected_backend = "dense_sdpa_sp_fallback"
+        with profile.span("attention_plan_dense_mask"):
+            mixed_mask = mixed_plan.to_dense_mask(query_for_attention.device)
+        if sequence_shard_enabled:
+            with profile.span("sp_mask_pad"):
+                mixed_mask = pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp(
+                    mixed_mask,
+                    layout.total_seq_len,
+                    sp_pad_tokens,
+                )
+            with profile.span("attention"):
+                output = attention(
+                    query_for_attention,
+                    mixed_view.key,
+                    mixed_view.value,
+                    attn_mask=mixed_mask,
+                    kv_is_replicated=True,
+                )
+        else:
+            with profile.span("attention"):
+                output = attention(
+                    query_for_attention,
+                    mixed_view.key,
+                    mixed_view.value,
+                    attn_mask=mixed_mask,
+                )
+    profile.log(
+        attention_backend=selected_backend,
+        query_seq_len=query.shape[1],
+        mixed_kv_seq_len=mixed_view.total_seq_len,
+        cached_noisy_seq_len=mixed_view.cached_noisy_seq_len,
+        sequence_shard_enabled=sequence_shard_enabled,
+        sp_pad_tokens=sp_pad_tokens,
+    )
+    return output
 
 
 def validate_wan_s2v_stream_r1_forward_cache(

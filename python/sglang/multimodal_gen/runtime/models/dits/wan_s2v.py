@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VStreamR1AttentionLayout,
     run_wan_s2v_stream_r1_cached_self_attention,
     validate_wan_s2v_stream_r1_forward_cache,
+    wan_s2v_stream_r1_uses_head_sharded_sp_kv_cache,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -1067,10 +1068,16 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                     )
                     self._logged_stream_r1_sp_no_kv_mask = True
             elif sequence_shard_enabled and not self._logged_stream_r1_sp_kv_mask:
-                logger.info(
-                    "Stream-R1 S2V KV cache SP is using replicated mixed-KV "
-                    "local/sink attention masks."
-                )
+                if wan_s2v_stream_r1_uses_head_sharded_sp_kv_cache():
+                    logger.info(
+                        "Stream-R1 S2V KV cache SP is using packed varlen "
+                        "attention with head-sharded KV cache."
+                    )
+                else:
+                    logger.info(
+                        "Stream-R1 S2V KV cache SP is using replicated mixed-KV "
+                        "local/sink attention masks."
+                    )
                 self._logged_stream_r1_sp_kv_mask = True
         if sequence_shard_enabled:
             sp_world_size = get_sp_world_size()

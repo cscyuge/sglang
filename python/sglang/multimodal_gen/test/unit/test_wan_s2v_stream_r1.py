@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import WanS2VPipelineConfig
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
@@ -12,15 +13,19 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
+    WanS2VStreamR1AttentionPlan,
     WanS2VStreamR1AttentionLayout,
     WanS2VStreamR1MixedKVView,
     WanS2VStreamR1NoisyKVCacheView,
     WanS2VStreamR1NoisyKVCacheUpdate,
+    build_wan_s2v_stream_r1_packed_attention_workspace,
     build_wan_s2v_stream_r1_cached_noisy_kv_index,
     build_wan_s2v_stream_r1_mixed_kv_attention_mask,
+    build_wan_s2v_stream_r1_mixed_kv_attention_plan,
     compose_wan_s2v_stream_r1_mixed_kv_view,
     pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp,
     run_wan_s2v_stream_r1_cached_self_attention,
+    stream_r1_packed_varlen_attention,
     split_wan_s2v_stream_r1_projected_kv,
     update_wan_s2v_stream_r1_noisy_kv_cache,
     validate_wan_s2v_stream_r1_forward_cache,
@@ -228,8 +233,12 @@ class TestWanS2VStreamR1AttentionLayout(unittest.TestCase):
         )
 
         mask = layout.build_no_kv_attention_mask(torch.device("cpu"))[0]
+        plan_mask = layout.to_no_kv_attention_plan().to_dense_mask(torch.device("cpu"))[
+            0
+        ]
 
         self.assertEqual(mask.shape, (10, 10))
+        torch.testing.assert_close(plan_mask, mask)
         self.assertEqual(
             torch.nonzero(mask[0], as_tuple=False).flatten().tolist(),
             [0, 1, 2, 3, 8, 9],
@@ -252,11 +261,31 @@ class TestWanS2VStreamR1AttentionLayout(unittest.TestCase):
         )
 
         mask = layout.build_no_kv_attention_mask(torch.device("cpu"))[0]
+        plan = layout.to_no_kv_attention_plan()
 
+        self.assertEqual(plan.query_seq_len, 6)
+        self.assertEqual(plan.kv_seq_len, 6)
+        self.assertEqual(plan.query_block_tokens, 4)
+        torch.testing.assert_close(plan.to_dense_mask(torch.device("cpu"))[0], mask)
         self.assertEqual(
             torch.nonzero(mask[0], as_tuple=False).flatten().tolist(),
             [0, 1, 2, 3, 4, 5],
         )
+
+    def test_attention_plan_rejects_mismatched_noisy_kv_index(self):
+        with self.assertRaisesRegex(ValueError, "noisy_kv_absolute_index"):
+            WanS2VStreamR1AttentionPlan(
+                query_seq_len=2,
+                kv_seq_len=3,
+                noisy_query_seq_len=2,
+                noisy_kv_seq_len=2,
+                condition_kv_seq_len=1,
+                frame_seq_length=1,
+                query_block_tokens=2,
+                local_attn_size=2,
+                sink_size=0,
+                noisy_kv_absolute_index=torch.tensor([0]),
+            )
 
     def test_layout_rejects_unaligned_current_start(self):
         with self.assertRaisesRegex(ValueError, "frame-aligned"):
@@ -473,11 +502,33 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         )
 
         index = build_wan_s2v_stream_r1_cached_noisy_kv_index(noisy_view, update)
+        plan = build_wan_s2v_stream_r1_mixed_kv_attention_plan(
+            noisy_view, mixed, update
+        )
         mask = build_wan_s2v_stream_r1_mixed_kv_attention_mask(
             noisy_view, mixed, update
         )[0]
 
         self.assertEqual(index.tolist(), [0, 2, 3, 4, 5])
+        self.assertEqual(plan.query_seq_len, 6)
+        self.assertEqual(plan.kv_seq_len, 7)
+        self.assertEqual(plan.noisy_kv_absolute_index.tolist(), [0, 2, 3, 4, 5])
+        self.assertEqual(
+            [
+                (
+                    group.query_start,
+                    group.query_end,
+                    group.kv_indices.tolist(),
+                )
+                for group in plan.query_groups(torch.device("cpu"))
+            ],
+            [
+                (0, 2, [0, 1, 2, 5, 6]),
+                (2, 4, [0, 2, 3, 4, 5, 6]),
+                (4, 6, [0, 1, 2, 3, 4, 5, 6]),
+            ],
+        )
+        torch.testing.assert_close(plan.to_dense_mask(torch.device("cpu"))[0], mask)
         self.assertEqual(mask.shape, (6, 7))
         self.assertEqual(
             torch.nonzero(mask[0], as_tuple=False).flatten().tolist(),
@@ -533,6 +584,88 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         self.assertEqual(padded.shape, (1, 4, 3))
         torch.testing.assert_close(padded[:, :2], mask)
         self.assertTrue(padded[:, 2:].all().item())
+
+    def test_packed_varlen_attention_matches_dense_sdpa_reference(self):
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=1,
+            local_attn_size=5,
+            sink_size=1,
+            current_start=2,
+        )
+        cached_key, cached_value = self._indexed_kv([0, 2, 3, 4, 5])
+        cached_key = cached_key.expand(1, -1, 2, 4).contiguous()
+        cached_value = cached_value.expand(1, -1, 2, 4).contiguous()
+        noisy_view = WanS2VStreamR1NoisyKVCacheView(
+            key=cached_key,
+            value=cached_value,
+            global_end_index=6,
+            local_end_index=5,
+            local_start=2,
+            local_end=6,
+        )
+        condition_key = torch.arange(16, dtype=torch.float32).view(1, 2, 2, 4)
+        condition_value = condition_key + 100
+        mixed = WanS2VStreamR1MixedKVView(
+            key=torch.cat([cached_key, condition_key], dim=1),
+            value=torch.cat([cached_value, condition_value], dim=1),
+            cached_noisy_seq_len=5,
+            condition_seq_len=2,
+            global_end_index=6,
+            local_end_index=5,
+            local_start=2,
+            local_end=6,
+        )
+        plan = build_wan_s2v_stream_r1_mixed_kv_attention_plan(
+            noisy_view, mixed, update
+        )
+        query = torch.randn(1, 6, 2, 4)
+        scale = 0.5
+
+        packed = stream_r1_packed_varlen_attention(
+            query,
+            mixed.key,
+            mixed.value,
+            plan,
+            softmax_scale=scale,
+            force_torch=True,
+        )
+        mask = plan.to_dense_mask(query.device).to(dtype=query.dtype)
+        mask = (mask - 1.0) * torch.finfo(query.dtype).max
+        dense = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            mixed.key.transpose(1, 2),
+            mixed.value.transpose(1, 2),
+            attn_mask=mask[:, None, :, :],
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+        ).transpose(1, 2)
+
+        torch.testing.assert_close(packed, dense, rtol=1e-5, atol=1e-5)
+
+    def test_packed_attention_workspace_records_segments(self):
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=4,
+            total_seq_len=6,
+            frame_seq_length=1,
+            num_frame_per_block=2,
+            local_attn_size=2,
+            sink_size=1,
+        )
+        plan = layout.to_no_kv_attention_plan()
+        query = torch.randn(1, 6, 1, 2)
+        key = torch.randn(1, 6, 1, 2)
+        value = torch.randn(1, 6, 1, 2)
+
+        workspace = build_wan_s2v_stream_r1_packed_attention_workspace(
+            query, key, value, plan
+        )
+
+        self.assertEqual(workspace.cu_seqlens_q.tolist(), [0, 2, 4, 6])
+        self.assertEqual(workspace.max_seqlen_q, 2)
+        self.assertGreaterEqual(workspace.max_seqlen_k, 4)
+        self.assertEqual(len(workspace.segments), 3)
 
 
 class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
@@ -703,6 +836,204 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
         )
         self.assertEqual(calls[-1]["attn_mask"].shape, (1, 4, 3))
         self.assertTrue(calls[-1]["attn_mask"][:, 3:].all().item())
+
+    def test_cached_branch_uses_packed_backend_without_calling_dense_attention(self):
+        cache = {
+            "k": torch.zeros(1, 4, 1, 2),
+            "v": torch.zeros(1, 4, 1, 2),
+            "global_end_index": torch.zeros(1, dtype=torch.long),
+            "local_end_index": torch.zeros(1, dtype=torch.long),
+        }
+
+        class FailingAttention:
+            softmax_scale = 1.0
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError("dense attention should not be called")
+
+        query = torch.randn(1, 3, 1, 2)
+        key = torch.randn(1, 3, 1, 2)
+        value = torch.randn(1, 3, 1, 2)
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=2,
+            total_seq_len=3,
+            frame_seq_length=1,
+            num_frame_per_block=2,
+            local_attn_size=4,
+            sink_size=1,
+            current_start=0,
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
+        ):
+            output = run_wan_s2v_stream_r1_cached_self_attention(
+                FailingAttention(),
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=cache,
+                layout=layout,
+                cache_start=None,
+            )
+
+        self.assertEqual(output.shape, query.shape)
+
+    def test_cached_branch_falls_back_to_dense_attention_for_sp_packed_backend(self):
+        cache = self._cache(tokens=4)
+        calls = []
+
+        def recording_attention(query, key, value, attn_mask=None, **kwargs):
+            calls.append(
+                {
+                    "attn_mask": attn_mask.clone(),
+                    "kwargs": dict(kwargs),
+                }
+            )
+            return query + 10
+
+        query = torch.zeros(1, 2, 1, 1)
+        key_local = torch.tensor([0.0, 1.0]).view(1, 2, 1, 1)
+        value_local = key_local + 100
+        key_padded_global = torch.tensor([0.0, 1.0, 100.0, 999.0]).view(
+            1, 4, 1, 1
+        )
+        value_padded_global = key_padded_global + 100
+
+        def fake_all_gather(tensor, dim):
+            if torch.equal(tensor, key_local):
+                return key_padded_global
+            if torch.equal(tensor, value_local):
+                return value_padded_global
+            raise AssertionError("unexpected tensor gathered")
+
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=2,
+            total_seq_len=3,
+            frame_seq_length=1,
+            num_frame_per_block=2,
+            local_attn_size=4,
+            sink_size=1,
+            current_start=0,
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "get_sp_world_size",
+            return_value=2,
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "sequence_model_parallel_all_gather",
+            side_effect=fake_all_gather,
+        ):
+            output = run_wan_s2v_stream_r1_cached_self_attention(
+                recording_attention,
+                query=query,
+                key=key_local,
+                value=value_local,
+                kv_cache=cache,
+                layout=layout,
+                cache_start=None,
+                sequence_shard_enabled=True,
+                sp_pad_tokens=1,
+            )
+
+        torch.testing.assert_close(output, query + 10)
+        self.assertEqual(calls[-1]["kwargs"], {"kv_is_replicated": True})
+        self.assertEqual(calls[-1]["attn_mask"].shape, (1, 4, 3))
+
+    def test_cached_branch_uses_head_sharded_packed_backend_for_sp(self):
+        cache = {
+            "k": torch.zeros(1, 4, 1, 2),
+            "v": torch.zeros(1, 4, 1, 2),
+            "global_end_index": torch.zeros(1, dtype=torch.long),
+            "local_end_index": torch.zeros(1, dtype=torch.long),
+        }
+
+        class FailingAttention:
+            softmax_scale = 1.0
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError("dense attention should not be called")
+
+        query_local = torch.randn(1, 2, 2, 2)
+        key_local = torch.randn(1, 2, 2, 2)
+        value_local = torch.randn(1, 2, 2, 2)
+        query_global = torch.randn(1, 4, 1, 2)
+        key_global = torch.randn(1, 4, 1, 2)
+        value_global = torch.randn(1, 4, 1, 2)
+        output_local = torch.randn(1, 2, 2, 2)
+        output_all_to_all_inputs = []
+
+        def fake_qkv_all_to_all(query, key, value):
+            torch.testing.assert_close(query, query_local)
+            torch.testing.assert_close(key, key_local)
+            torch.testing.assert_close(value, value_local)
+            return query_global, key_global, value_global
+
+        def fake_output_all_to_all(output, head_dim):
+            self.assertEqual(head_dim, 2)
+            output_all_to_all_inputs.append(output.detach().clone())
+            return output_local
+
+        def fail_all_gather(*args, **kwargs):
+            raise AssertionError("SP packed backend should not all-gather K/V")
+
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=2,
+            total_seq_len=3,
+            frame_seq_length=1,
+            num_frame_per_block=2,
+            local_attn_size=4,
+            sink_size=1,
+            current_start=0,
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "get_sp_world_size",
+            return_value=2,
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "_usp_input_all_to_all_qkv",
+            side_effect=fake_qkv_all_to_all,
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "_usp_output_all_to_all",
+            side_effect=fake_output_all_to_all,
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "sequence_model_parallel_all_gather",
+            side_effect=fail_all_gather,
+        ):
+            output = run_wan_s2v_stream_r1_cached_self_attention(
+                FailingAttention(),
+                query=query_local,
+                key=key_local,
+                value=value_local,
+                kv_cache=cache,
+                layout=layout,
+                cache_start=None,
+                sequence_shard_enabled=True,
+                sp_pad_tokens=1,
+            )
+
+        torch.testing.assert_close(output, output_local)
+        self.assertEqual(cache["global_end_index"].item(), 2)
+        self.assertEqual(cache["k"].shape, (1, 4, 1, 2))
+        self.assertEqual(len(output_all_to_all_inputs), 1)
+        self.assertEqual(output_all_to_all_inputs[0].shape, (1, 4, 1, 2))
+        torch.testing.assert_close(
+            output_all_to_all_inputs[0][:, 3:],
+            torch.zeros(1, 1, 1, 2),
+        )
 
     def test_cached_branch_requires_cache_and_layout(self):
         query = torch.zeros(1, 2, 1, 1)
@@ -1251,6 +1582,37 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             self.assertEqual(block_cache["local_end_index"].dtype, torch.long)
 
         stage._guard_cache_runtime(state)
+
+    def test_stage_allocates_head_sharded_kv_cache_for_packed_sp_backend(self):
+        stage = self._stage()
+        stage._s2v_kv_attention_kernel_supported = True
+        request = self._attention_request(stream_r1_kv_cache=True)
+
+        with patch.dict(
+            "os.environ",
+            {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "get_sp_world_size",
+            return_value=3,
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.wan_s2v.get_sp_world_size",
+            return_value=3,
+        ):
+            state = stage._prepare_cache_state(
+                request=request,
+                batch_size=2,
+                frame_seq_length=5,
+                dtype=torch.float16,
+                device=torch.device("cpu"),
+            )
+
+        self.assertTrue(state.allocated)
+        self.assertEqual(state.metadata.local_num_attention_heads, 1)
+        for block_cache in state.kv_cache:
+            self.assertEqual(block_cache["k"].shape, (2, 20, 1, 8))
+            self.assertEqual(block_cache["v"].shape, (2, 20, 1, 8))
 
     def test_stage_override_allocates_and_forwards_kv_cache(self):
         stage = self._stage()

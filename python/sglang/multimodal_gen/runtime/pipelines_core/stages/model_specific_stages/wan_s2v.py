@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VKVCacheBlock,
+    wan_s2v_stream_r1_uses_head_sharded_sp_kv_cache,
 )
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -865,6 +866,15 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 getattr(self.transformer, "local_num_heads", global_heads),
             )
         )
+        if wan_s2v_stream_r1_uses_head_sharded_sp_kv_cache():
+            sp_world_size = get_sp_world_size()
+            if local_num_heads % sp_world_size != 0:
+                raise ValueError(
+                    "Stream-R1 S2V packed SP KV cache requires local attention "
+                    f"heads ({local_num_heads}) to be divisible by SP world size "
+                    f"({sp_world_size})"
+                )
+            local_num_heads = local_num_heads // sp_world_size
         attention_head_dim = int(
             getattr(
                 first_block,
