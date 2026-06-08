@@ -977,13 +977,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
-        if batch.image_latent is not None:
+        image_latent = self._select_workflow_image_latent(ctx, step, batch)
+        if image_latent is not None:
             assert (
                 not server_args.pipeline_config.task_type == ModelTaskType.TI2V
             ), "image latents should not be provided for TI2V task"
-            latent_model_input = torch.cat(
-                [latent_model_input, batch.image_latent], dim=1
-            ).to(ctx.target_dtype)
+            latent_model_input = torch.cat([latent_model_input, image_latent], dim=1).to(
+                ctx.target_dtype
+            )
 
         # 2. Expand the timestep to the shape expected by the current model.
         timestep = self.expand_timestep_before_forward(
@@ -1035,6 +1036,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ctx.latents,
             ctx.z,
         )
+
+    def _select_workflow_image_latent(
+        self, ctx: DenoisingContext, step: DenoisingStepState, batch: Req
+    ) -> torch.Tensor | list[torch.Tensor] | None:
+        workflow_image_latents = batch.extra.get("workflow_image_latents")
+        if ctx.workflow_plan is None or not isinstance(workflow_image_latents, dict):
+            return batch.image_latent
+
+        expert = ctx.workflow_plan.select_expert(
+            step.step_index, ctx.num_inference_steps
+        )
+        return workflow_image_latents.get(expert.name, batch.image_latent)
 
     def _record_trajectory(
         self,
@@ -1164,6 +1177,33 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
             for name, value in sp_video_metadata.items():
                 setattr(batch, name, value)
+
+            workflow_image_latents = batch.extra.get("workflow_image_latents")
+            if isinstance(workflow_image_latents, dict):
+                sharded_workflow_image_latents = {}
+                for expert_name, image_latent in workflow_image_latents.items():
+                    if image_latent is None:
+                        continue
+                    if image_latent is batch.image_latent:
+                        sharded_workflow_image_latents[expert_name] = batch.image_latent
+                        continue
+                    sp_video_metadata = {
+                        name: getattr(batch, name)
+                        for name in (
+                            "sp_video_latent_num_frames",
+                            "sp_video_start_frame",
+                            "sp_video_tokens_per_frame",
+                            "sp_video_valid_token_count",
+                        )
+                        if hasattr(batch, name)
+                    }
+                    sharded_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
+                        batch, image_latent
+                    )
+                    for name, value in sp_video_metadata.items():
+                        setattr(batch, name, value)
+                    sharded_workflow_image_latents[expert_name] = sharded_latent
+                batch.extra["workflow_image_latents"] = sharded_workflow_image_latents
 
     def _postprocess_sp_latents(
         self,

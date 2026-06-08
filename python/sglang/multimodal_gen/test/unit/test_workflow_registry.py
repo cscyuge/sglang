@@ -42,6 +42,14 @@ def test_builtin_wan2_2_lightning_presets_load():
     assert ready["defaults"]["height"] == 480
     assert ready["defaults"]["num_frames"] == 81
     assert ready["defaults"]["num_inference_steps"] == 4
+    assert ready["defaults"]["image_conditioning"] == {
+        "type": "painter_i2v_advanced",
+        "motion_amplitude": 1.3,
+        "color_protect": True,
+        "correct_strength": 0.05,
+        "enhanced_experts": ["high_noise"],
+        "original_experts": ["low_noise"],
+    }
     assert ready["sampler"] == {
         "sampler": "euler",
         "schedule": "simple",
@@ -90,6 +98,10 @@ def test_lightning_i2v_workflow_uses_default_negative_prompt():
     assert plan.negative_prompt.startswith("\u8272\u8c03\u8273\u4e3d")
     assert plan.parameters["num_inference_steps"] == 4
     assert plan.effective_parameters()["negative_prompt"] == plan.negative_prompt
+    assert (
+        plan.effective_parameters()["image_conditioning"]["type"]
+        == "painter_i2v_advanced"
+    )
     assert plan.effective_parameters()["experts"][0]["end_step"] == 2
 
     video_kwargs = plan.to_video_request_kwargs(input_reference="/tmp/input.png")
@@ -120,6 +132,28 @@ def test_lightning_i2v_workflow_allows_negative_prompt_override():
         },
     )
     assert cleared.to_video_request_kwargs()["negative_prompt"] == ""
+
+
+def test_lightning_i2v_workflow_allows_painter_parameter_overrides():
+    preset = get_workflow_registry().get("wan2.2-lightning/nsfw-i2v-comfy-v1")
+
+    plan = preset.resolve(
+        input_values={
+            "prompt": "animate this image",
+            "input_reference": "/tmp/input.png",
+        },
+        parameters={
+            "motion_amplitude": 1.1,
+            "color_protect": False,
+            "correct_strength": 0.0,
+        },
+    )
+
+    effective = plan.effective_parameters()
+    assert effective["image_conditioning"]["type"] == "painter_i2v_advanced"
+    assert effective["motion_amplitude"] == 1.1
+    assert effective["color_protect"] is False
+    assert effective["correct_strength"] == 0.0
 
 
 def test_resolve_t2v_workflow_plan_with_overrides():

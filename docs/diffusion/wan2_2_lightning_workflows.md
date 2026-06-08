@@ -23,12 +23,17 @@ The ready preset uses:
 - high-noise transformer for steps `[0, 2)` with flow shift `5`
 - low-noise transformer for steps `[2, end)` with flow shift `8`
 - CFG values `guidance_scale=1.0` and `guidance_scale_2=1.0`
+- `PainterI2VAdvanced` image conditioning with `motion_amplitude=1.3`,
+  `color_protect=true`, and `correct_strength=0.05`
 - the Comfy workflow's negative prompt as the default negative prompt
 
 The Comfy first segment has separate `ModelSamplingSD3` shifts for high and low
 models (`5` and `8`). SGLang maps those into per-expert request-local schedulers
-for this preset. This aligns the first-segment sampler shifts, but does not make
-the service a general ComfyUI graph executor.
+for this preset. The preset also maps the `PainterI2VAdvanced` node into Wan
+I2V preprocessing: high-noise steps receive the motion-enhanced image latent,
+while low-noise steps receive the original image latent. This aligns the active
+first-segment sampler and image-conditioning path, but does not make the service
+a general ComfyUI graph executor.
 
 ## Serve
 
@@ -86,9 +91,10 @@ curl --noproxy '*' -sS "http://localhost:30020/v1/workflows/runs" \
 ```
 
 The request may override `width`, `height`, `num_frames`, `fps`,
-`num_inference_steps`, `guidance_scale`, `guidance_scale_2`, and `seed`. If
-`input.negative_prompt` is omitted, the preset uses the negative prompt from the
-Comfy workflow.
+`num_inference_steps`, `guidance_scale`, `guidance_scale_2`, `seed`, and
+Painter tuning fields `motion_amplitude`, `color_protect`, and
+`correct_strength`. If `input.negative_prompt` is omitted, the preset uses the
+negative prompt from the Comfy workflow.
 
 Poll and download the run like other workflow jobs:
 
@@ -103,6 +109,6 @@ curl --noproxy '*' -sS -L \
 
 The ready preset does not implement arbitrary ComfyUI node execution. In
 particular, it does not execute the disabled `PainterLongVideo` continuation
-subgraphs, RIFE interpolation, upscaling nodes, or custom Comfy-only latent
+subgraphs, RIFE interpolation, upscaling nodes, or multi-segment latent/image
 handoff logic. Use it when the desired product behavior is one SGLang request
 with image plus text input and one video output.

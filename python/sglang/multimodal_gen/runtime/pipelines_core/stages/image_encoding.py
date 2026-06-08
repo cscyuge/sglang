@@ -80,6 +80,7 @@ class ImageVAEEncodingFingerprint:
     encode_sample_mode: str
     vae_precision: Any
     vae_tiling: bool
+    workflow_image_conditioning: Any
 
 
 def _freeze_image_source_value(value):
@@ -802,6 +803,7 @@ class ImageVAEEncodingStage(PipelineStage):
         "condition_image_latent_ids",
         "vae_image_sizes",
     )
+    deduplicated_extra_tensor_tree_output_keys = ("workflow_image_latents",)
 
     def __init__(self, vae: ParallelTiledVAE, **kwargs) -> None:
         super().__init__()
@@ -951,6 +953,12 @@ class ImageVAEEncodingStage(PipelineStage):
                 all_image_latents.append(image_latent)
 
         batch.image_latent = torch.cat(all_image_latents, dim=1)
+        finalize_image_latent_variants = getattr(
+            server_args.pipeline_config, "finalize_image_latent_variants", None
+        )
+        if callable(finalize_image_latent_variants):
+            finalize_image_latent_variants(batch)
+
         if condition_latents is not None:
             prepare_condition_image_latent_ids(condition_latents, batch)
 
@@ -966,6 +974,22 @@ class ImageVAEEncodingStage(PipelineStage):
         if sample_mode == "sample":
             return id(batch)
 
+        workflow_image_conditioning = None
+        workflow = batch.extra.get("workflow")
+        if isinstance(workflow, dict):
+            effective_parameters = workflow.get("effective_parameters")
+            if isinstance(effective_parameters, dict):
+                workflow_image_conditioning = {
+                    key: effective_parameters[key]
+                    for key in (
+                        "image_conditioning",
+                        "motion_amplitude",
+                        "color_protect",
+                        "correct_strength",
+                    )
+                    if key in effective_parameters
+                }
+
         return ImageVAEEncodingFingerprint(
             image_source=_build_image_source_fingerprint(batch, prefer_vae_image=True),
             height=batch.height,
@@ -974,6 +998,9 @@ class ImageVAEEncodingStage(PipelineStage):
             encode_sample_mode=sample_mode,
             vae_precision=server_args.pipeline_config.vae_precision,
             vae_tiling=bool(server_args.pipeline_config.vae_tiling),
+            workflow_image_conditioning=self.freeze_for_dedup(
+                workflow_image_conditioning
+            ),
         )
 
     def retrieve_latents(

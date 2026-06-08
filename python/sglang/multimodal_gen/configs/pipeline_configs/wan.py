@@ -25,6 +25,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_PAINTER_I2V_ADVANCED = "painter_i2v_advanced"
+_WORKFLOW_IMAGE_LATENT_VARIANT_PARTS = "_workflow_image_latent_variant_parts"
+_WORKFLOW_IMAGE_LATENTS = "workflow_image_latents"
+
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
     mask: torch.Tensor = outputs.attention_mask
@@ -42,6 +46,116 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
     return prompt_embeds_tensor
 
 
+def _get_painter_i2v_advanced_options(batch) -> dict | None:
+    workflow = batch.extra.get("workflow") if isinstance(batch.extra, dict) else None
+    if not isinstance(workflow, dict):
+        return None
+    effective_parameters = workflow.get("effective_parameters")
+    if not isinstance(effective_parameters, dict):
+        return None
+
+    image_conditioning = effective_parameters.get("image_conditioning")
+    if not isinstance(image_conditioning, dict):
+        return None
+    if str(image_conditioning.get("type", "")).lower() != _PAINTER_I2V_ADVANCED:
+        return None
+
+    enhanced_experts = _string_tuple(
+        image_conditioning.get("enhanced_experts", ("high_noise",))
+    )
+    original_experts = _string_tuple(
+        image_conditioning.get("original_experts", ("low_noise",))
+    )
+    return {
+        "motion_amplitude": float(
+            effective_parameters.get(
+                "motion_amplitude", image_conditioning.get("motion_amplitude", 1.3)
+            )
+        ),
+        "color_protect": bool(
+            effective_parameters.get(
+                "color_protect", image_conditioning.get("color_protect", True)
+            )
+        ),
+        "correct_strength": float(
+            effective_parameters.get(
+                "correct_strength", image_conditioning.get("correct_strength", 0.05)
+            )
+        ),
+        "enhanced_experts": enhanced_experts,
+        "original_experts": original_experts,
+    }
+
+
+def _string_tuple(value) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value)
+
+
+def _apply_painter_i2v_advanced_conditioning(
+    latent_condition: torch.Tensor,
+    *,
+    motion_amplitude: float,
+    color_protect: bool,
+    correct_strength: float,
+) -> torch.Tensor:
+    if latent_condition.dim() != 5:
+        return latent_condition
+
+    concat_latent_image = latent_condition
+    original_latent = concat_latent_image.clone()
+    enhanced_latent = concat_latent_image
+
+    if motion_amplitude > 1.0 and concat_latent_image.shape[2] > 1:
+        base_latent = concat_latent_image[:, :, 0:1]
+        gray_latent = concat_latent_image[:, :, 1:]
+        diff = gray_latent - base_latent
+        diff_mean = diff.mean(dim=(1, 3, 4), keepdim=True)
+        diff_centered = diff - diff_mean
+        scaled_latent = base_latent + diff_centered * motion_amplitude + diff_mean
+        scaled_latent = torch.clamp(scaled_latent, -6, 6)
+        enhanced_latent = torch.cat([base_latent, scaled_latent], dim=2)
+
+    if color_protect and correct_strength > 0:
+        corrected = enhanced_latent.clone()
+        orig_mean = original_latent.mean(dim=(2, 3, 4))
+        enhanced_mean = corrected.mean(dim=(2, 3, 4))
+        mean_drift = torch.abs(enhanced_mean - orig_mean) / (
+            torch.abs(orig_mean) + 1e-6
+        )
+        problem_channels = mean_drift > 0.18
+        drift_amount = enhanced_mean - orig_mean
+        correction = (
+            drift_amount
+            * problem_channels.to(dtype=corrected.dtype)
+            * float(correct_strength)
+            * 0.03
+        )
+        corrected = torch.where(
+            corrected > 0,
+            corrected - correction[:, :, None, None, None],
+            corrected,
+        )
+
+        orig_brightness = original_latent.mean()
+        enhanced_brightness = corrected.mean()
+        if enhanced_brightness < orig_brightness * 0.92:
+            max_boost = torch.as_tensor(
+                1.05, device=corrected.device, dtype=corrected.dtype
+            )
+            brightness_boost = torch.minimum(
+                orig_brightness / (enhanced_brightness + 1e-6), max_boost
+            )
+            corrected = torch.where(
+                corrected < 0.5, corrected * brightness_boost, corrected
+            )
+
+        enhanced_latent = torch.clamp(corrected, -6, 6)
+
+    return enhanced_latent
+
+
 @dataclass
 class WanI2VCommonConfig(PipelineConfig):
     # for all wan i2v pipelines
@@ -56,6 +170,41 @@ class WanI2VCommonConfig(PipelineConfig):
             )
             return num_frames
         return num_frames
+
+    def postprocess_image_latent(self, latent_condition, batch):
+        image_latents = super().postprocess_image_latent(latent_condition, batch)
+        painter_options = _get_painter_i2v_advanced_options(batch)
+        if painter_options is None:
+            return image_latents
+
+        enhanced_condition = _apply_painter_i2v_advanced_conditioning(
+            latent_condition,
+            motion_amplitude=painter_options["motion_amplitude"],
+            color_protect=painter_options["color_protect"],
+            correct_strength=painter_options["correct_strength"],
+        )
+        enhanced_image_latents = super().postprocess_image_latent(
+            enhanced_condition, batch
+        )
+
+        variant_parts = batch.extra.setdefault(_WORKFLOW_IMAGE_LATENT_VARIANT_PARTS, {})
+        for expert_name in painter_options["enhanced_experts"]:
+            variant_parts.setdefault(expert_name, []).append(enhanced_image_latents)
+        for expert_name in painter_options["original_experts"]:
+            variant_parts.setdefault(expert_name, []).append(image_latents)
+
+        return enhanced_image_latents
+
+    def finalize_image_latent_variants(self, batch) -> None:
+        variant_parts = batch.extra.pop(_WORKFLOW_IMAGE_LATENT_VARIANT_PARTS, None)
+        if not isinstance(variant_parts, dict):
+            return
+
+        batch.extra[_WORKFLOW_IMAGE_LATENTS] = {
+            str(expert_name): torch.cat(parts, dim=1)
+            for expert_name, parts in variant_parts.items()
+            if parts
+        }
 
 
 @dataclass
