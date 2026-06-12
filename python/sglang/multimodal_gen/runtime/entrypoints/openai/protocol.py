@@ -80,6 +80,7 @@ class VideoResponse(BaseModel):
     file_path: Optional[str] = None
     stream_url: Optional[str] = None
     events_url: Optional[str] = None
+    webrtc_url: Optional[str] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
     num_chunks: Optional[int] = None
@@ -138,6 +139,26 @@ class VideoRemixRequest(BaseModel):
     prompt: str
 
 
+class WebRTCIceServer(BaseModel):
+    urls: Union[str, List[str]]
+    username: Optional[str] = None
+    credential: Optional[str] = None
+
+
+class WebRTCOfferRequest(BaseModel):
+    sdp: str
+    type: str = "offer"
+    fps: int = Field(default=25, ge=1, le=60)
+    include_audio: bool = True
+    buffer_frames: int = Field(default=0, ge=0, le=500)
+    ice_servers: Optional[List[WebRTCIceServer]] = None
+
+
+class WebRTCAnswerResponse(BaseModel):
+    sdp: str
+    type: str = "answer"
+
+
 # Session API protocol models (live-streaming FlashTalk)
 class SessionResponse(BaseModel):
     session_id: str
@@ -145,6 +166,7 @@ class SessionResponse(BaseModel):
     status: str = "created"  # created | running | ended | failed
     stream_url: Optional[str] = None
     events_url: Optional[str] = None
+    webrtc_url: Optional[str] = None
     artc_channel: Optional[str] = None
     created_at: int = Field(default_factory=lambda: int(time.time()))
     chunks_received: int = 0

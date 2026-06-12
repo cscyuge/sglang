@@ -261,6 +261,58 @@ curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
   -o output.mp4
 ```
 
+**Stream video over WebRTC**
+
+**Endpoint:** `POST /v1/videos/{video_id}/webrtc`
+
+This endpoint accepts a standard WebRTC SDP offer and returns an SDP answer.
+It streams the same generated frames used by `/stream`; for FlashTalk sessions,
+audio is read from live audio chunks and sent as a WebRTC audio track.
+
+Install the diffusion extra with WebRTC support:
+
+```bash
+pip install "sglang[diffusion]"
+```
+
+Browser example:
+
+```javascript
+const pc = new RTCPeerConnection();
+
+pc.ontrack = (event) => {
+  const [stream] = event.streams;
+  document.querySelector("video").srcObject = stream;
+};
+
+pc.addTransceiver("video", { direction: "recvonly" });
+pc.addTransceiver("audio", { direction: "recvonly" });
+
+const offer = await pc.createOffer();
+await pc.setLocalDescription(offer);
+
+const resp = await fetch("http://localhost:30010/v1/videos/<VIDEO_ID>/webrtc", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer sk-proj-1234567890"
+  },
+  body: JSON.stringify({
+    sdp: pc.localDescription.sdp,
+    type: pc.localDescription.type,
+    fps: 25,
+    include_audio: true,
+    buffer_frames: 0,
+    ice_servers: [
+      { urls: "stun:stun.l.google.com:19302" }
+    ]
+  })
+});
+
+const answer = await resp.json();
+await pc.setRemoteDescription(answer);
+```
+
 ---
 
 ### LoRA Management

@@ -112,6 +112,7 @@ diffusion_hip = [
   "runai_model_streamer>=0.15.5",
   "cache-dit==1.1.8",
   "addict",
+  "aiortc>=1.14.0",
 ]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
@@ -142,6 +143,7 @@ diffusion_musa = [
   "runai_model_streamer>=0.15.5",
   "cache-dit==1.1.8",
   "addict",
+  "aiortc>=1.14.0",
 ]
 
 tracing = [
