@@ -80,25 +80,31 @@ def conv2d_implicit_gemm(
                     kh_idx = k_rem // KW
                     ih_idx = oh + kh_idx
                     iw_idx = ow + kw_idx
-                    in_bound = (
+                    if (
                         (m < M_total)
                         and (k < K_total)
                         and (ih_idx < H_in)
                         and (iw_idx < W_in)
-                    )
-                    data_shared[i, j] = T.if_then_else(
-                        in_bound,
-                        data[n_idx, ih_idx, iw_idx, c],
-                        T.cast(0, dtype),
-                    )
+                    ):
+                        data_shared[i, j] = data[n_idx, ih_idx, iw_idx, c]
+                    else:
+                        data_shared[i, j] = T.cast(0, dtype)
 
-                T.copy(
-                    weight[k_iter * block_K, bn * block_N], weight_shared
-                )
+                for i, j in T.Parallel(block_K, block_N):
+                    k = k_iter * block_K + i
+                    n = bn * block_N + j
+                    if (k < K_total) and (n < C_out):
+                        weight_shared[i, j] = weight[k, n]
+                    else:
+                        weight_shared[i, j] = T.cast(0, dtype)
                 T.gemm(data_shared, weight_shared, out_local)
 
             T.copy(out_local, out_shared)
-            T.copy(out_shared, output[bm * block_M, bn * block_N])
+            for i, j in T.Parallel(block_M, block_N):
+                m = bm * block_M + i
+                n = bn * block_N + j
+                if (m < M_total) and (n < C_out):
+                    output[m, n] = out_shared[i, j]
 
     return tl_conv2d
 
@@ -173,6 +179,9 @@ def get_or_prepare_weight_2d(weight: torch.Tensor) -> torch.Tensor:
     return entry[0]
 
 
+@torch.compiler.disable(
+    reason="TileLang kernels are external JIT kernels and must run eagerly under torch.compile."
+)
 def tilelang_conv2d_forward(
     x_padded: torch.Tensor,
     weight: torch.Tensor,

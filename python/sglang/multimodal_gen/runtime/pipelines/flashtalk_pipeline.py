@@ -327,6 +327,15 @@ class VAECudaGraphRunner:
         def run_once():
             return forward_fn(self.static_input)
 
+        # Ensure any lazy work in forward_fn (torch.compile, Inductor codegen,
+        # external JIT kernels) is completed on the current stream before the
+        # side-stream warmup and CUDA graph capture.  Running first compile
+        # inside the side stream has produced asynchronous CUDA failures on
+        # FlashTalk's compiled VAE decoder with TileLang kernels.
+        compiled_output = run_once()
+        torch.cuda.synchronize()
+        del compiled_output
+
         # Warmup on a side stream (isolates warmup allocations)
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
