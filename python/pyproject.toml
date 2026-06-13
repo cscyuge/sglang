@@ -169,7 +169,6 @@ dev = ["sglang[test]"]
 
 all = [
   "sglang[diffusion]",
-  "sglang[tilelang]",
   "sglang[tracing]",
   "sglang[http2]",
 ]
