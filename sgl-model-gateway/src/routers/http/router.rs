@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use tracing::{debug, error};
@@ -270,6 +271,78 @@ impl Router {
         response
     }
 
+    pub async fn route_raw_request_internal(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: Bytes,
+        route: &'static str,
+        model_id: Option<&str>,
+    ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        let endpoint = route_to_endpoint(route);
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            bool_to_static_str(false),
+        );
+
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_: u32| {
+                let body = body.clone();
+                async move {
+                    let res = self
+                        .route_raw_request_once(headers, body, route, model_id)
+                        .await;
+
+                    Metrics::record_router_upstream_response(
+                        metrics_labels::ROUTER_HTTP,
+                        res.status().as_u16(),
+                        extract_error_code_from_response(&res),
+                    );
+
+                    res
+                }
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+            },
+        )
+        .await;
+
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                start.elapsed(),
+            );
+        } else if !is_retryable_status(response.status()) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
+    }
+
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -325,6 +398,56 @@ impl Router {
         }
 
         // Record worker errors for server errors (5xx)
+        if status.is_server_error() {
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
+        }
+
+        response
+    }
+
+    async fn route_raw_request_once(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: Bytes,
+        route: &'static str,
+        model_id: Option<&str>,
+    ) -> Response {
+        let worker = match self.select_worker_for_model(model_id, None, headers).await {
+            Some(w) => w,
+            None => {
+                return error::service_unavailable(
+                    "no_available_workers",
+                    "No available workers (all circuits open or unhealthy)",
+                );
+            }
+        };
+
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        let load_guard = ["cache_aware", "manual"]
+            .contains(&policy.name())
+            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+
+        events::RequestSentEvent { url: worker.url() }.emit();
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+
+        let response = self
+            .send_raw_request(Some(&headers_with_trace), body, route, &worker, load_guard)
+            .await;
+
+        events::RequestReceivedEvent {}.emit();
+
+        let status = response.status();
+        worker.record_outcome(status.is_success());
+
         if status.is_server_error() {
             Metrics::record_worker_error(
                 metrics_labels::WORKER_REGULAR,
@@ -650,6 +773,72 @@ impl Router {
         }
     }
 
+    async fn send_raw_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: Bytes,
+        route: &'static str,
+        worker: &Arc<dyn Worker>,
+        load_guard: Option<WorkerLoadGuard>,
+    ) -> Response {
+        let worker_url = worker.url();
+        let api_key = worker.api_key().clone();
+        let base_url = self.worker_base_url(worker_url);
+
+        let mut request_builder = self.client.post(format!("{}{}", base_url, route)).body(body);
+
+        let has_user_auth = headers.is_some_and(|hdrs| {
+            hdrs.contains_key("authorization") || hdrs.contains_key("Authorization")
+        });
+
+        if let Some(headers) = headers {
+            request_builder = header_utils::apply_request_headers(headers, request_builder, false);
+        }
+
+        if !has_user_auth {
+            if let Some(key) = api_key {
+                let mut auth_header = String::with_capacity(7 + key.len());
+                auth_header.push_str("Bearer ");
+                auth_header.push_str(&key);
+                request_builder = request_builder.header("Authorization", auth_header);
+            }
+        }
+
+        let res = match request_builder.send().await {
+            Ok(res) => res,
+            Err(e) => {
+                error!(
+                    "Failed to send raw request worker_url={} route={} error={}",
+                    worker_url, route, e
+                );
+                return convert_reqwest_error(e);
+            }
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let response_headers = header_utils::preserve_response_headers(res.headers());
+
+        let response = match res.bytes().await {
+            Ok(body) => {
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                *response.headers_mut() = response_headers;
+                response
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to get response body: {}", e);
+                error::internal_error("read_response_body_failed", error_msg)
+            }
+        };
+
+        if let Some(guard) = load_guard {
+            AttachedBody::wrap_response(response, guard)
+        } else {
+            response
+        }
+    }
+
     async fn build_rerank_response(
         req: &RerankRequest,
         response: Response,
@@ -844,6 +1033,17 @@ impl RouterTrait for Router {
         } else {
             response
         }
+    }
+
+    async fn route_raw_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: Bytes,
+        route: &'static str,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_raw_request_internal(headers, body, route, model_id)
+            .await
     }
 
     fn router_type(&self) -> &'static str {

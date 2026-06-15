@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
@@ -195,6 +196,21 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
+    }
+
+    /// Route raw HTTP request bodies to OpenAI-compatible image generation endpoints.
+    async fn route_raw_request(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: Bytes,
+        _route: &'static str,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Raw request endpoint not implemented",
+        )
+            .into_response()
     }
 
     /// Get router type name

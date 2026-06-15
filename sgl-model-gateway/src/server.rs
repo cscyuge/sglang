@@ -7,6 +7,7 @@ use std::{
 };
 
 use axum::{
+    body::to_bytes,
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -179,6 +180,93 @@ async fn generate(
         .router
         .route_generate(Some(&headers), &body, model_id)
         .await
+}
+
+async fn route_raw_image_request(
+    state: Arc<AppState>,
+    req: Request,
+    route: &'static str,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
+    let body = match to_bytes(body, state.context.router_config.max_payload_size).await {
+        Ok(body) => body,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": format!("Failed to read request body: {}", e),
+                        "type": "invalid_request_error",
+                        "code": "read_request_body_failed"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+    let model_id = extract_image_request_model_id(&headers, &body);
+
+    state
+        .router
+        .route_raw_request(Some(&headers), body, route, model_id.as_deref())
+        .await
+}
+
+async fn v1_images_generations(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    route_raw_image_request(state, req, "/v1/images/generations").await
+}
+
+async fn v1_images_edits(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    route_raw_image_request(state, req, "/v1/images/edits").await
+}
+
+fn extract_image_request_model_id(headers: &http::HeaderMap, body: &[u8]) -> Option<String> {
+    extract_image_request_field(headers, body, "model")
+}
+
+fn extract_image_request_field(
+    headers: &http::HeaderMap,
+    body: &[u8],
+    field_name: &str,
+) -> Option<String> {
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    if content_type.contains("application/json") || body.first() == Some(&b'{') {
+        return serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| value.get(field_name)?.as_str().map(str::to_owned))
+            .filter(|s| !s.is_empty());
+    }
+
+    if content_type.contains("application/x-www-form-urlencoded") {
+        return url::form_urlencoded::parse(body)
+            .find(|(key, _)| key == field_name)
+            .map(|(_, value)| value.into_owned())
+            .filter(|s| !s.is_empty());
+    }
+
+    if content_type.contains("multipart/form-data") {
+        return extract_multipart_text_field(body, field_name);
+    }
+
+    None
+}
+
+fn extract_multipart_text_field(body: &[u8], field_name: &str) -> Option<String> {
+    let needle = format!("name=\"{}\"", field_name);
+    let field_pos = memchr::memmem::find(body, needle.as_bytes())?;
+    let after_field = &body[field_pos + needle.len()..];
+    let value_start = memchr::memmem::find(after_field, b"\r\n\r\n")? + 4;
+    let value_bytes = &after_field[value_start..];
+    let value_end =
+        memchr::memmem::find(value_bytes, b"\r\n--").unwrap_or(value_bytes.len());
+    let value = std::str::from_utf8(&value_bytes[..value_end]).ok()?.trim();
+
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 async fn v1_chat_completions(
@@ -549,6 +637,8 @@ pub fn build_app(
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/classify", post(v1_classify))
+        .route("/v1/images/generations", post(v1_images_generations))
+        .route("/v1/images/edits", post(v1_images_edits))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
@@ -1147,4 +1237,61 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(content_type: &str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_str(content_type).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn extracts_model_from_json_image_request() {
+        let headers = headers("application/json");
+        let body = br#"{"model":"flux2","prompt":"hello"}"#;
+
+        assert_eq!(
+            extract_image_request_model_id(&headers, body).as_deref(),
+            Some("flux2")
+        );
+    }
+
+    #[test]
+    fn extracts_model_from_multipart_image_request() {
+        let headers = headers("multipart/form-data; boundary=abc123");
+        let body = concat!(
+            "--abc123\r\n",
+            "Content-Disposition: form-data; name=\"image\"; filename=\"cover.png\"\r\n",
+            "Content-Type: image/png\r\n\r\n",
+            "PNGDATA\r\n",
+            "--abc123\r\n",
+            "Content-Disposition: form-data; name=\"model\"\r\n\r\n",
+            "qwen-edit\r\n",
+            "--abc123--\r\n"
+        )
+        .as_bytes();
+
+        assert_eq!(
+            extract_image_request_model_id(&headers, body).as_deref(),
+            Some("qwen-edit")
+        );
+    }
+
+    #[test]
+    fn extracts_model_from_urlencoded_image_request() {
+        let headers = headers("application/x-www-form-urlencoded");
+        let body = b"model=flux2&prompt=hello";
+
+        assert_eq!(
+            extract_image_request_model_id(&headers, body).as_deref(),
+            Some("flux2")
+        );
+    }
 }

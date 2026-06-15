@@ -14,6 +14,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use dashmap::DashMap;
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -724,6 +725,37 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 "No router available for rerank request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_raw_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: Bytes,
+        route: &'static str,
+        model_id: Option<&str>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+        let selected_model = effective_model_id.as_deref().or(model_id);
+        let router = self.select_router_for_request(headers, selected_model);
+
+        if let Some(router) = router {
+            router
+                .route_raw_request(headers, body, route, selected_model)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for raw request",
             )
                 .into_response()
         }
