@@ -14,7 +14,7 @@ from packaging.version import Version
 from sglang.srt.utils import get_device_sm, is_cuda
 
 TILELANG_MIN_VERSION = "0.1.11"
-SUPPORTED_SMS = (89, 90)
+SUPPORTED_SMS = (89, 90, 120)
 
 
 def get_availability_error() -> Optional[str]:
@@ -24,7 +24,7 @@ def get_availability_error() -> Optional[str]:
     sm = get_device_sm()
     if sm not in SUPPORTED_SMS:
         return (
-            "TileLang FP8 GEMM currently supports only SM89 and SM90 GPUs; "
+            "TileLang FP8 GEMM currently supports only SM89, SM90, and SM120 GPUs; "
             f"detected SM{sm}."
         )
 

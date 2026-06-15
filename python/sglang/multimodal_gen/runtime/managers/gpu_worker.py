@@ -60,6 +60,8 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.srt.layers import tilelang_gemm_wrapper
+from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -138,6 +140,12 @@ class GPUWorker:
             setproctitle(f"sgl_diffusion::scheduler{suffix}")
         else:
             setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
+
+        initialize_fp8_gemm_config(self.server_args)
+        if self.server_args.fp8_gemm_runner_backend == "tilelang":
+            tilelang_gemm_wrapper.update_tilelang_config(
+                self.local_rank, self.server_args
+            )
 
         self.pipeline = build_pipeline(self.server_args)
 

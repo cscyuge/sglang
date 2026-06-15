@@ -5099,7 +5099,7 @@ class ServerArgs:
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
             "'aiter' (ROCm only), "
-            "'tilelang' (TileLang >=0.1.9 backend; fail-fast on unsupported inputs). "
+            "'tilelang' (TileLang >=0.1.11 backend for SM89/SM90/SM120; fail-fast on unsupported inputs). "
             "NOTE: This replaces the deprecated environment variables "
             "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
         )

@@ -73,6 +73,17 @@ logger = init_logger(__name__)
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+FP8_GEMM_RUNNER_BACKEND_CHOICES = (
+    "auto",
+    "deep_gemm",
+    "flashinfer_trtllm",
+    "flashinfer_cutlass",
+    "flashinfer_deepgemm",
+    "cutlass",
+    "triton",
+    "aiter",
+    "tilelang",
+)
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 
@@ -208,6 +219,7 @@ class ServerArgs(DisaggArgsMixin):
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
     )
+    fp8_gemm_runner_backend: str = "auto"
 
     # Master port for distributed inference
     master_port: int = 30005
@@ -991,6 +1003,18 @@ class ServerArgs(DisaggArgsMixin):
 
         # Nunchaku SVDQuant quantization parameters
         NunchakuSVDQuantArgs.add_cli_args(parser)
+        parser.add_argument(
+            "--fp8-gemm-backend",
+            type=str,
+            choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.fp8_gemm_runner_backend,
+            dest="fp8_gemm_runner_backend",
+            help=(
+                "FP8 GEMM backend for quantized transformer linear layers. "
+                "Use 'tilelang' with SGLANG_TILELANG_GEMM_CONFIG_PATH to load "
+                "pre-tuned TileLang FP8 GEMM configs."
+            ),
+        )
 
         # Master port for distributed inference
         parser.add_argument(
@@ -1300,6 +1324,8 @@ class ServerArgs(DisaggArgsMixin):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
+                if arg_name == "fp8_gemm_backend":
+                    provided_arg_names.add("fp8_gemm_runner_backend")
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():

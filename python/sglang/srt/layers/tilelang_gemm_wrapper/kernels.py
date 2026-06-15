@@ -9,6 +9,9 @@ _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
 
+if hasattr(tilelang.PassConfigKey, "TL_DISABLE_DATA_RACE_CHECK"):
+    _PASS_CONFIGS[tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK] = True
+
 if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
     _PASS_CONFIGS[tilelang.PassConfigKey.TL_DISABLE_FAST_MATH] = True
 elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
