@@ -19,12 +19,8 @@ try:
     import tilelang.language as T
 
     _HAS_TILELANG = True
-    _PASS_CONFIGS = {}
-    if hasattr(tilelang.PassConfigKey, "TL_DISABLE_DATA_RACE_CHECK"):
-        _PASS_CONFIGS[tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK] = True
 except ImportError:
     _HAS_TILELANG = False
-    _PASS_CONFIGS = {}
 
 
 def conv3d_implicit_gemm(
@@ -179,7 +175,7 @@ def compile_kernel(N_batch, C_in, D_in, H_in, W_in, C_out, KD, KH, KW):
             dtype=dtype_str,
             accum_dtype="float32",
         )
-        compiled = tilelang.compile(kernel_fn, out_idx=[2], pass_configs=_PASS_CONFIGS)
+        compiled = tilelang.compile(kernel_fn, out_idx=[2])
         compiled._out_shape = (N_batch, OD, OH, OW, C_out)
         _kernel_cache[cache_key] = compiled
 
