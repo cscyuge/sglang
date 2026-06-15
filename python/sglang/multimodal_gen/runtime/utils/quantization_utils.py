@@ -205,6 +205,15 @@ def handle_fp8_metadata_format(quant_config_dict):
     ):
         quant_config_dict["quant_method"] = "fp8"
         quant_config_dict["activation_scheme"] = "dynamic"
+        packed_qkv_pattern = re.compile(
+            r"^double_blocks\.\d+\.(img|txt)_attn\.qkv$"
+        )
+        quant_config_dict["checkpoint_uses_packed_qkv"] = any(
+            packed_qkv_pattern.match(layer_name)
+            and isinstance(layer_cfg, dict)
+            and "float8" in layer_cfg.get("format", "")
+            for layer_name, layer_cfg in layers.items()
+        )
     return quant_config_dict
 
 

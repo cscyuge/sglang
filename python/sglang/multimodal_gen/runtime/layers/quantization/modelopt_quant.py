@@ -143,9 +143,11 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         is_checkpoint_fp8_serialized: bool = False,
         exclude_modules: Optional[List[str]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        checkpoint_uses_packed_qkv: bool = False,
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         if is_checkpoint_fp8_serialized:
             logger.warning(
                 "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change."
@@ -186,6 +188,9 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             is_checkpoint_fp8_serialized=True,
             exclude_modules=exclude_modules,
             packed_modules_mapping=config.get("packed_modules_mapping"),
+            checkpoint_uses_packed_qkv=config.get(
+                "checkpoint_uses_packed_qkv", False
+            ),
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):

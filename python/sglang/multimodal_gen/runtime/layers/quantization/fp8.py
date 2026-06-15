@@ -84,6 +84,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        checkpoint_uses_packed_qkv: bool = False,
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -93,6 +94,7 @@ class Fp8Config(QuantizationConfig):
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
         self.packed_modules_mapping = packed_modules_mapping or {}
+        self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -141,6 +143,10 @@ class Fp8Config(QuantizationConfig):
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
+            checkpoint_uses_packed_qkv=config.get(
+                "checkpoint_uses_packed_qkv", False
+            ),
         )
 
     def get_quant_method(

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import save_file
 
 partial_json_parser = types.ModuleType("partial_json_parser")
 partial_json_parser_core = types.ModuleType("partial_json_parser.core")
@@ -44,11 +45,13 @@ sys.modules.setdefault(
 sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_options)
 
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp8Config,
     _prepare_nvfp4_weight_bytes,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
@@ -58,6 +61,9 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    get_quant_config_from_safetensors_metadata,
+)
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
 )
@@ -202,6 +208,96 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(len(spec.post_load_hooks), 1)
         self.assertIs(nunchaku_config.model_cls, _FakeFluxTransformer)
         mock_maybe_download.assert_not_called()
+
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
+        side_effect=AssertionError("NVFP4 fallback should not run for FP8 metadata"),
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_quant_config_from_safetensors_metadata",
+        return_value=ModelOptFp8Config(is_checkpoint_fp8_serialized=True),
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils._resolve_quant_config_from_transformer_override",
+        return_value=None,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_quant_config",
+        return_value=None,
+    )
+    def test_resolve_transformer_quant_load_spec_prefers_fp8_metadata_before_nvfp4_fallback(
+        self,
+        _mock_config_quant,
+        _mock_override_quant,
+        _mock_metadata_quant,
+        _mock_nvfp4,
+    ):
+        server_args = self._make_server_args(
+            transformer_weights_path="/tmp/flux2-klein-fp8.safetensors"
+        )
+
+        spec = resolve_transformer_quant_load_spec(
+            hf_config={},
+            server_args=server_args,
+            safetensors_list=[server_args.transformer_weights_path],
+            component_model_path="/unused/component/path",
+            model_cls=_FakeFluxTransformer,
+            cls_name=_FakeFluxTransformer.__name__,
+        )
+
+        self.assertIsInstance(spec.quant_config, ModelOptFp8Config)
+        self.assertIsNone(spec.param_dtype)
+
+    def test_fp8_metadata_marks_packed_flux2_qkv(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file(
+                {"dummy": torch.zeros(1)},
+                f.name,
+                metadata={
+                    "_quantization_metadata": json.dumps(
+                        {
+                            "format_version": "1.0",
+                            "layers": {
+                                "double_blocks.0.img_attn.qkv": {
+                                    "format": "float8_e4m3fn"
+                                },
+                                "single_blocks.0.linear1": {
+                                    "format": "float8_e4m3fn"
+                                },
+                            },
+                        }
+                    )
+                },
+            )
+
+            config = get_quant_config_from_safetensors_metadata(f.name)
+
+        self.assertIsInstance(config, Fp8Config)
+        self.assertTrue(config.checkpoint_uses_packed_qkv)
+
+    def test_fp8_metadata_leaves_split_qkv_unmarked(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file(
+                {"dummy": torch.zeros(1)},
+                f.name,
+                metadata={
+                    "_quantization_metadata": json.dumps(
+                        {
+                            "format_version": "1.0",
+                            "layers": {
+                                "transformer_blocks.0.attn.to_q": {
+                                    "format": "float8_e4m3fn"
+                                },
+                            },
+                        }
+                    )
+                },
+            )
+
+            config = get_quant_config_from_safetensors_metadata(f.name)
+
+        self.assertIsInstance(config, Fp8Config)
+        self.assertFalse(config.checkpoint_uses_packed_qkv)
 
     def test_flux2_mixed_nvfp4_fallback_disables_conflicting_offloads(self):
         server_args = self._make_server_args(

@@ -174,11 +174,10 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        # Some FLUX.2 NVFP4 checkpoints store Q/K/V packed as a single tensor, while
-        # ModelOpt's standard diffusers export keeps the original to_q/to_k/to_v layout.
-        # Only enable the fused loader path for the packed checkpoint family.
-        self.use_fused_qkv = isinstance(quant_config, ModelOptFp4Config) and getattr(
-            quant_config, "checkpoint_uses_packed_qkv", False
+        # Some FLUX.2 quantized checkpoints store Q/K/V packed as a single tensor,
+        # while standard diffusers exports keep the original to_q/to_k/to_v layout.
+        self.use_fused_qkv = bool(
+            getattr(quant_config, "checkpoint_uses_packed_qkv", False)
         )
         self.use_fused_added_qkv = self.use_fused_qkv
 
@@ -238,13 +237,17 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
             if self.use_fused_added_qkv:
-                # txt_attn.qkv is always BF16 in the NVFP4 checkpoint — no quant needed
+                txt_qkv_quant_config = (
+                    None
+                    if isinstance(quant_config, ModelOptFp4Config)
+                    else quant_config
+                )
                 self.to_added_qkv = MergedColumnParallelLinear(
                     added_kv_proj_dim,
                     [self.inner_dim] * 3,
                     bias=added_proj_bias,
                     gather_output=False,
-                    quant_config=None,
+                    quant_config=txt_qkv_quant_config,
                     prefix=f"{prefix}.to_added_qkv" if prefix else "to_added_qkv",
                 )
             else:
