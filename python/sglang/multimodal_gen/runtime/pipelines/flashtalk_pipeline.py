@@ -1610,6 +1610,21 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 logger.warning(
                     "Frame conversion failed for chunk %d: %s", chunk_idx, e
                 )
+        if frame_dir and chunk_audio_data is not None:
+            try:
+                audio_path = os.path.join(frame_dir, f"audio_{chunk_idx:05d}.npy")
+                tmp_path = audio_path + ".tmp"
+                with open(tmp_path, "wb") as f:
+                    np.save(
+                        f,
+                        np.asarray(chunk_audio_data, dtype=np.float32),
+                        allow_pickle=False,
+                    )
+                os.replace(tmp_path, audio_path)
+            except Exception as e:
+                logger.warning(
+                    "Streaming audio save failed for chunk %d: %s", chunk_idx, e
+                )
         if frames_np is not None and frame_dir and frame_executor is not None:
             try:
                 frame_futures.append(

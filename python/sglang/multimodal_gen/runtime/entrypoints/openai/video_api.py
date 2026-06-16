@@ -984,6 +984,31 @@ def _resample_16k_float_to_48k_s16(raw: np.ndarray) -> np.ndarray:
     return np.clip(resampled * 32767, -32768, 32767).astype(np.int16)
 
 
+def _slice_audio_or_silence(
+    samples: Optional[np.ndarray], start: int, n_samples: int
+) -> np.ndarray:
+    if samples is None or start >= len(samples):
+        return np.zeros(n_samples, dtype=np.int16)
+    end = start + n_samples
+    chunk = samples[start:end]
+    if len(chunk) < n_samples:
+        chunk = np.pad(chunk, (0, n_samples - len(chunk)))
+    return chunk.astype(np.int16, copy=False)
+
+
+def _load_aligned_session_audio_slot(
+    frame_dir: str, chunk_idx: int
+) -> Optional[np.ndarray]:
+    path = os.path.join(frame_dir, f"audio_{chunk_idx:05d}.npy")
+    if not os.path.exists(path):
+        return None
+    try:
+        return _resample_16k_float_to_48k_s16(np.load(path))
+    except Exception as e:
+        logger.debug("Aligned session audio slot %d load error: %s", chunk_idx, e)
+        return None
+
+
 async def _fmp4_generator(
     frame_dir: str,
     fps: int,
@@ -1022,6 +1047,8 @@ async def _fmp4_generator(
 
     width = meta.get("width", 512)
     height = meta.get("height", 512)
+    frames_per_chunk = int(meta.get("frames_per_chunk") or 0)
+    use_aligned_session_audio = is_session_audio and frames_per_chunk > 0
 
     # ── Open PyAV fMP4 container writing to BytesIO ──
     buf = BytesIO()
@@ -1065,6 +1092,8 @@ async def _fmp4_generator(
     _session_audio_buf: Optional[np.ndarray] = None  # int16 @ 48 kHz
     _session_audio_buf_pos = 0  # how much of _session_audio_buf has been consumed
     _session_chunk_idx = 0  # next chunk file to try loading
+    _aligned_session_chunk_idx = -1
+    _aligned_session_audio_buf: Optional[np.ndarray] = None
 
     def _load_session_audio_chunks() -> None:
         """Try to load any new session audio chunks into _session_audio_buf."""
@@ -1124,6 +1153,24 @@ async def _fmp4_generator(
         _session_audio_buf_pos = min(end, len(_session_audio_buf))
         return chunk
 
+    def _get_aligned_session_audio_for_frame(
+        fidx: int, n_samples: int
+    ) -> np.ndarray:
+        """Return audio from the slot written for the same generated video chunk."""
+        nonlocal _aligned_session_chunk_idx, _aligned_session_audio_buf
+        chunk_idx = fidx // frames_per_chunk
+        frame_in_chunk = fidx % frames_per_chunk
+        if chunk_idx != _aligned_session_chunk_idx or _aligned_session_audio_buf is None:
+            _aligned_session_chunk_idx = chunk_idx
+            _aligned_session_audio_buf = _load_aligned_session_audio_slot(
+                frame_dir, chunk_idx
+            )
+        return _slice_audio_or_silence(
+            _aligned_session_audio_buf,
+            frame_in_chunk * n_samples,
+            n_samples,
+        )
+
     def _flush_buf() -> bytes:
         """Read new bytes from the BytesIO buffer and reset it."""
         data = buf.getvalue()
@@ -1169,7 +1216,12 @@ async def _fmp4_generator(
         if audio_stream is not None:
             audio_chunk = None
             if is_session_audio:
-                audio_chunk = _get_session_audio_for_frame(audio_samples_per_frame)
+                if use_aligned_session_audio:
+                    audio_chunk = _get_aligned_session_audio_for_frame(
+                        fidx, audio_samples_per_frame
+                    )
+                else:
+                    audio_chunk = _get_session_audio_for_frame(audio_samples_per_frame)
             elif audio_samples is not None:
                 start = audio_pos
                 end = min(start + audio_samples_per_frame, len(audio_samples))
@@ -1359,6 +1411,16 @@ def _build_webrtc_tracks(
     frame_dir = _frame_dir_for_job(video_id)
     session_audio_dir = _session_audio_dir_for_job(video_id)
     audio_path = job.get("audio_path")
+    aligned_frames_per_chunk = 0
+    if session_audio_dir is not None:
+        meta_path = os.path.join(frame_dir, "meta.json")
+        try:
+            with open(meta_path, "r") as f:
+                aligned_frames_per_chunk = int(
+                    (json.load(f) or {}).get("frames_per_chunk") or 0
+                )
+        except Exception:
+            aligned_frames_per_chunk = 28
 
     class FrameDirectoryVideoTrack(VideoStreamTrack):
         """WebRTC video track reading frame_NNNNN.jpg files from a job."""
@@ -1427,6 +1489,13 @@ def _build_webrtc_tracks(
             self._session_audio_buf: Optional[np.ndarray] = None
             self._session_audio_buf_pos = 0
             self._session_chunk_idx = 0
+            self._aligned_session_chunk_idx = -1
+            self._aligned_session_audio_buf: Optional[np.ndarray] = None
+            self._aligned_session_samples_per_chunk = (
+                aligned_frames_per_chunk * self._sample_rate // fps
+                if aligned_frames_per_chunk > 0
+                else 0
+            )
 
         async def _pace(self) -> None:
             now = asyncio.get_event_loop().time()
@@ -1504,6 +1573,32 @@ def _build_webrtc_tracks(
             self._session_audio_buf_pos = min(end, len(self._session_audio_buf))
             return chunk
 
+        def _next_aligned_session_audio(self) -> Optional[np.ndarray]:
+            if self._aligned_session_samples_per_chunk <= 0:
+                return None
+
+            chunk_idx = self._pts // self._aligned_session_samples_per_chunk
+            offset = self._pts % self._aligned_session_samples_per_chunk
+            if (
+                chunk_idx != self._aligned_session_chunk_idx
+                or self._aligned_session_audio_buf is None
+            ):
+                self._aligned_session_chunk_idx = chunk_idx
+                self._aligned_session_audio_buf = _load_aligned_session_audio_slot(
+                    frame_dir, int(chunk_idx)
+                )
+
+            if self._aligned_session_audio_buf is None and os.path.exists(
+                os.path.join(frame_dir, "done")
+            ):
+                return None
+
+            return _slice_audio_or_silence(
+                self._aligned_session_audio_buf,
+                int(offset),
+                self._samples_per_frame,
+            )
+
         async def _next_file_audio(self) -> Optional[np.ndarray]:
             await self._ensure_file_audio_loaded()
             if self._audio_samples is None:
@@ -1529,7 +1624,10 @@ def _build_webrtc_tracks(
 
             await self._pace()
             if session_audio_dir is not None:
-                chunk = self._next_session_audio()
+                if aligned_frames_per_chunk > 0:
+                    chunk = self._next_aligned_session_audio()
+                else:
+                    chunk = self._next_session_audio()
             else:
                 chunk = await self._next_file_audio()
             if chunk is None:
