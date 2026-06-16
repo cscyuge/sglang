@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -881,8 +882,13 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     }
 
     def post_load_weights(self) -> None:
-        if not isinstance(
-            getattr(self, "quant_config", None), (ModelOptFp4Config, ModelOptFp8Config)
+        quant_config = getattr(self, "quant_config", None)
+        uses_bfl_packed_fp8 = isinstance(quant_config, Fp8Config) and getattr(
+            quant_config, "checkpoint_uses_packed_qkv", False
+        )
+        if not (
+            isinstance(quant_config, (ModelOptFp4Config, ModelOptFp8Config))
+            or uses_bfl_packed_fp8
         ):
             return
 

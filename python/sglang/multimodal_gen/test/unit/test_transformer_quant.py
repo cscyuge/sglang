@@ -81,6 +81,21 @@ class _FakeQuantConfig:
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
+    def _make_flux2_post_load_stub(self, quant_config):
+        model = Flux2Transformer2DModel.__new__(Flux2Transformer2DModel)
+        model.quant_config = quant_config
+        model.scale_shift_swap_params = (
+            "norm_out.linear.weight",
+            "norm_out.linear.bias",
+        )
+        model.norm_out = SimpleNamespace(
+            linear=SimpleNamespace(
+                weight=torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0, 4.0])),
+                bias=torch.nn.Parameter(torch.tensor([5.0, 6.0, 7.0, 8.0])),
+            )
+        )
+        return model
+
     def _make_server_args(self, **overrides):
         defaults = dict(
             transformer_weights_path=None,
@@ -358,16 +373,22 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertFalse(config.swap_weight_nibbles)
 
     def test_flux2_modelopt_fp8_post_load_swaps_adaln_scale_shift(self):
-        model = Flux2Transformer2DModel.__new__(Flux2Transformer2DModel)
-        model.quant_config = ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
-        model.scale_shift_swap_params = (
-            "norm_out.linear.weight",
-            "norm_out.linear.bias",
+        model = self._make_flux2_post_load_stub(
+            ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
         )
-        model.norm_out = SimpleNamespace(
-            linear=SimpleNamespace(
-                weight=torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0, 4.0])),
-                bias=torch.nn.Parameter(torch.tensor([5.0, 6.0, 7.0, 8.0])),
+
+        Flux2Transformer2DModel.post_load_weights(model)
+
+        self.assertEqual(
+            model.norm_out.linear.weight.tolist(), [3.0, 4.0, 1.0, 2.0]
+        )
+        self.assertEqual(model.norm_out.linear.bias.tolist(), [7.0, 8.0, 5.0, 6.0])
+
+    def test_flux2_packed_fp8_post_load_swaps_adaln_scale_shift(self):
+        model = self._make_flux2_post_load_stub(
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                checkpoint_uses_packed_qkv=True,
             )
         )
 
@@ -377,6 +398,21 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             model.norm_out.linear.weight.tolist(), [3.0, 4.0, 1.0, 2.0]
         )
         self.assertEqual(model.norm_out.linear.bias.tolist(), [7.0, 8.0, 5.0, 6.0])
+
+    def test_flux2_split_fp8_post_load_keeps_diffusers_adaln_order(self):
+        model = self._make_flux2_post_load_stub(
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                checkpoint_uses_packed_qkv=False,
+            )
+        )
+
+        Flux2Transformer2DModel.post_load_weights(model)
+
+        self.assertEqual(
+            model.norm_out.linear.weight.tolist(), [1.0, 2.0, 3.0, 4.0]
+        )
+        self.assertEqual(model.norm_out.linear.bias.tolist(), [5.0, 6.0, 7.0, 8.0])
 
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(
