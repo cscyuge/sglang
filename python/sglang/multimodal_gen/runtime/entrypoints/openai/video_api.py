@@ -1877,8 +1877,12 @@ async def stream_video(
                     break
                 await asyncio.sleep(0.1)
 
-        # Schedule cleanup
-        asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=5.0))
+        # Normal jobs own their stream frame directory here. Session frame dirs
+        # are shared IPC between the long-running pipeline and fMP4/WebRTC/MJPEG
+        # clients, so session lifecycle cleanup in _dispatch_session_async owns
+        # their removal.
+        if video_id not in _SESSION_STORE:
+            asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=5.0))
 
     return StreamingResponse(
         _mjpeg_generator(),

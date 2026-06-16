@@ -1612,6 +1612,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 )
         if frame_dir and chunk_audio_data is not None:
             try:
+                if not os.path.isdir(frame_dir):
+                    raise FileNotFoundError(frame_dir)
                 audio_path = os.path.join(frame_dir, f"audio_{chunk_idx:05d}.npy")
                 tmp_path = audio_path + ".tmp"
                 with open(tmp_path, "wb") as f:
@@ -1621,6 +1623,11 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         allow_pickle=False,
                     )
                 os.replace(tmp_path, audio_path)
+            except FileNotFoundError:
+                logger.debug(
+                    "Streaming frame dir disappeared before audio save for chunk %d",
+                    chunk_idx,
+                )
             except Exception as e:
                 logger.warning(
                     "Streaming audio save failed for chunk %d: %s", chunk_idx, e
