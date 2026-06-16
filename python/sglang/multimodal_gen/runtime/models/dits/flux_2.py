@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp8Config,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -880,11 +881,13 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     }
 
     def post_load_weights(self) -> None:
-        if not isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
+        if not isinstance(
+            getattr(self, "quant_config", None), (ModelOptFp4Config, ModelOptFp8Config)
+        ):
             return
 
-        # BFL/ComfyUI checkpoints store AdaLN modulation params as [scale, shift],
-        # while diffusers expects [shift, scale].
+        # BFL/ComfyUI ModelOpt checkpoints store AdaLN modulation params as
+        # [scale, shift], while diffusers expects [shift, scale].
         for param_name in self.scale_shift_swap_params:
             parts = param_name.split(".")
             module = self

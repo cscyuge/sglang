@@ -61,6 +61,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.flux_2 import Flux2Transformer2DModel
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config_from_safetensors_metadata,
 )
@@ -355,6 +356,27 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertFalse(config.swap_weight_nibbles)
+
+    def test_flux2_modelopt_fp8_post_load_swaps_adaln_scale_shift(self):
+        model = Flux2Transformer2DModel.__new__(Flux2Transformer2DModel)
+        model.quant_config = ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+        model.scale_shift_swap_params = (
+            "norm_out.linear.weight",
+            "norm_out.linear.bias",
+        )
+        model.norm_out = SimpleNamespace(
+            linear=SimpleNamespace(
+                weight=torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0, 4.0])),
+                bias=torch.nn.Parameter(torch.tensor([5.0, 6.0, 7.0, 8.0])),
+            )
+        )
+
+        Flux2Transformer2DModel.post_load_weights(model)
+
+        self.assertEqual(
+            model.norm_out.linear.weight.tolist(), [3.0, 4.0, 1.0, 2.0]
+        )
+        self.assertEqual(model.norm_out.linear.bias.tolist(), [7.0, 8.0, 5.0, 6.0])
 
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(
