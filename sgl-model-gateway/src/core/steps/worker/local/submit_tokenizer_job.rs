@@ -41,6 +41,17 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
+        if labels
+            .get("model_type")
+            .map(|model_type| model_type.eq_ignore_ascii_case("diffusion"))
+            .unwrap_or(false)
+        {
+            info!(
+                "Skipping tokenizer registration for diffusion worker(s); image routes are proxied without router-side tokenization"
+            );
+            return Ok(StepResult::Success);
+        }
+
         // Get job queue
         let job_queue = match app_context.worker_job_queue.get() {
             Some(queue) => queue,
