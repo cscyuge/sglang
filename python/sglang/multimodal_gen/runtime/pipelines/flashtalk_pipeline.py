@@ -419,6 +419,38 @@ def _wait_for_session_audio_chunk(
     return None
 
 
+def _wait_for_session_audio_path(
+    session_dir: str,
+    chunk_idx: int,
+    cancel_file: str | None,
+    timeout: float,
+    poll_interval: float,
+) -> tuple[bool, float]:
+    """Wait briefly for a session audio chunk file.
+
+    Session streaming callers normally push one audio window per video chunk.
+    FlashTalk may generate slightly faster than real time, so the next chunk
+    can be a few milliseconds late.  This helper provides a bounded grace
+    window before falling back to internally generated silence.
+    """
+    if timeout <= 0:
+        return False, 0.0
+
+    chunk_path = os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
+    end_path = os.path.join(session_dir, "end")
+    start = time.time()
+    deadline = start + timeout
+    while time.time() < deadline:
+        if os.path.exists(chunk_path):
+            return True, time.time() - start
+        if os.path.exists(end_path):
+            return False, time.time() - start
+        if cancel_file and os.path.exists(cancel_file):
+            return False, time.time() - start
+        time.sleep(min(poll_interval, max(0.0, deadline - time.time())))
+    return os.path.exists(chunk_path), time.time() - start
+
+
 def _apply_fp8_quant_to_model(model: torch.nn.Module, fp8_config) -> int:
     """Patch block-level linear layers for FP8 quantization on meta device.
 
@@ -2241,6 +2273,20 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _silence_samples = slice_len * sample_rate // fps  # 17920
             _chunk_wall_time = slice_len / fps  # ~1.12s
             _end_path = os.path.join(session_dir, "end")
+            _session_audio_grace_s = max(
+                0.0,
+                float(os.environ.get("FLASHTALK_SESSION_AUDIO_GRACE_S", "0.25")),
+            )
+            _session_audio_grace_s = min(_session_audio_grace_s, _chunk_wall_time * 0.4)
+            _session_audio_grace_poll_s = max(
+                0.005,
+                float(os.environ.get("FLASHTALK_SESSION_AUDIO_GRACE_POLL_S", "0.01")),
+            )
+            # Only use the grace wait as a jitter absorber after a caller
+            # supplied chunk was consumed.  Once we have fallen back to
+            # internal silence, keep generating without repeated waits so the
+            # stream never stalls when the caller is genuinely idle/disconnected.
+            _last_audio_loaded_from_client = False
 
             # Optional ARTC push streamer (lazy-start: connect on first chunk).
             # Only rank 0 pushes — creating pushers on all workers would
@@ -2339,6 +2385,38 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 # --- Audio: use prefetch or load+process normally ---
                 _audio_prefetched = False
                 if _prefetched_result is not None:
+                    _pf_silence = _prefetched_result[2]
+                    _pf_loaded = _prefetched_result[3]
+                    if _pf_silence and not _pf_loaded:
+                        _audio_chunk_path = os.path.join(
+                            session_dir,
+                            "audio_chunks",
+                            f"chunk_{audio_chunk_idx:04d}.npy",
+                        )
+                        if (
+                            not os.path.exists(_audio_chunk_path)
+                            and _last_audio_loaded_from_client
+                        ):
+                            _arrived, _waited_s = _wait_for_session_audio_path(
+                                session_dir,
+                                audio_chunk_idx,
+                                _cancel_file,
+                                _session_audio_grace_s,
+                                _session_audio_grace_poll_s,
+                            )
+                            if _arrived and get_world_rank() == 0:
+                                logger.info(
+                                    "Session audio chunk %d arrived after %.3fs "
+                                    "grace wait; discarding prefetched silence",
+                                    audio_chunk_idx,
+                                    _waited_s,
+                                )
+                        if os.path.exists(_audio_chunk_path):
+                            # Prefetch may have checked just before the client
+                            # wrote this chunk.  Do not let stale prefetched
+                            # silence override real/realtime-padded audio.
+                            _prefetched_result = None
+                if _prefetched_result is not None:
                     # Previous chunk prefetched this chunk's audio
                     (
                         _pf_audio_context,
@@ -2359,6 +2437,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _used_silence = _pf_silence
                     if _pf_loaded:
                         audio_chunk_idx += 1
+                    _loaded_from_client = _pf_loaded
 
                     # Update the real ring buffer (prefetch used a snapshot)
                     audio_dq.extend(chunk_audio_data)
@@ -2372,25 +2451,47 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         "audio_chunks",
                         f"chunk_{audio_chunk_idx:04d}.npy",
                     )
+                    if (
+                        not os.path.exists(_audio_chunk_path)
+                        and _last_audio_loaded_from_client
+                    ):
+                        _arrived, _waited_s = _wait_for_session_audio_path(
+                            session_dir,
+                            audio_chunk_idx,
+                            _cancel_file,
+                            _session_audio_grace_s,
+                            _session_audio_grace_poll_s,
+                        )
+                        if _arrived and get_world_rank() == 0:
+                            logger.info(
+                                "Session audio chunk %d arrived after %.3fs "
+                                "grace wait",
+                                audio_chunk_idx,
+                                _waited_s,
+                            )
                     if os.path.exists(_audio_chunk_path):
                         try:
                             chunk_audio_data = np.load(_audio_chunk_path)
                             audio_chunk_idx += 1
+                            _loaded_from_client = True
                         except Exception:
                             time.sleep(0.01)
                             try:
                                 chunk_audio_data = np.load(_audio_chunk_path)
                                 audio_chunk_idx += 1
+                                _loaded_from_client = True
                             except Exception:
                                 chunk_audio_data = np.zeros(
                                     _silence_samples, dtype=np.float32
                                 )
                                 _used_silence = True
+                                _loaded_from_client = False
                     else:
                         chunk_audio_data = np.zeros(
                             _silence_samples, dtype=np.float32
                         )
                         _used_silence = True
+                        _loaded_from_client = False
 
                 chunk_start = time.time()
                 _stage_start = time.perf_counter()
@@ -2571,6 +2672,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 )
                 logger.info("Session chunk %d: %.3fs", chunk_idx, _t_chunk)
                 chunk_idx += 1
+                _last_audio_loaded_from_client = _loaded_from_client
 
                 # Real-time pacing: sleep up to one chunk's wall-clock
                 # duration so generation rate matches the real-time
@@ -2614,11 +2716,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             break
                         if _cancel_file and os.path.exists(_cancel_file):
                             break
-                        # For silence chunks, break when real audio arrives
-                        if _used_silence:
-                            if os.path.exists(_next_audio_path):
+                        # Break when the next audio arrives during pacing.
+                        # If prefetch already fell back to silence, invalidate
+                        # it so the next loop loads the newly written file.
+                        if os.path.exists(_next_audio_path):
+                            if (
+                                _prefetched_result is not None
+                                and _prefetched_result[2]  # used_silence
+                            ):
                                 _prefetched_result = None
-                                break
+                            break
 
                 # Periodically drain completed futures to avoid unbounded list growth
                 if chunk_idx % 50 == 0 and _frame_futures:
