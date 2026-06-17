@@ -419,55 +419,6 @@ def _wait_for_session_audio_chunk(
     return None
 
 
-def _load_session_audio_chunk_file(chunk_path: str) -> np.ndarray | None:
-    try:
-        return np.load(chunk_path)
-    except Exception:
-        # The writer uses atomic rename, but keep one retry for compatibility
-        # with older clients or filesystems that expose a mid-write file.
-        time.sleep(0.01)
-        try:
-            return np.load(chunk_path)
-        except Exception:
-            return None
-
-
-def _wait_for_session_audio_chunk_ready(
-    session_dir: str,
-    chunk_idx: int,
-    cancel_file: str | None,
-    timeout: float,
-    poll_interval: float,
-) -> tuple[np.ndarray | None, str]:
-    """Wait until the next live-session audio chunk is available.
-
-    Returns ``(audio, "audio")`` when a chunk is loaded.  Other statuses are
-    ``"end"``, ``"cancel"``, ``"timeout"``, or ``"error"``.
-    """
-    chunk_path = os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
-    end_path = os.path.join(session_dir, "end")
-    deadline = None if timeout < 0 else time.time() + max(0.0, timeout)
-    poll_interval = max(0.005, poll_interval)
-
-    while True:
-        if os.path.exists(end_path):
-            return None, "end"
-        if cancel_file and os.path.exists(cancel_file):
-            return None, "cancel"
-        if os.path.exists(chunk_path):
-            audio = _load_session_audio_chunk_file(chunk_path)
-            if audio is not None:
-                return audio, "audio"
-            return None, "error"
-        if deadline is not None:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                return None, "timeout"
-            time.sleep(min(poll_interval, remaining))
-        else:
-            time.sleep(poll_interval)
-
-
 def _apply_fp8_quant_to_model(model: torch.nn.Module, fp8_config) -> int:
     """Patch block-level linear layers for FP8 quantization on meta device.
 
@@ -2290,23 +2241,6 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _silence_samples = slice_len * sample_rate // fps  # 17920
             _chunk_wall_time = slice_len / fps  # ~1.12s
             _end_path = os.path.join(session_dir, "end")
-            # In live sessions, generating an immediate synthetic silence chunk
-            # while the caller is between turns can add one full inference window
-            # of latency to the next real audio chunk.  Wait for real audio and
-            # only synthesize silence after this deadline.  Set to 0 to restore
-            # the old eager-silence behavior, or a negative value to wait
-            # indefinitely until audio/end/cancel.
-            _idle_wait_s = float(
-                os.environ.get("SGLANG_FLASHTALK_SESSION_IDLE_WAIT_S", "300")
-            )
-            _idle_poll_s = float(
-                os.environ.get("SGLANG_FLASHTALK_SESSION_IDLE_POLL_S", "0.02")
-            )
-            logger.info(
-                "Session audio idle wait enabled: wait_s=%.3f poll_s=%.3f",
-                _idle_wait_s,
-                _idle_poll_s,
-            )
 
             # Optional ARTC push streamer (lazy-start: connect on first chunk).
             # Only rank 0 pushes — creating pushers on all workers would
@@ -2415,26 +2349,22 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     ) = _prefetched_result
                     _prefetched_result = None
 
-                    if _pf_loaded and not _pf_silence:
-                        # Sync: make default stream wait for the overlap stream's
-                        # GPU work (wav2vec + audio_proj) to finish before we use
-                        # the prefetched audio_context tensor in denoising.
-                        # Stream-side wait avoids unnecessary CPU blocking.
-                        torch.cuda.current_stream(device).wait_event(_pf_event)
+                    # Sync: make default stream wait for the overlap stream's
+                    # GPU work (wav2vec + audio_proj) to finish before we use
+                    # the prefetched audio_context tensor in denoising.
+                    # Stream-side wait avoids unnecessary CPU blocking.
+                    torch.cuda.current_stream(device).wait_event(_pf_event)
 
-                        chunk_audio_data = _pf_chunk_audio
-                        _used_silence = False
+                    chunk_audio_data = _pf_chunk_audio
+                    _used_silence = _pf_silence
+                    if _pf_loaded:
                         audio_chunk_idx += 1
 
-                        # Update the real ring buffer (prefetch used a snapshot)
-                        audio_dq.extend(chunk_audio_data)
-                        batch.extra["audio_context"] = _pf_audio_context
-                        _audio_prefetched = True
-                    else:
-                        torch.cuda.current_stream(device).wait_event(_pf_event)
-                        chunk_audio_data = None
-                        _used_silence = False
-                if not _audio_prefetched:
+                    # Update the real ring buffer (prefetch used a snapshot)
+                    audio_dq.extend(chunk_audio_data)
+                    batch.extra["audio_context"] = _pf_audio_context
+                    _audio_prefetched = True
+                else:
                     # Normal path: load audio file
                     _used_silence = False
                     _audio_chunk_path = os.path.join(
@@ -2443,60 +2373,24 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         f"chunk_{audio_chunk_idx:04d}.npy",
                     )
                     if os.path.exists(_audio_chunk_path):
-                        chunk_audio_data = _load_session_audio_chunk_file(
-                            _audio_chunk_path
-                        )
-                        if chunk_audio_data is not None:
+                        try:
+                            chunk_audio_data = np.load(_audio_chunk_path)
                             audio_chunk_idx += 1
-                        else:
-                            chunk_audio_data = np.zeros(
-                                _silence_samples, dtype=np.float32
-                            )
-                            _used_silence = True
+                        except Exception:
+                            time.sleep(0.01)
+                            try:
+                                chunk_audio_data = np.load(_audio_chunk_path)
+                                audio_chunk_idx += 1
+                            except Exception:
+                                chunk_audio_data = np.zeros(
+                                    _silence_samples, dtype=np.float32
+                                )
+                                _used_silence = True
                     else:
-                        _wait_start = time.time()
-                        chunk_audio_data, _wait_status = (
-                            _wait_for_session_audio_chunk_ready(
-                                session_dir,
-                                audio_chunk_idx,
-                                _cancel_file,
-                                _idle_wait_s,
-                                _idle_poll_s,
-                            )
+                        chunk_audio_data = np.zeros(
+                            _silence_samples, dtype=np.float32
                         )
-                        _waited_s = time.time() - _wait_start
-                        if _wait_status == "audio" and chunk_audio_data is not None:
-                            audio_chunk_idx += 1
-                            if _waited_s >= 0.05:
-                                logger.info(
-                                    "Session: audio chunk %d arrived after idle wait %.3fs",
-                                    audio_chunk_idx - 1,
-                                    _waited_s,
-                                )
-                        elif _wait_status == "end":
-                            logger.info(
-                                "Session ended while waiting for audio chunk %d",
-                                audio_chunk_idx,
-                            )
-                            break
-                        elif _wait_status == "cancel":
-                            logger.info(
-                                "Session cancelled while waiting for audio chunk %d",
-                                audio_chunk_idx,
-                            )
-                            _cancelled = True
-                            break
-                        else:
-                            if _wait_status == "timeout":
-                                logger.info(
-                                    "Session idle wait %.3fs expired at chunk %d; generating silence",
-                                    _idle_wait_s,
-                                    chunk_idx,
-                                )
-                            chunk_audio_data = np.zeros(
-                                _silence_samples, dtype=np.float32
-                            )
-                            _used_silence = True
+                        _used_silence = True
 
                 chunk_start = time.time()
                 _stage_start = time.perf_counter()
@@ -2587,16 +2481,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 # CPU audio preprocessing + GPU wav2vec/audio_proj can run
                 # concurrently while VAE decode+encode runs on the default stream.
                 _audio_prefetch_future: Future | None = None
-                _prefetch_audio_path = os.path.join(
-                    session_dir,
-                    "audio_chunks",
-                    f"chunk_{audio_chunk_idx:04d}.npy",
-                )
-                if (
-                    _enable_audio_overlap
-                    and _audio_prefetch_pool is not None
-                    and os.path.exists(_prefetch_audio_path)
-                ):
+                if _enable_audio_overlap and _audio_prefetch_pool is not None:
                     # Record event BEFORE graph replay so the overlap stream
                     # has a deterministic sync point (denoising done, VAE not
                     # yet started).  The overlap stream waits for this event
