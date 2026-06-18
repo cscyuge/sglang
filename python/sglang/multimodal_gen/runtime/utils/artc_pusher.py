@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 _SDK_DIR = os.path.join(os.path.dirname(__file__), "alirtc")
 _CHUNK = "chunk"
+_CLEAR_BUFFER = "clear_buffer"
 _STOP = "stop"
 
 
@@ -246,7 +247,11 @@ def _join_channel(engine, handler: _WorkerEventHandler, config: dict) -> None:
     )
 
     join_cfg = JoinChannelConfig()
-    join_cfg.publishAvsyncMode = PublishAvsyncMode.PublishAvsyncWithPts
+    avsync_mode = str(config.get("avsync_mode") or "nodelay").strip().lower()
+    if avsync_mode in ("pts", "with_pts", "withpts"):
+        join_cfg.publishAvsyncMode = PublishAvsyncMode.PublishAvsyncWithPts
+    else:
+        join_cfg.publishAvsyncMode = PublishAvsyncMode.PublishAvsyncNoDelay
     join_cfg.publishMode = PublishMode.PublishAutomatically
     engine.JoinChannel(
         config["token"],
@@ -264,12 +269,13 @@ def _join_channel(engine, handler: _WorkerEventHandler, config: dict) -> None:
     handler.audio_published.wait(timeout=5.0)
     handler.video_published.wait(timeout=5.0)
     logger.info(
-        "ARTC worker ready: channel=%s user=%s %dx%d@%dfps",
+        "ARTC worker ready: channel=%s user=%s %dx%d@%dfps avsync=%s",
         config["channel"],
         config["userid"],
         config["width"],
         config["height"],
         config["fps"],
+        avsync_mode,
     )
 
 
@@ -291,6 +297,10 @@ def _drain_worker_queue(
     v_ts = 0
     a_ts = 0
     timeline_path = config.get("timeline_path")
+    frame_pacing = bool(config.get("frame_pacing", False))
+    reset_pts_on_clear = bool(config.get("reset_pts_on_clear", True))
+    frame_interval_s = 1.0 / max(fps, 1)
+    next_frame_at = time.monotonic()
 
     while True:
         try:
@@ -304,6 +314,30 @@ def _drain_worker_queue(
 
         if item is None or item[0] == _STOP:
             break
+        if item[0] == _CLEAR_BUFFER:
+            meta = item[1] if len(item) > 1 and isinstance(item[1], dict) else {}
+            clear_started = time.monotonic()
+            try:
+                engine.ClearDataBuffer()
+                handler.push_audio_full = False
+                handler.push_video_full = False
+                if reset_pts_on_clear:
+                    v_ts = 0
+                    a_ts = 0
+                next_frame_at = time.monotonic()
+                emit_chunk_timeline(
+                    timeline_path,
+                    "artc_worker_buffer_cleared",
+                    chunk_idx=meta.get("chunk_idx"),
+                    audio_chunk_idx=meta.get("audio_chunk_idx"),
+                    turn_id=meta.get("turn_id"),
+                    reason=meta.get("reason"),
+                    reset_pts=reset_pts_on_clear,
+                    elapsed_ms=round((time.monotonic() - clear_started) * 1000, 3),
+                )
+            except Exception as exc:
+                logger.warning("ARTC ClearDataBuffer failed: %s", exc)
+            continue
         if item[0] != _CHUNK:
             continue
 
@@ -332,6 +366,12 @@ def _drain_worker_queue(
         for i in range(num_frames):
             if handler.failed:
                 raise RuntimeError("ARTC SDK failed during frame push")
+
+            if frame_pacing:
+                now = time.monotonic()
+                if next_frame_at > now:
+                    time.sleep(next_frame_at - now)
+                next_frame_at = max(next_frame_at + frame_interval_s, time.monotonic())
 
             while handler.push_video_full:
                 time.sleep(0.001)
@@ -557,6 +597,8 @@ class ArtcPusher:
         self._start_done = threading.Event()
         self._start_requested = False
         self._stop_requested = threading.Event()
+        self._last_enqueued_real_turn_id: Optional[str] = None
+        self._last_enqueued_was_filler = False
 
     @property
     def failed(self) -> bool:
@@ -655,6 +697,7 @@ class ArtcPusher:
                 if kind == "ready":
                     self._started = True
                     self._start_done.set()
+                    self._ensure_sender_thread()
                     logger.info(
                         "ARTC start() finished in %.3fs for channel=%s worker_pid=%s",
                         time.perf_counter() - t0,
@@ -736,17 +779,37 @@ class ArtcPusher:
             "enqueue_monotonic_s": time.monotonic(),
         }
         item = (_CHUNK, frames_np, audio_int16, meta)
-        if not self._meta_is_filler(meta):
-            self.drop_filler_chunks(reason="real_chunk_enqueue")
-        queue_dropped = False
+
+        meta_is_filler = self._meta_is_filler(meta)
         dropped_filler = 0
+        dropped_stale = 0
+        clear_enqueued = False
+
+        if meta_is_filler:
+            if not self._started:
+                # ARTC startup can take several seconds. Keeping every prestart
+                # filler chunk creates a playback backlog before the first real
+                # response, so retain at most the latest placeholder.
+                dropped_filler += self.drop_filler_chunks(
+                    reason="prestart_latest_filler"
+                )
+        else:
+            dropped_filler += self.drop_filler_chunks(reason="real_chunk_enqueue")
+            dropped_stale += self.drop_stale_chunks(
+                active_turn_id=turn_id,
+                reason="real_chunk_enqueue",
+            )
+            if self._should_clear_before_real(meta):
+                clear_enqueued = self._enqueue_clear_buffer(meta)
+
+        queue_dropped = False
         enqueued = False
         try:
             self._command_queue.put_nowait(item)
             enqueued = True
         except queue.Full:
-            dropped_filler = self.drop_filler_chunks(reason="queue_full")
-            if self._meta_is_filler(meta):
+            dropped_filler += self.drop_filler_chunks(reason="queue_full")
+            if meta_is_filler:
                 if dropped_filler:
                     try:
                         self._command_queue.put_nowait(item)
@@ -759,17 +822,19 @@ class ArtcPusher:
                     chunk_source,
                 )
             else:
-                try:
-                    self._command_queue.get_nowait()
-                    queue_dropped = True
-                except queue.Empty:
-                    pass
+                queue_dropped = bool(self.drop_oldest_chunk(reason="queue_full"))
                 try:
                     self._command_queue.put_nowait(item)
                     enqueued = True
                 except queue.Full:
                     pass
                 logger.warning("ARTC pusher queue full, dropped oldest chunk")
+        if meta_is_filler:
+            self._last_enqueued_was_filler = True
+        elif enqueued:
+            self._last_enqueued_was_filler = False
+            if turn_id:
+                self._last_enqueued_real_turn_id = turn_id
         emit_chunk_timeline(
             self._timeline_path,
             "artc_chunk_enqueued",
@@ -786,6 +851,8 @@ class ArtcPusher:
             queue_size=self._command_queue.qsize() if self._command_queue else None,
             queue_dropped=queue_dropped,
             dropped_filler=dropped_filler,
+            dropped_stale=dropped_stale,
+            clear_enqueued=clear_enqueued,
             enqueued=enqueued,
             pusher_started=bool(self._started),
         )
@@ -804,6 +871,98 @@ class ArtcPusher:
             return False
         meta = item[3] if isinstance(item[3], dict) else {}
         return self._meta_is_filler(meta)
+
+    @staticmethod
+    def _item_meta(item) -> dict:
+        if not isinstance(item, tuple):
+            return {}
+        if item and item[0] == _CHUNK and len(item) > 3 and isinstance(item[3], dict):
+            return item[3]
+        if item and item[0] == _CLEAR_BUFFER and len(item) > 1 and isinstance(item[1], dict):
+            return item[1]
+        return {}
+
+    def _should_clear_before_real(self, meta: dict) -> bool:
+        turn_id = meta.get("turn_id")
+        if self._last_enqueued_was_filler:
+            return True
+        if turn_id and turn_id != self._last_enqueued_real_turn_id:
+            return True
+        if self._last_enqueued_real_turn_id is None and turn_id:
+            return True
+        return False
+
+    def _enqueue_clear_buffer(self, meta: dict) -> bool:
+        if self._command_queue is None:
+            return False
+        clear_meta = {
+            "chunk_idx": meta.get("chunk_idx"),
+            "audio_chunk_idx": meta.get("audio_chunk_idx"),
+            "turn_id": meta.get("turn_id"),
+            "reason": "real_turn_boundary",
+            "enqueue_monotonic_s": time.monotonic(),
+        }
+        item = (_CLEAR_BUFFER, clear_meta)
+        enqueued = self._put_control_item(item)
+        emit_chunk_timeline(
+            self._timeline_path,
+            "artc_clear_buffer_enqueued",
+            chunk_idx=clear_meta["chunk_idx"],
+            audio_chunk_idx=clear_meta["audio_chunk_idx"],
+            turn_id=clear_meta["turn_id"],
+            reason=clear_meta["reason"],
+            enqueued=enqueued,
+            queue_size=self._command_queue.qsize()
+            if self._command_queue is not None
+            else None,
+        )
+        return enqueued
+
+    def _put_control_item(self, item) -> bool:
+        if self._command_queue is None:
+            return False
+        try:
+            self._command_queue.put_nowait(item)
+            return True
+        except queue.Full:
+            self.drop_filler_chunks(reason="control_queue_full")
+            self.drop_oldest_chunk(reason="control_queue_full")
+            try:
+                self._command_queue.put_nowait(item)
+                return True
+            except queue.Full:
+                return False
+
+    def drop_oldest_chunk(self, reason: str = "") -> int:
+        if self._command_queue is None:
+            return 0
+
+        kept = []
+        dropped = 0
+        while True:
+            try:
+                item = self._command_queue.get_nowait()
+            except queue.Empty:
+                break
+            if dropped == 0 and isinstance(item, tuple) and item and item[0] == _CHUNK:
+                dropped = 1
+                continue
+            kept.append(item)
+        for item in kept:
+            try:
+                self._command_queue.put_nowait(item)
+            except queue.Full:
+                break
+        if dropped:
+            emit_chunk_timeline(
+                self._timeline_path,
+                "artc_oldest_chunk_dropped",
+                reason=reason,
+                queue_size=self._command_queue.qsize()
+                if self._command_queue is not None
+                else None,
+            )
+        return dropped
 
     def drop_filler_chunks(self, reason: str = "") -> int:
         """Drop queued filler chunks that have not been sent to the worker."""
@@ -843,6 +1002,49 @@ class ArtcPusher:
             )
         return dropped
 
+    def drop_stale_chunks(self, active_turn_id: Optional[str], reason: str = "") -> int:
+        """Drop queued chunks from older turns before a new real turn starts."""
+        if self._command_queue is None or not active_turn_id:
+            return 0
+
+        kept = []
+        dropped = 0
+        while True:
+            try:
+                item = self._command_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, tuple) and item and item[0] == _CHUNK:
+                meta = self._item_meta(item)
+                item_turn_id = meta.get("turn_id")
+                if self._meta_is_filler(meta) or item_turn_id != active_turn_id:
+                    dropped += 1
+                    continue
+            kept.append(item)
+        for item in kept:
+            try:
+                self._command_queue.put_nowait(item)
+            except queue.Full:
+                break
+        if dropped:
+            emit_chunk_timeline(
+                self._timeline_path,
+                "artc_stale_chunks_dropped",
+                dropped_chunks=dropped,
+                active_turn_id=active_turn_id,
+                reason=reason,
+                queue_size=self._command_queue.qsize()
+                if self._command_queue is not None
+                else None,
+            )
+            logger.info(
+                "ARTC pusher dropped %d stale chunks for turn=%s reason=%s",
+                dropped,
+                active_turn_id,
+                reason,
+            )
+        return dropped
+
     def stop(self, timeout: float = 10.0) -> None:
         """Stop the worker process; kill its process group on timeout."""
         if not self._started and not self._start_requested and self._process is None:
@@ -875,6 +1077,17 @@ class ArtcPusher:
         self._close_queues()
 
     def _worker_config(self) -> dict:
+        avsync_mode = os.environ.get("SGLANG_ARTC_AVSYNC_MODE", "nodelay").strip()
+        frame_pacing_env = os.environ.get("SGLANG_ARTC_FRAME_PACING")
+        if frame_pacing_env is None:
+            frame_pacing = avsync_mode.lower() not in ("pts", "with_pts", "withpts")
+        else:
+            frame_pacing = frame_pacing_env.strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
         return {
             "token": self._token,
             "channel": self._channel,
@@ -885,6 +1098,14 @@ class ArtcPusher:
             "queue_maxsize": self._queue_maxsize,
             "sdk_path": self._sdk_path,
             "timeline_path": self._timeline_path,
+            "avsync_mode": avsync_mode,
+            "frame_pacing": frame_pacing,
+            "reset_pts_on_clear": os.environ.get(
+                "SGLANG_ARTC_RESET_PTS_ON_CLEAR", "1"
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on"),
             "join_timeout": float(os.environ.get("SGLANG_ARTC_JOIN_TIMEOUT", "10.0")),
             "leave_timeout": float(os.environ.get("SGLANG_ARTC_LEAVE_TIMEOUT", "2.0")),
         }
@@ -912,6 +1133,12 @@ class ArtcPusher:
         os.close(command_read_fd)
         os.close(status_write_fd)
         _send_message(self._command_write_fd, self._worker_config())
+
+    def _ensure_sender_thread(self) -> None:
+        if self._command_queue is None or self._command_write_fd is None:
+            return
+        if self._sender_thread is not None and self._sender_thread.is_alive():
+            return
         self._sender_thread = threading.Thread(
             target=self._sender_loop,
             daemon=True,
@@ -967,6 +1194,7 @@ class ArtcPusher:
                 elif kind == "ready":
                     self._started = True
                     self._start_done.set()
+                    self._ensure_sender_thread()
                 elif kind == "stopped":
                     self._started = False
 
@@ -1027,24 +1255,48 @@ class ArtcPusher:
                 return
             if item[0] == _STOP:
                 return
-            meta = item[3] if len(item) > 3 and isinstance(item[3], dict) else {}
-            emit_chunk_timeline(
-                self._timeline_path,
-                "artc_chunk_ipc_sent",
-                chunk_idx=meta.get("chunk_idx"),
-                audio_chunk_idx=meta.get("audio_chunk_idx"),
-                chunk_source=meta.get("chunk_source"),
-                is_filler=meta.get("is_filler"),
-                turn_id=meta.get("turn_id"),
-                queue_size=self._command_queue.qsize()
-                if self._command_queue is not None
-                else None,
-                enqueue_to_ipc_ms=round(
-                    (time.monotonic() - meta.get("enqueue_monotonic_s", time.monotonic()))
-                    * 1000,
-                    3,
-                ),
-            )
+            meta = self._item_meta(item)
+            if item[0] == _CLEAR_BUFFER:
+                emit_chunk_timeline(
+                    self._timeline_path,
+                    "artc_clear_buffer_ipc_sent",
+                    chunk_idx=meta.get("chunk_idx"),
+                    audio_chunk_idx=meta.get("audio_chunk_idx"),
+                    turn_id=meta.get("turn_id"),
+                    reason=meta.get("reason"),
+                    queue_size=self._command_queue.qsize()
+                    if self._command_queue is not None
+                    else None,
+                    enqueue_to_ipc_ms=round(
+                        (
+                            time.monotonic()
+                            - meta.get("enqueue_monotonic_s", time.monotonic())
+                        )
+                        * 1000,
+                        3,
+                    ),
+                )
+            else:
+                emit_chunk_timeline(
+                    self._timeline_path,
+                    "artc_chunk_ipc_sent",
+                    chunk_idx=meta.get("chunk_idx"),
+                    audio_chunk_idx=meta.get("audio_chunk_idx"),
+                    chunk_source=meta.get("chunk_source"),
+                    is_filler=meta.get("is_filler"),
+                    turn_id=meta.get("turn_id"),
+                    queue_size=self._command_queue.qsize()
+                    if self._command_queue is not None
+                    else None,
+                    enqueue_to_ipc_ms=round(
+                        (
+                            time.monotonic()
+                            - meta.get("enqueue_monotonic_s", time.monotonic())
+                        )
+                        * 1000,
+                        3,
+                    ),
+                )
 
     def _close_queues(self) -> None:
         for fd in (self._command_write_fd, self._status_read_fd):
