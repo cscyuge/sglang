@@ -500,6 +500,37 @@ def _find_pending_real_audio_after_fillers(
     return None, skipped
 
 
+def _wait_for_pending_real_audio_after_fillers(
+    session_dir: str,
+    start_idx: int,
+    max_scan: int,
+    timeout: float,
+    poll_interval: float,
+    cancel_file: str | None,
+) -> tuple[int | None, int, float]:
+    """Briefly wait for real audio that can replace pending filler chunks."""
+    if timeout <= 0:
+        return None, 0, 0.0
+
+    end_path = os.path.join(session_dir, "end")
+    start = time.time()
+    deadline = start + timeout
+    last_skipped = 0
+    while time.time() < deadline:
+        next_real_idx, skipped = _find_pending_real_audio_after_fillers(
+            session_dir, start_idx, max_scan
+        )
+        last_skipped = skipped
+        if next_real_idx is not None:
+            return next_real_idx, skipped, time.time() - start
+        if os.path.exists(end_path):
+            break
+        if cancel_file and os.path.exists(cancel_file):
+            break
+        time.sleep(min(poll_interval, max(0.0, deadline - time.time())))
+    return None, last_skipped, time.time() - start
+
+
 def _apply_fp8_quant_to_model(model: torch.nn.Module, fp8_config) -> int:
     """Patch block-level linear layers for FP8 quantization on meta device.
 
@@ -2389,6 +2420,18 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 0,
                 int(os.environ.get("FLASHTALK_SESSION_MAX_FILLER_SKIP_CHUNKS", "16")),
             )
+            _pending_filler_replace_grace_s = max(
+                0.0,
+                float(
+                    os.environ.get(
+                        "FLASHTALK_SESSION_PENDING_FILLER_REPLACE_GRACE_S",
+                        "0.20",
+                    )
+                ),
+            )
+            _pending_filler_replace_grace_s = min(
+                _pending_filler_replace_grace_s, _chunk_wall_time * 0.25
+            )
             # Only use the grace wait as a jitter absorber after a caller
             # supplied chunk was consumed.  Once we have fallen back to
             # internal silence, keep generating without repeated waits so the
@@ -2405,6 +2448,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     silence_samples=_silence_samples,
                     audio_grace_s=round(_session_audio_grace_s, 6),
                     max_filler_skip_chunks=_max_filler_skip_chunks,
+                    pending_filler_replace_grace_s=round(
+                        _pending_filler_replace_grace_s, 6
+                    ),
                 )
 
             # Optional ARTC push streamer (lazy-start: connect on first chunk).
@@ -2530,6 +2576,54 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _old_audio_chunk_idx,
                         audio_chunk_idx,
                     )
+
+                _current_audio_meta = (
+                    _session_audio_chunk_meta(session_dir, audio_chunk_idx)
+                    if os.path.exists(
+                        _session_audio_chunk_path(session_dir, audio_chunk_idx)
+                    )
+                    else {}
+                )
+                if (
+                    _pending_filler_replace_grace_s > 0
+                    and str(_current_audio_meta.get("chunk_source") or "")
+                    == "response_pending_silence"
+                    and is_flashtalk_filler_audio_meta(_current_audio_meta)
+                ):
+                    (
+                        _next_real_audio_idx,
+                        _skipped_filler_chunks,
+                        _waited_s,
+                    ) = _wait_for_pending_real_audio_after_fillers(
+                        session_dir,
+                        audio_chunk_idx,
+                        _max_filler_skip_chunks,
+                        _pending_filler_replace_grace_s,
+                        _session_audio_grace_poll_s,
+                        _cancel_file,
+                    )
+                    if _next_real_audio_idx is not None:
+                        _old_audio_chunk_idx = audio_chunk_idx
+                        audio_chunk_idx = _next_real_audio_idx
+                        _prefetched_result = None
+                        if _timeline_rank0:
+                            emit_chunk_timeline(
+                                _chunk_timeline_path,
+                                "pending_filler_audio_replaced",
+                                chunk_idx=chunk_idx,
+                                from_audio_chunk_idx=_old_audio_chunk_idx,
+                                to_audio_chunk_idx=audio_chunk_idx,
+                                skipped_chunks=_skipped_filler_chunks,
+                                waited_s=round(_waited_s, 6),
+                            )
+                        logger.info(
+                            "Session: replaced response-pending filler after %.3fs "
+                            "(audio_chunk_idx %d -> %d, skipped=%d)",
+                            _waited_s,
+                            _old_audio_chunk_idx,
+                            audio_chunk_idx,
+                            _skipped_filler_chunks,
+                        )
 
                 # --- Audio: use prefetch or load+process normally ---
                 _audio_prefetched = False

@@ -81,6 +81,7 @@ def is_flashtalk_filler_audio_meta(meta: dict[str, Any] | None) -> bool:
         "filler",
         "silence",
         "idle_silence",
+        "response_pending_silence",
         "warmup_silence",
         "internal_silence",
     }
