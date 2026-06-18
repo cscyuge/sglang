@@ -21,6 +21,16 @@ from typing import Optional
 
 import numpy as np
 
+try:
+    from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
+        emit_chunk_timeline,
+    )
+except Exception:
+
+    def emit_chunk_timeline(path, event, **fields):
+        return
+
+
 logger = logging.getLogger(__name__)
 
 _SDK_DIR = os.path.join(os.path.dirname(__file__), "alirtc")
@@ -280,6 +290,7 @@ def _drain_worker_queue(
     samples_per_frame = 16000 // fps
     v_ts = 0
     a_ts = 0
+    timeline_path = config.get("timeline_path")
 
     while True:
         try:
@@ -297,7 +308,27 @@ def _drain_worker_queue(
             continue
 
         frames_np, audio_int16 = item[1], item[2]
+        meta = item[3] if len(item) > 3 and isinstance(item[3], dict) else {}
+        chunk_idx = meta.get("chunk_idx")
+        audio_chunk_idx = meta.get("audio_chunk_idx")
         num_frames = frames_np.shape[0]
+        chunk_started = time.monotonic()
+        emit_chunk_timeline(
+            timeline_path,
+            "artc_worker_chunk_received",
+            chunk_idx=chunk_idx,
+            audio_chunk_idx=audio_chunk_idx,
+            used_silence=meta.get("used_silence"),
+            audio_loaded=meta.get("audio_loaded"),
+            audio_prefetched=meta.get("audio_prefetched"),
+            chunk_source=meta.get("chunk_source"),
+            is_filler=meta.get("is_filler"),
+            turn_id=meta.get("turn_id"),
+            frame_count=int(num_frames),
+            audio_samples=int(len(audio_int16)) if audio_int16 is not None else 0,
+            video_pts_ms=v_ts,
+            audio_pts_ms=a_ts,
+        )
         for i in range(num_frames):
             if handler.failed:
                 raise RuntimeError("ARTC SDK failed during frame push")
@@ -321,6 +352,18 @@ def _drain_worker_queue(
             video_sample.strideV = 0
             video_sample.rotation = 0
             engine.PushExternalVideoFrame(video_sample, VideoSource.VideoSourceCamera)
+            if i == 0:
+                emit_chunk_timeline(
+                    timeline_path,
+                    "artc_worker_first_video_frame_pushed",
+                    chunk_idx=chunk_idx,
+                    audio_chunk_idx=audio_chunk_idx,
+                    chunk_source=meta.get("chunk_source"),
+                    is_filler=meta.get("is_filler"),
+                    turn_id=meta.get("turn_id"),
+                    video_pts_ms=v_ts,
+                    elapsed_ms=round((time.monotonic() - chunk_started) * 1000, 3),
+                )
             v_ts += ms_per_frame
 
             if audio_int16 is not None:
@@ -341,7 +384,37 @@ def _drain_worker_queue(
                 engine.PushExternalAudioFrameRawData(
                     audio_bytes, len(audio_bytes), a_ts
                 )
+                if i == 0:
+                    emit_chunk_timeline(
+                        timeline_path,
+                        "artc_worker_first_audio_frame_pushed",
+                        chunk_idx=chunk_idx,
+                        audio_chunk_idx=audio_chunk_idx,
+                        chunk_source=meta.get("chunk_source"),
+                        is_filler=meta.get("is_filler"),
+                        turn_id=meta.get("turn_id"),
+                        audio_pts_ms=a_ts,
+                        elapsed_ms=round(
+                            (time.monotonic() - chunk_started) * 1000, 3
+                        ),
+                    )
                 a_ts += ms_per_frame
+        emit_chunk_timeline(
+            timeline_path,
+            "artc_worker_chunk_pushed",
+            chunk_idx=chunk_idx,
+            audio_chunk_idx=audio_chunk_idx,
+            chunk_source=meta.get("chunk_source"),
+            is_filler=meta.get("is_filler"),
+            turn_id=meta.get("turn_id"),
+            frame_count=int(num_frames),
+            audio_samples=int(len(audio_int16)) if audio_int16 is not None else 0,
+            elapsed_ms=round((time.monotonic() - chunk_started) * 1000, 3),
+            next_video_pts_ms=v_ts,
+            next_audio_pts_ms=a_ts,
+            video_buffer_full=handler.push_video_full,
+            audio_buffer_full=handler.push_audio_full,
+        )
 
 
 def _leave_and_release(engine, handler: _WorkerEventHandler, config: dict) -> None:
@@ -459,6 +532,7 @@ class ArtcPusher:
         fps: int = 25,
         queue_maxsize: int = 8,
         sdk_path: Optional[str] = None,
+        timeline_path: Optional[str] = None,
     ):
         self._token = artc_token
         self._channel = artc_channel
@@ -468,6 +542,7 @@ class ArtcPusher:
         self._fps = fps
         self._queue_maxsize = queue_maxsize
         self._sdk_path = sdk_path or _SDK_DIR
+        self._timeline_path = timeline_path
 
         self._command_queue: Optional[queue.Queue] = None
         self._command_write_fd: Optional[int] = None
@@ -629,6 +704,14 @@ class ArtcPusher:
         self,
         frames_np: np.ndarray,
         audio_16k: Optional[np.ndarray] = None,
+        chunk_idx: Optional[int] = None,
+        audio_chunk_idx: Optional[int] = None,
+        used_silence: Optional[bool] = None,
+        audio_loaded: Optional[bool] = None,
+        audio_prefetched: Optional[bool] = None,
+        chunk_source: Optional[str] = None,
+        is_filler: Optional[bool] = None,
+        turn_id: Optional[str] = None,
     ) -> None:
         """Enqueue a chunk of RGB video frames and optional 16 kHz mono audio."""
         if self.failed:
@@ -641,19 +724,124 @@ class ArtcPusher:
             audio_int16 = np.clip(audio_16k * 32767, -32768, 32767).astype(np.int16)
 
         self._ensure_queues()
-        item = (_CHUNK, frames_np, audio_int16)
+        meta = {
+            "chunk_idx": chunk_idx,
+            "audio_chunk_idx": audio_chunk_idx,
+            "used_silence": used_silence,
+            "audio_loaded": audio_loaded,
+            "audio_prefetched": audio_prefetched,
+            "chunk_source": chunk_source,
+            "is_filler": is_filler,
+            "turn_id": turn_id,
+            "enqueue_monotonic_s": time.monotonic(),
+        }
+        item = (_CHUNK, frames_np, audio_int16, meta)
+        if not self._meta_is_filler(meta):
+            self.drop_filler_chunks(reason="real_chunk_enqueue")
+        queue_dropped = False
+        dropped_filler = 0
+        enqueued = False
         try:
             self._command_queue.put_nowait(item)
+            enqueued = True
         except queue.Full:
+            dropped_filler = self.drop_filler_chunks(reason="queue_full")
+            if self._meta_is_filler(meta):
+                if dropped_filler:
+                    try:
+                        self._command_queue.put_nowait(item)
+                        enqueued = True
+                    except queue.Full:
+                        pass
+                logger.warning(
+                    "ARTC pusher queue full, dropped filler chunk=%s source=%s",
+                    chunk_idx,
+                    chunk_source,
+                )
+            else:
+                try:
+                    self._command_queue.get_nowait()
+                    queue_dropped = True
+                except queue.Empty:
+                    pass
+                try:
+                    self._command_queue.put_nowait(item)
+                    enqueued = True
+                except queue.Full:
+                    pass
+                logger.warning("ARTC pusher queue full, dropped oldest chunk")
+        emit_chunk_timeline(
+            self._timeline_path,
+            "artc_chunk_enqueued",
+            chunk_idx=chunk_idx,
+            audio_chunk_idx=audio_chunk_idx,
+            used_silence=used_silence,
+            audio_loaded=audio_loaded,
+            audio_prefetched=audio_prefetched,
+            chunk_source=chunk_source,
+            is_filler=is_filler,
+            turn_id=turn_id,
+            frame_count=int(frames_np.shape[0]),
+            audio_samples=int(len(audio_int16)) if audio_int16 is not None else 0,
+            queue_size=self._command_queue.qsize() if self._command_queue else None,
+            queue_dropped=queue_dropped,
+            dropped_filler=dropped_filler,
+            enqueued=enqueued,
+            pusher_started=bool(self._started),
+        )
+
+    @staticmethod
+    def _meta_is_filler(meta: dict) -> bool:
+        explicit = meta.get("is_filler")
+        if explicit is not None:
+            if isinstance(explicit, str):
+                return explicit.strip().lower() in ("1", "true", "yes", "on")
+            return bool(explicit)
+        return bool(meta.get("used_silence")) or not bool(meta.get("audio_loaded"))
+
+    def _item_is_filler(self, item) -> bool:
+        if not isinstance(item, tuple) or len(item) < 4 or item[0] != _CHUNK:
+            return False
+        meta = item[3] if isinstance(item[3], dict) else {}
+        return self._meta_is_filler(meta)
+
+    def drop_filler_chunks(self, reason: str = "") -> int:
+        """Drop queued filler chunks that have not been sent to the worker."""
+        if self._command_queue is None:
+            return 0
+
+        kept = []
+        dropped = 0
+        while True:
             try:
-                self._command_queue.get_nowait()
+                item = self._command_queue.get_nowait()
             except queue.Empty:
-                pass
+                break
+            if self._item_is_filler(item):
+                dropped += 1
+            else:
+                kept.append(item)
+        for item in kept:
             try:
                 self._command_queue.put_nowait(item)
             except queue.Full:
-                pass
-            logger.warning("ARTC pusher queue full, dropped oldest chunk")
+                break
+        if dropped:
+            emit_chunk_timeline(
+                self._timeline_path,
+                "artc_filler_chunks_dropped",
+                dropped_chunks=dropped,
+                reason=reason,
+                queue_size=self._command_queue.qsize()
+                if self._command_queue is not None
+                else None,
+            )
+            logger.info(
+                "ARTC pusher dropped %d queued filler chunks reason=%s",
+                dropped,
+                reason,
+            )
+        return dropped
 
     def stop(self, timeout: float = 10.0) -> None:
         """Stop the worker process; kill its process group on timeout."""
@@ -696,6 +884,7 @@ class ArtcPusher:
             "fps": self._fps,
             "queue_maxsize": self._queue_maxsize,
             "sdk_path": self._sdk_path,
+            "timeline_path": self._timeline_path,
             "join_timeout": float(os.environ.get("SGLANG_ARTC_JOIN_TIMEOUT", "10.0")),
             "leave_timeout": float(os.environ.get("SGLANG_ARTC_LEAVE_TIMEOUT", "2.0")),
         }
@@ -838,6 +1027,24 @@ class ArtcPusher:
                 return
             if item[0] == _STOP:
                 return
+            meta = item[3] if len(item) > 3 and isinstance(item[3], dict) else {}
+            emit_chunk_timeline(
+                self._timeline_path,
+                "artc_chunk_ipc_sent",
+                chunk_idx=meta.get("chunk_idx"),
+                audio_chunk_idx=meta.get("audio_chunk_idx"),
+                chunk_source=meta.get("chunk_source"),
+                is_filler=meta.get("is_filler"),
+                turn_id=meta.get("turn_id"),
+                queue_size=self._command_queue.qsize()
+                if self._command_queue is not None
+                else None,
+                enqueue_to_ipc_ms=round(
+                    (time.monotonic() - meta.get("enqueue_monotonic_s", time.monotonic()))
+                    * 1000,
+                    3,
+                ),
+            )
 
     def _close_queues(self) -> None:
         for fd in (self._command_write_fd, self._status_read_fd):

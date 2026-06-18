@@ -168,6 +168,7 @@ class SessionResponse(BaseModel):
     events_url: Optional[str] = None
     webrtc_url: Optional[str] = None
     artc_channel: Optional[str] = None
+    chunk_timeline_path: Optional[str] = None
     created_at: int = Field(default_factory=lambda: int(time.time()))
     chunks_received: int = 0
     chunks_processed: int = 0

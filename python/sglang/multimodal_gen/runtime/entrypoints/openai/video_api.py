@@ -50,6 +50,12 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
+    emit_chunk_timeline,
+    flashtalk_chunk_timeline_path,
+    is_flashtalk_filler_audio_meta,
+    write_flashtalk_audio_chunk_meta,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -406,6 +412,7 @@ async def create_session(
     # Create session directory
     session_dir = _session_dir_for_id(session_id)
     os.makedirs(os.path.join(session_dir, "audio_chunks"), exist_ok=True)
+    chunk_timeline_path = flashtalk_chunk_timeline_path(session_dir)
 
     # Build sampling params (minimal — no audio, short duration placeholder)
     req = VideoGenerationsRequest(
@@ -427,6 +434,7 @@ async def create_session(
     batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
     batch.extra["session_mode"] = True
     batch.extra["session_dir"] = session_dir
+    batch.extra["chunk_timeline_path"] = chunk_timeline_path
     batch.extra["artc_token"] = artc_token
     batch.extra["artc_channel"] = artc_channel
     batch.extra["artc_userid"] = artc_userid
@@ -440,11 +448,20 @@ async def create_session(
         "events_url": f"/v1/videos/{session_id}/events",
         "webrtc_url": f"/v1/videos/{session_id}/webrtc",
         "artc_channel": artc_channel,
+        "chunk_timeline_path": chunk_timeline_path,
         "created_at": int(time.time()),
         "chunks_received": 0,
         "chunks_processed": 0,
     }
     _SESSION_STORE[session_id] = session_data
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "session_created",
+        session_id=session_id,
+        artc_channel=artc_channel,
+        artc_userid=artc_userid,
+        session_dir=session_dir,
+    )
 
     # Also register as a video job so /stream and /events endpoints work
     await VIDEO_STORE.upsert(
@@ -471,6 +488,9 @@ async def create_session(
 async def push_session_chunk(
     session_id: str = Path(...),
     audio: Optional[UploadFile] = File(None),
+    chunk_source: Optional[str] = Form(None),
+    is_filler: Optional[bool] = Form(None),
+    turn_id: Optional[str] = Form(None),
 ):
     """Push an audio chunk to a running session.
 
@@ -492,14 +512,27 @@ async def push_session_chunk(
         raise HTTPException(status_code=400, detail="audio file is required")
 
     session_dir = _session_dir_for_id(session_id)
+    chunk_timeline_path = session.get("chunk_timeline_path") or flashtalk_chunk_timeline_path(
+        session_dir
+    )
     chunk_idx = session["chunks_received"]
     session["chunks_received"] = chunk_idx + 1  # atomic increment before await
     chunk_path = os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
+    upload_started = time.monotonic()
 
     # Read uploaded audio and convert to float32 numpy
     audio_bytes = await audio.read()
     filename = audio.filename or ""
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "audio_chunk_upload_received",
+        session_id=session_id,
+        chunk_idx=chunk_idx,
+        filename=filename,
+        upload_bytes=len(audio_bytes),
+    )
 
+    decode_started = time.monotonic()
     if filename.endswith(".npy"):
         # Raw numpy array
         audio_array = np.load(BytesIO(audio_bytes))
@@ -530,20 +563,74 @@ async def push_session_chunk(
                 audio_array, _ = librosa.load(tmp_path, sr=16000, mono=True)
             finally:
                 os.unlink(tmp_path)
+    decode_ms = (time.monotonic() - decode_started) * 1000
 
     audio_array = audio_array.astype(np.float32)
+    chunk_source = (chunk_source or "audio").strip() or "audio"
+    chunk_meta = {
+        "session_id": session_id,
+        "chunk_idx": chunk_idx,
+        "chunk_source": chunk_source,
+        "is_filler": bool(is_filler) if is_filler is not None else None,
+        "turn_id": (turn_id or "").strip() or None,
+        "filename": filename,
+        "samples": int(len(audio_array)),
+        "duration_s": round(len(audio_array) / 16000, 6),
+        "rms": (
+            round(float(np.sqrt(np.mean(np.square(audio_array)))), 8)
+            if len(audio_array)
+            else 0.0
+        ),
+    }
+    if chunk_meta["is_filler"] is None:
+        chunk_meta["is_filler"] = is_flashtalk_filler_audio_meta(chunk_meta)
 
     # Atomic write: write to tmp then rename
+    write_started = time.monotonic()
     tmp_path = chunk_path.removesuffix(".npy") + ".tmp.npy"
     np.save(tmp_path, audio_array)
-    os.rename(tmp_path, chunk_path)
+    write_flashtalk_audio_chunk_meta(session_dir, chunk_idx, chunk_meta)
+    os.replace(tmp_path, chunk_path)
+    write_ms = (time.monotonic() - write_started) * 1000
+    total_ms = (time.monotonic() - upload_started) * 1000
+    duration_s = len(audio_array) / 16000
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "audio_chunk_saved",
+        session_id=session_id,
+        chunk_idx=chunk_idx,
+        samples=len(audio_array),
+        duration_s=round(duration_s, 6),
+        chunk_source=chunk_meta["chunk_source"],
+        is_filler=chunk_meta["is_filler"],
+        turn_id=chunk_meta["turn_id"],
+        rms=chunk_meta["rms"],
+        decode_ms=round(decode_ms, 3),
+        write_ms=round(write_ms, 3),
+        total_ms=round(total_ms, 3),
+        chunk_path=chunk_path,
+    )
+    logger.info(
+        "FlashTalk chunk timeline: session=%s chunk=%d saved samples=%d "
+        "duration=%.3fs decode=%.1fms write=%.1fms total=%.1fms",
+        session_id,
+        chunk_idx,
+        len(audio_array),
+        duration_s,
+        decode_ms,
+        write_ms,
+        total_ms,
+    )
 
     return {
         "success": True,
         "session_id": session_id,
         "chunk_idx": chunk_idx,
         "samples": len(audio_array),
-        "duration_s": round(len(audio_array) / 16000, 3),
+        "duration_s": round(duration_s, 3),
+        "chunk_source": chunk_meta["chunk_source"],
+        "is_filler": chunk_meta["is_filler"],
+        "turn_id": chunk_meta["turn_id"],
     }
 
 
