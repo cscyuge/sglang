@@ -599,6 +599,8 @@ class ArtcPusher:
         self._stop_requested = threading.Event()
         self._last_enqueued_real_turn_id: Optional[str] = None
         self._last_enqueued_was_filler = False
+        self._real_chunk_enqueued = False
+        self._real_playout_until_monotonic = 0.0
 
     @property
     def failed(self) -> bool:
@@ -767,6 +769,8 @@ class ArtcPusher:
             audio_int16 = np.clip(audio_16k * 32767, -32768, 32767).astype(np.int16)
 
         self._ensure_queues()
+        frame_count = int(frames_np.shape[0])
+        duration_s = frame_count / max(self._fps, 1)
         meta = {
             "chunk_idx": chunk_idx,
             "audio_chunk_idx": audio_chunk_idx,
@@ -776,6 +780,8 @@ class ArtcPusher:
             "chunk_source": chunk_source,
             "is_filler": is_filler,
             "turn_id": turn_id,
+            "frame_count": frame_count,
+            "duration_s": duration_s,
             "enqueue_monotonic_s": time.monotonic(),
         }
         item = (_CHUNK, frames_np, audio_int16, meta)
@@ -833,6 +839,11 @@ class ArtcPusher:
             self._last_enqueued_was_filler = True
         elif enqueued:
             self._last_enqueued_was_filler = False
+            self._real_chunk_enqueued = True
+            now = time.monotonic()
+            self._real_playout_until_monotonic = (
+                max(now, self._real_playout_until_monotonic) + duration_s
+            )
             if turn_id:
                 self._last_enqueued_real_turn_id = turn_id
         emit_chunk_timeline(
@@ -846,7 +857,7 @@ class ArtcPusher:
             chunk_source=chunk_source,
             is_filler=is_filler,
             turn_id=turn_id,
-            frame_count=int(frames_np.shape[0]),
+            frame_count=frame_count,
             audio_samples=int(len(audio_int16)) if audio_int16 is not None else 0,
             queue_size=self._command_queue.qsize() if self._command_queue else None,
             queue_dropped=queue_dropped,
@@ -855,6 +866,13 @@ class ArtcPusher:
             clear_enqueued=clear_enqueued,
             enqueued=enqueued,
             pusher_started=bool(self._started),
+            real_playout_ahead_ms=round(
+                max(0.0, self._real_playout_until_monotonic - time.monotonic())
+                * 1000,
+                1,
+            )
+            if not meta_is_filler and enqueued
+            else None,
         )
 
     @staticmethod
@@ -884,6 +902,30 @@ class ArtcPusher:
 
     def _should_clear_before_real(self, meta: dict) -> bool:
         turn_id = meta.get("turn_id")
+        # ClearDataBuffer drops media that has reached the ARTC SDK but has not
+        # yet played.  Never clear while real digital-human speech is expected
+        # to still be buffered; doing so is visible as skipped video/mouth frames.
+        if self._real_chunk_enqueued:
+            real_ahead_s = self._real_playout_until_monotonic - time.monotonic()
+            try:
+                guard_s = float(
+                    os.environ.get("SGLANG_ARTC_CLEAR_REAL_GUARD_S", "0.25")
+                )
+            except ValueError:
+                guard_s = 0.25
+            guard_s = max(0.0, guard_s)
+            if real_ahead_s > guard_s:
+                emit_chunk_timeline(
+                    self._timeline_path,
+                    "artc_clear_buffer_suppressed",
+                    chunk_idx=meta.get("chunk_idx"),
+                    audio_chunk_idx=meta.get("audio_chunk_idx"),
+                    turn_id=turn_id,
+                    reason="real_playout_active",
+                    real_playout_ahead_ms=round(real_ahead_s * 1000, 1),
+                    guard_ms=round(guard_s * 1000, 1),
+                )
+                return False
         if self._last_enqueued_was_filler:
             return True
         if turn_id and turn_id != self._last_enqueued_real_turn_id:
@@ -1003,12 +1045,18 @@ class ArtcPusher:
         return dropped
 
     def drop_stale_chunks(self, active_turn_id: Optional[str], reason: str = "") -> int:
-        """Drop queued chunks from older turns before a new real turn starts."""
+        """Drop queued filler from older turns before a new real turn starts.
+
+        Real chunks are preserved even when their turn id is older. Dropping
+        them causes visible skips in the digital-human speech; a small backlog is
+        preferable to swallowing already generated mouth/video frames.
+        """
         if self._command_queue is None or not active_turn_id:
             return 0
 
         kept = []
         dropped = 0
+        kept_stale_real = 0
         while True:
             try:
                 item = self._command_queue.get_nowait()
@@ -1017,9 +1065,11 @@ class ArtcPusher:
             if isinstance(item, tuple) and item and item[0] == _CHUNK:
                 meta = self._item_meta(item)
                 item_turn_id = meta.get("turn_id")
-                if self._meta_is_filler(meta) or item_turn_id != active_turn_id:
+                if self._meta_is_filler(meta):
                     dropped += 1
                     continue
+                if item_turn_id and item_turn_id != active_turn_id:
+                    kept_stale_real += 1
             kept.append(item)
         for item in kept:
             try:
@@ -1040,6 +1090,23 @@ class ArtcPusher:
             logger.info(
                 "ARTC pusher dropped %d stale chunks for turn=%s reason=%s",
                 dropped,
+                active_turn_id,
+                reason,
+            )
+        if kept_stale_real:
+            emit_chunk_timeline(
+                self._timeline_path,
+                "artc_stale_real_chunks_preserved",
+                kept_chunks=kept_stale_real,
+                active_turn_id=active_turn_id,
+                reason=reason,
+                queue_size=self._command_queue.qsize()
+                if self._command_queue is not None
+                else None,
+            )
+            logger.info(
+                "ARTC pusher preserved %d stale real chunks for turn=%s reason=%s",
+                kept_stale_real,
                 active_turn_id,
                 reason,
             )
