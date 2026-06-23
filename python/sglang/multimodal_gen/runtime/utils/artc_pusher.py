@@ -6,6 +6,7 @@ keeps SDK hangs, wrapper thread state, and CoreService cleanup isolated from the
 model-serving process.
 """
 
+import importlib.util
 import logging
 import os
 import pickle
@@ -21,14 +22,30 @@ from typing import Optional
 
 import numpy as np
 
-try:
-    from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
-        emit_chunk_timeline,
-    )
-except Exception:
 
-    def emit_chunk_timeline(path, event, **fields):
-        return
+def _load_emit_chunk_timeline():
+    # The ARTC worker is launched as this file directly. Importing through the
+    # sglang package triggers the full multimodal runtime import stack and adds
+    # several seconds to every ARTC startup.
+    timeline_path = os.path.join(os.path.dirname(__file__), "chunk_timeline.py")
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_sglang_artc_chunk_timeline", timeline_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load chunk_timeline from {timeline_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.emit_chunk_timeline
+    except Exception:
+
+        def _noop_emit_chunk_timeline(path, event, **fields):
+            return
+
+        return _noop_emit_chunk_timeline
+
+
+emit_chunk_timeline = _load_emit_chunk_timeline()
 
 
 logger = logging.getLogger(__name__)
