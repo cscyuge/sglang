@@ -32,6 +32,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
     VideoListResponse,
     VideoResponse,
+    WebRTCAnswerResponse,
+    WebRTCOfferRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
@@ -48,6 +50,12 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
+    emit_chunk_timeline,
+    flashtalk_chunk_timeline_path,
+    is_flashtalk_filler_audio_meta,
+    write_flashtalk_audio_chunk_meta,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -129,6 +137,7 @@ def _video_job_from_sampling(
         "file_path": os.path.abspath(sampling.output_file_path()),
         "stream_url": f"/v1/videos/{request_id}/stream",
         "events_url": f"/v1/videos/{request_id}/events",
+        "webrtc_url": f"/v1/videos/{request_id}/webrtc",
         "audio_path": getattr(req, "audio_path", None),
     }
 
@@ -264,6 +273,7 @@ async def _dispatch_job_async(
 
 # -- Session store (in-memory, matches VIDEO_STORE pattern) --
 _SESSION_STORE: Dict[str, Dict[str, Any]] = {}
+_WEBRTC_PEERS: set[Any] = set()
 
 
 async def _dispatch_session_async(session_id: str, batch: Req) -> None:
@@ -402,6 +412,7 @@ async def create_session(
     # Create session directory
     session_dir = _session_dir_for_id(session_id)
     os.makedirs(os.path.join(session_dir, "audio_chunks"), exist_ok=True)
+    chunk_timeline_path = flashtalk_chunk_timeline_path(session_dir)
 
     # Build sampling params (minimal — no audio, short duration placeholder)
     req = VideoGenerationsRequest(
@@ -423,6 +434,7 @@ async def create_session(
     batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
     batch.extra["session_mode"] = True
     batch.extra["session_dir"] = session_dir
+    batch.extra["chunk_timeline_path"] = chunk_timeline_path
     batch.extra["artc_token"] = artc_token
     batch.extra["artc_channel"] = artc_channel
     batch.extra["artc_userid"] = artc_userid
@@ -434,12 +446,22 @@ async def create_session(
         "status": "created",
         "stream_url": f"/v1/videos/{session_id}/stream",
         "events_url": f"/v1/videos/{session_id}/events",
+        "webrtc_url": f"/v1/videos/{session_id}/webrtc",
         "artc_channel": artc_channel,
+        "chunk_timeline_path": chunk_timeline_path,
         "created_at": int(time.time()),
         "chunks_received": 0,
         "chunks_processed": 0,
     }
     _SESSION_STORE[session_id] = session_data
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "session_created",
+        session_id=session_id,
+        artc_channel=artc_channel,
+        artc_userid=artc_userid,
+        session_dir=session_dir,
+    )
 
     # Also register as a video job so /stream and /events endpoints work
     await VIDEO_STORE.upsert(
@@ -452,6 +474,7 @@ async def create_session(
             "created_at": session_data["created_at"],
             "stream_url": session_data["stream_url"],
             "events_url": session_data["events_url"],
+            "webrtc_url": session_data["webrtc_url"],
         },
     )
 
@@ -465,6 +488,9 @@ async def create_session(
 async def push_session_chunk(
     session_id: str = Path(...),
     audio: Optional[UploadFile] = File(None),
+    chunk_source: Optional[str] = Form(None),
+    is_filler: Optional[bool] = Form(None),
+    turn_id: Optional[str] = Form(None),
 ):
     """Push an audio chunk to a running session.
 
@@ -486,14 +512,27 @@ async def push_session_chunk(
         raise HTTPException(status_code=400, detail="audio file is required")
 
     session_dir = _session_dir_for_id(session_id)
+    chunk_timeline_path = session.get("chunk_timeline_path") or flashtalk_chunk_timeline_path(
+        session_dir
+    )
     chunk_idx = session["chunks_received"]
     session["chunks_received"] = chunk_idx + 1  # atomic increment before await
     chunk_path = os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
+    upload_started = time.monotonic()
 
     # Read uploaded audio and convert to float32 numpy
     audio_bytes = await audio.read()
     filename = audio.filename or ""
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "audio_chunk_upload_received",
+        session_id=session_id,
+        chunk_idx=chunk_idx,
+        filename=filename,
+        upload_bytes=len(audio_bytes),
+    )
 
+    decode_started = time.monotonic()
     if filename.endswith(".npy"):
         # Raw numpy array
         audio_array = np.load(BytesIO(audio_bytes))
@@ -524,20 +563,74 @@ async def push_session_chunk(
                 audio_array, _ = librosa.load(tmp_path, sr=16000, mono=True)
             finally:
                 os.unlink(tmp_path)
+    decode_ms = (time.monotonic() - decode_started) * 1000
 
     audio_array = audio_array.astype(np.float32)
+    chunk_source = (chunk_source or "audio").strip() or "audio"
+    chunk_meta = {
+        "session_id": session_id,
+        "chunk_idx": chunk_idx,
+        "chunk_source": chunk_source,
+        "is_filler": bool(is_filler) if is_filler is not None else None,
+        "turn_id": (turn_id or "").strip() or None,
+        "filename": filename,
+        "samples": int(len(audio_array)),
+        "duration_s": round(len(audio_array) / 16000, 6),
+        "rms": (
+            round(float(np.sqrt(np.mean(np.square(audio_array)))), 8)
+            if len(audio_array)
+            else 0.0
+        ),
+    }
+    if chunk_meta["is_filler"] is None:
+        chunk_meta["is_filler"] = is_flashtalk_filler_audio_meta(chunk_meta)
 
     # Atomic write: write to tmp then rename
+    write_started = time.monotonic()
     tmp_path = chunk_path.removesuffix(".npy") + ".tmp.npy"
     np.save(tmp_path, audio_array)
-    os.rename(tmp_path, chunk_path)
+    write_flashtalk_audio_chunk_meta(session_dir, chunk_idx, chunk_meta)
+    os.replace(tmp_path, chunk_path)
+    write_ms = (time.monotonic() - write_started) * 1000
+    total_ms = (time.monotonic() - upload_started) * 1000
+    duration_s = len(audio_array) / 16000
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "audio_chunk_saved",
+        session_id=session_id,
+        chunk_idx=chunk_idx,
+        samples=len(audio_array),
+        duration_s=round(duration_s, 6),
+        chunk_source=chunk_meta["chunk_source"],
+        is_filler=chunk_meta["is_filler"],
+        turn_id=chunk_meta["turn_id"],
+        rms=chunk_meta["rms"],
+        decode_ms=round(decode_ms, 3),
+        write_ms=round(write_ms, 3),
+        total_ms=round(total_ms, 3),
+        chunk_path=chunk_path,
+    )
+    logger.info(
+        "FlashTalk chunk timeline: session=%s chunk=%d saved samples=%d "
+        "duration=%.3fs decode=%.1fms write=%.1fms total=%.1fms",
+        session_id,
+        chunk_idx,
+        len(audio_array),
+        duration_s,
+        decode_ms,
+        write_ms,
+        total_ms,
+    )
 
     return {
         "success": True,
         "session_id": session_id,
         "chunk_idx": chunk_idx,
         "samples": len(audio_array),
-        "duration_s": round(len(audio_array) / 16000, 3),
+        "duration_s": round(duration_s, 3),
+        "chunk_source": chunk_meta["chunk_source"],
+        "is_filler": chunk_meta["is_filler"],
+        "turn_id": chunk_meta["turn_id"],
     }
 
 
@@ -959,6 +1052,50 @@ async def _wait_for_meta(frame_dir: str, timeout: float = 60.0) -> Optional[dict
     return None
 
 
+def _resample_16k_float_to_48k_s16(raw: np.ndarray) -> np.ndarray:
+    """Convert mono/stereo float audio at 16 kHz to mono int16 at 48 kHz."""
+    raw = np.asarray(raw, dtype=np.float32)
+    if raw.ndim > 1:
+        raw = raw.mean(axis=-1)
+    if raw.size == 0:
+        return np.zeros(0, dtype=np.int16)
+
+    ratio = 3.0
+    out_len = int(len(raw) * ratio)
+    indices = np.arange(out_len) / ratio
+    left = np.floor(indices).astype(np.intp)
+    frac = (indices - left).astype(np.float32)
+    np.clip(left, 0, len(raw) - 1, out=left)
+    right = np.minimum(left + 1, len(raw) - 1)
+    resampled = raw[left] * (1 - frac) + raw[right] * frac
+    return np.clip(resampled * 32767, -32768, 32767).astype(np.int16)
+
+
+def _slice_audio_or_silence(
+    samples: Optional[np.ndarray], start: int, n_samples: int
+) -> np.ndarray:
+    if samples is None or start >= len(samples):
+        return np.zeros(n_samples, dtype=np.int16)
+    end = start + n_samples
+    chunk = samples[start:end]
+    if len(chunk) < n_samples:
+        chunk = np.pad(chunk, (0, n_samples - len(chunk)))
+    return chunk.astype(np.int16, copy=False)
+
+
+def _load_aligned_session_audio_slot(
+    frame_dir: str, chunk_idx: int
+) -> Optional[np.ndarray]:
+    path = os.path.join(frame_dir, f"audio_{chunk_idx:05d}.npy")
+    if not os.path.exists(path):
+        return None
+    try:
+        return _resample_16k_float_to_48k_s16(np.load(path))
+    except Exception as e:
+        logger.debug("Aligned session audio slot %d load error: %s", chunk_idx, e)
+        return None
+
+
 async def _fmp4_generator(
     frame_dir: str,
     fps: int,
@@ -979,7 +1116,6 @@ async def _fmp4_generator(
     import av
 
     AUDIO_SAMPLE_RATE = 48000
-    SESSION_AUDIO_INPUT_SR = 16000
 
     is_session_audio = session_audio_dir is not None
 
@@ -998,6 +1134,8 @@ async def _fmp4_generator(
 
     width = meta.get("width", 512)
     height = meta.get("height", 512)
+    frames_per_chunk = int(meta.get("frames_per_chunk") or 0)
+    use_aligned_session_audio = is_session_audio and frames_per_chunk > 0
 
     # ── Open PyAV fMP4 container writing to BytesIO ──
     buf = BytesIO()
@@ -1041,11 +1179,12 @@ async def _fmp4_generator(
     _session_audio_buf: Optional[np.ndarray] = None  # int16 @ 48 kHz
     _session_audio_buf_pos = 0  # how much of _session_audio_buf has been consumed
     _session_chunk_idx = 0  # next chunk file to try loading
+    _aligned_session_chunk_idx = -1
+    _aligned_session_audio_buf: Optional[np.ndarray] = None
 
     def _load_session_audio_chunks() -> None:
         """Try to load any new session audio chunks into _session_audio_buf."""
         nonlocal _session_audio_buf, _session_audio_buf_pos, _session_chunk_idx
-        loaded_any = False
         while True:
             path = os.path.join(
                 session_audio_dir, f"chunk_{_session_chunk_idx:04d}.npy"
@@ -1054,16 +1193,7 @@ async def _fmp4_generator(
                 break
             try:
                 raw = np.load(path)  # float32 @ 16 kHz
-                # Simple linear-interpolation upsample 16 kHz → 48 kHz (ratio=3)
-                ratio = AUDIO_SAMPLE_RATE / SESSION_AUDIO_INPUT_SR
-                out_len = int(len(raw) * ratio)
-                indices = np.arange(out_len) / ratio
-                left = np.floor(indices).astype(np.intp)
-                frac = (indices - left).astype(np.float32)
-                np.clip(left, 0, len(raw) - 1, out=left)
-                right = np.minimum(left + 1, len(raw) - 1)
-                resampled = raw[left] * (1 - frac) + raw[right] * frac
-                chunk_s16 = np.clip(resampled * 32767, -32768, 32767).astype(np.int16)
+                chunk_s16 = _resample_16k_float_to_48k_s16(raw)
                 if _session_audio_buf is None:
                     _session_audio_buf = chunk_s16
                     _session_audio_buf_pos = 0
@@ -1076,7 +1206,6 @@ async def _fmp4_generator(
                     )
                     _session_audio_buf_pos = 0
                 _session_chunk_idx += 1
-                loaded_any = True
             except Exception as e:
                 logger.debug(
                     "Session audio chunk %d load error: %s", _session_chunk_idx, e
@@ -1110,6 +1239,24 @@ async def _fmp4_generator(
             chunk = np.pad(chunk, (0, n_samples - len(chunk)))
         _session_audio_buf_pos = min(end, len(_session_audio_buf))
         return chunk
+
+    def _get_aligned_session_audio_for_frame(
+        fidx: int, n_samples: int
+    ) -> np.ndarray:
+        """Return audio from the slot written for the same generated video chunk."""
+        nonlocal _aligned_session_chunk_idx, _aligned_session_audio_buf
+        chunk_idx = fidx // frames_per_chunk
+        frame_in_chunk = fidx % frames_per_chunk
+        if chunk_idx != _aligned_session_chunk_idx or _aligned_session_audio_buf is None:
+            _aligned_session_chunk_idx = chunk_idx
+            _aligned_session_audio_buf = _load_aligned_session_audio_slot(
+                frame_dir, chunk_idx
+            )
+        return _slice_audio_or_silence(
+            _aligned_session_audio_buf,
+            frame_in_chunk * n_samples,
+            n_samples,
+        )
 
     def _flush_buf() -> bytes:
         """Read new bytes from the BytesIO buffer and reset it."""
@@ -1156,7 +1303,12 @@ async def _fmp4_generator(
         if audio_stream is not None:
             audio_chunk = None
             if is_session_audio:
-                audio_chunk = _get_session_audio_for_frame(audio_samples_per_frame)
+                if use_aligned_session_audio:
+                    audio_chunk = _get_aligned_session_audio_for_frame(
+                        fidx, audio_samples_per_frame
+                    )
+                else:
+                    audio_chunk = _get_session_audio_for_frame(audio_samples_per_frame)
             elif audio_samples is not None:
                 start = audio_pos
                 end = min(start + audio_samples_per_frame, len(audio_samples))
@@ -1230,9 +1382,7 @@ async def _fmp4_generator(
                         if not os.path.exists(frame_path):
                             break
                         try:
-                            rgb = await asyncio.to_thread(
-                                _read_jpeg_as_rgb, frame_path
-                            )
+                            rgb = await asyncio.to_thread(_read_jpeg_as_rgb, frame_path)
                             new_bytes = _encode_one_frame(frame_idx, rgb)
                             if new_bytes:
                                 yield new_bytes
@@ -1272,6 +1422,406 @@ async def _fmp4_generator(
     # Schedule cleanup (session mode cleanup is handled by _dispatch_session_async)
     if not is_session_audio:
         asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=5.0))
+
+
+def _session_audio_dir_for_job(video_id: str) -> Optional[str]:
+    """Return a session audio chunk directory if *video_id* is a live session."""
+    if video_id not in _SESSION_STORE:
+        return None
+    session_dir = _session_dir_for_id(video_id)
+    chunks_dir = os.path.join(session_dir, "audio_chunks")
+    return chunks_dir if os.path.isdir(chunks_dir) else None
+
+
+async def _wait_for_ready_frames(
+    frame_dir: str,
+    buffer_frames: int,
+    *,
+    timeout: float = 60.0,
+) -> bool:
+    """Wait until *buffer_frames* exist or generation finishes."""
+    if buffer_frames <= 0:
+        return True
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        ready = 0
+        while os.path.exists(os.path.join(frame_dir, f"frame_{ready:05d}.jpg")):
+            ready += 1
+        if ready >= buffer_frames:
+            return True
+        if os.path.exists(os.path.join(frame_dir, "done")):
+            return ready > 0
+        await asyncio.sleep(0.1)
+    return False
+
+
+async def _wait_for_frame_path(
+    frame_dir: str,
+    frame_idx: int,
+    *,
+    timeout: float = 60.0,
+) -> Optional[str]:
+    """Wait for a streaming JPEG frame and return its path."""
+    frame_path = os.path.join(frame_dir, f"frame_{frame_idx:05d}.jpg")
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if os.path.exists(frame_path):
+            return frame_path
+        if os.path.exists(os.path.join(frame_dir, "done")):
+            return None
+        await asyncio.sleep(0.1)
+    return None
+
+
+def _build_webrtc_tracks(
+    *,
+    video_id: str,
+    job: dict,
+    fps: int,
+    include_audio: bool,
+    buffer_frames: int,
+):
+    """Create aiortc media tracks backed by the streaming frame/audio files."""
+    try:
+        import av
+        from aiortc import AudioStreamTrack, VideoStreamTrack
+        from aiortc.mediastreams import MediaStreamError
+    except ImportError as e:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "WebRTC streaming requires the optional `aiortc` dependency. "
+                "Install with `pip install aiortc` or `pip install 'sglang[diffusion]'`."
+            ),
+        ) from e
+
+    frame_dir = _frame_dir_for_job(video_id)
+    session_audio_dir = _session_audio_dir_for_job(video_id)
+    audio_path = job.get("audio_path")
+    aligned_frames_per_chunk = 0
+    if session_audio_dir is not None:
+        meta_path = os.path.join(frame_dir, "meta.json")
+        try:
+            with open(meta_path, "r") as f:
+                aligned_frames_per_chunk = int(
+                    (json.load(f) or {}).get("frames_per_chunk") or 0
+                )
+        except Exception:
+            aligned_frames_per_chunk = 28
+
+    class FrameDirectoryVideoTrack(VideoStreamTrack):
+        """WebRTC video track reading frame_NNNNN.jpg files from a job."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._frame_idx = 0
+            self._fps = fps
+            self._time_base = fractions.Fraction(1, fps)
+            self._playback_epoch: float | None = None
+            self._prebuffered = False
+
+        async def _pace(self) -> None:
+            now = asyncio.get_event_loop().time()
+            if self._playback_epoch is None:
+                self._playback_epoch = now
+                return
+            target = self._playback_epoch + self._frame_idx / self._fps
+            delay = target - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+        async def recv(self):
+            if self.readyState != "live":
+                raise MediaStreamError
+
+            if not self._prebuffered:
+                ready = await _wait_for_ready_frames(frame_dir, buffer_frames)
+                if not ready:
+                    self.stop()
+                    raise MediaStreamError
+                self._prebuffered = True
+
+            frame_path = await _wait_for_frame_path(frame_dir, self._frame_idx)
+            if frame_path is None:
+                self.stop()
+                raise MediaStreamError
+
+            await self._pace()
+            try:
+                rgb = await asyncio.to_thread(_read_jpeg_as_rgb, frame_path)
+            except Exception as e:
+                logger.debug("WebRTC video frame read failed: %s", e)
+                self.stop()
+                raise MediaStreamError from e
+
+            frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            frame.pts = self._frame_idx
+            frame.time_base = self._time_base
+            self._frame_idx += 1
+            return frame
+
+    class FileOrSessionAudioTrack(AudioStreamTrack):
+        """WebRTC audio track for uploaded audio files or live session chunks."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._sample_rate = 48000
+            self._samples_per_frame = 960  # 20 ms at 48 kHz
+            self._time_base = fractions.Fraction(1, self._sample_rate)
+            self._pts = 0
+            self._audio_pos = 0
+            self._playback_epoch: float | None = None
+            self._audio_loaded = False
+            self._audio_samples: Optional[np.ndarray] = None
+            self._session_audio_buf: Optional[np.ndarray] = None
+            self._session_audio_buf_pos = 0
+            self._session_chunk_idx = 0
+            self._aligned_session_chunk_idx = -1
+            self._aligned_session_audio_buf: Optional[np.ndarray] = None
+            self._aligned_session_samples_per_chunk = (
+                aligned_frames_per_chunk * self._sample_rate // fps
+                if aligned_frames_per_chunk > 0
+                else 0
+            )
+
+        async def _pace(self) -> None:
+            now = asyncio.get_event_loop().time()
+            if self._playback_epoch is None:
+                self._playback_epoch = now
+                return
+            target = self._playback_epoch + self._pts / self._sample_rate
+            delay = target - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+        async def _ensure_file_audio_loaded(self) -> None:
+            if self._audio_loaded:
+                return
+            self._audio_loaded = True
+            if audio_path and os.path.exists(audio_path):
+                self._audio_samples = await asyncio.to_thread(
+                    _load_audio_for_fmp4,
+                    audio_path,
+                    self._sample_rate,
+                )
+
+        def _load_session_audio_chunks(self) -> None:
+            if session_audio_dir is None:
+                return
+            while True:
+                path = os.path.join(
+                    session_audio_dir, f"chunk_{self._session_chunk_idx:04d}.npy"
+                )
+                if not os.path.exists(path):
+                    break
+                try:
+                    chunk_s16 = _resample_16k_float_to_48k_s16(np.load(path))
+                except Exception as e:
+                    logger.debug(
+                        "WebRTC session audio chunk %d load error: %s",
+                        self._session_chunk_idx,
+                        e,
+                    )
+                    break
+                if self._session_audio_buf is None:
+                    self._session_audio_buf = chunk_s16
+                    self._session_audio_buf_pos = 0
+                else:
+                    self._session_audio_buf = np.concatenate(
+                        [
+                            self._session_audio_buf[self._session_audio_buf_pos :],
+                            chunk_s16,
+                        ]
+                    )
+                    self._session_audio_buf_pos = 0
+                self._session_chunk_idx += 1
+
+        def _next_session_audio(self) -> Optional[np.ndarray]:
+            remaining = 0
+            if self._session_audio_buf is not None:
+                remaining = len(self._session_audio_buf) - self._session_audio_buf_pos
+            if remaining < self._samples_per_frame:
+                self._load_session_audio_chunks()
+                if self._session_audio_buf is not None:
+                    remaining = (
+                        len(self._session_audio_buf) - self._session_audio_buf_pos
+                    )
+
+            done = os.path.exists(os.path.join(frame_dir, "done"))
+            if self._session_audio_buf is None or remaining <= 0:
+                if done:
+                    return None
+                return np.zeros(self._samples_per_frame, dtype=np.int16)
+
+            end = self._session_audio_buf_pos + self._samples_per_frame
+            chunk = self._session_audio_buf[self._session_audio_buf_pos : end]
+            if len(chunk) < self._samples_per_frame:
+                chunk = np.pad(chunk, (0, self._samples_per_frame - len(chunk)))
+            self._session_audio_buf_pos = min(end, len(self._session_audio_buf))
+            return chunk
+
+        def _next_aligned_session_audio(self) -> Optional[np.ndarray]:
+            if self._aligned_session_samples_per_chunk <= 0:
+                return None
+
+            chunk_idx = self._pts // self._aligned_session_samples_per_chunk
+            offset = self._pts % self._aligned_session_samples_per_chunk
+            if (
+                chunk_idx != self._aligned_session_chunk_idx
+                or self._aligned_session_audio_buf is None
+            ):
+                self._aligned_session_chunk_idx = chunk_idx
+                self._aligned_session_audio_buf = _load_aligned_session_audio_slot(
+                    frame_dir, int(chunk_idx)
+                )
+
+            if self._aligned_session_audio_buf is None and os.path.exists(
+                os.path.join(frame_dir, "done")
+            ):
+                return None
+
+            return _slice_audio_or_silence(
+                self._aligned_session_audio_buf,
+                int(offset),
+                self._samples_per_frame,
+            )
+
+        async def _next_file_audio(self) -> Optional[np.ndarray]:
+            await self._ensure_file_audio_loaded()
+            if self._audio_samples is None:
+                return None
+            if self._audio_pos >= len(self._audio_samples):
+                if os.path.exists(os.path.join(frame_dir, "done")):
+                    return None
+                return np.zeros(self._samples_per_frame, dtype=np.int16)
+
+            end = min(
+                self._audio_pos + self._samples_per_frame,
+                len(self._audio_samples),
+            )
+            chunk = self._audio_samples[self._audio_pos : end]
+            self._audio_pos = end
+            if len(chunk) < self._samples_per_frame:
+                chunk = np.pad(chunk, (0, self._samples_per_frame - len(chunk)))
+            return chunk
+
+        async def recv(self):
+            if self.readyState != "live":
+                raise MediaStreamError
+
+            await self._pace()
+            if session_audio_dir is not None:
+                if aligned_frames_per_chunk > 0:
+                    chunk = self._next_aligned_session_audio()
+                else:
+                    chunk = self._next_session_audio()
+            else:
+                chunk = await self._next_file_audio()
+            if chunk is None:
+                self.stop()
+                raise MediaStreamError
+
+            frame = av.AudioFrame.from_ndarray(
+                chunk.reshape(1, -1),
+                format="s16",
+                layout="mono",
+            )
+            frame.sample_rate = self._sample_rate
+            frame.pts = self._pts
+            frame.time_base = self._time_base
+            self._pts += self._samples_per_frame
+            return frame
+
+    video_track = FrameDirectoryVideoTrack()
+    audio_track = None
+    has_file_audio = bool(audio_path and os.path.exists(audio_path))
+    if include_audio and (session_audio_dir is not None or has_file_audio):
+        audio_track = FileOrSessionAudioTrack()
+    return video_track, audio_track
+
+
+@router.post("/{video_id}/webrtc", response_model=WebRTCAnswerResponse)
+async def create_webrtc_answer(
+    offer: WebRTCOfferRequest,
+    video_id: str = Path(...),
+):
+    """Create a WebRTC answer for a video job or live FlashTalk session.
+
+    The client posts an SDP offer and receives an SDP answer. Media tracks are
+    backed by the same streaming frame/audio files used by /stream and /events.
+    """
+    try:
+        from aiortc import (
+            RTCConfiguration,
+            RTCIceServer,
+            RTCPeerConnection,
+            RTCSessionDescription,
+        )
+    except ImportError as e:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "WebRTC streaming requires the optional `aiortc` dependency. "
+                "Install with `pip install aiortc` or `pip install 'sglang[diffusion]'`."
+            ),
+        ) from e
+
+    offer_type = offer.type.lower()
+    if offer_type != "offer":
+        raise HTTPException(status_code=400, detail="WebRTC request type must be offer")
+
+    job = await VIDEO_STORE.get(video_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    configuration = None
+    if offer.ice_servers:
+        configuration = RTCConfiguration(
+            iceServers=[
+                RTCIceServer(
+                    urls=ice_server.urls,
+                    username=ice_server.username,
+                    credential=ice_server.credential,
+                )
+                for ice_server in offer.ice_servers
+            ]
+        )
+
+    pc = RTCPeerConnection(configuration=configuration)
+    _WEBRTC_PEERS.add(pc)
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        if pc.connectionState in ("failed", "closed", "disconnected"):
+            await pc.close()
+            _WEBRTC_PEERS.discard(pc)
+
+    try:
+        video_track, audio_track = _build_webrtc_tracks(
+            video_id=video_id,
+            job=job,
+            fps=offer.fps,
+            include_audio=offer.include_audio,
+            buffer_frames=offer.buffer_frames,
+        )
+        pc.addTrack(video_track)
+        if audio_track is not None:
+            pc.addTrack(audio_track)
+
+        await pc.setRemoteDescription(
+            RTCSessionDescription(sdp=offer.sdp, type=offer_type)
+        )
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+    except Exception:
+        _WEBRTC_PEERS.discard(pc)
+        await pc.close()
+        raise
+
+    return WebRTCAnswerResponse(
+        sdp=pc.localDescription.sdp,
+        type=pc.localDescription.type,
+    )
 
 
 @router.get("/{video_id}/stream")
@@ -1414,8 +1964,12 @@ async def stream_video(
                     break
                 await asyncio.sleep(0.1)
 
-        # Schedule cleanup
-        asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=5.0))
+        # Normal jobs own their stream frame directory here. Session frame dirs
+        # are shared IPC between the long-running pipeline and fMP4/WebRTC/MJPEG
+        # clients, so session lifecycle cleanup in _dispatch_session_async owns
+        # their removal.
+        if video_id not in _SESSION_STORE:
+            asyncio.create_task(_cleanup_frame_dir(frame_dir, delay=5.0))
 
     return StreamingResponse(
         _mjpeg_generator(),

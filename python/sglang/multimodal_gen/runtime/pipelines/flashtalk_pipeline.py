@@ -78,6 +78,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     FlashTalkColorCorrectionStage,
     FlashTalkDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
+    emit_chunk_timeline,
+    flashtalk_chunk_timeline_path,
+    is_flashtalk_filler_audio_meta,
+    read_flashtalk_audio_chunk_meta,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -327,6 +333,15 @@ class VAECudaGraphRunner:
         def run_once():
             return forward_fn(self.static_input)
 
+        # Ensure any lazy work in forward_fn (torch.compile, Inductor codegen,
+        # external JIT kernels) is completed on the current stream before the
+        # side-stream warmup and CUDA graph capture.  Running first compile
+        # inside the side stream has produced asynchronous CUDA failures on
+        # FlashTalk's compiled VAE decoder with TileLang kernels.
+        compiled_output = run_once()
+        torch.cuda.synchronize()
+        del compiled_output
+
         # Warmup on a side stream (isolates warmup allocations)
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -408,6 +423,112 @@ def _wait_for_session_audio_chunk(
                     return None
         time.sleep(poll_interval)
     return None
+
+
+def _wait_for_session_audio_path(
+    session_dir: str,
+    chunk_idx: int,
+    cancel_file: str | None,
+    timeout: float,
+    poll_interval: float,
+) -> tuple[bool, float]:
+    """Wait briefly for a session audio chunk file.
+
+    Session streaming callers normally push one audio window per video chunk.
+    FlashTalk may generate slightly faster than real time, so the next chunk
+    can be a few milliseconds late.  This helper provides a bounded grace
+    window before falling back to internally generated silence.
+    """
+    if timeout <= 0:
+        return False, 0.0
+
+    chunk_path = os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
+    end_path = os.path.join(session_dir, "end")
+    start = time.time()
+    deadline = start + timeout
+    while time.time() < deadline:
+        if os.path.exists(chunk_path):
+            return True, time.time() - start
+        if os.path.exists(end_path):
+            return False, time.time() - start
+        if cancel_file and os.path.exists(cancel_file):
+            return False, time.time() - start
+        time.sleep(min(poll_interval, max(0.0, deadline - time.time())))
+    return os.path.exists(chunk_path), time.time() - start
+
+
+def _session_audio_chunk_path(session_dir: str, chunk_idx: int) -> str:
+    return os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
+
+
+def _session_audio_chunk_meta(session_dir: str, chunk_idx: int) -> dict[str, Any]:
+    return read_flashtalk_audio_chunk_meta(session_dir, chunk_idx)
+
+
+def _session_audio_chunk_is_filler(session_dir: str, chunk_idx: int) -> bool:
+    return is_flashtalk_filler_audio_meta(
+        _session_audio_chunk_meta(session_dir, chunk_idx)
+    )
+
+
+def _session_audio_chunk_is_real(session_dir: str, chunk_idx: int) -> bool:
+    path = _session_audio_chunk_path(session_dir, chunk_idx)
+    return os.path.exists(path) and not _session_audio_chunk_is_filler(
+        session_dir, chunk_idx
+    )
+
+
+def _find_pending_real_audio_after_fillers(
+    session_dir: str,
+    start_idx: int,
+    max_scan: int,
+) -> tuple[int | None, int]:
+    """Return a later real chunk if only filler chunks are pending before it."""
+    if max_scan <= 0:
+        return None, 0
+
+    skipped = 0
+    for idx in range(start_idx, start_idx + max_scan + 1):
+        if not os.path.exists(_session_audio_chunk_path(session_dir, idx)):
+            return None, skipped
+        if _session_audio_chunk_is_filler(session_dir, idx):
+            skipped += 1
+            continue
+        if skipped > 0:
+            return idx, skipped
+        return None, skipped
+    return None, skipped
+
+
+def _wait_for_pending_real_audio_after_fillers(
+    session_dir: str,
+    start_idx: int,
+    max_scan: int,
+    timeout: float,
+    poll_interval: float,
+    cancel_file: str | None,
+) -> tuple[int | None, int, float]:
+    """Briefly wait for real audio that can replace pending filler chunks."""
+    if timeout <= 0:
+        return None, 0, 0.0
+
+    end_path = os.path.join(session_dir, "end")
+    start = time.time()
+    deadline = start + timeout
+    last_skipped = 0
+    while time.time() < deadline:
+        next_real_idx, skipped = _find_pending_real_audio_after_fillers(
+            session_dir, start_idx, max_scan
+        )
+        last_skipped = skipped
+        if next_real_idx is not None:
+            return next_real_idx, skipped, time.time() - start
+        if os.path.exists(end_path):
+            break
+        if cancel_file and os.path.exists(cancel_file):
+            break
+        time.sleep(min(poll_interval, max(0.0, deadline - time.time())))
+    return None, last_skipped, time.time() - start
 
 
 def _apply_fp8_quant_to_model(model: torch.nn.Module, fp8_config) -> int:
@@ -1582,6 +1703,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         frames_per_chunk: int,
         rtmp_pusher=None,
         chunk_audio_data=None,
+        timeline_path: str | None = None,
+        audio_chunk_idx: int | None = None,
+        used_silence: bool | None = None,
+        audio_loaded: bool | None = None,
+        audio_prefetched: bool | None = None,
+        chunk_source: str | None = None,
+        is_filler: bool | None = None,
+        turn_id: str | None = None,
     ) -> None:
         """Save per-chunk JPEG frames for streaming and optionally push via RTMP/SRT.
 
@@ -1600,6 +1729,28 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             except Exception as e:
                 logger.warning(
                     "Frame conversion failed for chunk %d: %s", chunk_idx, e
+                )
+        if frame_dir and chunk_audio_data is not None:
+            try:
+                if not os.path.isdir(frame_dir):
+                    raise FileNotFoundError(frame_dir)
+                audio_path = os.path.join(frame_dir, f"audio_{chunk_idx:05d}.npy")
+                tmp_path = audio_path + ".tmp"
+                with open(tmp_path, "wb") as f:
+                    np.save(
+                        f,
+                        np.asarray(chunk_audio_data, dtype=np.float32),
+                        allow_pickle=False,
+                    )
+                os.replace(tmp_path, audio_path)
+            except FileNotFoundError:
+                logger.debug(
+                    "Streaming frame dir disappeared before audio save for chunk %d",
+                    chunk_idx,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Streaming audio save failed for chunk %d: %s", chunk_idx, e
                 )
         if frames_np is not None and frame_dir and frame_executor is not None:
             try:
@@ -1626,7 +1777,49 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         "Stream pusher not ready yet; queueing chunk %d while ARTC startup completes",
                         chunk_idx,
                     )
-                rtmp_pusher.push_chunk(frames_np, chunk_audio_data)
+                submit_started = time.monotonic()
+                emit_chunk_timeline(
+                    timeline_path,
+                    "artc_submit_start",
+                    chunk_idx=chunk_idx,
+                    audio_chunk_idx=audio_chunk_idx,
+                    used_silence=used_silence,
+                    audio_loaded=audio_loaded,
+                    audio_prefetched=audio_prefetched,
+                    chunk_source=chunk_source,
+                    is_filler=is_filler,
+                    turn_id=turn_id,
+                    frame_count=int(frames_np.shape[0]),
+                    audio_samples=(
+                        int(len(chunk_audio_data))
+                        if chunk_audio_data is not None
+                        else 0
+                    ),
+                    pusher_started=bool(rtmp_pusher._started),
+                )
+                rtmp_pusher.push_chunk(
+                    frames_np,
+                    chunk_audio_data,
+                    chunk_idx=chunk_idx,
+                    audio_chunk_idx=audio_chunk_idx,
+                    used_silence=used_silence,
+                    audio_loaded=audio_loaded,
+                    audio_prefetched=audio_prefetched,
+                    chunk_source=chunk_source,
+                    is_filler=is_filler,
+                    turn_id=turn_id,
+                )
+                emit_chunk_timeline(
+                    timeline_path,
+                    "artc_submit_done",
+                    chunk_idx=chunk_idx,
+                    audio_chunk_idx=audio_chunk_idx,
+                    chunk_source=chunk_source,
+                    is_filler=is_filler,
+                    turn_id=turn_id,
+                    submit_ms=round((time.monotonic() - submit_started) * 1000, 3),
+                    pusher_started=bool(rtmp_pusher._started),
+                )
             except Exception as e:
                 logger.warning(
                     "RTMP push failed for chunk %d: %s", chunk_idx, e
@@ -2207,9 +2400,58 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             all_chunk_frames = []
             chunk_idx = 0
             audio_chunk_idx = 0  # separate counter for audio file lookups
+            _chunk_timeline_path = batch.extra.get(
+                "chunk_timeline_path"
+            ) or flashtalk_chunk_timeline_path(session_dir)
+            _timeline_rank0 = get_world_rank() == 0
             _silence_samples = slice_len * sample_rate // fps  # 17920
             _chunk_wall_time = slice_len / fps  # ~1.12s
             _end_path = os.path.join(session_dir, "end")
+            _session_audio_grace_s = max(
+                0.0,
+                float(os.environ.get("FLASHTALK_SESSION_AUDIO_GRACE_S", "0.25")),
+            )
+            _session_audio_grace_s = min(_session_audio_grace_s, _chunk_wall_time * 0.4)
+            _session_audio_grace_poll_s = max(
+                0.005,
+                float(os.environ.get("FLASHTALK_SESSION_AUDIO_GRACE_POLL_S", "0.01")),
+            )
+            _max_filler_skip_chunks = max(
+                0,
+                int(os.environ.get("FLASHTALK_SESSION_MAX_FILLER_SKIP_CHUNKS", "16")),
+            )
+            _pending_filler_replace_grace_s = max(
+                0.0,
+                float(
+                    os.environ.get(
+                        "FLASHTALK_SESSION_PENDING_FILLER_REPLACE_GRACE_S",
+                        "0.20",
+                    )
+                ),
+            )
+            _pending_filler_replace_grace_s = min(
+                _pending_filler_replace_grace_s, _chunk_wall_time * 0.25
+            )
+            # Only use the grace wait as a jitter absorber after a caller
+            # supplied chunk was consumed.  Once we have fallen back to
+            # internal silence, keep generating without repeated waits so the
+            # stream never stalls when the caller is genuinely idle/disconnected.
+            _last_audio_loaded_from_client = False
+            if _timeline_rank0:
+                emit_chunk_timeline(
+                    _chunk_timeline_path,
+                    "session_loop_start",
+                    session_dir=session_dir,
+                    fps=fps,
+                    slice_len=slice_len,
+                    chunk_wall_time_s=round(_chunk_wall_time, 6),
+                    silence_samples=_silence_samples,
+                    audio_grace_s=round(_session_audio_grace_s, 6),
+                    max_filler_skip_chunks=_max_filler_skip_chunks,
+                    pending_filler_replace_grace_s=round(
+                        _pending_filler_replace_grace_s, 6
+                    ),
+                )
 
             # Optional ARTC push streamer (lazy-start: connect on first chunk).
             # Only rank 0 pushes — creating pushers on all workers would
@@ -2233,6 +2475,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             width=batch.width,
                             height=batch.height,
                             fps=batch.fps or 25,
+                            timeline_path=_chunk_timeline_path,
                         )
                         _stream_pusher.start_async()
                         logger.info(
@@ -2305,8 +2548,115 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _cancelled = True
                     break
 
+                (
+                    _next_real_audio_idx,
+                    _skipped_filler_chunks,
+                ) = _find_pending_real_audio_after_fillers(
+                    session_dir,
+                    audio_chunk_idx,
+                    _max_filler_skip_chunks,
+                )
+                if _next_real_audio_idx is not None:
+                    _old_audio_chunk_idx = audio_chunk_idx
+                    audio_chunk_idx = _next_real_audio_idx
+                    _prefetched_result = None
+                    if _timeline_rank0:
+                        emit_chunk_timeline(
+                            _chunk_timeline_path,
+                            "filler_audio_chunks_skipped",
+                            chunk_idx=chunk_idx,
+                            from_audio_chunk_idx=_old_audio_chunk_idx,
+                            to_audio_chunk_idx=audio_chunk_idx,
+                            skipped_chunks=_skipped_filler_chunks,
+                        )
+                    logger.info(
+                        "Session: skipped %d pending filler audio chunks "
+                        "(audio_chunk_idx %d -> %d) before real audio",
+                        _skipped_filler_chunks,
+                        _old_audio_chunk_idx,
+                        audio_chunk_idx,
+                    )
+
+                _current_audio_meta = (
+                    _session_audio_chunk_meta(session_dir, audio_chunk_idx)
+                    if os.path.exists(
+                        _session_audio_chunk_path(session_dir, audio_chunk_idx)
+                    )
+                    else {}
+                )
+                if (
+                    _pending_filler_replace_grace_s > 0
+                    and str(_current_audio_meta.get("chunk_source") or "")
+                    == "response_pending_silence"
+                    and is_flashtalk_filler_audio_meta(_current_audio_meta)
+                ):
+                    (
+                        _next_real_audio_idx,
+                        _skipped_filler_chunks,
+                        _waited_s,
+                    ) = _wait_for_pending_real_audio_after_fillers(
+                        session_dir,
+                        audio_chunk_idx,
+                        _max_filler_skip_chunks,
+                        _pending_filler_replace_grace_s,
+                        _session_audio_grace_poll_s,
+                        _cancel_file,
+                    )
+                    if _next_real_audio_idx is not None:
+                        _old_audio_chunk_idx = audio_chunk_idx
+                        audio_chunk_idx = _next_real_audio_idx
+                        _prefetched_result = None
+                        if _timeline_rank0:
+                            emit_chunk_timeline(
+                                _chunk_timeline_path,
+                                "pending_filler_audio_replaced",
+                                chunk_idx=chunk_idx,
+                                from_audio_chunk_idx=_old_audio_chunk_idx,
+                                to_audio_chunk_idx=audio_chunk_idx,
+                                skipped_chunks=_skipped_filler_chunks,
+                                waited_s=round(_waited_s, 6),
+                            )
+                        logger.info(
+                            "Session: replaced response-pending filler after %.3fs "
+                            "(audio_chunk_idx %d -> %d, skipped=%d)",
+                            _waited_s,
+                            _old_audio_chunk_idx,
+                            audio_chunk_idx,
+                            _skipped_filler_chunks,
+                        )
+
                 # --- Audio: use prefetch or load+process normally ---
                 _audio_prefetched = False
+                if _prefetched_result is not None:
+                    _pf_silence = _prefetched_result[2]
+                    _pf_loaded = _prefetched_result[3]
+                    if _pf_silence and not _pf_loaded:
+                        _audio_chunk_path = _session_audio_chunk_path(
+                            session_dir, audio_chunk_idx
+                        )
+                        if (
+                            not os.path.exists(_audio_chunk_path)
+                            and _last_audio_loaded_from_client
+                        ):
+                            _arrived, _waited_s = _wait_for_session_audio_path(
+                                session_dir,
+                                audio_chunk_idx,
+                                _cancel_file,
+                                _session_audio_grace_s,
+                                _session_audio_grace_poll_s,
+                            )
+                            if _arrived and get_world_rank() == 0:
+                                logger.info(
+                                    "Session audio chunk %d arrived after %.3fs "
+                                    "grace wait; discarding prefetched silence",
+                                    audio_chunk_idx,
+                                    _waited_s,
+                                )
+                        if os.path.exists(_audio_chunk_path):
+                            # Prefetch may have checked just before the client
+                            # wrote this chunk.  Do not let stale prefetched
+                            # silence override real/realtime-padded audio.
+                            _prefetched_result = None
                 if _prefetched_result is not None:
                     # Previous chunk prefetched this chunk's audio
                     (
@@ -2328,6 +2678,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _used_silence = _pf_silence
                     if _pf_loaded:
                         audio_chunk_idx += 1
+                    _loaded_from_client = _pf_loaded
 
                     # Update the real ring buffer (prefetch used a snapshot)
                     audio_dq.extend(chunk_audio_data)
@@ -2336,34 +2687,83 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 else:
                     # Normal path: load audio file
                     _used_silence = False
-                    _audio_chunk_path = os.path.join(
-                        session_dir,
-                        "audio_chunks",
-                        f"chunk_{audio_chunk_idx:04d}.npy",
+                    _audio_chunk_path = _session_audio_chunk_path(
+                        session_dir, audio_chunk_idx
                     )
+                    if (
+                        not os.path.exists(_audio_chunk_path)
+                        and _last_audio_loaded_from_client
+                    ):
+                        _arrived, _waited_s = _wait_for_session_audio_path(
+                            session_dir,
+                            audio_chunk_idx,
+                            _cancel_file,
+                            _session_audio_grace_s,
+                            _session_audio_grace_poll_s,
+                        )
+                        if _arrived and get_world_rank() == 0:
+                            logger.info(
+                                "Session audio chunk %d arrived after %.3fs "
+                                "grace wait",
+                                audio_chunk_idx,
+                                _waited_s,
+                            )
                     if os.path.exists(_audio_chunk_path):
                         try:
                             chunk_audio_data = np.load(_audio_chunk_path)
                             audio_chunk_idx += 1
+                            _loaded_from_client = True
                         except Exception:
                             time.sleep(0.01)
                             try:
                                 chunk_audio_data = np.load(_audio_chunk_path)
                                 audio_chunk_idx += 1
+                                _loaded_from_client = True
                             except Exception:
                                 chunk_audio_data = np.zeros(
                                     _silence_samples, dtype=np.float32
                                 )
                                 _used_silence = True
+                                _loaded_from_client = False
                     else:
                         chunk_audio_data = np.zeros(
                             _silence_samples, dtype=np.float32
                         )
                         _used_silence = True
+                        _loaded_from_client = False
 
                 chunk_start = time.time()
                 _stage_start = time.perf_counter()
                 _timing_parts = []
+                _source_audio_chunk_idx = (
+                    None if _used_silence else audio_chunk_idx - 1
+                )
+                _audio_chunk_meta = (
+                    {}
+                    if _source_audio_chunk_idx is None
+                    else _session_audio_chunk_meta(session_dir, _source_audio_chunk_idx)
+                )
+                _chunk_source = (
+                    "internal_silence"
+                    if _used_silence
+                    else str(_audio_chunk_meta.get("chunk_source") or "audio")
+                )
+                _is_filler_chunk = bool(
+                    _used_silence
+                    or is_flashtalk_filler_audio_meta(_audio_chunk_meta)
+                )
+                _turn_id = _audio_chunk_meta.get("turn_id")
+                if (
+                    _stream_pusher is not None
+                    and not _is_filler_chunk
+                    and hasattr(_stream_pusher, "drop_filler_chunks")
+                ):
+                    try:
+                        _stream_pusher.drop_filler_chunks(
+                            reason="real_audio_generation_start"
+                        )
+                    except Exception:
+                        pass
                 if _used_silence:
                     logger.info(
                         "Session: generating chunk %d (silence, "
@@ -2378,6 +2778,21 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         chunk_idx,
                         audio_chunk_idx - 1,
                         " [prefetched]" if _audio_prefetched else "",
+                    )
+                if _timeline_rank0:
+                    emit_chunk_timeline(
+                        _chunk_timeline_path,
+                        "chunk_generation_start",
+                        chunk_idx=chunk_idx,
+                        audio_chunk_idx=_source_audio_chunk_idx,
+                        next_audio_chunk_idx=audio_chunk_idx,
+                        used_silence=_used_silence,
+                        audio_loaded=_loaded_from_client,
+                        audio_prefetched=_audio_prefetched,
+                        chunk_source=_chunk_source,
+                        is_filler=_is_filler_chunk,
+                        turn_id=_turn_id,
+                        audio_samples=int(len(chunk_audio_data)),
                     )
 
                 # a. Per-chunk audio processing (skip if prefetched)
@@ -2505,6 +2920,14 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     chunk_frames, chunk_idx, _frame_dir, _frame_executor,
                     _frame_futures, _frames_per_chunk,
                     rtmp_pusher=_stream_pusher, chunk_audio_data=chunk_audio_data,
+                    timeline_path=_chunk_timeline_path,
+                    audio_chunk_idx=_source_audio_chunk_idx,
+                    used_silence=_used_silence,
+                    audio_loaded=_loaded_from_client,
+                    audio_prefetched=_audio_prefetched,
+                    chunk_source=_chunk_source,
+                    is_filler=_is_filler_chunk,
+                    turn_id=_turn_id,
                 )
                 _timing_parts.append(
                     ("stream", time.perf_counter() - _stage_start)
@@ -2539,28 +2962,43 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     ),
                 )
                 logger.info("Session chunk %d: %.3fs", chunk_idx, _t_chunk)
+                if _timeline_rank0:
+                    emit_chunk_timeline(
+                        _chunk_timeline_path,
+                        "chunk_generation_done",
+                        chunk_idx=chunk_idx,
+                        audio_chunk_idx=_source_audio_chunk_idx,
+                        next_audio_chunk_idx=audio_chunk_idx,
+                        used_silence=_used_silence,
+                        audio_loaded=_loaded_from_client,
+                        audio_prefetched=_audio_prefetched,
+                        chunk_source=_chunk_source,
+                        is_filler=_is_filler_chunk,
+                        turn_id=_turn_id,
+                        total_ms=round(_t_chunk * 1000, 3),
+                        timings={
+                            name: round(duration * 1000, 3)
+                            for name, duration in _timing_parts
+                        },
+                    )
                 chunk_idx += 1
+                _last_audio_loaded_from_client = _loaded_from_client
 
-                # Real-time pacing: sleep up to one chunk's wall-clock
-                # duration so generation rate matches the real-time
-                # audio arrival / SDK push rate.  Without this, chunks
-                # generated faster than real-time would pile up in the
-                # push queue and get dropped.
-                #
-                # Skip pacing entirely when the next audio chunk is
-                # already on disk — this means audio arrived faster
-                # than real-time (e.g. burst upload) and we should
-                # generate as fast as possible to catch up.
-                _next_audio_path = os.path.join(
-                    session_dir,
-                    "audio_chunks",
-                    f"chunk_{audio_chunk_idx:04d}.npy",
+                # Real-time pacing: sleep up to one chunk's wall-clock duration.
+                # Only real audio backlog is worth catching up.  Caller-supplied
+                # idle/warmup silence is just filler; generating it faster than
+                # real time builds output backlog and delays later real speech.
+                _next_audio_path = _session_audio_chunk_path(
+                    session_dir, audio_chunk_idx
                 )
                 _has_pending_audio = os.path.exists(_next_audio_path)
+                _has_pending_real_audio = _has_pending_audio and not (
+                    _session_audio_chunk_is_filler(session_dir, audio_chunk_idx)
+                )
 
-                if _has_pending_audio:
-                    # Catch-up mode: audio is queued, skip pacing to
-                    # process the backlog as fast as possible.
+                if _has_pending_real_audio:
+                    # Catch-up mode: real audio is queued, skip pacing to
+                    # process the response backlog as fast as possible.
                     # Only invalidate the prefetch if it fell back to
                     # silence — the real audio file may have arrived
                     # after the prefetch checked.  When the prefetch
@@ -2571,7 +3009,21 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         and _prefetched_result[2]  # used_silence
                     ):
                         _prefetched_result = None
+                    if _timeline_rank0:
+                        emit_chunk_timeline(
+                            _chunk_timeline_path,
+                            "pacing_skipped_for_real_audio_backlog",
+                            chunk_idx=chunk_idx,
+                            next_audio_chunk_idx=audio_chunk_idx,
+                        )
                 else:
+                    if _timeline_rank0 and _has_pending_audio:
+                        emit_chunk_timeline(
+                            _chunk_timeline_path,
+                            "pacing_kept_for_filler_audio",
+                            chunk_idx=chunk_idx,
+                            next_audio_chunk_idx=audio_chunk_idx,
+                        )
                     _remaining = _chunk_wall_time - _t_chunk
                     while _remaining > 0:
                         time.sleep(min(0.05, _remaining))
@@ -2583,11 +3035,18 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                             break
                         if _cancel_file and os.path.exists(_cancel_file):
                             break
-                        # For silence chunks, break when real audio arrives
-                        if _used_silence:
-                            if os.path.exists(_next_audio_path):
+                        # Break when real audio arrives during pacing.
+                        # If prefetch already fell back to silence, invalidate
+                        # it so the next loop loads the newly written file.
+                        if _session_audio_chunk_is_real(
+                            session_dir, audio_chunk_idx
+                        ):
+                            if (
+                                _prefetched_result is not None
+                                and _prefetched_result[2]  # used_silence
+                            ):
                                 _prefetched_result = None
-                                break
+                            break
 
                 # Periodically drain completed futures to avoid unbounded list growth
                 if chunk_idx % 50 == 0 and _frame_futures:
