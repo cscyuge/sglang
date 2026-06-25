@@ -42,6 +42,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     WanS2VDenoisingDispatchStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.stream_r1_checkpoint import (
+    load_stream_r1_generator_checkpoint,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -297,6 +300,37 @@ class WanS2VPipeline(FlashTalkPipeline):
             cpu_offload=server_args.dit_cpu_offload,
             param_names_mapping=get_param_names_mapping(model.param_names_mapping),
         )
+
+        stream_r1_checkpoint_path = getattr(
+            server_args.pipeline_config, "stream_r1_generator_checkpoint_path", None
+        )
+        if stream_r1_checkpoint_path:
+            checkpoint_info = load_stream_r1_generator_checkpoint(
+                model,
+                stream_r1_checkpoint_path,
+                use_ema=bool(
+                    getattr(server_args.pipeline_config, "use_stream_r1_ema", True)
+                ),
+                strict=False,
+                param_names_mapping=get_param_names_mapping(model.param_names_mapping),
+            )
+            logger.info(
+                "Loaded Stream-R1 generator checkpoint from %s "
+                "(source=%s, tensors=%d, skipped=%d, missing=%d, unexpected=%d)",
+                checkpoint_info.checkpoint_path,
+                checkpoint_info.source_key or "<root>",
+                checkpoint_info.num_tensors,
+                len(checkpoint_info.skipped_keys),
+                len(checkpoint_info.missing_keys),
+                len(checkpoint_info.unexpected_keys),
+            )
+            if checkpoint_info.missing_keys or checkpoint_info.unexpected_keys:
+                logger.warning(
+                    "Stream-R1 checkpoint load used strict=False; "
+                    "first missing keys=%s, first unexpected keys=%s",
+                    list(checkpoint_info.missing_keys[:8]),
+                    list(checkpoint_info.unexpected_keys[:8]),
+                )
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
