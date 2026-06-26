@@ -55,11 +55,12 @@ class TestStreamR1CheckpointLoader(unittest.TestCase):
         cleaned, skipped = clean_stream_r1_state_dict_keys(
             {
                 "_fsdp_wrapped_module._orig_mod.module.weight": torch.ones(2, 2),
+                "model.mapped": torch.ones(1),
                 "step": 800,
             }
         )
 
-        self.assertEqual(set(cleaned), {"weight"})
+        self.assertEqual(set(cleaned), {"weight", "mapped"})
         self.assertEqual(skipped, ("step",))
 
     def test_loads_checkpoint_with_name_mapping(self):

@@ -18,6 +18,7 @@ _WRAPPER_PREFIXES = (
     "_checkpoint_wrapped_module.",
     "_orig_mod.",
 )
+_ROOT_MODULE_PREFIXES = ("module.", "model.")
 
 
 @dataclass(frozen=True)
@@ -68,8 +69,14 @@ def clean_stream_r1_state_dict_keys(
         clean_key = key
         for prefix in _WRAPPER_PREFIXES:
             clean_key = clean_key.replace(prefix, "")
-        if clean_key.startswith("module."):
-            clean_key = clean_key[len("module.") :]
+        stripped = True
+        while stripped:
+            stripped = False
+            for prefix in _ROOT_MODULE_PREFIXES:
+                if clean_key.startswith(prefix):
+                    clean_key = clean_key[len(prefix) :]
+                    stripped = True
+                    break
         cleaned[clean_key] = value
 
     return cleaned, tuple(skipped)
