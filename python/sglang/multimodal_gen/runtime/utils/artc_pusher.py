@@ -23,7 +23,38 @@ from typing import Optional
 import numpy as np
 
 
-def _load_emit_chunk_timeline():
+def _fallback_compact_chunk_trace_fields(**kwargs):
+    fields = {}
+    meta = kwargs.pop("meta", None) or {}
+    for key, value in meta.items():
+        if key in {
+            "session_id",
+            "turn_id",
+            "client_chunk_idx",
+            "client_chunk_ms",
+            "chunk_source",
+            "is_filler",
+            "is_first_real_chunk",
+            "allow_preempt_filler",
+            "turn_start_policy",
+            "client_turn_t0_wall_ms",
+            "client_t0_to_post_start_ms",
+            "client_post_start_wall_ms",
+            "client_input_rms",
+            "client_input_peak",
+            "queue_size",
+            "pending_filler_ms",
+            "audio_queue_ms",
+            "video_queue_ms",
+        }:
+            fields[key] = value
+    for key, value in kwargs.items():
+        if value is not None:
+            fields[key] = value
+    return fields
+
+
+def _load_chunk_timeline_helpers():
     # The ARTC worker is launched as this file directly. Importing through the
     # sglang package triggers the full multimodal runtime import stack and adds
     # several seconds to every ARTC startup.
@@ -36,16 +67,23 @@ def _load_emit_chunk_timeline():
             raise ImportError(f"Cannot load chunk_timeline from {timeline_path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.emit_chunk_timeline
+        return (
+            module.emit_chunk_timeline,
+            getattr(
+                module,
+                "compact_chunk_trace_fields",
+                _fallback_compact_chunk_trace_fields,
+            ),
+        )
     except Exception:
 
         def _noop_emit_chunk_timeline(path, event, **fields):
             return
 
-        return _noop_emit_chunk_timeline
+        return _noop_emit_chunk_timeline, _fallback_compact_chunk_trace_fields
 
 
-emit_chunk_timeline = _load_emit_chunk_timeline()
+emit_chunk_timeline, compact_chunk_trace_fields = _load_chunk_timeline_helpers()
 
 
 logger = logging.getLogger(__name__)
@@ -117,8 +155,17 @@ def _put_status(status_fd: int, kind: str, message: str = "") -> None:
 class _WorkerEventHandler:
     """AliRTC callbacks scoped to one worker process and one channel."""
 
-    def __init__(self, status_fd: int):
+    def __init__(
+        self,
+        status_fd: int,
+        timeline_path: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel: Optional[str] = None,
+    ):
         self._status_fd = status_fd
+        self._timeline_path = timeline_path
+        self._session_id = session_id
+        self._channel = channel
         self.joined = threading.Event()
         self.left = threading.Event()
         self.audio_published = threading.Event()
@@ -127,18 +174,48 @@ class _WorkerEventHandler:
         self.push_video_full = False
         self.push_audio_full = False
 
+    @staticmethod
+    def _state_value(value):
+        return getattr(value, "value", value)
+
+    def _emit(self, event: str, **fields) -> None:
+        emit_chunk_timeline(
+            self._timeline_path,
+            event,
+            session_id=self._session_id,
+            channel=self._channel,
+            wall_clock=time.time(),
+            **fields,
+        )
+
     def OnAudioPublishStateChanged(self, oldState, newState, elapsed, channel):
         logger.debug(
             "ARTC audio publish: %s -> %s (ch=%s)", oldState, newState, channel
         )
-        if getattr(newState, "value", newState) == 2:
+        self._emit(
+            "artc_publish_state",
+            media="audio",
+            old_state=self._state_value(oldState),
+            new_state=self._state_value(newState),
+            elapsed=elapsed,
+            callback_channel=channel,
+        )
+        if self._state_value(newState) == 2:
             self.audio_published.set()
 
     def OnVideoPublishStateChanged(self, oldState, newState, elapsed, channel):
         logger.debug(
             "ARTC video publish: %s -> %s (ch=%s)", oldState, newState, channel
         )
-        if getattr(newState, "value", newState) == 2:
+        self._emit(
+            "artc_publish_state",
+            media="video",
+            old_state=self._state_value(oldState),
+            new_state=self._state_value(newState),
+            elapsed=elapsed,
+            callback_channel=channel,
+        )
+        if self._state_value(newState) == 2:
             self.video_published.set()
 
     def OnPushAudioFrameBufferFull(self, isFull):
@@ -155,10 +232,23 @@ class _WorkerEventHandler:
         self.failed = True
         msg = f"ARTC SDK error: {error_code}"
         logger.error(msg)
+        self._emit("artc_error", error_code=error_code, message=msg)
+        self._emit("error", component="artc", error_code=error_code, message=msg)
         _put_status(self._status_fd, "failed", msg)
 
     def OnConnectionStatusChanged(self, status, reason):
         logger.info("ARTC connection: status=%s reason=%s", status, reason)
+        self._emit(
+            "artc_connection_state",
+            status=self._state_value(status),
+            reason=self._state_value(reason),
+        )
+        self._emit(
+            "connection_state",
+            component="artc",
+            status=self._state_value(status),
+            reason=self._state_value(reason),
+        )
 
     def OnJoinChannelResult(self, result, channel, userId):
         logger.info(
@@ -169,6 +259,21 @@ class _WorkerEventHandler:
         )
         if result != 0:
             self.failed = True
+            self._emit(
+                "artc_error",
+                error_code=result,
+                message=f"ARTC JoinChannel failed: {result}",
+                callback_channel=channel,
+                user_id=userId,
+            )
+            self._emit(
+                "error",
+                component="artc",
+                error_code=result,
+                message=f"ARTC JoinChannel failed: {result}",
+                callback_channel=channel,
+                user_id=userId,
+            )
             _put_status(
                 self._status_fd,
                 "failed",
@@ -367,19 +472,22 @@ def _drain_worker_queue(
         emit_chunk_timeline(
             timeline_path,
             "artc_worker_chunk_received",
-            chunk_idx=chunk_idx,
-            audio_chunk_idx=audio_chunk_idx,
+            **compact_chunk_trace_fields(
+                session_id=config.get("session_id"),
+                meta=meta,
+                chunk_idx=chunk_idx,
+                audio_chunk_idx=audio_chunk_idx,
+                pts=a_ts,
+            ),
             used_silence=meta.get("used_silence"),
             audio_loaded=meta.get("audio_loaded"),
             audio_prefetched=meta.get("audio_prefetched"),
-            chunk_source=meta.get("chunk_source"),
-            is_filler=meta.get("is_filler"),
-            turn_id=meta.get("turn_id"),
             frame_count=int(num_frames),
             audio_samples=int(len(audio_int16)) if audio_int16 is not None else 0,
             video_pts_ms=v_ts,
             audio_pts_ms=a_ts,
         )
+        first_non_silent_audio_pushed = False
         for i in range(num_frames):
             if handler.failed:
                 raise RuntimeError("ARTC SDK failed during frame push")
@@ -413,12 +521,28 @@ def _drain_worker_queue(
                 emit_chunk_timeline(
                     timeline_path,
                     "artc_worker_first_video_frame_pushed",
-                    chunk_idx=chunk_idx,
-                    audio_chunk_idx=audio_chunk_idx,
-                    chunk_source=meta.get("chunk_source"),
-                    is_filler=meta.get("is_filler"),
-                    turn_id=meta.get("turn_id"),
+                    **compact_chunk_trace_fields(
+                        session_id=config.get("session_id"),
+                        meta=meta,
+                        chunk_idx=chunk_idx,
+                        audio_chunk_idx=audio_chunk_idx,
+                        pts=v_ts,
+                    ),
                     video_pts_ms=v_ts,
+                    elapsed_ms=round((time.monotonic() - chunk_started) * 1000, 3),
+                )
+                emit_chunk_timeline(
+                    timeline_path,
+                    "artc_first_video_frame_push_done",
+                    **compact_chunk_trace_fields(
+                        session_id=config.get("session_id"),
+                        meta=meta,
+                        chunk_idx=chunk_idx,
+                        audio_chunk_idx=audio_chunk_idx,
+                        pts=v_ts,
+                    ),
+                    video_pts_ms=v_ts,
+                    frame_index=i,
                     elapsed_ms=round((time.monotonic() - chunk_started) * 1000, 3),
                 )
             v_ts += ms_per_frame
@@ -438,6 +562,22 @@ def _drain_worker_queue(
                         (0, samples_per_frame - len(audio_slice)),
                     )
                 audio_bytes = audio_slice.tobytes()
+                audio_push_started = time.monotonic()
+                if i == 0:
+                    emit_chunk_timeline(
+                        timeline_path,
+                        "artc_first_audio_frame_push_start",
+                        **compact_chunk_trace_fields(
+                            session_id=config.get("session_id"),
+                            meta=meta,
+                            chunk_idx=chunk_idx,
+                            audio_chunk_idx=audio_chunk_idx,
+                            pts=a_ts,
+                        ),
+                        audio_pts_ms=a_ts,
+                        frame_index=i,
+                        audio_samples=int(len(audio_slice)),
+                    )
                 engine.PushExternalAudioFrameRawData(
                     audio_bytes, len(audio_bytes), a_ts
                 )
@@ -445,12 +585,67 @@ def _drain_worker_queue(
                     emit_chunk_timeline(
                         timeline_path,
                         "artc_worker_first_audio_frame_pushed",
-                        chunk_idx=chunk_idx,
-                        audio_chunk_idx=audio_chunk_idx,
-                        chunk_source=meta.get("chunk_source"),
-                        is_filler=meta.get("is_filler"),
-                        turn_id=meta.get("turn_id"),
+                        **compact_chunk_trace_fields(
+                            session_id=config.get("session_id"),
+                            meta=meta,
+                            chunk_idx=chunk_idx,
+                            audio_chunk_idx=audio_chunk_idx,
+                            pts=a_ts,
+                        ),
                         audio_pts_ms=a_ts,
+                        elapsed_ms=round(
+                            (time.monotonic() - chunk_started) * 1000, 3
+                        ),
+                    )
+                    emit_chunk_timeline(
+                        timeline_path,
+                        "artc_first_audio_frame_push_done",
+                        **compact_chunk_trace_fields(
+                            session_id=config.get("session_id"),
+                            meta=meta,
+                            chunk_idx=chunk_idx,
+                            audio_chunk_idx=audio_chunk_idx,
+                            pts=a_ts,
+                        ),
+                        audio_pts_ms=a_ts,
+                        frame_index=i,
+                        push_ms=round(
+                            (time.monotonic() - audio_push_started) * 1000, 3
+                        ),
+                        elapsed_ms=round(
+                            (time.monotonic() - chunk_started) * 1000, 3
+                        ),
+                    )
+                try:
+                    non_silent_threshold = int(
+                        os.environ.get(
+                            "SGLANG_ARTC_NON_SILENT_INT16_THRESHOLD", "16"
+                        )
+                    )
+                except ValueError:
+                    non_silent_threshold = 16
+                if (
+                    not first_non_silent_audio_pushed
+                    and len(audio_slice) > 0
+                    and int(np.max(np.abs(audio_slice))) > max(0, non_silent_threshold)
+                ):
+                    first_non_silent_audio_pushed = True
+                    emit_chunk_timeline(
+                        timeline_path,
+                        "artc_first_non_silent_audio_frame_push_done",
+                        **compact_chunk_trace_fields(
+                            session_id=config.get("session_id"),
+                            meta=meta,
+                            chunk_idx=chunk_idx,
+                            audio_chunk_idx=audio_chunk_idx,
+                            pts=a_ts,
+                        ),
+                        audio_pts_ms=a_ts,
+                        frame_index=i,
+                        audio_peak=int(np.max(np.abs(audio_slice))),
+                        push_ms=round(
+                            (time.monotonic() - audio_push_started) * 1000, 3
+                        ),
                         elapsed_ms=round(
                             (time.monotonic() - chunk_started) * 1000, 3
                         ),
@@ -459,11 +654,13 @@ def _drain_worker_queue(
         emit_chunk_timeline(
             timeline_path,
             "artc_worker_chunk_pushed",
-            chunk_idx=chunk_idx,
-            audio_chunk_idx=audio_chunk_idx,
-            chunk_source=meta.get("chunk_source"),
-            is_filler=meta.get("is_filler"),
-            turn_id=meta.get("turn_id"),
+            **compact_chunk_trace_fields(
+                session_id=config.get("session_id"),
+                meta=meta,
+                chunk_idx=chunk_idx,
+                audio_chunk_idx=audio_chunk_idx,
+                pts=a_ts,
+            ),
             frame_count=int(num_frames),
             audio_samples=int(len(audio_int16)) if audio_int16 is not None else 0,
             elapsed_ms=round((time.monotonic() - chunk_started) * 1000, 3),
@@ -527,7 +724,12 @@ def _artc_worker_main(config: dict, command_fd: int, status_fd: int) -> None:
             datefmt="%m-%d %H:%M:%S",
         )
 
-    handler = _WorkerEventHandler(status_fd)
+    handler = _WorkerEventHandler(
+        status_fd,
+        timeline_path=config.get("timeline_path"),
+        session_id=config.get("session_id"),
+        channel=config.get("channel"),
+    )
     engine = None
     try:
         engine = _create_engine(config, handler)
@@ -537,6 +739,23 @@ def _artc_worker_main(config: dict, command_fd: int, status_fd: int) -> None:
         _drain_worker_queue(engine, handler, config, command_fd)
     except Exception as exc:
         logger.exception("ARTC worker failed for channel=%s", config["channel"])
+        emit_chunk_timeline(
+            config.get("timeline_path"),
+            "artc_error",
+            session_id=config.get("session_id"),
+            channel=config.get("channel"),
+            wall_clock=time.time(),
+            message=str(exc),
+        )
+        emit_chunk_timeline(
+            config.get("timeline_path"),
+            "error",
+            component="artc",
+            session_id=config.get("session_id"),
+            channel=config.get("channel"),
+            wall_clock=time.time(),
+            message=str(exc),
+        )
         _put_status(status_fd, "failed", str(exc))
     finally:
         _leave_and_release(engine, handler, config)
@@ -590,6 +809,7 @@ class ArtcPusher:
         queue_maxsize: int = 8,
         sdk_path: Optional[str] = None,
         timeline_path: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         self._token = artc_token
         self._channel = artc_channel
@@ -600,6 +820,7 @@ class ArtcPusher:
         self._queue_maxsize = queue_maxsize
         self._sdk_path = sdk_path or _SDK_DIR
         self._timeline_path = timeline_path
+        self._session_id = session_id
 
         self._command_queue: Optional[queue.Queue] = None
         self._command_write_fd: Optional[int] = None
@@ -774,6 +995,8 @@ class ArtcPusher:
         chunk_source: Optional[str] = None,
         is_filler: Optional[bool] = None,
         turn_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        audio_chunk_meta: Optional[dict] = None,
     ) -> None:
         """Enqueue a chunk of RGB video frames and optional 16 kHz mono audio."""
         if self.failed:
@@ -788,22 +1011,27 @@ class ArtcPusher:
         self._ensure_queues()
         frame_count = int(frames_np.shape[0])
         duration_s = frame_count / max(self._fps, 1)
-        meta = {
+        meta = dict(audio_chunk_meta or {})
+        meta.update({
+            "session_id": session_id or self._session_id or meta.get("session_id"),
             "chunk_idx": chunk_idx,
             "audio_chunk_idx": audio_chunk_idx,
             "used_silence": used_silence,
             "audio_loaded": audio_loaded,
             "audio_prefetched": audio_prefetched,
-            "chunk_source": chunk_source,
-            "is_filler": is_filler,
-            "turn_id": turn_id,
+            "chunk_source": chunk_source or meta.get("chunk_source"),
+            "is_filler": is_filler
+            if is_filler is not None
+            else meta.get("is_filler"),
+            "turn_id": turn_id or meta.get("turn_id"),
             "frame_count": frame_count,
             "duration_s": duration_s,
             "enqueue_monotonic_s": time.monotonic(),
-        }
+        })
         item = (_CHUNK, frames_np, audio_int16, meta)
 
         meta_is_filler = self._meta_is_filler(meta)
+        effective_turn_id = meta.get("turn_id")
         dropped_filler = 0
         dropped_stale = 0
         clear_enqueued = False
@@ -819,7 +1047,7 @@ class ArtcPusher:
         else:
             dropped_filler += self.drop_filler_chunks(reason="real_chunk_enqueue")
             dropped_stale += self.drop_stale_chunks(
-                active_turn_id=turn_id,
+                active_turn_id=effective_turn_id,
                 reason="real_chunk_enqueue",
             )
             if self._should_clear_before_real(meta):
@@ -861,22 +1089,35 @@ class ArtcPusher:
             self._real_playout_until_monotonic = (
                 max(now, self._real_playout_until_monotonic) + duration_s
             )
-            if turn_id:
-                self._last_enqueued_real_turn_id = turn_id
+            if effective_turn_id:
+                self._last_enqueued_real_turn_id = effective_turn_id
+        current_queue_stats = self.queue_stats()
+        if self._command_queue is not None:
+            meta["queue_size"] = self._command_queue.qsize()
+        if current_queue_stats.get("video_queue_ms") is not None:
+            meta["video_queue_ms"] = current_queue_stats.get("video_queue_ms")
+        if current_queue_stats.get("artc_pending_filler_ms") is not None:
+            meta["pending_filler_ms"] = current_queue_stats.get(
+                "artc_pending_filler_ms"
+            )
         emit_chunk_timeline(
             self._timeline_path,
             "artc_chunk_enqueued",
-            chunk_idx=chunk_idx,
-            audio_chunk_idx=audio_chunk_idx,
+            **compact_chunk_trace_fields(
+                session_id=session_id or self._session_id,
+                meta=meta,
+                chunk_idx=chunk_idx,
+                audio_chunk_idx=audio_chunk_idx,
+                queue_size=self._command_queue.qsize()
+                if self._command_queue
+                else None,
+                video_queue_ms=current_queue_stats.get("video_queue_ms"),
+            ),
             used_silence=used_silence,
             audio_loaded=audio_loaded,
             audio_prefetched=audio_prefetched,
-            chunk_source=chunk_source,
-            is_filler=is_filler,
-            turn_id=turn_id,
             frame_count=frame_count,
             audio_samples=int(len(audio_int16)) if audio_int16 is not None else 0,
-            queue_size=self._command_queue.qsize() if self._command_queue else None,
             queue_dropped=queue_dropped,
             dropped_filler=dropped_filler,
             dropped_stale=dropped_stale,
@@ -916,6 +1157,26 @@ class ArtcPusher:
         if item and item[0] == _CLEAR_BUFFER and len(item) > 1 and isinstance(item[1], dict):
             return item[1]
         return {}
+
+    def queue_stats(self) -> dict[str, float | int | None]:
+        if self._command_queue is None:
+            return {"video_queue_ms": None}
+        items = list(self._command_queue.queue)
+        video_queue_ms = 0.0
+        pending_filler_ms = 0.0
+        for item in items:
+            if not isinstance(item, tuple) or not item or item[0] != _CHUNK:
+                continue
+            meta = self._item_meta(item)
+            duration_ms = float(meta.get("duration_s") or 0.0) * 1000.0
+            video_queue_ms += duration_ms
+            if self._meta_is_filler(meta):
+                pending_filler_ms += duration_ms
+        return {
+            "artc_queue_size": self._command_queue.qsize(),
+            "video_queue_ms": round(video_queue_ms, 3),
+            "artc_pending_filler_ms": round(pending_filler_ms, 3),
+        }
 
     def _should_clear_before_real(self, meta: dict) -> bool:
         turn_id = meta.get("turn_id")
@@ -1182,6 +1443,7 @@ class ArtcPusher:
             "queue_maxsize": self._queue_maxsize,
             "sdk_path": self._sdk_path,
             "timeline_path": self._timeline_path,
+            "session_id": self._session_id,
             "avsync_mode": avsync_mode,
             "frame_pacing": frame_pacing,
             "reset_pts_on_clear": os.environ.get(
@@ -1344,13 +1606,17 @@ class ArtcPusher:
                 emit_chunk_timeline(
                     self._timeline_path,
                     "artc_clear_buffer_ipc_sent",
-                    chunk_idx=meta.get("chunk_idx"),
-                    audio_chunk_idx=meta.get("audio_chunk_idx"),
-                    turn_id=meta.get("turn_id"),
+                    **compact_chunk_trace_fields(
+                        session_id=self._session_id,
+                        meta=meta,
+                        chunk_idx=meta.get("chunk_idx"),
+                        audio_chunk_idx=meta.get("audio_chunk_idx"),
+                        queue_size=self._command_queue.qsize()
+                        if self._command_queue is not None
+                        else None,
+                        video_queue_ms=self.queue_stats().get("video_queue_ms"),
+                    ),
                     reason=meta.get("reason"),
-                    queue_size=self._command_queue.qsize()
-                    if self._command_queue is not None
-                    else None,
                     enqueue_to_ipc_ms=round(
                         (
                             time.monotonic()
@@ -1364,14 +1630,16 @@ class ArtcPusher:
                 emit_chunk_timeline(
                     self._timeline_path,
                     "artc_chunk_ipc_sent",
-                    chunk_idx=meta.get("chunk_idx"),
-                    audio_chunk_idx=meta.get("audio_chunk_idx"),
-                    chunk_source=meta.get("chunk_source"),
-                    is_filler=meta.get("is_filler"),
-                    turn_id=meta.get("turn_id"),
-                    queue_size=self._command_queue.qsize()
-                    if self._command_queue is not None
-                    else None,
+                    **compact_chunk_trace_fields(
+                        session_id=self._session_id,
+                        meta=meta,
+                        chunk_idx=meta.get("chunk_idx"),
+                        audio_chunk_idx=meta.get("audio_chunk_idx"),
+                        queue_size=self._command_queue.qsize()
+                        if self._command_queue is not None
+                        else None,
+                        video_queue_ms=self.queue_stats().get("video_queue_ms"),
+                    ),
                     enqueue_to_ipc_ms=round(
                         (
                             time.monotonic()

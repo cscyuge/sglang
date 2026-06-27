@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
+    compact_chunk_trace_fields,
     emit_chunk_timeline,
     flashtalk_chunk_timeline_path,
     is_flashtalk_filler_audio_meta,
@@ -199,6 +200,93 @@ def _session_dir_for_id(session_id: str) -> str:
     """Return the .sessions/{session_id}/ directory for session IPC."""
     server_args = get_global_server_args()
     return os.path.join(server_args.output_path, ".sessions", session_id)
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in ("1", "true", "yes", "on"):
+            return True
+        if value in ("0", "false", "no", "off"):
+            return False
+    return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _merge_chunk_metadata(
+    metadata: str | None,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    if metadata:
+        try:
+            parsed = json.loads(metadata)
+            if isinstance(parsed, dict):
+                merged.update(parsed)
+        except Exception:
+            logger.debug("Ignoring invalid chunk metadata JSON")
+    for key, value in values.items():
+        if value is not None:
+            merged[key] = value
+
+    for key in (
+        "is_filler",
+        "is_first_real_chunk",
+        "allow_preempt_filler",
+    ):
+        if key in merged:
+            coerced = _coerce_bool(merged.get(key))
+            if coerced is not None:
+                merged[key] = coerced
+    for key in ("client_chunk_idx",):
+        if key in merged:
+            coerced = _coerce_int(merged.get(key))
+            if coerced is not None:
+                merged[key] = coerced
+    for key in (
+        "client_chunk_ms",
+        "client_turn_t0_wall_ms",
+        "client_t0_to_post_start_ms",
+        "client_post_start_wall_ms",
+        "client_input_rms",
+        "client_input_peak",
+    ):
+        if key in merged:
+            coerced = _coerce_float(merged.get(key))
+            if coerced is not None:
+                merged[key] = coerced
+    return merged
+
+
+def _session_pending_chunk_count(session: dict[str, Any]) -> int:
+    return max(
+        0,
+        int(session.get("chunks_received") or 0)
+        - int(session.get("chunks_processed") or 0),
+    )
 
 
 async def _cleanup_frame_dir(frame_dir: str, delay: float = 5.0) -> None:
@@ -433,6 +521,7 @@ async def create_session(
     # Build batch and inject session mode flags
     batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
     batch.extra["session_mode"] = True
+    batch.extra["session_id"] = session_id
     batch.extra["session_dir"] = session_dir
     batch.extra["chunk_timeline_path"] = chunk_timeline_path
     batch.extra["artc_token"] = artc_token
@@ -486,11 +575,23 @@ async def create_session(
 
 @router.post("/sessions/{session_id}/chunks")
 async def push_session_chunk(
+    request: Request,
     session_id: str = Path(...),
     audio: Optional[UploadFile] = File(None),
+    metadata: Optional[str] = Form(None),
     chunk_source: Optional[str] = Form(None),
     is_filler: Optional[bool] = Form(None),
     turn_id: Optional[str] = Form(None),
+    client_chunk_idx: Optional[int] = Form(None),
+    client_chunk_ms: Optional[float] = Form(None),
+    is_first_real_chunk: Optional[bool] = Form(None),
+    allow_preempt_filler: Optional[bool] = Form(None),
+    turn_start_policy: Optional[str] = Form(None),
+    client_turn_t0_wall_ms: Optional[float] = Form(None),
+    client_t0_to_post_start_ms: Optional[float] = Form(None),
+    client_post_start_wall_ms: Optional[float] = Form(None),
+    client_input_rms: Optional[float] = Form(None),
+    client_input_peak: Optional[float] = Form(None),
 ):
     """Push an audio chunk to a running session.
 
@@ -523,13 +624,71 @@ async def push_session_chunk(
     # Read uploaded audio and convert to float32 numpy
     audio_bytes = await audio.read()
     filename = audio.filename or ""
+    received_wall_clock = time.time()
+    chunk_source = (chunk_source or "audio").strip() or "audio"
+    chunk_meta = _merge_chunk_metadata(
+        metadata,
+        {
+            "session_id": session_id,
+            "chunk_idx": chunk_idx,
+            "chunk_source": chunk_source,
+            "is_filler": is_filler,
+            "turn_id": (turn_id or "").strip() or None,
+            "client_chunk_idx": client_chunk_idx,
+            "client_chunk_ms": client_chunk_ms,
+            "is_first_real_chunk": is_first_real_chunk,
+            "allow_preempt_filler": allow_preempt_filler,
+            "turn_start_policy": (turn_start_policy or "").strip() or None,
+            "client_turn_t0_wall_ms": client_turn_t0_wall_ms,
+            "client_t0_to_post_start_ms": client_t0_to_post_start_ms,
+            "client_post_start_wall_ms": client_post_start_wall_ms,
+            "client_input_rms": client_input_rms,
+            "client_input_peak": client_input_peak,
+        },
+    )
+    chunk_meta["session_id"] = session_id
+    chunk_meta["chunk_idx"] = chunk_idx
+    chunk_meta["chunk_source"] = (
+        str(chunk_meta.get("chunk_source") or "audio").strip() or "audio"
+    )
+    if chunk_meta.get("turn_id") == "":
+        chunk_meta["turn_id"] = None
     emit_chunk_timeline(
         chunk_timeline_path,
         "audio_chunk_upload_received",
-        session_id=session_id,
-        chunk_idx=chunk_idx,
-        filename=filename,
-        upload_bytes=len(audio_bytes),
+        **compact_chunk_trace_fields(
+            session_id=session_id,
+            meta=chunk_meta,
+            audio_chunk_idx=chunk_idx,
+            wall_clock=received_wall_clock,
+            queue_size=_session_pending_chunk_count(session),
+            filename=filename,
+            upload_bytes=len(audio_bytes),
+            remote_addr=request.client.host if request.client else None,
+        ),
+    )
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "worker_chunk_received",
+        **compact_chunk_trace_fields(
+            session_id=session_id,
+            meta=chunk_meta,
+            audio_chunk_idx=chunk_idx,
+            wall_clock=received_wall_clock,
+            queue_size=_session_pending_chunk_count(session),
+            filename=filename,
+            upload_bytes=len(audio_bytes),
+            remote_addr=request.client.host if request.client else None,
+        ),
+    )
+    logger.debug(
+        "FlashTalk chunk received session=%s chunk=%s source=%s filler=%s turn=%s bytes=%s",
+        session_id,
+        chunk_idx,
+        chunk_meta.get("chunk_source"),
+        chunk_meta.get("is_filler"),
+        chunk_meta.get("turn_id"),
+        len(audio_bytes),
     )
 
     decode_started = time.monotonic()
@@ -566,23 +725,22 @@ async def push_session_chunk(
     decode_ms = (time.monotonic() - decode_started) * 1000
 
     audio_array = audio_array.astype(np.float32)
-    chunk_source = (chunk_source or "audio").strip() or "audio"
-    chunk_meta = {
-        "session_id": session_id,
-        "chunk_idx": chunk_idx,
-        "chunk_source": chunk_source,
-        "is_filler": bool(is_filler) if is_filler is not None else None,
-        "turn_id": (turn_id or "").strip() or None,
-        "filename": filename,
-        "samples": int(len(audio_array)),
-        "duration_s": round(len(audio_array) / 16000, 6),
-        "rms": (
-            round(float(np.sqrt(np.mean(np.square(audio_array)))), 8)
+    chunk_meta.update(
+        {
+            "filename": filename,
+            "samples": int(len(audio_array)),
+            "duration_s": round(len(audio_array) / 16000, 6),
+            "rms": (
+                round(float(np.sqrt(np.mean(np.square(audio_array)))), 8)
+                if len(audio_array)
+                else 0.0
+            ),
+            "peak": round(float(np.max(np.abs(audio_array))), 8)
             if len(audio_array)
-            else 0.0
-        ),
-    }
-    if chunk_meta["is_filler"] is None:
+            else 0.0,
+        }
+    )
+    if chunk_meta.get("is_filler") is None:
         chunk_meta["is_filler"] = is_flashtalk_filler_audio_meta(chunk_meta)
 
     # Atomic write: write to tmp then rename
@@ -594,21 +752,43 @@ async def push_session_chunk(
     write_ms = (time.monotonic() - write_started) * 1000
     total_ms = (time.monotonic() - upload_started) * 1000
     duration_s = len(audio_array) / 16000
+    queue_size = _session_pending_chunk_count(session)
     emit_chunk_timeline(
         chunk_timeline_path,
         "audio_chunk_saved",
-        session_id=session_id,
-        chunk_idx=chunk_idx,
-        samples=len(audio_array),
-        duration_s=round(duration_s, 6),
-        chunk_source=chunk_meta["chunk_source"],
-        is_filler=chunk_meta["is_filler"],
-        turn_id=chunk_meta["turn_id"],
-        rms=chunk_meta["rms"],
-        decode_ms=round(decode_ms, 3),
-        write_ms=round(write_ms, 3),
-        total_ms=round(total_ms, 3),
-        chunk_path=chunk_path,
+        **compact_chunk_trace_fields(
+            session_id=session_id,
+            meta=chunk_meta,
+            audio_chunk_idx=chunk_idx,
+            wall_clock=time.time(),
+            queue_size=queue_size,
+            samples=len(audio_array),
+            duration_s=round(duration_s, 6),
+            rms=chunk_meta["rms"],
+            peak=chunk_meta["peak"],
+            decode_ms=round(decode_ms, 3),
+            write_ms=round(write_ms, 3),
+            total_ms=round(total_ms, 3),
+            chunk_path=chunk_path,
+        ),
+    )
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "worker_chunk_enqueued",
+        **compact_chunk_trace_fields(
+            session_id=session_id,
+            meta=chunk_meta,
+            audio_chunk_idx=chunk_idx,
+            wall_clock=time.time(),
+            queue_size=queue_size,
+            samples=len(audio_array),
+            duration_s=round(duration_s, 6),
+            pending_filler_ms=round(duration_s * 1000, 3)
+            if is_flashtalk_filler_audio_meta(chunk_meta)
+            else 0.0,
+            audio_queue_ms=round(duration_s * 1000, 3),
+            chunk_path=chunk_path,
+        ),
     )
     logger.info(
         "FlashTalk chunk timeline: session=%s chunk=%d saved samples=%d "
@@ -631,6 +811,8 @@ async def push_session_chunk(
         "chunk_source": chunk_meta["chunk_source"],
         "is_filler": chunk_meta["is_filler"],
         "turn_id": chunk_meta["turn_id"],
+        "client_chunk_idx": chunk_meta.get("client_chunk_idx"),
+        "is_first_real_chunk": chunk_meta.get("is_first_real_chunk"),
     }
 
 

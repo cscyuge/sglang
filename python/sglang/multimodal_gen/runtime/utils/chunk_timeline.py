@@ -9,6 +9,22 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+CHUNK_TRACE_META_KEYS = (
+    "turn_id",
+    "client_chunk_idx",
+    "client_chunk_ms",
+    "chunk_source",
+    "is_filler",
+    "is_first_real_chunk",
+    "allow_preempt_filler",
+    "turn_start_policy",
+    "client_turn_t0_wall_ms",
+    "client_t0_to_post_start_ms",
+    "client_post_start_wall_ms",
+    "client_input_rms",
+    "client_input_peak",
+)
+
 
 def _enabled() -> bool:
     value = os.environ.get("SGLANG_FLASHTALK_CHUNK_TIMELINE", "1").strip().lower()
@@ -87,13 +103,79 @@ def is_flashtalk_filler_audio_meta(meta: dict[str, Any] | None) -> bool:
     }
 
 
+def compact_chunk_trace_fields(
+    *,
+    session_id: str | None = None,
+    meta: dict[str, Any] | None = None,
+    chunk_idx: int | None = None,
+    audio_chunk_idx: int | None = None,
+    pts: int | float | None = None,
+    wall_clock: int | float | None = None,
+    queue_size: int | None = None,
+    pending_filler_ms: int | float | None = None,
+    audio_queue_ms: int | float | None = None,
+    video_queue_ms: int | float | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build a consistent field set for chunk/worker/ARTC trace events."""
+    meta = meta or {}
+    fields: dict[str, Any] = {}
+
+    resolved_session_id = session_id or meta.get("session_id")
+    if resolved_session_id is not None:
+        fields["session_id"] = resolved_session_id
+    if chunk_idx is not None:
+        fields["chunk_idx"] = chunk_idx
+    if audio_chunk_idx is not None:
+        fields["audio_chunk_idx"] = audio_chunk_idx
+
+    for key in CHUNK_TRACE_META_KEYS:
+        if key in meta:
+            fields[key] = meta.get(key)
+
+    if "is_filler" not in fields and meta:
+        fields["is_filler"] = is_flashtalk_filler_audio_meta(meta)
+
+    if pts is not None:
+        fields["pts"] = pts
+    if wall_clock is not None:
+        fields["wall_clock"] = wall_clock
+    queue_size = queue_size if queue_size is not None else meta.get("queue_size")
+    pending_filler_ms = (
+        pending_filler_ms
+        if pending_filler_ms is not None
+        else meta.get("pending_filler_ms")
+    )
+    audio_queue_ms = (
+        audio_queue_ms if audio_queue_ms is not None else meta.get("audio_queue_ms")
+    )
+    video_queue_ms = (
+        video_queue_ms if video_queue_ms is not None else meta.get("video_queue_ms")
+    )
+    if queue_size is not None:
+        fields["queue_size"] = queue_size
+    if pending_filler_ms is not None:
+        fields["pending_filler_ms"] = pending_filler_ms
+    if audio_queue_ms is not None:
+        fields["audio_queue_ms"] = audio_queue_ms
+    if video_queue_ms is not None:
+        fields["video_queue_ms"] = video_queue_ms
+
+    for key, value in extra.items():
+        if value is not None:
+            fields[key] = value
+    return fields
+
+
 def emit_chunk_timeline(path: str | None, event: str, **fields: Any) -> None:
     if not path or not _enabled():
         return
 
+    wall_now = time.time()
     record = {
         "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "wall_time_s": time.time(),
+        "wall_time_s": wall_now,
+        "wall_clock": wall_now,
         "monotonic_s": time.monotonic(),
         "pid": os.getpid(),
         "event": event,
