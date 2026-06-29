@@ -717,6 +717,7 @@ async def push_session_chunk(
     )
     if chunk_meta.get("turn_id") == "":
         chunk_meta["turn_id"] = None
+    chunk_meta.setdefault("turn_id", None)
     emit_chunk_timeline(
         chunk_timeline_path,
         "audio_chunk_upload_received",
@@ -910,7 +911,7 @@ async def push_session_chunk(
         "duration_s": round(duration_s, 3),
         "chunk_source": chunk_meta["chunk_source"],
         "is_filler": chunk_meta["is_filler"],
-        "turn_id": chunk_meta["turn_id"],
+        "turn_id": chunk_meta.get("turn_id"),
         "client_chunk_idx": chunk_meta.get("client_chunk_idx"),
         "is_first_real_chunk": chunk_meta.get("is_first_real_chunk"),
     }
