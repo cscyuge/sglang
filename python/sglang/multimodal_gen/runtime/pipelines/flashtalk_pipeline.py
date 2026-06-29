@@ -2579,9 +2579,15 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 0.005,
                 float(os.environ.get("FLASHTALK_SESSION_AUDIO_GRACE_POLL_S", "0.01")),
             )
+            _audio_delta_wait_default_s = _chunk_wall_time + 0.25
             _audio_delta_wait_s = max(
                 0.0,
-                float(os.environ.get("FLASHTALK_AUDIO_DELTA_WAIT_S", "1.0")),
+                float(
+                    os.environ.get(
+                        "FLASHTALK_AUDIO_DELTA_WAIT_S",
+                        str(_audio_delta_wait_default_s),
+                    )
+                ),
             )
             _max_filler_skip_chunks = max(
                 0,

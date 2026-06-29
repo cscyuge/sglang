@@ -349,18 +349,32 @@ def _audio_delta_chunk_samples() -> int:
 
 
 def _audio_delta_first_chunk_samples() -> int:
-    target = _audio_delta_chunk_samples()
-    value = int(os.environ.get("FLASHTALK_AUDIO_DELTA_FIRST_CHUNK_SAMPLES", "6400"))
-    if value <= 0 or value >= target:
-        return target
-    return value
+    # FlashTalk emits a fixed number of video frames per chunk. Keep the
+    # first audio window the same length so ARTC does not pad most of the
+    # first video chunk with silence and push real speech into the next chunk.
+    return _audio_delta_chunk_samples()
 
 
 def _session_audio_delta_state(session: dict[str, Any]) -> dict[str, Any]:
     state = session.setdefault("audio_delta_state", {})
     state.setdefault("segments", [])
     state.setdefault("buffered_samples", 0)
+    state.setdefault("real_chunk_keys_seen", set())
     return state
+
+
+def _audio_delta_source_is_silence(source: str) -> bool:
+    source = (source or "").strip().lower()
+    return source in {
+        "silence",
+        "clock_silence",
+        "audio_stream_silence",
+        "response_pending_silence",
+        "idle_silence",
+        "warmup_silence",
+        "internal_silence",
+        "filler",
+    }
 
 
 def _pcm16_bytes_to_float32(payload: bytes) -> np.ndarray:
@@ -1250,10 +1264,14 @@ async def push_session_audio_delta(
     seq = _coerce_int(body.get("seq"))
     pts_ms = _coerce_float(body.get("pts_ms"))
     duration_ms = _coerce_float(body.get("duration_ms"))
-    is_silence = bool(_coerce_bool(body.get("is_silence")))
+    explicit_is_silence = _coerce_bool(body.get("is_silence"))
+    is_silence = bool(explicit_is_silence)
+    raw_source = body.get("source")
     source = str(
-        body.get("source") or ("clock_silence" if is_silence else "qwen_real")
+        raw_source or ("clock_silence" if is_silence else "qwen_real")
     ).strip()
+    if explicit_is_silence is None and _audio_delta_source_is_silence(source):
+        is_silence = True
     payload_b64 = body.get("payload_b64") or body.get("payload")
     if not payload_b64:
         if duration_ms is None or duration_ms <= 0:
@@ -1264,9 +1282,12 @@ async def push_session_audio_delta(
         samples = max(1, int(round(sample_rate * duration_ms / 1000.0)))
         payload_b64 = base64.b64encode(b"\x00\x00" * samples).decode("ascii")
         is_silence = True
-        source = source or "clock_silence"
+        if raw_source is None:
+            source = "clock_silence"
 
     audio_16k = _decode_audio_delta_payload(str(payload_b64), sample_rate)
+    if explicit_is_silence is None and _audio_delta_source_is_silence(source):
+        is_silence = True
     if duration_ms is None:
         duration_ms = len(audio_16k) / 16.0
     segment_meta = {
@@ -1322,12 +1343,18 @@ async def push_session_audio_delta(
             "response_id"
         )
         chunk_meta["client_audio_delta_mode"] = True
+        has_real_audio = float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0
+        real_chunk_key = (
+            chunk_meta.get("response_id")
+            or chunk_meta.get("turn_id")
+            or "__session_default__"
+        )
+        real_chunk_keys_seen = state.setdefault("real_chunk_keys_seen", set())
         is_first_real_chunk = (
-            float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0
-            and int(state.get("real_chunks_assembled") or 0) == 0
+            has_real_audio and real_chunk_key not in real_chunk_keys_seen
         )
         chunk_meta["is_first_real_chunk"] = is_first_real_chunk
-        chunk_meta["allow_preempt_filler"] = float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0
+        chunk_meta["allow_preempt_filler"] = has_real_audio
         if is_first_real_chunk:
             chunk_meta["turn_start_policy"] = "preempt_filler_reset_pts"
 
@@ -1353,7 +1380,8 @@ async def push_session_audio_delta(
             worker_received_wall_ms=worker_received_wall_ms,
         )
         assembled_chunks.append(assembled)
-        if float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0:
+        if has_real_audio:
+            real_chunk_keys_seen.add(real_chunk_key)
             state["real_chunks_assembled"] = int(state.get("real_chunks_assembled") or 0) + 1
 
     return {
