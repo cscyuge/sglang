@@ -7,6 +7,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import (
+    WanS2VPipelineConfig,
+)
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
@@ -64,6 +67,14 @@ class TestModelIdResolution(unittest.TestCase):
         _get_config_info.cache_clear()
         info = _get_config_info(expanded, model_id="Qwen-Image")
         self.assertIsNotNone(info)
+
+    def test_model_id_accepts_full_hf_repo_id(self):
+        info = _get_config_info(
+            "/data/model/dmd_chunk3_step800_model",
+            model_id="Wan-AI/Wan2.2-S2V-14B",
+        )
+        self.assertIsNotNone(info)
+        self.assertIs(info.pipeline_config_cls, WanS2VPipelineConfig)
 
     def test_hf_cache_snapshot_path_resolves_registered_nvfp4_model(self):
         path = (

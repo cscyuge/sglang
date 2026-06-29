@@ -476,7 +476,9 @@ class WanS2VAudioEncodingStage(AudioEncodingStage):
                     speech_array, sampling_rate=sample_rate
                 ).input_values
             )
-            audio_feature = torch.from_numpy(audio_feature).float().to(device).unsqueeze(0)
+            audio_feature = (
+                torch.from_numpy(audio_feature).float().to(device).unsqueeze(0)
+            )
         else:
             audio_feature = (
                 torch.from_numpy(speech_array).float().to(device)
@@ -558,8 +560,12 @@ class WanS2VDenoisingStage(PipelineStage):
             timesteps = self.scheduler.timesteps
 
         guidance_scale = batch.guidance_scale or 4.5
-        generator = batch.generator[0] if isinstance(batch.generator, list) else batch.generator
-        autocast_enabled = dit_dtype != torch.float32 and not server_args.disable_autocast
+        generator = (
+            batch.generator[0] if isinstance(batch.generator, list) else batch.generator
+        )
+        autocast_enabled = (
+            dit_dtype != torch.float32 and not server_args.disable_autocast
+        )
 
         self.load_model()
         try:
@@ -1071,6 +1077,94 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 )
         return None
 
+    def denoise_stream_r1_block(
+        self,
+        *,
+        batch: Req,
+        block_latents: torch.Tensor,
+        block_bundle: WanS2VConditionBundle,
+        block_start: int,
+        frame_seq_length: int,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        cache_state: WanS2VStreamR1CacheState,
+        crossattn_cache: list[dict] | None,
+        generator: torch.Generator | None,
+        dit_dtype: torch.dtype,
+        autocast_enabled: bool,
+    ) -> torch.Tensor:
+        """Denoise one Stream-R1 S2V latent block.
+
+        The full-clip path calls this once per block. Realtime session
+        generation also calls this helper so it can preserve the same
+        timestep and attention behavior without rerunning the whole pipeline.
+        """
+        current_latents = block_latents
+        noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
+        video_raw_latent_shape = noise_latents_btchw.shape
+        current_start = block_start * frame_seq_length
+
+        for i, t_cur in enumerate(timesteps):
+            t_expand = t_cur.reshape(1).repeat(current_latents.shape[0])
+            with (
+                torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=dit_dtype,
+                    enabled=autocast_enabled,
+                ),
+                set_forward_context(
+                    current_timestep=i,
+                    attn_metadata=None,
+                    forward_batch=batch,
+                ),
+            ):
+                noise_pred_bcthw = self.transformer(
+                    hidden_states=current_latents,
+                    timestep=t_expand,
+                    encoder_hidden_states=prompt_embeds,
+                    ref_latents=block_bundle.ref_latents,
+                    motion_latents=block_bundle.motion_latents,
+                    cond_states=block_bundle.cond_states,
+                    audio_input=block_bundle.audio_input,
+                    audio_emb=block_bundle.audio_emb,
+                    motion_frames=block_bundle.motion_frames,
+                    add_last_motion=block_bundle.add_last_motion,
+                    drop_motion_frames=block_bundle.drop_motion_frames,
+                    kv_cache=cache_state.kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start,
+                    cache_start=None,
+                    stream_r1_mode=True,
+                )
+            noise_pred_btchw = noise_pred_bcthw.permute(0, 2, 1, 3, 4)
+            pred_video_btchw = pred_noise_to_pred_video(
+                pred_noise=noise_pred_btchw.flatten(0, 1),
+                noise_input_latent=noise_latents_btchw.flatten(0, 1),
+                timestep=t_cur.reshape(1),
+                scheduler=self.scheduler,
+            ).unflatten(0, noise_pred_btchw.shape[:2])
+
+            if i < timesteps.numel() - 1:
+                next_timestep = (
+                    timesteps[i + 1].reshape(1).to(device=current_latents.device)
+                )
+                noise = torch.randn(
+                    video_raw_latent_shape,
+                    dtype=pred_video_btchw.dtype,
+                    generator=generator,
+                    device=current_latents.device,
+                )
+                noise_latents_btchw = self.scheduler.add_noise(
+                    pred_video_btchw.flatten(0, 1),
+                    noise.flatten(0, 1),
+                    next_timestep,
+                ).unflatten(0, pred_video_btchw.shape[:2])
+                current_latents = noise_latents_btchw.permute(0, 2, 1, 3, 4)
+            else:
+                current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
+
+        return current_latents
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
@@ -1148,65 +1242,20 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     policy=bundle.control_policy,
                 )
                 current_latents = latents[:, :, block_start:block_end, :, :]
-                noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
-                video_raw_latent_shape = noise_latents_btchw.shape
-
-                for i, t_cur in enumerate(timesteps):
-                    t_expand = t_cur.reshape(1).repeat(current_latents.shape[0])
-                    with (
-                        torch.autocast(
-                            device_type=current_platform.device_type,
-                            dtype=dit_dtype,
-                            enabled=autocast_enabled,
-                        ),
-                        set_forward_context(
-                            current_timestep=i,
-                            attn_metadata=None,
-                            forward_batch=batch,
-                        ),
-                    ):
-                        noise_pred_bcthw = self.transformer(
-                            hidden_states=current_latents,
-                            timestep=t_expand,
-                            encoder_hidden_states=prompt_embeds,
-                            ref_latents=block_bundle.ref_latents,
-                            motion_latents=block_bundle.motion_latents,
-                            cond_states=block_bundle.cond_states,
-                            audio_input=block_bundle.audio_input,
-                            audio_emb=block_bundle.audio_emb,
-                            motion_frames=block_bundle.motion_frames,
-                            add_last_motion=block_bundle.add_last_motion,
-                            drop_motion_frames=block_bundle.drop_motion_frames,
-                            kv_cache=cache_state.kv_cache,
-                            crossattn_cache=crossattn_cache,
-                            current_start=block_start * frame_seq_length,
-                            cache_start=None,
-                            stream_r1_mode=True,
-                        )
-                    noise_pred_btchw = noise_pred_bcthw.permute(0, 2, 1, 3, 4)
-                    pred_video_btchw = pred_noise_to_pred_video(
-                        pred_noise=noise_pred_btchw.flatten(0, 1),
-                        noise_input_latent=noise_latents_btchw.flatten(0, 1),
-                        timestep=t_cur.reshape(1),
-                        scheduler=self.scheduler,
-                    ).unflatten(0, noise_pred_btchw.shape[:2])
-
-                    if i < timesteps.numel() - 1:
-                        next_timestep = timesteps[i + 1].reshape(1).to(device=device)
-                        noise = torch.randn(
-                            video_raw_latent_shape,
-                            dtype=pred_video_btchw.dtype,
-                            generator=generator,
-                            device=device,
-                        )
-                        noise_latents_btchw = self.scheduler.add_noise(
-                            pred_video_btchw.flatten(0, 1),
-                            noise.flatten(0, 1),
-                            next_timestep,
-                        ).unflatten(0, pred_video_btchw.shape[:2])
-                        current_latents = noise_latents_btchw.permute(0, 2, 1, 3, 4)
-                    else:
-                        current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
+                current_latents = self.denoise_stream_r1_block(
+                    batch=batch,
+                    block_latents=current_latents,
+                    block_bundle=block_bundle,
+                    block_start=block_start,
+                    frame_seq_length=frame_seq_length,
+                    timesteps=timesteps,
+                    prompt_embeds=prompt_embeds,
+                    cache_state=cache_state,
+                    crossattn_cache=crossattn_cache,
+                    generator=generator,
+                    dit_dtype=dit_dtype,
+                    autocast_enabled=autocast_enabled,
+                )
 
                 latents[:, :, block_start:block_end, :, :] = current_latents
                 self._clean_context_refresh(

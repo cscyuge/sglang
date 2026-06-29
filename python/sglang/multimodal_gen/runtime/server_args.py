@@ -960,6 +960,11 @@ class ServerArgs(DisaggArgsMixin):
             help="Use CPU offload for image encoder. Enable if run out of memory.",
         )
         parser.add_argument(
+            "--audio-encoder-cpu-offload",
+            action=StoreBoolean,
+            help="Use CPU offload for audio encoder. Enable if run out of memory.",
+        )
+        parser.add_argument(
             "--vae-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for VAE. Enable if run out of memory.",

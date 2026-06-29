@@ -18,7 +18,9 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
 
     task_type: ModelTaskType = ModelTaskType.I2V
     dit_config: DiTConfig = field(default_factory=WanS2VConfig)
-    text_encoder_configs: tuple = field(default_factory=lambda: (_flashtalk_t5_config(),))
+    text_encoder_configs: tuple = field(
+        default_factory=lambda: (_flashtalk_t5_config(),)
+    )
     use_cfg: bool = True
     flow_shift: float | None = 3.0
     audio_encoder_precision: str = "fp32"
@@ -37,6 +39,13 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     cache_audio_embeddings: bool = True
     stream_r1_generator_checkpoint_path: str | None = None
     use_stream_r1_ema: bool = True
+    wan_s2v_realtime: bool = True
+    wan_s2v_realtime_audio_window_seconds: float = 8.0
+    wan_s2v_idle_policy: str = "hold"
+    wan_s2v_max_silence_blocks: int = 1
+    wan_s2v_audio_overlap: bool = False
+    wan_s2v_wav2vec_cuda_graph: bool = False
+    wan_s2v_vae_cuda_graph: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -61,6 +70,12 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
             raise ValueError("s2v_audio_lookahead_frames must be non-negative")
         if self.denoising_step_list is not None and len(self.denoising_step_list) == 0:
             raise ValueError("denoising_step_list must not be empty")
+        if self.wan_s2v_realtime_audio_window_seconds <= 0:
+            raise ValueError("wan_s2v_realtime_audio_window_seconds must be positive")
+        if self.wan_s2v_idle_policy not in ("hold", "silence"):
+            raise ValueError("wan_s2v_idle_policy must be either 'hold' or 'silence'")
+        if self.wan_s2v_max_silence_blocks < 0:
+            raise ValueError("wan_s2v_max_silence_blocks must be non-negative")
 
     def postprocess_image_latent(self, latent_condition, batch):
         return latent_condition

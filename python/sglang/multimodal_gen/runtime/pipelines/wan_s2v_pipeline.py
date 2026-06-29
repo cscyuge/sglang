@@ -15,7 +15,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     set_default_torch_dtype,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import safetensors_weights_iterator
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    safetensors_weights_iterator,
+)
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v import WanS2VTransformer3DModel
 from sglang.multimodal_gen.runtime.models.encoders.wav2vec2 import Wav2Vec2AudioEncoder
 from sglang.multimodal_gen.runtime.pipelines.flashtalk_pipeline import (
@@ -44,6 +46,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.stream_r1_checkpoint import (
     load_stream_r1_generator_checkpoint,
+)
+from sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime import (
+    WanS2VRealtimeSessionRunner,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -99,12 +104,16 @@ class WanS2VPipeline(FlashTalkPipeline):
         vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
         io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="s2v_pth")
         t5_future = (
-            io_executor.submit(torch.load, t5_path, map_location="cpu", weights_only=True)
+            io_executor.submit(
+                torch.load, t5_path, map_location="cpu", weights_only=True
+            )
             if os.path.exists(t5_path)
             else None
         )
         vae_future = (
-            io_executor.submit(torch.load, vae_path, map_location="cpu", weights_only=True)
+            io_executor.submit(
+                torch.load, vae_path, map_location="cpu", weights_only=True
+            )
             if os.path.exists(vae_path)
             else None
         )
@@ -164,7 +173,9 @@ class WanS2VPipeline(FlashTalkPipeline):
         return loaded_components
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_stage(stage_name="input_validation_stage", stage=InputValidationStage())
+        self.add_stage(
+            stage_name="input_validation_stage", stage=InputValidationStage()
+        )
         self.add_stage(
             stage_name="prompt_encoding_stage",
             stage=TextEncodingStage(
@@ -211,6 +222,13 @@ class WanS2VPipeline(FlashTalkPipeline):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        if batch.extra.get("session_mode", False):
+            if not bool(getattr(server_args.pipeline_config, "wan_s2v_realtime", True)):
+                raise RuntimeError(
+                    "Wan S2V realtime session is disabled. Use /v1/videos with "
+                    "audio_path/audio_url or set wan_s2v_realtime=true."
+                )
+            return WanS2VRealtimeSessionRunner(self).run(batch, server_args)
         return ComposedPipelineBase.forward(self, batch, server_args)
 
     def _load_transformer(
@@ -287,7 +305,9 @@ class WanS2VPipeline(FlashTalkPipeline):
             fp8_config = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
                 activation_scheme="dynamic",
-                weight_block_size=quant_config_dict.get("weight_block_size", [128, 128]),
+                weight_block_size=quant_config_dict.get(
+                    "weight_block_size", [128, 128]
+                ),
             )
             _apply_fp8_quant_to_model(model, fp8_config)
 
@@ -365,7 +385,9 @@ class WanS2VPipeline(FlashTalkPipeline):
             for part in parts[:-1]:
                 parent = getattr(parent, part)
             parent.register_buffer(
-                parts[-1], torch.zeros(buf.shape, dtype=buf.dtype, device=target), persistent=False
+                parts[-1],
+                torch.zeros(buf.shape, dtype=buf.dtype, device=target),
+                persistent=False,
             )
 
         for n, p in list(model.named_parameters()) + list(model.named_buffers()):
