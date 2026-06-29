@@ -23,6 +23,38 @@ CHUNK_TRACE_META_KEYS = (
     "client_post_start_wall_ms",
     "client_input_rms",
     "client_input_peak",
+    "worker_received_wall_ms",
+    "received_monotonic_s",
+    "queue_size_before",
+    "queue_size_after",
+    "pending_filler_chunks",
+    "pending_real_chunks",
+    "wait_after_received_ms",
+    "session_chunk_idx",
+    "input_audio_ms",
+    "input_rms",
+    "input_peak",
+    "generate_ms",
+    "audio_ms",
+    "video_frames",
+    "first_audio_pts",
+    "first_video_pts",
+    "last_audio_pts",
+    "last_video_pts",
+    "frame_idx",
+    "is_silent",
+    "rms",
+    "peak",
+    "pending_frames",
+    "pusher_userid",
+    "state",
+    "reason",
+    "error_code",
+    "error_message",
+    "audio_published",
+    "video_published",
+    "dual_stream_enabled",
+    "low_stream_profile",
 )
 
 
@@ -47,6 +79,49 @@ def flashtalk_audio_chunk_meta_path(
     if not session_dir:
         return None
     return os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.json")
+
+
+def flashtalk_audio_chunk_consumed_idx_path(session_dir: str | None) -> str | None:
+    if not session_dir:
+        return None
+    return os.path.join(session_dir, "audio_chunks", ".consumed_idx")
+
+
+def read_flashtalk_audio_consumed_idx(session_dir: str | None) -> int:
+    path = flashtalk_audio_chunk_consumed_idx_path(session_dir)
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        with open(path, encoding="utf-8") as fp:
+            return max(0, int((fp.read() or "0").strip()))
+    except Exception:
+        return 0
+
+
+def write_flashtalk_audio_consumed_idx(
+    session_dir: str | None,
+    next_chunk_idx: int,
+) -> None:
+    path = flashtalk_audio_chunk_consumed_idx_path(session_dir)
+    if not path:
+        return
+    try:
+        next_chunk_idx = max(0, int(next_chunk_idx))
+    except Exception:
+        return
+    try:
+        current = read_flashtalk_audio_consumed_idx(session_dir)
+        if next_chunk_idx < current:
+            return
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fp:
+            fp.write(str(next_chunk_idx))
+        os.replace(tmp_path, path)
+    except Exception:
+        return
 
 
 def read_flashtalk_audio_chunk_meta(

@@ -55,6 +55,8 @@ from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
     emit_chunk_timeline,
     flashtalk_chunk_timeline_path,
     is_flashtalk_filler_audio_meta,
+    read_flashtalk_audio_chunk_meta,
+    read_flashtalk_audio_consumed_idx,
     write_flashtalk_audio_chunk_meta,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -287,6 +289,58 @@ def _session_pending_chunk_count(session: dict[str, Any]) -> int:
         int(session.get("chunks_received") or 0)
         - int(session.get("chunks_processed") or 0),
     )
+
+
+def _session_audio_chunk_path(session_dir: str, chunk_idx: int) -> str:
+    return os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
+
+
+def _session_audio_duration_ms(meta: dict[str, Any]) -> float:
+    try:
+        return float(meta.get("duration_s")) * 1000.0
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(meta.get("samples")) / 16.0
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(meta.get("client_chunk_ms"))
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
+def _session_audio_queue_stats(
+    session_dir: str,
+    *,
+    max_scan: int = 512,
+) -> dict[str, float | int]:
+    start_idx = read_flashtalk_audio_consumed_idx(session_dir)
+    queue_size = 0
+    pending_filler_chunks = 0
+    pending_real_chunks = 0
+    pending_filler_ms = 0.0
+    audio_queue_ms = 0.0
+    for idx in range(start_idx, start_idx + max_scan):
+        if not os.path.exists(_session_audio_chunk_path(session_dir, idx)):
+            break
+        meta = read_flashtalk_audio_chunk_meta(session_dir, idx)
+        duration_ms = _session_audio_duration_ms(meta)
+        queue_size += 1
+        audio_queue_ms += duration_ms
+        if is_flashtalk_filler_audio_meta(meta):
+            pending_filler_chunks += 1
+            pending_filler_ms += duration_ms
+        else:
+            pending_real_chunks += 1
+    return {
+        "queue_size": queue_size,
+        "pending_filler_chunks": pending_filler_chunks,
+        "pending_filler_ms": round(pending_filler_ms, 3),
+        "pending_real_chunks": pending_real_chunks,
+        "audio_queue_ms": round(audio_queue_ms, 3),
+    }
 
 
 async def _cleanup_frame_dir(frame_dir: str, delay: float = 5.0) -> None:
@@ -619,12 +673,15 @@ async def push_session_chunk(
     chunk_idx = session["chunks_received"]
     session["chunks_received"] = chunk_idx + 1  # atomic increment before await
     chunk_path = os.path.join(session_dir, "audio_chunks", f"chunk_{chunk_idx:04d}.npy")
-    upload_started = time.monotonic()
+    worker_received_wall_ms = int(round(time.time() * 1000.0))
+    received_wall_clock = worker_received_wall_ms / 1000.0
+    received_monotonic_s = time.monotonic()
+    queue_stats_before = _session_audio_queue_stats(session_dir)
+    upload_started = received_monotonic_s
 
     # Read uploaded audio and convert to float32 numpy
     audio_bytes = await audio.read()
     filename = audio.filename or ""
-    received_wall_clock = time.time()
     chunk_source = (chunk_source or "audio").strip() or "audio"
     chunk_meta = _merge_chunk_metadata(
         metadata,
@@ -644,6 +701,13 @@ async def push_session_chunk(
             "client_post_start_wall_ms": client_post_start_wall_ms,
             "client_input_rms": client_input_rms,
             "client_input_peak": client_input_peak,
+            "worker_received_wall_ms": worker_received_wall_ms,
+            "received_monotonic_s": received_monotonic_s,
+            "queue_size_before": queue_stats_before.get("queue_size"),
+            "pending_filler_chunks": queue_stats_before.get("pending_filler_chunks"),
+            "pending_filler_ms": queue_stats_before.get("pending_filler_ms"),
+            "pending_real_chunks": queue_stats_before.get("pending_real_chunks"),
+            "audio_queue_ms": queue_stats_before.get("audio_queue_ms"),
         },
     )
     chunk_meta["session_id"] = session_id
@@ -661,10 +725,16 @@ async def push_session_chunk(
             meta=chunk_meta,
             audio_chunk_idx=chunk_idx,
             wall_clock=received_wall_clock,
-            queue_size=_session_pending_chunk_count(session),
+            queue_size=queue_stats_before.get("queue_size"),
             filename=filename,
             upload_bytes=len(audio_bytes),
             remote_addr=request.client.host if request.client else None,
+            worker_received_wall_ms=worker_received_wall_ms,
+            queue_size_before=queue_stats_before.get("queue_size"),
+            pending_filler_chunks=queue_stats_before.get("pending_filler_chunks"),
+            pending_filler_ms=queue_stats_before.get("pending_filler_ms"),
+            pending_real_chunks=queue_stats_before.get("pending_real_chunks"),
+            audio_queue_ms=queue_stats_before.get("audio_queue_ms"),
         ),
     )
     emit_chunk_timeline(
@@ -675,10 +745,17 @@ async def push_session_chunk(
             meta=chunk_meta,
             audio_chunk_idx=chunk_idx,
             wall_clock=received_wall_clock,
-            queue_size=_session_pending_chunk_count(session),
+            queue_size=queue_stats_before.get("queue_size"),
             filename=filename,
             upload_bytes=len(audio_bytes),
             remote_addr=request.client.host if request.client else None,
+            worker_received_wall_ms=worker_received_wall_ms,
+            queue_size_before=queue_stats_before.get("queue_size"),
+            queue_size_after=queue_stats_before.get("queue_size"),
+            pending_filler_chunks=queue_stats_before.get("pending_filler_chunks"),
+            pending_filler_ms=queue_stats_before.get("pending_filler_ms"),
+            pending_real_chunks=queue_stats_before.get("pending_real_chunks"),
+            audio_queue_ms=queue_stats_before.get("audio_queue_ms"),
         ),
     )
     logger.debug(
@@ -752,7 +829,21 @@ async def push_session_chunk(
     write_ms = (time.monotonic() - write_started) * 1000
     total_ms = (time.monotonic() - upload_started) * 1000
     duration_s = len(audio_array) / 16000
-    queue_size = _session_pending_chunk_count(session)
+    queue_stats_after = _session_audio_queue_stats(session_dir)
+    chunk_meta.update(
+        {
+            "queue_size_after": queue_stats_after.get("queue_size"),
+            "pending_filler_chunks": queue_stats_after.get("pending_filler_chunks"),
+            "pending_filler_ms": queue_stats_after.get("pending_filler_ms"),
+            "pending_real_chunks": queue_stats_after.get("pending_real_chunks"),
+            "audio_queue_ms": queue_stats_after.get("audio_queue_ms"),
+            "wait_after_received_ms": round(
+                (time.monotonic() - received_monotonic_s) * 1000.0,
+                3,
+            ),
+        }
+    )
+    write_flashtalk_audio_chunk_meta(session_dir, chunk_idx, chunk_meta)
     emit_chunk_timeline(
         chunk_timeline_path,
         "audio_chunk_saved",
@@ -761,7 +852,7 @@ async def push_session_chunk(
             meta=chunk_meta,
             audio_chunk_idx=chunk_idx,
             wall_clock=time.time(),
-            queue_size=queue_size,
+            queue_size=queue_stats_after.get("queue_size"),
             samples=len(audio_array),
             duration_s=round(duration_s, 6),
             rms=chunk_meta["rms"],
@@ -770,6 +861,12 @@ async def push_session_chunk(
             write_ms=round(write_ms, 3),
             total_ms=round(total_ms, 3),
             chunk_path=chunk_path,
+            queue_size_before=queue_stats_before.get("queue_size"),
+            queue_size_after=queue_stats_after.get("queue_size"),
+            pending_filler_chunks=queue_stats_after.get("pending_filler_chunks"),
+            pending_filler_ms=queue_stats_after.get("pending_filler_ms"),
+            pending_real_chunks=queue_stats_after.get("pending_real_chunks"),
+            audio_queue_ms=queue_stats_after.get("audio_queue_ms"),
         ),
     )
     emit_chunk_timeline(
@@ -780,13 +877,16 @@ async def push_session_chunk(
             meta=chunk_meta,
             audio_chunk_idx=chunk_idx,
             wall_clock=time.time(),
-            queue_size=queue_size,
+            queue_size=queue_stats_after.get("queue_size"),
             samples=len(audio_array),
             duration_s=round(duration_s, 6),
-            pending_filler_ms=round(duration_s * 1000, 3)
-            if is_flashtalk_filler_audio_meta(chunk_meta)
-            else 0.0,
-            audio_queue_ms=round(duration_s * 1000, 3),
+            queue_size_before=queue_stats_before.get("queue_size"),
+            queue_size_after=queue_stats_after.get("queue_size"),
+            pending_filler_chunks=queue_stats_after.get("pending_filler_chunks"),
+            pending_filler_ms=queue_stats_after.get("pending_filler_ms"),
+            pending_real_chunks=queue_stats_after.get("pending_real_chunks"),
+            audio_queue_ms=queue_stats_after.get("audio_queue_ms"),
+            wait_after_received_ms=chunk_meta.get("wait_after_received_ms"),
             chunk_path=chunk_path,
         ),
     )

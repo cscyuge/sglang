@@ -46,6 +46,34 @@ def _fallback_compact_chunk_trace_fields(**kwargs):
             "pending_filler_ms",
             "audio_queue_ms",
             "video_queue_ms",
+            "pending_filler_chunks",
+            "pending_real_chunks",
+            "wait_after_received_ms",
+            "session_chunk_idx",
+            "input_audio_ms",
+            "input_rms",
+            "input_peak",
+            "generate_ms",
+            "audio_ms",
+            "video_frames",
+            "first_audio_pts",
+            "first_video_pts",
+            "last_audio_pts",
+            "last_video_pts",
+            "frame_idx",
+            "is_silent",
+            "rms",
+            "peak",
+            "pending_frames",
+            "pusher_userid",
+            "state",
+            "reason",
+            "error_code",
+            "error_message",
+            "audio_published",
+            "video_published",
+            "dual_stream_enabled",
+            "low_stream_profile",
         }:
             fields[key] = value
     for key, value in kwargs.items():
@@ -152,6 +180,26 @@ def _put_status(status_fd: int, kind: str, message: str = "") -> None:
         pass
 
 
+def _audio_int16_stats(audio_slice) -> dict[str, float | int | bool]:
+    if audio_slice is None or len(audio_slice) == 0:
+        return {"rms": 0.0, "peak": 0, "is_silent": True}
+    audio_i32 = np.asarray(audio_slice, dtype=np.int32)
+    peak = int(np.max(np.abs(audio_i32))) if len(audio_i32) else 0
+    rms = (
+        float(np.sqrt(np.mean(np.square(audio_i32.astype(np.float64)))))
+        if len(audio_i32)
+        else 0.0
+    )
+    try:
+        non_silent_threshold = int(
+            os.environ.get("SGLANG_ARTC_NON_SILENT_INT16_THRESHOLD", "16")
+        )
+    except ValueError:
+        non_silent_threshold = 16
+    is_silent = peak <= max(0, non_silent_threshold)
+    return {"rms": round(rms, 3), "peak": peak, "is_silent": is_silent}
+
+
 class _WorkerEventHandler:
     """AliRTC callbacks scoped to one worker process and one channel."""
 
@@ -161,11 +209,17 @@ class _WorkerEventHandler:
         timeline_path: Optional[str] = None,
         session_id: Optional[str] = None,
         channel: Optional[str] = None,
+        pusher_userid: Optional[str] = None,
+        dual_stream_enabled: Optional[bool] = None,
+        low_stream_profile: Optional[str] = None,
     ):
         self._status_fd = status_fd
         self._timeline_path = timeline_path
         self._session_id = session_id
         self._channel = channel
+        self._pusher_userid = pusher_userid
+        self._dual_stream_enabled = dual_stream_enabled
+        self._low_stream_profile = low_stream_profile
         self.joined = threading.Event()
         self.left = threading.Event()
         self.audio_published = threading.Event()
@@ -184,6 +238,11 @@ class _WorkerEventHandler:
             event,
             session_id=self._session_id,
             channel=self._channel,
+            pusher_userid=self._pusher_userid,
+            audio_published=self.audio_published.is_set(),
+            video_published=self.video_published.is_set(),
+            dual_stream_enabled=self._dual_stream_enabled,
+            low_stream_profile=self._low_stream_profile,
             wall_clock=time.time(),
             **fields,
         )
@@ -192,31 +251,33 @@ class _WorkerEventHandler:
         logger.debug(
             "ARTC audio publish: %s -> %s (ch=%s)", oldState, newState, channel
         )
+        if self._state_value(newState) == 2:
+            self.audio_published.set()
         self._emit(
             "artc_publish_state",
             media="audio",
             old_state=self._state_value(oldState),
             new_state=self._state_value(newState),
+            state=self._state_value(newState),
             elapsed=elapsed,
             callback_channel=channel,
         )
-        if self._state_value(newState) == 2:
-            self.audio_published.set()
 
     def OnVideoPublishStateChanged(self, oldState, newState, elapsed, channel):
         logger.debug(
             "ARTC video publish: %s -> %s (ch=%s)", oldState, newState, channel
         )
+        if self._state_value(newState) == 2:
+            self.video_published.set()
         self._emit(
             "artc_publish_state",
             media="video",
             old_state=self._state_value(oldState),
             new_state=self._state_value(newState),
+            state=self._state_value(newState),
             elapsed=elapsed,
             callback_channel=channel,
         )
-        if self._state_value(newState) == 2:
-            self.video_published.set()
 
     def OnPushAudioFrameBufferFull(self, isFull):
         self.push_audio_full = isFull
@@ -232,8 +293,19 @@ class _WorkerEventHandler:
         self.failed = True
         msg = f"ARTC SDK error: {error_code}"
         logger.error(msg)
-        self._emit("artc_error", error_code=error_code, message=msg)
-        self._emit("error", component="artc", error_code=error_code, message=msg)
+        self._emit(
+            "artc_error", error_code=error_code, error_message=msg, message=msg
+        )
+        self._emit(
+            "artc_push_error", error_code=error_code, error_message=msg, message=msg
+        )
+        self._emit(
+            "error",
+            component="artc",
+            error_code=error_code,
+            error_message=msg,
+            message=msg,
+        )
         _put_status(self._status_fd, "failed", msg)
 
     def OnConnectionStatusChanged(self, status, reason):
@@ -241,12 +313,14 @@ class _WorkerEventHandler:
         self._emit(
             "artc_connection_state",
             status=self._state_value(status),
+            state=self._state_value(status),
             reason=self._state_value(reason),
         )
         self._emit(
             "connection_state",
             component="artc",
             status=self._state_value(status),
+            state=self._state_value(status),
             reason=self._state_value(reason),
         )
 
@@ -262,6 +336,15 @@ class _WorkerEventHandler:
             self._emit(
                 "artc_error",
                 error_code=result,
+                error_message=f"ARTC JoinChannel failed: {result}",
+                message=f"ARTC JoinChannel failed: {result}",
+                callback_channel=channel,
+                user_id=userId,
+            )
+            self._emit(
+                "artc_push_error",
+                error_code=result,
+                error_message=f"ARTC JoinChannel failed: {result}",
                 message=f"ARTC JoinChannel failed: {result}",
                 callback_channel=channel,
                 user_id=userId,
@@ -270,6 +353,7 @@ class _WorkerEventHandler:
                 "error",
                 component="artc",
                 error_code=result,
+                error_message=f"ARTC JoinChannel failed: {result}",
                 message=f"ARTC JoinChannel failed: {result}",
                 callback_channel=channel,
                 user_id=userId,
@@ -423,6 +507,15 @@ def _drain_worker_queue(
     reset_pts_on_clear = bool(config.get("reset_pts_on_clear", True))
     frame_interval_s = 1.0 / max(fps, 1)
     next_frame_at = time.monotonic()
+    last_pts_reset_meta = None
+
+    def _worker_meta_is_filler(meta: dict) -> bool:
+        explicit = meta.get("is_filler")
+        if explicit is not None:
+            if isinstance(explicit, str):
+                return explicit.strip().lower() in ("1", "true", "yes", "on")
+            return bool(explicit)
+        return bool(meta.get("used_silence")) or not bool(meta.get("audio_loaded"))
 
     while True:
         try:
@@ -440,22 +533,51 @@ def _drain_worker_queue(
             meta = item[1] if len(item) > 1 and isinstance(item[1], dict) else {}
             clear_started = time.monotonic()
             try:
+                old_next_video_pts = v_ts
+                old_next_audio_pts = a_ts
                 engine.ClearDataBuffer()
                 handler.push_audio_full = False
                 handler.push_video_full = False
                 if reset_pts_on_clear:
                     v_ts = 0
                     a_ts = 0
+                last_pts_reset_meta = {
+                    "old_next_audio_pts": old_next_audio_pts,
+                    "old_next_video_pts": old_next_video_pts,
+                    "new_first_audio_pts": a_ts,
+                    "new_first_video_pts": v_ts,
+                    "reset_applied": reset_pts_on_clear,
+                    "reason": meta.get("reason") or "clear_buffer",
+                }
                 next_frame_at = time.monotonic()
                 emit_chunk_timeline(
                     timeline_path,
                     "artc_worker_buffer_cleared",
+                    session_id=config.get("session_id"),
+                    channel=config.get("channel"),
+                    pusher_userid=config.get("userid"),
                     chunk_idx=meta.get("chunk_idx"),
                     audio_chunk_idx=meta.get("audio_chunk_idx"),
                     turn_id=meta.get("turn_id"),
                     reason=meta.get("reason"),
                     reset_pts=reset_pts_on_clear,
                     elapsed_ms=round((time.monotonic() - clear_started) * 1000, 3),
+                )
+                emit_chunk_timeline(
+                    timeline_path,
+                    "pts_reset_on_real_audio",
+                    session_id=config.get("session_id"),
+                    channel=config.get("channel"),
+                    pusher_userid=config.get("userid"),
+                    chunk_idx=meta.get("chunk_idx"),
+                    audio_chunk_idx=meta.get("audio_chunk_idx"),
+                    turn_id=meta.get("turn_id"),
+                    old_next_audio_pts=old_next_audio_pts,
+                    old_next_video_pts=old_next_video_pts,
+                    new_first_audio_pts=a_ts,
+                    new_first_video_pts=v_ts,
+                    reset_applied=reset_pts_on_clear,
+                    reason=meta.get("reason") or "clear_buffer",
                 )
             except Exception as exc:
                 logger.warning("ARTC ClearDataBuffer failed: %s", exc)
@@ -469,6 +591,44 @@ def _drain_worker_queue(
         audio_chunk_idx = meta.get("audio_chunk_idx")
         num_frames = frames_np.shape[0]
         chunk_started = time.monotonic()
+        is_filler_chunk = _worker_meta_is_filler(meta)
+        pending_frames = meta.get("pending_frames")
+        if not is_filler_chunk:
+            emit_chunk_timeline(
+                timeline_path,
+                "pts_real_audio_alignment",
+                **compact_chunk_trace_fields(
+                    session_id=config.get("session_id"),
+                    meta=meta,
+                    chunk_idx=chunk_idx,
+                    audio_chunk_idx=audio_chunk_idx,
+                    pts=a_ts,
+                    wall_clock=time.time(),
+                    old_next_audio_pts=(
+                        last_pts_reset_meta.get("old_next_audio_pts")
+                        if last_pts_reset_meta
+                        else a_ts
+                    ),
+                    old_next_video_pts=(
+                        last_pts_reset_meta.get("old_next_video_pts")
+                        if last_pts_reset_meta
+                        else v_ts
+                    ),
+                    new_first_audio_pts=a_ts,
+                    new_first_video_pts=v_ts,
+                    reset_applied=(
+                        last_pts_reset_meta.get("reset_applied")
+                        if last_pts_reset_meta
+                        else False
+                    ),
+                    reason=(
+                        last_pts_reset_meta.get("reason")
+                        if last_pts_reset_meta
+                        else "real_audio_chunk"
+                    ),
+                ),
+            )
+            last_pts_reset_meta = None
         emit_chunk_timeline(
             timeline_path,
             "artc_worker_chunk_received",
@@ -486,6 +646,7 @@ def _drain_worker_queue(
             audio_samples=int(len(audio_int16)) if audio_int16 is not None else 0,
             video_pts_ms=v_ts,
             audio_pts_ms=a_ts,
+            pending_frames=pending_frames,
         )
         first_non_silent_audio_pushed = False
         for i in range(num_frames):
@@ -516,7 +677,31 @@ def _drain_worker_queue(
             video_sample.strideU = 0
             video_sample.strideV = 0
             video_sample.rotation = 0
-            engine.PushExternalVideoFrame(video_sample, VideoSource.VideoSourceCamera)
+            video_push_started = time.monotonic()
+            try:
+                engine.PushExternalVideoFrame(
+                    video_sample, VideoSource.VideoSourceCamera
+                )
+            except Exception as exc:
+                emit_chunk_timeline(
+                    timeline_path,
+                    "artc_push_error",
+                    **compact_chunk_trace_fields(
+                        session_id=config.get("session_id"),
+                        meta=meta,
+                        chunk_idx=chunk_idx,
+                        audio_chunk_idx=audio_chunk_idx,
+                        pts=v_ts,
+                        wall_clock=time.time(),
+                        frame_idx=i,
+                        pending_frames=pending_frames,
+                        error_message=str(exc),
+                        message=str(exc),
+                    ),
+                    media="video",
+                    error_code=type(exc).__name__,
+                )
+                raise
             if i == 0:
                 emit_chunk_timeline(
                     timeline_path,
@@ -540,9 +725,19 @@ def _drain_worker_queue(
                         chunk_idx=chunk_idx,
                         audio_chunk_idx=audio_chunk_idx,
                         pts=v_ts,
+                        wall_clock=time.time(),
+                        frame_idx=i,
+                        pending_frames=pending_frames,
+                        audio_queue_ms=meta.get("audio_queue_ms"),
+                        video_queue_ms=meta.get("video_queue_ms"),
                     ),
                     video_pts_ms=v_ts,
                     frame_index=i,
+                    push_ms=round(
+                        (time.monotonic() - video_push_started) * 1000,
+                        3,
+                    ),
+                    wall_ms=int(round(time.time() * 1000.0)),
                     elapsed_ms=round((time.monotonic() - chunk_started) * 1000, 3),
                 )
             v_ts += ms_per_frame
@@ -561,6 +756,7 @@ def _drain_worker_queue(
                         audio_slice,
                         (0, samples_per_frame - len(audio_slice)),
                     )
+                audio_stats = _audio_int16_stats(audio_slice)
                 audio_bytes = audio_slice.tobytes()
                 audio_push_started = time.monotonic()
                 if i == 0:
@@ -573,14 +769,47 @@ def _drain_worker_queue(
                             chunk_idx=chunk_idx,
                             audio_chunk_idx=audio_chunk_idx,
                             pts=a_ts,
+                            wall_clock=time.time(),
+                            frame_idx=i,
+                            is_silent=audio_stats.get("is_silent"),
+                            rms=audio_stats.get("rms"),
+                            peak=audio_stats.get("peak"),
+                            pending_frames=pending_frames,
+                            audio_queue_ms=meta.get("audio_queue_ms"),
+                            video_queue_ms=meta.get("video_queue_ms"),
                         ),
                         audio_pts_ms=a_ts,
                         frame_index=i,
+                        wall_ms=int(round(time.time() * 1000.0)),
                         audio_samples=int(len(audio_slice)),
                     )
-                engine.PushExternalAudioFrameRawData(
-                    audio_bytes, len(audio_bytes), a_ts
-                )
+                try:
+                    engine.PushExternalAudioFrameRawData(
+                        audio_bytes, len(audio_bytes), a_ts
+                    )
+                except Exception as exc:
+                    emit_chunk_timeline(
+                        timeline_path,
+                        "artc_push_error",
+                        **compact_chunk_trace_fields(
+                            session_id=config.get("session_id"),
+                            meta=meta,
+                            chunk_idx=chunk_idx,
+                            audio_chunk_idx=audio_chunk_idx,
+                            pts=a_ts,
+                            wall_clock=time.time(),
+                            frame_idx=i,
+                            is_silent=audio_stats.get("is_silent"),
+                            rms=audio_stats.get("rms"),
+                            peak=audio_stats.get("peak"),
+                            pending_frames=pending_frames,
+                            error_message=str(exc),
+                            message=str(exc),
+                        ),
+                        media="audio",
+                        error_code=type(exc).__name__,
+                    )
+                    raise
                 if i == 0:
                     emit_chunk_timeline(
                         timeline_path,
@@ -606,28 +835,29 @@ def _drain_worker_queue(
                             chunk_idx=chunk_idx,
                             audio_chunk_idx=audio_chunk_idx,
                             pts=a_ts,
+                            wall_clock=time.time(),
+                            frame_idx=i,
+                            is_silent=audio_stats.get("is_silent"),
+                            rms=audio_stats.get("rms"),
+                            peak=audio_stats.get("peak"),
+                            pending_frames=pending_frames,
+                            audio_queue_ms=meta.get("audio_queue_ms"),
+                            video_queue_ms=meta.get("video_queue_ms"),
                         ),
                         audio_pts_ms=a_ts,
                         frame_index=i,
                         push_ms=round(
                             (time.monotonic() - audio_push_started) * 1000, 3
                         ),
+                        wall_ms=int(round(time.time() * 1000.0)),
                         elapsed_ms=round(
                             (time.monotonic() - chunk_started) * 1000, 3
                         ),
                     )
-                try:
-                    non_silent_threshold = int(
-                        os.environ.get(
-                            "SGLANG_ARTC_NON_SILENT_INT16_THRESHOLD", "16"
-                        )
-                    )
-                except ValueError:
-                    non_silent_threshold = 16
                 if (
                     not first_non_silent_audio_pushed
                     and len(audio_slice) > 0
-                    and int(np.max(np.abs(audio_slice))) > max(0, non_silent_threshold)
+                    and not bool(audio_stats.get("is_silent"))
                 ):
                     first_non_silent_audio_pushed = True
                     emit_chunk_timeline(
@@ -639,13 +869,22 @@ def _drain_worker_queue(
                             chunk_idx=chunk_idx,
                             audio_chunk_idx=audio_chunk_idx,
                             pts=a_ts,
+                            wall_clock=time.time(),
+                            frame_idx=i,
+                            is_silent=False,
+                            rms=audio_stats.get("rms"),
+                            peak=audio_stats.get("peak"),
+                            pending_frames=pending_frames,
+                            audio_queue_ms=meta.get("audio_queue_ms"),
+                            video_queue_ms=meta.get("video_queue_ms"),
                         ),
                         audio_pts_ms=a_ts,
                         frame_index=i,
-                        audio_peak=int(np.max(np.abs(audio_slice))),
+                        audio_peak=audio_stats.get("peak"),
                         push_ms=round(
                             (time.monotonic() - audio_push_started) * 1000, 3
                         ),
+                        wall_ms=int(round(time.time() * 1000.0)),
                         elapsed_ms=round(
                             (time.monotonic() - chunk_started) * 1000, 3
                         ),
@@ -729,6 +968,9 @@ def _artc_worker_main(config: dict, command_fd: int, status_fd: int) -> None:
         timeline_path=config.get("timeline_path"),
         session_id=config.get("session_id"),
         channel=config.get("channel"),
+        pusher_userid=config.get("userid"),
+        dual_stream_enabled=config.get("dual_stream_enabled"),
+        low_stream_profile=config.get("low_stream_profile"),
     )
     engine = None
     try:
@@ -744,7 +986,19 @@ def _artc_worker_main(config: dict, command_fd: int, status_fd: int) -> None:
             "artc_error",
             session_id=config.get("session_id"),
             channel=config.get("channel"),
+            pusher_userid=config.get("userid"),
             wall_clock=time.time(),
+            error_message=str(exc),
+            message=str(exc),
+        )
+        emit_chunk_timeline(
+            config.get("timeline_path"),
+            "artc_push_error",
+            session_id=config.get("session_id"),
+            channel=config.get("channel"),
+            pusher_userid=config.get("userid"),
+            wall_clock=time.time(),
+            error_message=str(exc),
             message=str(exc),
         )
         emit_chunk_timeline(
@@ -753,7 +1007,9 @@ def _artc_worker_main(config: dict, command_fd: int, status_fd: int) -> None:
             component="artc",
             session_id=config.get("session_id"),
             channel=config.get("channel"),
+            pusher_userid=config.get("userid"),
             wall_clock=time.time(),
+            error_message=str(exc),
             message=str(exc),
         )
         _put_status(status_fd, "failed", str(exc))
@@ -1100,6 +1356,9 @@ class ArtcPusher:
             meta["pending_filler_ms"] = current_queue_stats.get(
                 "artc_pending_filler_ms"
             )
+        if current_queue_stats.get("pending_frames") is not None:
+            meta["pending_frames"] = current_queue_stats.get("pending_frames")
+        meta["pusher_userid"] = self._userid
         emit_chunk_timeline(
             self._timeline_path,
             "artc_chunk_enqueued",
@@ -1164,18 +1423,24 @@ class ArtcPusher:
         items = list(self._command_queue.queue)
         video_queue_ms = 0.0
         pending_filler_ms = 0.0
+        pending_frames = 0
         for item in items:
             if not isinstance(item, tuple) or not item or item[0] != _CHUNK:
                 continue
             meta = self._item_meta(item)
             duration_ms = float(meta.get("duration_s") or 0.0) * 1000.0
             video_queue_ms += duration_ms
+            try:
+                pending_frames += int(meta.get("frame_count") or 0)
+            except (TypeError, ValueError):
+                pass
             if self._meta_is_filler(meta):
                 pending_filler_ms += duration_ms
         return {
             "artc_queue_size": self._command_queue.qsize(),
             "video_queue_ms": round(video_queue_ms, 3),
             "artc_pending_filler_ms": round(pending_filler_ms, 3),
+            "pending_frames": pending_frames,
         }
 
     def _should_clear_before_real(self, meta: dict) -> bool:
@@ -1284,20 +1549,54 @@ class ArtcPusher:
             )
         return dropped
 
-    def drop_filler_chunks(self, reason: str = "") -> int:
+    def drop_filler_chunks_with_stats(
+        self,
+        reason: str = "",
+    ) -> dict[str, Optional[float] | int]:
         """Drop queued filler chunks that have not been sent to the worker."""
+        stats = {
+            "dropped_filler_chunks": 0,
+            "dropped_filler_audio_ms": 0.0,
+            "dropped_filler_video_frames": 0,
+            "first_dropped_pts": None,
+            "last_dropped_pts": None,
+        }
         if self._command_queue is None:
-            return 0
+            return stats
 
         kept = []
-        dropped = 0
         while True:
             try:
                 item = self._command_queue.get_nowait()
             except queue.Empty:
                 break
             if self._item_is_filler(item):
-                dropped += 1
+                meta = self._item_meta(item)
+                stats["dropped_filler_chunks"] += 1
+                duration_ms = float(meta.get("duration_s") or 0.0) * 1000.0
+                stats["dropped_filler_audio_ms"] += duration_ms
+                try:
+                    frame_count = int(meta.get("frame_count") or 0)
+                except (TypeError, ValueError):
+                    frame_count = 0
+                stats["dropped_filler_video_frames"] += frame_count
+                first_pts = meta.get("first_audio_pts")
+                if first_pts is None:
+                    try:
+                        chunk_idx = int(meta.get("chunk_idx"))
+                        first_pts = chunk_idx * duration_ms
+                    except (TypeError, ValueError):
+                        first_pts = None
+                last_pts = meta.get("last_audio_pts")
+                if last_pts is None and first_pts is not None:
+                    last_pts = float(first_pts) + max(
+                        0.0,
+                        duration_ms - 1000.0 / max(self._fps, 1),
+                    )
+                if first_pts is not None and stats["first_dropped_pts"] is None:
+                    stats["first_dropped_pts"] = round(float(first_pts), 3)
+                if last_pts is not None:
+                    stats["last_dropped_pts"] = round(float(last_pts), 3)
             else:
                 kept.append(item)
         for item in kept:
@@ -1305,11 +1604,15 @@ class ArtcPusher:
                 self._command_queue.put_nowait(item)
             except queue.Full:
                 break
-        if dropped:
+        if stats["dropped_filler_chunks"]:
+            stats["dropped_filler_audio_ms"] = round(
+                float(stats["dropped_filler_audio_ms"]), 3
+            )
             emit_chunk_timeline(
                 self._timeline_path,
                 "artc_filler_chunks_dropped",
-                dropped_chunks=dropped,
+                dropped_chunks=stats["dropped_filler_chunks"],
+                **stats,
                 reason=reason,
                 queue_size=self._command_queue.qsize()
                 if self._command_queue is not None
@@ -1317,10 +1620,15 @@ class ArtcPusher:
             )
             logger.info(
                 "ARTC pusher dropped %d queued filler chunks reason=%s",
-                dropped,
+                stats["dropped_filler_chunks"],
                 reason,
             )
-        return dropped
+        return stats
+
+    def drop_filler_chunks(self, reason: str = "") -> int:
+        """Drop queued filler chunks that have not been sent to the worker."""
+        stats = self.drop_filler_chunks_with_stats(reason=reason)
+        return int(stats.get("dropped_filler_chunks") or 0)
 
     def drop_stale_chunks(self, active_turn_id: Optional[str], reason: str = "") -> int:
         """Drop queued filler from older turns before a new real turn starts.
@@ -1446,6 +1754,16 @@ class ArtcPusher:
             "session_id": self._session_id,
             "avsync_mode": avsync_mode,
             "frame_pacing": frame_pacing,
+            "dual_stream_enabled": os.environ.get(
+                "SGLANG_ARTC_DUAL_STREAM_ENABLED", "0"
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on"),
+            "low_stream_profile": os.environ.get(
+                "SGLANG_ARTC_LOW_STREAM_PROFILE", ""
+            ).strip()
+            or None,
             "reset_pts_on_clear": os.environ.get(
                 "SGLANG_ARTC_RESET_PTS_ON_CLEAR", "1"
             )
@@ -1616,7 +1934,6 @@ class ArtcPusher:
                         else None,
                         video_queue_ms=self.queue_stats().get("video_queue_ms"),
                     ),
-                    reason=meta.get("reason"),
                     enqueue_to_ipc_ms=round(
                         (
                             time.monotonic()

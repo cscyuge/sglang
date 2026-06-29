@@ -84,6 +84,7 @@ from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
     flashtalk_chunk_timeline_path,
     is_flashtalk_filler_audio_meta,
     read_flashtalk_audio_chunk_meta,
+    write_flashtalk_audio_consumed_idx,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -498,6 +499,8 @@ def _session_audio_queue_stats(
     max_scan: int = 256,
 ) -> dict[str, float | int]:
     queue_size = 0
+    pending_filler_chunks = 0
+    pending_real_chunks = 0
     pending_filler_ms = 0.0
     audio_queue_ms = 0.0
     for idx in range(start_idx, start_idx + max_scan):
@@ -508,10 +511,15 @@ def _session_audio_queue_stats(
         queue_size += 1
         audio_queue_ms += duration_ms
         if _session_audio_chunk_is_filler(session_dir, idx):
+            pending_filler_chunks += 1
             pending_filler_ms += duration_ms
+        else:
+            pending_real_chunks += 1
     return {
         "queue_size": queue_size,
+        "pending_filler_chunks": pending_filler_chunks,
         "pending_filler_ms": round(pending_filler_ms, 3),
+        "pending_real_chunks": pending_real_chunks,
         "audio_queue_ms": round(audio_queue_ms, 3),
     }
 
@@ -544,6 +552,81 @@ def _is_non_silent_audio(audio: np.ndarray | None, meta: dict[str, Any]) -> bool
     except (TypeError, ValueError):
         rms = float(np.sqrt(np.mean(np.square(audio))))
     return peak > threshold or rms > threshold
+
+
+def _first_non_silent_audio_frame(
+    audio: np.ndarray | None,
+    *,
+    sample_rate: int,
+    fps: int,
+) -> dict[str, int | float] | None:
+    if audio is None or len(audio) == 0:
+        return None
+    try:
+        threshold = float(
+            os.environ.get("FLASHTALK_NON_SILENT_AUDIO_THRESHOLD", "0.0005")
+        )
+    except ValueError:
+        threshold = 0.0005
+    threshold = max(0.0, threshold)
+    samples_per_frame = max(1, int(sample_rate / max(fps, 1)))
+    audio_np = np.asarray(audio, dtype=np.float32)
+    frame_count = int(np.ceil(len(audio_np) / float(samples_per_frame)))
+    for frame_idx in range(frame_count):
+        start = frame_idx * samples_per_frame
+        frame = audio_np[start : start + samples_per_frame]
+        if len(frame) == 0:
+            continue
+        rms = float(np.sqrt(np.mean(np.square(frame))))
+        peak = float(np.max(np.abs(frame)))
+        if peak > threshold or rms > threshold:
+            return {
+                "frame_idx": frame_idx,
+                "pts": round(frame_idx * 1000.0 / max(fps, 1), 3),
+                "rms": round(rms, 8),
+                "peak": round(peak, 8),
+            }
+    return None
+
+
+def _audio_wait_after_received_ms(meta: dict[str, Any]) -> float | None:
+    try:
+        received_monotonic_s = float(meta.get("received_monotonic_s"))
+    except (TypeError, ValueError):
+        return None
+    return round(max(0.0, time.monotonic() - received_monotonic_s) * 1000.0, 3)
+
+
+def _drop_queued_filler_chunks(stream_pusher, reason: str) -> dict[str, Any]:
+    if stream_pusher is None:
+        return {
+            "dropped_filler_chunks": 0,
+            "dropped_filler_audio_ms": 0.0,
+            "dropped_filler_video_frames": 0,
+            "first_dropped_pts": None,
+            "last_dropped_pts": None,
+        }
+    try:
+        if hasattr(stream_pusher, "drop_filler_chunks_with_stats"):
+            return stream_pusher.drop_filler_chunks_with_stats(reason=reason)
+        if hasattr(stream_pusher, "drop_filler_chunks"):
+            dropped = int(stream_pusher.drop_filler_chunks(reason=reason) or 0)
+            return {
+                "dropped_filler_chunks": dropped,
+                "dropped_filler_audio_ms": None,
+                "dropped_filler_video_frames": None,
+                "first_dropped_pts": None,
+                "last_dropped_pts": None,
+            }
+    except Exception:
+        pass
+    return {
+        "dropped_filler_chunks": 0,
+        "dropped_filler_audio_ms": 0.0,
+        "dropped_filler_video_frames": 0,
+        "first_dropped_pts": None,
+        "last_dropped_pts": None,
+    }
 
 
 def _find_pending_real_audio_after_fillers(
@@ -2642,6 +2725,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     _old_audio_chunk_idx = audio_chunk_idx
                     audio_chunk_idx = _next_real_audio_idx
                     _prefetched_result = None
+                    write_flashtalk_audio_consumed_idx(session_dir, audio_chunk_idx)
                     if _timeline_rank0:
                         emit_chunk_timeline(
                             _chunk_timeline_path,
@@ -2688,6 +2772,9 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _old_audio_chunk_idx = audio_chunk_idx
                         audio_chunk_idx = _next_real_audio_idx
                         _prefetched_result = None
+                        write_flashtalk_audio_consumed_idx(
+                            session_dir, audio_chunk_idx
+                        )
                         if _timeline_rank0:
                             emit_chunk_timeline(
                                 _chunk_timeline_path,
@@ -2815,6 +2902,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _loaded_from_client = False
 
                 chunk_start = time.time()
+                _chunk_monotonic_start = time.monotonic()
                 _stage_start = time.perf_counter()
                 _timing_parts = []
                 _source_audio_chunk_idx = (
@@ -2846,13 +2934,43 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 if _turn_id is not None:
                     _trace_meta.setdefault("turn_id", _turn_id)
                 _chunk_pts_ms = round(chunk_idx * _chunk_wall_time * 1000.0, 3)
+                _input_audio_ms = round(
+                    int(len(chunk_audio_data)) * 1000.0 / max(sample_rate, 1),
+                    3,
+                )
+                try:
+                    _input_rms = float(_audio_chunk_meta.get("rms"))
+                except (TypeError, ValueError):
+                    _input_rms = (
+                        float(np.sqrt(np.mean(np.square(chunk_audio_data))))
+                        if len(chunk_audio_data)
+                        else 0.0
+                    )
+                try:
+                    _input_peak = float(_audio_chunk_meta.get("peak"))
+                except (TypeError, ValueError):
+                    _input_peak = (
+                        float(np.max(np.abs(chunk_audio_data)))
+                        if len(chunk_audio_data)
+                        else 0.0
+                    )
+                _trace_meta.setdefault("session_chunk_idx", chunk_idx)
+                _trace_meta.setdefault("input_audio_ms", _input_audio_ms)
+                _trace_meta.setdefault("input_rms", round(_input_rms, 8))
+                _trace_meta.setdefault("input_peak", round(_input_peak, 8))
+                if _source_audio_chunk_idx is not None:
+                    write_flashtalk_audio_consumed_idx(session_dir, audio_chunk_idx)
                 if (
                     _stream_pusher is not None
                     and not _is_filler_chunk
-                    and hasattr(_stream_pusher, "drop_filler_chunks")
+                    and (
+                        hasattr(_stream_pusher, "drop_filler_chunks_with_stats")
+                        or hasattr(_stream_pusher, "drop_filler_chunks")
+                    )
                 ):
                     try:
-                        _stream_pusher.drop_filler_chunks(
+                        _drop_queued_filler_chunks(
+                            _stream_pusher,
                             reason="real_audio_generation_start"
                         )
                     except Exception:
@@ -2876,6 +2994,32 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     if not _is_filler_chunk:
                         emit_chunk_timeline(
                             _chunk_timeline_path,
+                            "worker_real_chunk_dequeued",
+                            **compact_chunk_trace_fields(
+                                session_id=_session_id,
+                                meta=_trace_meta,
+                                chunk_idx=chunk_idx,
+                                audio_chunk_idx=_source_audio_chunk_idx,
+                                pts=_chunk_pts_ms,
+                                wall_clock=time.time(),
+                                queue_size=_audio_queue_stats.get("queue_size"),
+                                pending_filler_chunks=_audio_queue_stats.get(
+                                    "pending_filler_chunks"
+                                ),
+                                pending_filler_ms=_audio_queue_stats.get(
+                                    "pending_filler_ms"
+                                ),
+                                pending_real_chunks=_audio_queue_stats.get(
+                                    "pending_real_chunks"
+                                ),
+                                wait_after_received_ms=_audio_wait_after_received_ms(
+                                    _audio_chunk_meta
+                                ),
+                                **_video_queue_stats,
+                            ),
+                        )
+                        emit_chunk_timeline(
+                            _chunk_timeline_path,
                             "worker_real_chunk_generate_start",
                             **compact_chunk_trace_fields(
                                 session_id=_session_id,
@@ -2885,6 +3029,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                                 pts=_chunk_pts_ms,
                                 wall_clock=time.time(),
                                 audio_samples=int(len(chunk_audio_data)),
+                                session_chunk_idx=chunk_idx,
+                                input_audio_ms=_input_audio_ms,
+                                input_rms=round(_input_rms, 8),
+                                input_peak=round(_input_peak, 8),
                                 used_silence=_used_silence,
                                 audio_loaded=_loaded_from_client,
                                 audio_prefetched=_audio_prefetched,
@@ -2899,6 +3047,17 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         _ready_key = str(_turn_id or _source_audio_chunk_idx)
                         if _ready_key not in _first_non_silent_audio_ready_keys:
                             _first_non_silent_audio_ready_keys.add(_ready_key)
+                            _first_non_silent = _first_non_silent_audio_frame(
+                                chunk_audio_data,
+                                sample_rate=sample_rate,
+                                fps=fps,
+                            )
+                            _first_non_silent = _first_non_silent or {
+                                "frame_idx": 0,
+                                "pts": 0.0,
+                                "rms": round(_input_rms, 8),
+                                "peak": round(_input_peak, 8),
+                            }
                             emit_chunk_timeline(
                                 _chunk_timeline_path,
                                 "worker_first_non_silent_audio_ready",
@@ -2907,11 +3066,17 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                                     meta=_trace_meta,
                                     chunk_idx=chunk_idx,
                                     audio_chunk_idx=_source_audio_chunk_idx,
-                                    pts=_chunk_pts_ms,
+                                    pts=round(
+                                        _chunk_pts_ms
+                                        + float(_first_non_silent.get("pts") or 0.0),
+                                        3,
+                                    ),
                                     wall_clock=time.time(),
                                     audio_samples=int(len(chunk_audio_data)),
-                                    rms=_audio_chunk_meta.get("rms"),
-                                    peak=_audio_chunk_meta.get("peak"),
+                                    frame_idx=_first_non_silent.get("frame_idx"),
+                                    rms=_first_non_silent.get("rms"),
+                                    peak=_first_non_silent.get("peak"),
+                                    wall_ms=int(round(time.time() * 1000.0)),
                                     **_audio_queue_stats,
                                     **_video_queue_stats,
                                 ),
@@ -3048,6 +3213,162 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 _timing_parts.append(
                     ("vae+cc+motion", time.perf_counter() - _stage_start)
                 )
+                _generated_video_frames = int(chunk_frames.shape[2])
+                _first_audio_pts = _chunk_pts_ms
+                _first_video_pts = _chunk_pts_ms
+                _last_audio_pts = round(
+                    _first_audio_pts + max(0.0, _input_audio_ms - 1000.0 / max(fps, 1)),
+                    3,
+                )
+                _last_video_pts = round(
+                    _first_video_pts
+                    + max(0, _generated_video_frames - 1)
+                    * 1000.0
+                    / max(fps, 1),
+                    3,
+                )
+                _skip_stream_push = False
+                _skip_push_reason = None
+                _dropped_filler_stats = {
+                    "dropped_filler_chunks": 0,
+                    "dropped_filler_audio_ms": 0.0,
+                    "dropped_filler_video_frames": 0,
+                    "first_dropped_pts": None,
+                    "last_dropped_pts": None,
+                }
+                _real_audio_after_filler_idx = None
+                _real_audio_after_filler_skipped = 0
+                if _is_filler_chunk:
+                    _current_generation_audio_idx = (
+                        _source_audio_chunk_idx
+                        if _source_audio_chunk_idx is not None
+                        else audio_chunk_idx
+                    )
+                    if _session_audio_chunk_is_real(session_dir, audio_chunk_idx):
+                        _real_audio_after_filler_idx = audio_chunk_idx
+                    else:
+                        (
+                            _real_audio_after_filler_idx,
+                            _real_audio_after_filler_skipped,
+                        ) = _find_pending_real_audio_after_fillers(
+                            session_dir,
+                            audio_chunk_idx,
+                            _max_filler_skip_chunks,
+                        )
+                    if _real_audio_after_filler_idx is not None:
+                        _skip_stream_push = True
+                        _skip_push_reason = (
+                            "real_audio_arrived_during_filler_generation"
+                        )
+                        _elapsed_generation_ms = round(
+                            (time.monotonic() - _chunk_monotonic_start) * 1000.0,
+                            3,
+                        )
+                        if _timeline_rank0:
+                            _common_preempt_fields = compact_chunk_trace_fields(
+                                session_id=_session_id,
+                                meta=_trace_meta,
+                                chunk_idx=chunk_idx,
+                                audio_chunk_idx=_source_audio_chunk_idx,
+                                pts=_chunk_pts_ms,
+                                wall_clock=time.time(),
+                                current_session_chunk=chunk_idx,
+                                current_audio_chunk_idx=_current_generation_audio_idx,
+                                current_chunk_type=(
+                                    "silence" if _used_silence else "audio"
+                                ),
+                                is_prefetched=_audio_prefetched,
+                                elapsed_current_generation_ms=_elapsed_generation_ms,
+                                reason=_skip_push_reason,
+                                next_real_audio_chunk_idx=_real_audio_after_filler_idx,
+                                skipped_filler_chunks=_real_audio_after_filler_skipped,
+                                first_audio_pts=_first_audio_pts,
+                                last_audio_pts=_last_audio_pts,
+                                first_video_pts=_first_video_pts,
+                                last_video_pts=_last_video_pts,
+                                **_audio_queue_stats,
+                                **_video_queue_stats,
+                            )
+                            emit_chunk_timeline(
+                                _chunk_timeline_path,
+                                "real_audio_received_while_generating_filler",
+                                **_common_preempt_fields,
+                            )
+                            _cancel_fields = dict(_common_preempt_fields)
+                            _cancel_fields["reason"] = (
+                                "non_interruptible_gpu_generation_finished_before_cancel"
+                            )
+                            emit_chunk_timeline(
+                                _chunk_timeline_path,
+                                "filler_generation_cancelled",
+                                **_cancel_fields,
+                                cancelled=False,
+                            )
+                        _dropped_filler_stats = _drop_queued_filler_chunks(
+                            _stream_pusher,
+                            reason=_skip_push_reason,
+                        )
+                        if _timeline_rank0:
+                            emit_chunk_timeline(
+                                _chunk_timeline_path,
+                                "queued_filler_dropped",
+                                **compact_chunk_trace_fields(
+                                    session_id=_session_id,
+                                    meta=_trace_meta,
+                                    chunk_idx=chunk_idx,
+                                    audio_chunk_idx=_source_audio_chunk_idx,
+                                    pts=_chunk_pts_ms,
+                                    wall_clock=time.time(),
+                                    current_session_chunk=chunk_idx,
+                                    current_audio_chunk_idx=(
+                                        _current_generation_audio_idx
+                                    ),
+                                    current_chunk_type=(
+                                        "silence" if _used_silence else "audio"
+                                    ),
+                                    is_prefetched=_audio_prefetched,
+                                    elapsed_current_generation_ms=(
+                                        _elapsed_generation_ms
+                                    ),
+                                    reason=_skip_push_reason,
+                                    **_dropped_filler_stats,
+                                    **_audio_queue_stats,
+                                    **_video_queue_stats,
+                                ),
+                            )
+                            emit_chunk_timeline(
+                                _chunk_timeline_path,
+                                "filler_generated_but_not_pushed",
+                                **compact_chunk_trace_fields(
+                                    session_id=_session_id,
+                                    meta=_trace_meta,
+                                    chunk_idx=chunk_idx,
+                                    audio_chunk_idx=_source_audio_chunk_idx,
+                                    pts=_chunk_pts_ms,
+                                    wall_clock=time.time(),
+                                    current_session_chunk=chunk_idx,
+                                    current_audio_chunk_idx=(
+                                        _current_generation_audio_idx
+                                    ),
+                                    current_chunk_type=(
+                                        "silence" if _used_silence else "audio"
+                                    ),
+                                    is_prefetched=_audio_prefetched,
+                                    elapsed_current_generation_ms=(
+                                        _elapsed_generation_ms
+                                    ),
+                                    reason=_skip_push_reason,
+                                    generated_audio_ms=_input_audio_ms,
+                                    generated_video_frames=_generated_video_frames,
+                                    first_audio_pts=_first_audio_pts,
+                                    last_audio_pts=_last_audio_pts,
+                                    first_video_pts=_first_video_pts,
+                                    last_video_pts=_last_video_pts,
+                                    **_dropped_filler_stats,
+                                    **_audio_queue_stats,
+                                    **_video_queue_stats,
+                                ),
+                            )
                 # Session mode: frames are already streamed via fMP4,
                 # skip accumulating on GPU to avoid OOM on long sessions.
                 if not is_session:
@@ -3061,21 +3382,30 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     except Exception:
                         pass
                 _stage_start = time.perf_counter()
-                self._save_streaming_frames(
-                    chunk_frames, chunk_idx, _frame_dir, _frame_executor,
-                    _frame_futures, _frames_per_chunk,
-                    rtmp_pusher=_stream_pusher, chunk_audio_data=chunk_audio_data,
-                    timeline_path=_chunk_timeline_path,
-                    audio_chunk_idx=_source_audio_chunk_idx,
-                    used_silence=_used_silence,
-                    audio_loaded=_loaded_from_client,
-                    audio_prefetched=_audio_prefetched,
-                    chunk_source=_chunk_source,
-                    is_filler=_is_filler_chunk,
-                    turn_id=_turn_id,
-                    session_id=_session_id,
-                    audio_chunk_meta=_trace_meta,
-                )
+                if not _skip_stream_push:
+                    self._save_streaming_frames(
+                        chunk_frames, chunk_idx, _frame_dir, _frame_executor,
+                        _frame_futures, _frames_per_chunk,
+                        rtmp_pusher=_stream_pusher, chunk_audio_data=chunk_audio_data,
+                        timeline_path=_chunk_timeline_path,
+                        audio_chunk_idx=_source_audio_chunk_idx,
+                        used_silence=_used_silence,
+                        audio_loaded=_loaded_from_client,
+                        audio_prefetched=_audio_prefetched,
+                        chunk_source=_chunk_source,
+                        is_filler=_is_filler_chunk,
+                        turn_id=_turn_id,
+                        session_id=_session_id,
+                        audio_chunk_meta={
+                            **_trace_meta,
+                            "audio_ms": _input_audio_ms,
+                            "video_frames": _generated_video_frames,
+                            "first_audio_pts": _first_audio_pts,
+                            "first_video_pts": _first_video_pts,
+                            "last_audio_pts": _last_audio_pts,
+                            "last_video_pts": _last_video_pts,
+                        },
+                    )
                 _timing_parts.append(
                     ("stream", time.perf_counter() - _stage_start)
                 )
@@ -3094,6 +3424,12 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         )
                         _prefetched_result = None
                     _audio_prefetch_future = None
+                    if (
+                        _skip_stream_push
+                        and _prefetched_result is not None
+                        and _prefetched_result[2]
+                    ):
+                        _prefetched_result = None
 
                 _stage_start = time.perf_counter()
                 _t_chunk = time.time() - chunk_start
@@ -3128,6 +3464,19 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                                 pts=_chunk_pts_ms,
                                 wall_clock=time.time(),
                                 total_ms=round(_t_chunk * 1000, 3),
+                                generate_ms=round(_t_chunk * 1000, 3),
+                                session_chunk_idx=chunk_idx,
+                                input_audio_ms=_input_audio_ms,
+                                input_rms=round(_input_rms, 8),
+                                input_peak=round(_input_peak, 8),
+                                audio_ms=_input_audio_ms,
+                                video_frames=_generated_video_frames,
+                                first_audio_pts=_first_audio_pts,
+                                first_video_pts=_first_video_pts,
+                                last_audio_pts=_last_audio_pts,
+                                last_video_pts=_last_video_pts,
+                                stream_skipped=_skip_stream_push,
+                                skip_push_reason=_skip_push_reason,
                                 timings={
                                     name: round(duration * 1000, 3)
                                     for name, duration in _timing_parts
@@ -3161,7 +3510,16 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         used_silence=_used_silence,
                         audio_loaded=_loaded_from_client,
                         audio_prefetched=_audio_prefetched,
+                        stream_skipped=_skip_stream_push,
+                        skip_push_reason=_skip_push_reason,
                         total_ms=round(_t_chunk * 1000, 3),
+                        generate_ms=round(_t_chunk * 1000, 3),
+                        audio_ms=_input_audio_ms,
+                        video_frames=_generated_video_frames,
+                        first_audio_pts=_first_audio_pts,
+                        first_video_pts=_first_video_pts,
+                        last_audio_pts=_last_audio_pts,
+                        last_video_pts=_last_video_pts,
                         timings={
                             name: round(duration * 1000, 3)
                             for name, duration in _timing_parts
