@@ -638,6 +638,7 @@ def _drain_worker_queue(
                 chunk_idx=chunk_idx,
                 audio_chunk_idx=audio_chunk_idx,
                 pts=a_ts,
+                pending_frames=pending_frames,
             ),
             used_silence=meta.get("used_silence"),
             audio_loaded=meta.get("audio_loaded"),
@@ -646,7 +647,6 @@ def _drain_worker_queue(
             audio_samples=int(len(audio_int16)) if audio_int16 is not None else 0,
             video_pts_ms=v_ts,
             audio_pts_ms=a_ts,
-            pending_frames=pending_frames,
         )
         first_non_silent_audio_pushed = False
         for i in range(num_frames):
@@ -696,10 +696,10 @@ def _drain_worker_queue(
                         frame_idx=i,
                         pending_frames=pending_frames,
                         error_message=str(exc),
+                        error_code=type(exc).__name__,
                         message=str(exc),
+                        media="video",
                     ),
-                    media="video",
-                    error_code=type(exc).__name__,
                 )
                 raise
             if i == 0:
@@ -804,10 +804,10 @@ def _drain_worker_queue(
                             peak=audio_stats.get("peak"),
                             pending_frames=pending_frames,
                             error_message=str(exc),
+                            error_code=type(exc).__name__,
                             message=str(exc),
+                            media="audio",
                         ),
-                        media="audio",
-                        error_code=type(exc).__name__,
                     )
                     raise
                 if i == 0:
