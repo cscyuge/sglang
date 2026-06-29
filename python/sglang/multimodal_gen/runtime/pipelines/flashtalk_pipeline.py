@@ -2566,6 +2566,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 os.path.normpath(session_dir)
             )
             _timeline_rank0 = get_world_rank() == 0
+            _audio_delta_mode = bool(batch.extra.get("audio_delta_mode"))
             _silence_samples = slice_len * sample_rate // fps  # 17920
             _chunk_wall_time = slice_len / fps  # ~1.12s
             _end_path = os.path.join(session_dir, "end")
@@ -2577,6 +2578,10 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
             _session_audio_grace_poll_s = max(
                 0.005,
                 float(os.environ.get("FLASHTALK_SESSION_AUDIO_GRACE_POLL_S", "0.01")),
+            )
+            _audio_delta_wait_s = max(
+                0.0,
+                float(os.environ.get("FLASHTALK_AUDIO_DELTA_WAIT_S", "1.0")),
             )
             _max_filler_skip_chunks = max(
                 0,
@@ -2611,6 +2616,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     chunk_wall_time_s=round(_chunk_wall_time, 6),
                     silence_samples=_silence_samples,
                     audio_grace_s=round(_session_audio_grace_s, 6),
+                    audio_delta_mode=_audio_delta_mode,
+                    audio_delta_wait_s=round(_audio_delta_wait_s, 6),
                     max_filler_skip_chunks=_max_filler_skip_chunks,
                     pending_filler_replace_grace_s=round(
                         _pending_filler_replace_grace_s, 6
@@ -2662,6 +2669,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 use_streaming_audio
                 and skip_audio_offload
                 and audio_encoder is not None
+                and not _audio_delta_mode
             )
             if _enable_audio_overlap:
                 _audio_prefetch_pool = ThreadPoolExecutor(
@@ -2861,13 +2869,18 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     )
                     if (
                         not os.path.exists(_audio_chunk_path)
-                        and _last_audio_loaded_from_client
+                        and (_last_audio_loaded_from_client or _audio_delta_mode)
                     ):
+                        _wait_budget_s = (
+                            _audio_delta_wait_s
+                            if _audio_delta_mode
+                            else _session_audio_grace_s
+                        )
                         _arrived, _waited_s = _wait_for_session_audio_path(
                             session_dir,
                             audio_chunk_idx,
                             _cancel_file,
-                            _session_audio_grace_s,
+                            _wait_budget_s,
                             _session_audio_grace_poll_s,
                         )
                         if _arrived and get_world_rank() == 0:

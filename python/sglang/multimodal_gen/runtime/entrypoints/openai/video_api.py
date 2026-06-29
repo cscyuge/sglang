@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
+import base64
 import fractions
 import json
 import os
@@ -343,6 +344,299 @@ def _session_audio_queue_stats(
     }
 
 
+def _audio_delta_chunk_samples() -> int:
+    return max(1, int(os.environ.get("FLASHTALK_AUDIO_DELTA_CHUNK_SAMPLES", "17920")))
+
+
+def _audio_delta_first_chunk_samples() -> int:
+    target = _audio_delta_chunk_samples()
+    value = int(os.environ.get("FLASHTALK_AUDIO_DELTA_FIRST_CHUNK_SAMPLES", "6400"))
+    if value <= 0 or value >= target:
+        return target
+    return value
+
+
+def _session_audio_delta_state(session: dict[str, Any]) -> dict[str, Any]:
+    state = session.setdefault("audio_delta_state", {})
+    state.setdefault("segments", [])
+    state.setdefault("buffered_samples", 0)
+    return state
+
+
+def _pcm16_bytes_to_float32(payload: bytes) -> np.ndarray:
+    if len(payload) % 2:
+        payload = payload[:-1]
+    if not payload:
+        return np.zeros(0, dtype=np.float32)
+    pcm = np.frombuffer(payload, dtype="<i2").astype(np.float32)
+    return np.clip(pcm / 32768.0, -1.0, 1.0).astype(np.float32, copy=False)
+
+
+def _resample_float32_mono(
+    audio: np.ndarray,
+    *,
+    src_rate: int,
+    dst_rate: int = 16000,
+) -> np.ndarray:
+    if src_rate == dst_rate or len(audio) == 0:
+        return audio.astype(np.float32, copy=False)
+    out_len = max(1, int(round(len(audio) * dst_rate / max(1, src_rate))))
+    if len(audio) == 1:
+        return np.full(out_len, float(audio[0]), dtype=np.float32)
+    src_x = np.arange(len(audio), dtype=np.float64)
+    dst_x = np.arange(out_len, dtype=np.float64) * (src_rate / dst_rate)
+    return np.interp(dst_x, src_x, audio).astype(np.float32)
+
+
+def _decode_audio_delta_payload(payload_b64: str, sample_rate: int) -> np.ndarray:
+    try:
+        raw = base64.b64decode(payload_b64 or "", validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid payload_b64: {exc}")
+    audio = _pcm16_bytes_to_float32(raw)
+    return _resample_float32_mono(audio, src_rate=max(1, sample_rate), dst_rate=16000)
+
+
+def _append_audio_delta_segment(
+    session: dict[str, Any],
+    *,
+    audio_16k: np.ndarray,
+    meta: dict[str, Any],
+) -> dict[str, Any]:
+    state = _session_audio_delta_state(session)
+    if len(audio_16k) <= 0:
+        return state
+    segment = {
+        "audio": audio_16k.astype(np.float32, copy=False),
+        "meta": dict(meta),
+    }
+    state["segments"].append(segment)
+    state["buffered_samples"] = int(state.get("buffered_samples") or 0) + len(audio_16k)
+    return state
+
+
+def _pop_audio_delta_window(
+    session: dict[str, Any],
+    target_samples: int,
+) -> tuple[np.ndarray, dict[str, Any]] | None:
+    state = _session_audio_delta_state(session)
+    if int(state.get("buffered_samples") or 0) < target_samples:
+        return None
+
+    remaining = target_samples
+    parts: list[np.ndarray] = []
+    seq_values: list[int] = []
+    pts_start_ms = None
+    pts_end_ms = None
+    sources: set[str] = set()
+    turn_ids: list[str] = []
+    response_ids: list[str] = []
+    real_samples = 0
+    silence_samples = 0
+    frame_count = 0
+
+    while remaining > 0 and state["segments"]:
+        segment = state["segments"][0]
+        audio = segment["audio"]
+        meta = segment["meta"]
+        take = min(remaining, len(audio))
+        if take <= 0:
+            state["segments"].pop(0)
+            continue
+
+        part = audio[:take]
+        parts.append(part)
+        frame_count += 1
+        is_silence = bool(meta.get("is_silence"))
+        if is_silence:
+            silence_samples += take
+        else:
+            real_samples += take
+        source = str(meta.get("source") or ("clock_silence" if is_silence else "qwen_real"))
+        sources.add(source)
+        turn_id = meta.get("turn_id")
+        if turn_id:
+            turn_ids.append(str(turn_id))
+        response_id = meta.get("response_id")
+        if response_id:
+            response_ids.append(str(response_id))
+        if meta.get("seq") is not None:
+            try:
+                seq_values.append(int(meta["seq"]))
+            except Exception:
+                pass
+        try:
+            seg_pts = float(meta.get("pts_ms"))
+        except (TypeError, ValueError):
+            seg_pts = None
+        if pts_start_ms is None and seg_pts is not None:
+            pts_start_ms = seg_pts
+        if seg_pts is not None:
+            pts_end_ms = seg_pts + take / 16.0
+
+        if take == len(audio):
+            state["segments"].pop(0)
+        else:
+            segment["audio"] = audio[take:]
+            if seg_pts is not None:
+                meta["pts_ms"] = seg_pts + take / 16.0
+            try:
+                meta["duration_ms"] = max(0.0, float(meta.get("duration_ms")) - take / 16.0)
+            except (TypeError, ValueError):
+                meta["duration_ms"] = len(segment["audio"]) / 16.0
+        remaining -= take
+
+    state["buffered_samples"] = max(
+        0, int(state.get("buffered_samples") or 0) - target_samples
+    )
+    if not parts:
+        return None
+
+    audio_array = np.concatenate(parts).astype(np.float32, copy=False)
+    if real_samples <= 0:
+        chunk_source = "audio_stream_silence"
+    elif silence_samples <= 0:
+        chunk_source = "audio_stream_real"
+    else:
+        chunk_source = "audio_stream_mixed"
+    meta = {
+        "chunk_source": chunk_source,
+        "is_filler": real_samples <= 0,
+        "audio_delta_seq_start": min(seq_values) if seq_values else None,
+        "audio_delta_seq_end": max(seq_values) if seq_values else None,
+        "audio_delta_frames": frame_count,
+        "pts_start_ms": round(pts_start_ms, 3) if pts_start_ms is not None else None,
+        "pts_end_ms": round(pts_end_ms, 3) if pts_end_ms is not None else None,
+        "real_audio_ms": round(real_samples / 16.0, 3),
+        "silence_audio_ms": round(silence_samples / 16.0, 3),
+        "fifo_level_ms": round(int(state.get("buffered_samples") or 0) / 16.0, 3),
+        "audio_delta_sources": ",".join(sorted(sources)),
+        "turn_id": turn_ids[-1] if turn_ids else None,
+        "response_id": response_ids[-1] if response_ids else None,
+        "sample_rate": 16000,
+    }
+    return audio_array, meta
+
+
+def _write_session_audio_array(
+    *,
+    session_id: str,
+    session: dict[str, Any],
+    session_dir: str,
+    chunk_timeline_path: str | None,
+    audio_array: np.ndarray,
+    chunk_meta: dict[str, Any],
+    received_monotonic_s: float,
+    worker_received_wall_ms: int,
+) -> dict[str, Any]:
+    chunk_idx = session["chunks_received"]
+    session["chunks_received"] = chunk_idx + 1
+    chunk_path = _session_audio_chunk_path(session_dir, chunk_idx)
+    queue_stats_before = _session_audio_queue_stats(session_dir)
+    chunk_meta = dict(chunk_meta)
+    chunk_meta.update(
+        {
+            "session_id": session_id,
+            "chunk_idx": chunk_idx,
+            "worker_received_wall_ms": worker_received_wall_ms,
+            "received_monotonic_s": received_monotonic_s,
+            "queue_size_before": queue_stats_before.get("queue_size"),
+            "pending_filler_chunks": queue_stats_before.get("pending_filler_chunks"),
+            "pending_filler_ms": queue_stats_before.get("pending_filler_ms"),
+            "pending_real_chunks": queue_stats_before.get("pending_real_chunks"),
+            "audio_queue_ms": queue_stats_before.get("audio_queue_ms"),
+            "samples": int(len(audio_array)),
+            "duration_s": round(len(audio_array) / 16000, 6),
+            "rms": (
+                round(float(np.sqrt(np.mean(np.square(audio_array)))), 8)
+                if len(audio_array)
+                else 0.0
+            ),
+            "peak": round(float(np.max(np.abs(audio_array))), 8)
+            if len(audio_array)
+            else 0.0,
+        }
+    )
+    if chunk_meta.get("is_filler") is None:
+        chunk_meta["is_filler"] = is_flashtalk_filler_audio_meta(chunk_meta)
+
+    write_started = time.monotonic()
+    tmp_path = chunk_path.removesuffix(".npy") + ".tmp.npy"
+    np.save(tmp_path, audio_array.astype(np.float32, copy=False))
+    write_flashtalk_audio_chunk_meta(session_dir, chunk_idx, chunk_meta)
+    os.replace(tmp_path, chunk_path)
+    write_ms = (time.monotonic() - write_started) * 1000
+    total_ms = (time.monotonic() - received_monotonic_s) * 1000
+    queue_stats_after = _session_audio_queue_stats(session_dir)
+    chunk_meta.update(
+        {
+            "queue_size_after": queue_stats_after.get("queue_size"),
+            "pending_filler_chunks": queue_stats_after.get("pending_filler_chunks"),
+            "pending_filler_ms": queue_stats_after.get("pending_filler_ms"),
+            "pending_real_chunks": queue_stats_after.get("pending_real_chunks"),
+            "audio_queue_ms": queue_stats_after.get("audio_queue_ms"),
+            "wait_after_received_ms": round(total_ms, 3),
+        }
+    )
+    write_flashtalk_audio_chunk_meta(session_dir, chunk_idx, chunk_meta)
+
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "audio_window_assemble_done",
+        **compact_chunk_trace_fields(
+            session_id=session_id,
+            meta=chunk_meta,
+            audio_chunk_idx=chunk_idx,
+            wall_clock=time.time(),
+            queue_size=queue_stats_after.get("queue_size"),
+            samples=len(audio_array),
+            duration_s=round(len(audio_array) / 16000, 6),
+            write_ms=round(write_ms, 3),
+            total_ms=round(total_ms, 3),
+            chunk_path=chunk_path,
+        ),
+    )
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "worker_chunk_enqueued",
+        **compact_chunk_trace_fields(
+            session_id=session_id,
+            meta=chunk_meta,
+            audio_chunk_idx=chunk_idx,
+            wall_clock=time.time(),
+            queue_size=queue_stats_after.get("queue_size"),
+            samples=len(audio_array),
+            duration_s=round(len(audio_array) / 16000, 6),
+            chunk_path=chunk_path,
+        ),
+    )
+    logger.info(
+        "FlashTalk audio-delta assembled session=%s chunk=%d source=%s samples=%d real=%.1fms silence=%.1fms fifo=%.1fms",
+        session_id,
+        chunk_idx,
+        chunk_meta.get("chunk_source"),
+        len(audio_array),
+        float(chunk_meta.get("real_audio_ms") or 0.0),
+        float(chunk_meta.get("silence_audio_ms") or 0.0),
+        float(chunk_meta.get("fifo_level_ms") or 0.0),
+    )
+    return {
+        "chunk_idx": chunk_idx,
+        "samples": len(audio_array),
+        "duration_s": round(len(audio_array) / 16000, 3),
+        "chunk_source": chunk_meta.get("chunk_source"),
+        "is_filler": chunk_meta.get("is_filler"),
+        "turn_id": chunk_meta.get("turn_id"),
+        "real_audio_ms": chunk_meta.get("real_audio_ms"),
+        "silence_audio_ms": chunk_meta.get("silence_audio_ms"),
+        "fifo_level_ms": chunk_meta.get("fifo_level_ms"),
+        "audio_delta_seq_start": chunk_meta.get("audio_delta_seq_start"),
+        "audio_delta_seq_end": chunk_meta.get("audio_delta_seq_end"),
+        "pts_start_ms": chunk_meta.get("pts_start_ms"),
+        "pts_end_ms": chunk_meta.get("pts_end_ms"),
+    }
+
+
 async def _cleanup_frame_dir(frame_dir: str, delay: float = 5.0) -> None:
     """Remove a streaming frame directory after a delay."""
     await asyncio.sleep(delay)
@@ -502,6 +796,7 @@ async def create_session(
     artc_token: Optional[str] = Form(None),
     artc_channel: Optional[str] = Form(None),
     artc_userid: Optional[str] = Form(None),
+    audio_delta_mode: Optional[bool] = Form(False),
 ):
     """Create a persistent generation session for live streaming.
 
@@ -581,6 +876,7 @@ async def create_session(
     batch.extra["artc_token"] = artc_token
     batch.extra["artc_channel"] = artc_channel
     batch.extra["artc_userid"] = artc_userid
+    batch.extra["audio_delta_mode"] = bool(audio_delta_mode)
 
     # Store session metadata
     session_data = {
@@ -591,6 +887,7 @@ async def create_session(
         "events_url": f"/v1/videos/{session_id}/events",
         "webrtc_url": f"/v1/videos/{session_id}/webrtc",
         "artc_channel": artc_channel,
+        "audio_delta_mode": bool(audio_delta_mode),
         "chunk_timeline_path": chunk_timeline_path,
         "created_at": int(time.time()),
         "chunks_received": 0,
@@ -603,6 +900,7 @@ async def create_session(
         session_id=session_id,
         artc_channel=artc_channel,
         artc_userid=artc_userid,
+        audio_delta_mode=bool(audio_delta_mode),
         session_dir=session_dir,
     )
 
@@ -914,6 +1212,157 @@ async def push_session_chunk(
         "turn_id": chunk_meta.get("turn_id"),
         "client_chunk_idx": chunk_meta.get("client_chunk_idx"),
         "is_first_real_chunk": chunk_meta.get("is_first_real_chunk"),
+    }
+
+
+@router.post("/sessions/{session_id}/audio-deltas")
+async def push_session_audio_delta(
+    request: Request,
+    session_id: str = Path(...),
+):
+    """Push one small PCM audio delta for scheme-B live sessions.
+
+    The endpoint receives real or clock-silence PCM frames, appends them to a
+    per-session FIFO, and assembles them into the existing ``audio_chunks``
+    files consumed by the FlashTalk session pipeline.
+    """
+    if session_id not in _SESSION_STORE:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = _SESSION_STORE[session_id]
+    if session["status"] not in ("created", "running"):
+        raise HTTPException(status_code=400, detail=f"Session is {session['status']}")
+
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON object body is required")
+
+    session_dir = _session_dir_for_id(session_id)
+    chunk_timeline_path = session.get("chunk_timeline_path") or flashtalk_chunk_timeline_path(
+        session_dir
+    )
+    received_monotonic_s = time.monotonic()
+    worker_received_wall_ms = int(round(time.time() * 1000.0))
+    sample_rate = _coerce_int(body.get("sample_rate")) or 24000
+    seq = _coerce_int(body.get("seq"))
+    pts_ms = _coerce_float(body.get("pts_ms"))
+    duration_ms = _coerce_float(body.get("duration_ms"))
+    is_silence = bool(_coerce_bool(body.get("is_silence")))
+    source = str(
+        body.get("source") or ("clock_silence" if is_silence else "qwen_real")
+    ).strip()
+    payload_b64 = body.get("payload_b64") or body.get("payload")
+    if not payload_b64:
+        if duration_ms is None or duration_ms <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="payload_b64 is required unless duration_ms silence is provided",
+            )
+        samples = max(1, int(round(sample_rate * duration_ms / 1000.0)))
+        payload_b64 = base64.b64encode(b"\x00\x00" * samples).decode("ascii")
+        is_silence = True
+        source = source or "clock_silence"
+
+    audio_16k = _decode_audio_delta_payload(str(payload_b64), sample_rate)
+    if duration_ms is None:
+        duration_ms = len(audio_16k) / 16.0
+    segment_meta = {
+        "session_id": session_id,
+        "turn_id": (str(body.get("turn_id") or "").strip() or None),
+        "response_id": (str(body.get("response_id") or "").strip() or None),
+        "seq": seq,
+        "pts_ms": pts_ms,
+        "duration_ms": round(float(duration_ms), 3),
+        "sample_rate": sample_rate,
+        "source": source,
+        "is_silence": is_silence,
+        "payload_samples_16k": int(len(audio_16k)),
+        "client_send_wall_ms": _coerce_float(body.get("client_send_wall_ms")),
+        "client_audio_lead_ms": _coerce_float(body.get("lead_ms")),
+    }
+    state = _append_audio_delta_segment(
+        session,
+        audio_16k=audio_16k,
+        meta=segment_meta,
+    )
+    fifo_level_ms = int(state.get("buffered_samples") or 0) / 16.0
+    emit_chunk_timeline(
+        chunk_timeline_path,
+        "audio_delta_received",
+        session_id=session_id,
+        seq=seq,
+        pts_ms=pts_ms,
+        duration_ms=round(float(duration_ms), 3),
+        sample_rate=sample_rate,
+        source=source,
+        is_silence=is_silence,
+        payload_samples_16k=int(len(audio_16k)),
+        fifo_level_ms=round(fifo_level_ms, 3),
+        remote_addr=request.client.host if request.client else None,
+        worker_received_wall_ms=worker_received_wall_ms,
+    )
+
+    assembled_chunks = []
+    while True:
+        target_samples = (
+            _audio_delta_first_chunk_samples()
+            if int(session.get("chunks_received") or 0) == 0
+            else _audio_delta_chunk_samples()
+        )
+        popped = _pop_audio_delta_window(session, target_samples)
+        if popped is None:
+            break
+        audio_array, window_meta = popped
+        chunk_meta = dict(window_meta)
+        chunk_meta["turn_id"] = chunk_meta.get("turn_id") or segment_meta.get("turn_id")
+        chunk_meta["response_id"] = chunk_meta.get("response_id") or segment_meta.get(
+            "response_id"
+        )
+        chunk_meta["client_audio_delta_mode"] = True
+        is_first_real_chunk = (
+            float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0
+            and int(state.get("real_chunks_assembled") or 0) == 0
+        )
+        chunk_meta["is_first_real_chunk"] = is_first_real_chunk
+        chunk_meta["allow_preempt_filler"] = float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0
+        if is_first_real_chunk:
+            chunk_meta["turn_start_policy"] = "preempt_filler_reset_pts"
+
+        emit_chunk_timeline(
+            chunk_timeline_path,
+            "audio_window_assemble_start",
+            **compact_chunk_trace_fields(
+                session_id=session_id,
+                meta=chunk_meta,
+                wall_clock=time.time(),
+                samples=len(audio_array),
+                duration_s=round(len(audio_array) / 16000, 6),
+            ),
+        )
+        assembled = _write_session_audio_array(
+            session_id=session_id,
+            session=session,
+            session_dir=session_dir,
+            chunk_timeline_path=chunk_timeline_path,
+            audio_array=audio_array,
+            chunk_meta=chunk_meta,
+            received_monotonic_s=received_monotonic_s,
+            worker_received_wall_ms=worker_received_wall_ms,
+        )
+        assembled_chunks.append(assembled)
+        if float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0:
+            state["real_chunks_assembled"] = int(state.get("real_chunks_assembled") or 0) + 1
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "seq": seq,
+        "accepted_samples_16k": int(len(audio_16k)),
+        "fifo_level_ms": round(int(state.get("buffered_samples") or 0) / 16.0, 3),
+        "assembled_chunks": assembled_chunks,
     }
 
 
