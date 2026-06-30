@@ -559,6 +559,108 @@ class ImageVAEEncodingStage(PipelineStage):
         if self.server_args.vae_cpu_offload:
             self.vae = self.vae.to("cpu")
 
+    def _encode_vae_pixels(
+        self,
+        pixels: torch.Tensor,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        vae_dtype: torch.dtype,
+        vae_autocast_enabled: bool,
+    ) -> torch.Tensor:
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=vae_dtype,
+            enabled=vae_autocast_enabled,
+        ):
+            if server_args.pipeline_config.vae_tiling:
+                self.vae.enable_tiling()
+            # if server_args.vae_sp:
+            #     self.vae.enable_parallel()
+            if not vae_autocast_enabled:
+                pixels = pixels.to(vae_dtype)
+            latent_dist: DiagonalGaussianDistribution = self.vae.encode(pixels)
+            # for auto_encoder from diffusers
+            if isinstance(latent_dist, AutoencoderKLOutput):
+                latent_dist = latent_dist.latent_dist
+
+        generator = batch.generator
+        if generator is None:
+            raise ValueError("Generator must be provided")
+
+        sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+        latents = self.retrieve_latents(latent_dist, generator, sample_mode=sample_mode)
+        latents = server_args.pipeline_config.postprocess_vae_encode(latents, self.vae)
+        normalized_latents = server_args.pipeline_config.normalize_vae_encode(
+            latents, self.vae
+        )
+        if normalized_latents is None:
+            scaling_factor, shift_factor = (
+                server_args.pipeline_config.get_decode_scale_and_shift(
+                    device=latents.device,
+                    dtype=latents.dtype,
+                    vae=self.vae,
+                )
+            )
+
+            # apply shift & scale if needed
+            if isinstance(shift_factor, torch.Tensor):
+                shift_factor = shift_factor.to(latents.device)
+
+            if isinstance(scaling_factor, torch.Tensor):
+                scaling_factor = scaling_factor.to(latents.device)
+
+            latents -= shift_factor
+            latents = latents * scaling_factor
+        else:
+            latents = normalized_latents
+        return latents
+
+    def _resolve_s2v_init_first_frame_flags(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        batch_size: int,
+    ) -> list[bool]:
+        value = batch.extra.get("init_first_frame")
+        if value is None:
+            try:
+                value = getattr(batch, "init_first_frame")
+            except AttributeError:
+                value = None
+        if value is None:
+            value = getattr(server_args.pipeline_config, "s2v_init_first_frame", False)
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().tolist()
+        if isinstance(value, (list, tuple)):
+            if len(value) != batch_size:
+                raise ValueError(
+                    "init_first_frame list length must match the VAE image batch size"
+                )
+            return [bool(item) for item in value]
+        return [bool(value)] * batch_size
+
+    def _build_s2v_motion_pixels(
+        self,
+        ref_pixels: torch.Tensor,
+        flags: list[bool],
+        motion_frames: int,
+    ) -> torch.Tensor:
+        motion_pixels = ref_pixels.new_zeros(
+            ref_pixels.shape[0],
+            ref_pixels.shape[1],
+            motion_frames,
+            ref_pixels.shape[3],
+            ref_pixels.shape[4],
+        )
+        tail_frames = min(6, motion_frames)
+        for idx, flag in enumerate(flags):
+            if flag:
+                motion_pixels[idx : idx + 1, :, -tail_frames:] = ref_pixels[
+                    idx : idx + 1
+                ].expand(-1, -1, tail_frames, -1, -1)
+        return motion_pixels
+
     def forward(
         self,
         batch: Req,
@@ -581,10 +683,20 @@ class ImageVAEEncodingStage(PipelineStage):
             images = [images]
 
         all_image_latents = []
+        all_s2v_motion_latents = []
         prepare_condition_image_latent_ids = getattr(
             server_args.pipeline_config, "prepare_condition_image_latent_ids", None
         )
         condition_latents = [] if callable(prepare_condition_image_latent_ids) else None
+        arch_config = getattr(
+            getattr(server_args.pipeline_config, "dit_config", None),
+            "arch_config",
+            None,
+        )
+        raw_motion_frames = getattr(arch_config, "motion_frames", None)
+        should_prepare_s2v_motion = (
+            raw_motion_frames is not None and batch.extra.get("motion_latents") is None
+        )
         for image in images:
             image = self.preprocess(
                 image,
@@ -619,62 +731,13 @@ class ImageVAEEncodingStage(PipelineStage):
                 vae_dtype != torch.float32
             ) and not server_args.disable_autocast
 
-            # Encode Image
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=vae_dtype,
-                enabled=vae_autocast_enabled,
-            ):
-                if server_args.pipeline_config.vae_tiling:
-                    self.vae.enable_tiling()
-                # if server_args.vae_sp:
-                #     self.vae.enable_parallel()
-                if not vae_autocast_enabled:
-                    video_condition = video_condition.to(vae_dtype)
-                latent_dist: DiagonalGaussianDistribution = self.vae.encode(
-                    video_condition
-                )
-                # for auto_encoder from diffusers
-                if isinstance(latent_dist, AutoencoderKLOutput):
-                    latent_dist = latent_dist.latent_dist
-
-            generator = batch.generator
-            if generator is None:
-                raise ValueError("Generator must be provided")
-
-            sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
-
-            latent_condition = self.retrieve_latents(
-                latent_dist, generator, sample_mode=sample_mode
+            latent_condition = self._encode_vae_pixels(
+                video_condition,
+                batch,
+                server_args,
+                vae_dtype=vae_dtype,
+                vae_autocast_enabled=vae_autocast_enabled,
             )
-            latent_condition = server_args.pipeline_config.postprocess_vae_encode(
-                latent_condition, self.vae
-            )
-            normalized_latent_condition = (
-                server_args.pipeline_config.normalize_vae_encode(
-                    latent_condition, self.vae
-                )
-            )
-            if normalized_latent_condition is None:
-                scaling_factor, shift_factor = (
-                    server_args.pipeline_config.get_decode_scale_and_shift(
-                        device=latent_condition.device,
-                        dtype=latent_condition.dtype,
-                        vae=self.vae,
-                    )
-                )
-
-                # apply shift & scale if needed
-                if isinstance(shift_factor, torch.Tensor):
-                    shift_factor = shift_factor.to(latent_condition.device)
-
-                if isinstance(scaling_factor, torch.Tensor):
-                    scaling_factor = scaling_factor.to(latent_condition.device)
-
-                latent_condition -= shift_factor
-                latent_condition = latent_condition * scaling_factor
-            else:
-                latent_condition = normalized_latent_condition
 
             if condition_latents is not None:
                 condition_latents.append(latent_condition)
@@ -684,7 +747,38 @@ class ImageVAEEncodingStage(PipelineStage):
             )
             all_image_latents.append(image_latent)
 
+            if should_prepare_s2v_motion:
+                if isinstance(raw_motion_frames, (list, tuple)):
+                    motion_frames = int(raw_motion_frames[0])
+                else:
+                    motion_frames = int(raw_motion_frames)
+                flags = self._resolve_s2v_init_first_frame_flags(
+                    batch,
+                    server_args,
+                    image.shape[0],
+                )
+                motion_pixels = self._build_s2v_motion_pixels(
+                    image,
+                    flags,
+                    motion_frames,
+                )
+                all_s2v_motion_latents.append(
+                    self._encode_vae_pixels(
+                        motion_pixels,
+                        batch,
+                        server_args,
+                        vae_dtype=vae_dtype,
+                        vae_autocast_enabled=vae_autocast_enabled,
+                    )
+                )
+
         batch.image_latent = torch.cat(all_image_latents, dim=1)
+        if all_s2v_motion_latents:
+            if len(all_s2v_motion_latents) != 1:
+                raise ValueError(
+                    "Wan S2V init_first_frame currently expects one reference image"
+                )
+            batch.extra["motion_latents"] = all_s2v_motion_latents[0]
         if condition_latents is not None:
             prepare_condition_image_latent_ids(condition_latents, batch)
 

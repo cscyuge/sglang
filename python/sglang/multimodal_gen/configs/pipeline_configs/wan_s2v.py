@@ -36,6 +36,8 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     warp_denoising_step: bool = True
     s2v_control_policy: str = "lookahead"
     s2v_audio_lookahead_frames: int = 2
+    s2v_init_first_frame: bool = False
+    s2v_anchor_first_frame: bool = False
     cache_audio_embeddings: bool = True
     stream_r1_generator_checkpoint_path: str | None = None
     use_stream_r1_ema: bool = True

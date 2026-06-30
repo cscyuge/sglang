@@ -28,6 +28,8 @@ class WanS2VSamplingParams(SamplingParams):
     warp_denoising_step: bool | None = None
     control_policy: str | None = None
     audio_lookahead_frames: int | None = None
+    init_first_frame: bool | list[bool] | None = None
+    anchor_first_frame: bool | None = None
     cache_audio_embeddings: bool | None = None
     use_stream_r1_ema: bool | None = None
     disable_sp_frame_padding: bool = True
@@ -89,6 +91,8 @@ class WanS2VSamplingParams(SamplingParams):
             "warp_denoising_step",
             "control_policy",
             "audio_lookahead_frames",
+            "init_first_frame",
+            "anchor_first_frame",
             "cache_audio_embeddings",
             "use_stream_r1_ema",
         ):

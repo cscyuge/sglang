@@ -1168,6 +1168,22 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             else:
                 current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
 
+        anchor_first_frame = bool(
+            _resolve_request_value(
+                batch,
+                self.server_args,
+                "anchor_first_frame",
+                "s2v_anchor_first_frame",
+                False,
+            )
+        )
+        if anchor_first_frame and block_start == 0:
+            current_latents = current_latents.clone()
+            current_latents[:, :, :1] = block_bundle.ref_latents.to(
+                device=current_latents.device,
+                dtype=current_latents.dtype,
+            )
+
         return current_latents
 
     @torch.no_grad()
