@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v import WanS2VTransformer3DModel
 from sglang.multimodal_gen.runtime.models.encoders.wav2vec2 import Wav2Vec2AudioEncoder
+from sglang.multimodal_gen.runtime.models.schedulers.wan_s2v_scheduler import (
+    build_wan_s2v_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines.flashtalk_pipeline import (
     FlashTalkPipeline,
     _apply_fp8_quant_to_model,
@@ -28,9 +31,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
-    FlowUniPCMultistepScheduler,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     DecodingStage,
     ImageVAEEncodingStage,
@@ -77,8 +77,10 @@ class WanS2VPipeline(FlashTalkPipeline):
     ]
 
     def initialize_pipeline(self, server_args: ServerArgs):
-        self.modules["scheduler"] = FlowUniPCMultistepScheduler(
-            shift=server_args.pipeline_config.flow_shift
+        flow_shift = server_args.pipeline_config.flow_shift
+        self.modules["scheduler"] = build_wan_s2v_scheduler(
+            bool(getattr(server_args.pipeline_config, "stream_r1_mode", False)),
+            flow_shift,
         )
 
     def load_modules(

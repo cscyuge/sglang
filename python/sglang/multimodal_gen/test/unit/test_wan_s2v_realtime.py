@@ -12,6 +12,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import (
     WanS2VPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_self_forcing_flow_match import (
+    SelfForcingFlowMatchScheduler,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.wan_s2v_scheduler import (
+    build_wan_s2v_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime import (
     AudioRingBuffer,
     _wait_for_session_audio_chunk,
@@ -99,6 +108,29 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
 
         self.assertEqual(params.guidance_scale, 1.0)
         self.assertIsNone(params.negative_prompt)
+
+    def test_stream_r1_config_defaults_to_baseline_flow_shift(self):
+        self.assertEqual(WanS2VPipelineConfig().flow_shift, 3.0)
+        self.assertEqual(WanS2VPipelineConfig(stream_r1_mode=True).flow_shift, 5.0)
+
+    def test_stream_r1_scheduler_matches_baseline_timesteps(self):
+        scheduler = build_wan_s2v_scheduler(stream_r1_mode=True, flow_shift=5.0)
+
+        self.assertIsInstance(scheduler, SelfForcingFlowMatchScheduler)
+        scheduler.set_timesteps(1000, shift=5.0)
+        timesteps = scheduler.timesteps[[0, 250, 500, 750]]
+        torch.testing.assert_close(
+            timesteps,
+            torch.tensor([1000.0, 937.5, 833.3333, 625.0]),
+            rtol=1e-4,
+            atol=1e-3,
+        )
+
+    def test_non_stream_r1_scheduler_keeps_default_scheduler(self):
+        self.assertIsInstance(
+            build_wan_s2v_scheduler(stream_r1_mode=False, flow_shift=3.0),
+            FlowUniPCMultistepScheduler,
+        )
 
     def test_init_first_frame_builds_motion_pixels(self):
         stage = object.__new__(ImageVAEEncodingStage)

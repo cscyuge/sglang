@@ -1249,12 +1249,22 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 dtype=dit_dtype,
                 autocast_enabled=autocast_enabled,
             )
-            # Cross-attn K/V cache: one empty dict per transformer block.
-            # First forward call populates each with {"k": ..., "v": ...};
-            # subsequent passes reuse the cached projections.
-            crossattn_cache: list[dict] = [
-                {} for _ in range(len(self.transformer.blocks))
-            ]
+            use_crossattn_cache = bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "stream_r1_crossattn_cache",
+                    "stream_r1_crossattn_cache",
+                    False,
+                )
+            )
+            # Keep Stream-R1 baseline parity by default: the original
+            # benchmark path does not pass a cross-attention cache.
+            crossattn_cache: list[dict] | None = (
+                [{} for _ in range(len(self.transformer.blocks))]
+                if use_crossattn_cache
+                else None
+            )
             for block_start in range(0, latent_frames, num_frame_per_block):
                 block_end = block_start + num_frame_per_block
                 block_bundle = bundle.slice(

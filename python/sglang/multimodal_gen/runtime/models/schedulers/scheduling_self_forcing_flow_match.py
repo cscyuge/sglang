@@ -57,8 +57,12 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         num_inference_steps=100,
         denoising_strength=1.0,
         return_dict=False,
+        device=None,
+        shift=None,
         **kwargs,
     ):
+        if shift is not None:
+            self.shift = shift
         sigma_start = (
             self.sigma_min + (self.sigma_max - self.sigma_min) * denoising_strength
         )
@@ -76,6 +80,9 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
         self.timesteps = self.sigmas * self.num_train_timesteps
+        if device is not None:
+            self.sigmas = self.sigmas.to(device)
+            self.timesteps = self.timesteps.to(device)
 
     def step(
         self,

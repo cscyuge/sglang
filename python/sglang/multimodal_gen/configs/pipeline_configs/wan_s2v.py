@@ -22,13 +22,14 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
         default_factory=lambda: (_flashtalk_t5_config(),)
     )
     use_cfg: bool = True
-    flow_shift: float | None = 3.0
+    flow_shift: float | None = None
     audio_encoder_precision: str = "fp32"
     audio_encoder_path: str | None = None
     max_area: int = 1024 * 704
     force_condition_image_to_requested_size: bool = True
     stream_r1_mode: bool = False
     stream_r1_kv_cache: bool = False
+    stream_r1_crossattn_cache: bool = False
     num_frame_per_block: int = 7
     local_attn_size: int = 9
     sink_size: int = 3
@@ -54,6 +55,8 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
         super().__post_init__()
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+        if self.flow_shift is None:
+            self.flow_shift = 5.0 if self.stream_r1_mode else 3.0
         if self.num_frame_per_block <= 0:
             raise ValueError("num_frame_per_block must be positive")
         if self.local_attn_size <= 0:
