@@ -40,7 +40,7 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     s2v_anchor_first_frame: bool = False
     cache_audio_embeddings: bool = True
     stream_r1_generator_checkpoint_path: str | None = None
-    use_stream_r1_ema: bool = True
+    use_stream_r1_ema: bool = False
     wan_s2v_realtime: bool = True
     wan_s2v_realtime_audio_window_seconds: float = 8.0
     wan_s2v_idle_policy: str = "hold"

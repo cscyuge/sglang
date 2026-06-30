@@ -51,6 +51,20 @@ class TestStreamR1CheckpointLoader(unittest.TestCase):
         self.assertEqual(source_key, "generator")
         torch.testing.assert_close(state_dict["weight"], torch.zeros(1))
 
+    def test_defaults_to_generator_checkpoint(self):
+        module = TinyModule()
+        checkpoint_path = self._checkpoint_path(
+            {
+                "generator_ema": {"weight": torch.ones(2, 2)},
+                "generator": {"weight": torch.full((2, 2), 2.0)},
+            }
+        )
+
+        info = load_stream_r1_generator_checkpoint(module, checkpoint_path)
+
+        self.assertEqual(info.source_key, "generator")
+        torch.testing.assert_close(module.weight, torch.full((2, 2), 2.0))
+
     def test_cleans_wrapper_prefixes_and_skips_metadata(self):
         cleaned, skipped = clean_stream_r1_state_dict_keys(
             {

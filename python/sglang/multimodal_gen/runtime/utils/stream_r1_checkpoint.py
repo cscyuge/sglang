@@ -123,7 +123,7 @@ def load_stream_r1_generator_checkpoint(
     module: nn.Module,
     checkpoint_path: str,
     *,
-    use_ema: bool = True,
+    use_ema: bool = False,
     strict: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
 ) -> StreamR1CheckpointLoadInfo:

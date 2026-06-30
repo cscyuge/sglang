@@ -329,7 +329,7 @@ class WanS2VPipeline(FlashTalkPipeline):
                 model,
                 stream_r1_checkpoint_path,
                 use_ema=bool(
-                    getattr(server_args.pipeline_config, "use_stream_r1_ema", True)
+                    getattr(server_args.pipeline_config, "use_stream_r1_ema", False)
                 ),
                 strict=False,
                 param_names_mapping=get_param_names_mapping(model.param_names_mapping),
