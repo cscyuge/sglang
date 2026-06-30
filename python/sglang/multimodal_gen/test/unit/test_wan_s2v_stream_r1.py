@@ -619,18 +619,18 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
             frame_seq_length=1,
             local_attn_size=5,
             sink_size=1,
-            current_start=2,
+            current_start=4,
         )
-        cached_key, cached_value = self._indexed_kv([0, 2, 3, 4, 5])
+        cached_key, cached_value = self._indexed_kv([0, 4, 5, 6, 7])
         cached_key = cached_key.expand(1, -1, 2, 4).contiguous()
         cached_value = cached_value.expand(1, -1, 2, 4).contiguous()
         noisy_view = WanS2VStreamR1NoisyKVCacheView(
             key=cached_key,
             value=cached_value,
-            global_end_index=6,
+            global_end_index=8,
             local_end_index=5,
-            local_start=2,
-            local_end=6,
+            local_start=4,
+            local_end=8,
         )
         condition_key = torch.arange(16, dtype=torch.float32).view(1, 2, 2, 4)
         condition_value = condition_key + 100
@@ -639,14 +639,16 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
             value=torch.cat([cached_value, condition_value], dim=1),
             cached_noisy_seq_len=5,
             condition_seq_len=2,
-            global_end_index=6,
+            global_end_index=8,
             local_end_index=5,
-            local_start=2,
-            local_end=6,
+            local_start=4,
+            local_end=8,
         )
         plan = build_wan_s2v_stream_r1_mixed_kv_attention_plan(
             noisy_view, mixed, update
         )
+        groups = plan.query_groups(torch.device("cpu"))
+        self.assertEqual([group.kv_ranges for group in groups], [((0, 7),), ((1, 7),)])
         query = torch.randn(1, 6, 2, 4)
         scale = 0.5
 
@@ -694,6 +696,8 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         self.assertEqual(workspace.max_seqlen_q, 2)
         self.assertGreaterEqual(workspace.max_seqlen_k, 4)
         self.assertEqual(len(workspace.segments), 3)
+        self.assertTrue(workspace.query_matches_input_order)
+        self.assertEqual(workspace.query.data_ptr(), query.data_ptr())
 
 
 class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):

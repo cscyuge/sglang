@@ -212,6 +212,14 @@ class WanS2VStreamR1AttentionPlan:
         )
 
     def query_groups(self, device: torch.device) -> list["WanS2VStreamR1QueryGroup"]:
+        if (
+            self.noisy_kv_absolute_index is not None
+            and self.query_block_tokens == self.noisy_query_seq_len
+            and self.local_tokens >= self.noisy_kv_seq_len
+            and self.current_start % self.noisy_query_seq_len == 0
+        ):
+            return self._single_noisy_block_query_groups(device)
+
         groups: list[WanS2VStreamR1QueryGroup] = []
         noisy_kv_abs = self.noisy_kv_index(device)
         condition_indices = torch.arange(
@@ -275,6 +283,50 @@ class WanS2VStreamR1AttentionPlan:
             )
         return groups
 
+    def _single_noisy_block_query_groups(
+        self,
+        device: torch.device,
+    ) -> list["WanS2VStreamR1QueryGroup"]:
+        groups: list[WanS2VStreamR1QueryGroup] = []
+        full_kv_indices = torch.arange(
+            self.kv_seq_len,
+            dtype=torch.long,
+            device=device,
+        )
+        groups.append(
+            WanS2VStreamR1QueryGroup(
+                query_start=0,
+                query_end=self.noisy_query_seq_len,
+                kv_indices=full_kv_indices,
+                kv_ranges=((0, self.kv_seq_len),),
+            )
+        )
+
+        if self.condition_query_seq_len > 0:
+            if self.condition_queries_use_current_noisy_only:
+                condition_kv_start = max(
+                    0,
+                    self.noisy_kv_seq_len - self.noisy_query_seq_len,
+                )
+            else:
+                condition_kv_start = 0
+            condition_kv_indices = torch.arange(
+                condition_kv_start,
+                self.kv_seq_len,
+                dtype=torch.long,
+                device=device,
+            )
+            groups.append(
+                WanS2VStreamR1QueryGroup(
+                    query_start=self.noisy_query_seq_len,
+                    query_end=self.query_seq_len,
+                    kv_indices=condition_kv_indices,
+                    kv_ranges=((condition_kv_start, self.kv_seq_len),),
+                )
+            )
+
+        return groups
+
     def to_dense_mask(self, device: torch.device) -> torch.Tensor:
         """Export the compact plan as the current dense bool mask reference."""
 
@@ -293,6 +345,7 @@ class WanS2VStreamR1QueryGroup:
     query_start: int
     query_end: int
     kv_indices: torch.Tensor
+    kv_ranges: tuple[tuple[int, int], ...] | None = None
 
     @property
     def query_len(self) -> int:
@@ -320,6 +373,52 @@ class WanS2VStreamR1PackedAttentionWorkspace:
     max_seqlen_q: int
     max_seqlen_k: int
     segments: tuple[WanS2VStreamR1PackedAttentionSegment, ...]
+    query_matches_input_order: bool = False
+
+
+def _query_groups_match_input_order(
+    query_groups: list[WanS2VStreamR1QueryGroup],
+    query_seq_len: int,
+) -> bool:
+    query_start = 0
+    for group in query_groups:
+        if group.query_start != query_start:
+            return False
+        if group.query_end <= group.query_start:
+            return False
+        query_start = group.query_end
+    return query_start == query_seq_len
+
+
+def _flatten_query_for_packed_attention(query: torch.Tensor) -> torch.Tensor:
+    if query.is_contiguous():
+        return query.view(
+            query.shape[0] * query.shape[1], query.shape[2], query.shape[3]
+        )
+    return query.reshape(
+        query.shape[0] * query.shape[1],
+        query.shape[2],
+        query.shape[3],
+    ).contiguous()
+
+
+def _select_packed_kv_part(
+    tensor: torch.Tensor,
+    batch_index: int,
+    group: WanS2VStreamR1QueryGroup,
+) -> torch.Tensor:
+    if group.kv_ranges:
+        parts = [
+            tensor[batch_index, range_start:range_end]
+            for range_start, range_end in group.kv_ranges
+            if range_end > range_start
+        ]
+        if not parts:
+            raise ValueError("packed attention KV ranges must be non-empty")
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=0)
+    return tensor[batch_index].index_select(0, group.kv_indices)
 
 
 def build_wan_s2v_stream_r1_packed_attention_workspace(
@@ -349,16 +448,23 @@ def build_wan_s2v_stream_r1_packed_attention_workspace(
     max_q = 0
     max_k = 0
     query_groups = plan.query_groups(query.device)
+    query_matches_input_order = _query_groups_match_input_order(
+        query_groups,
+        plan.query_seq_len,
+    )
     for batch_index in range(query.shape[0]):
         for group in query_groups:
             if group.query_len <= 0:
                 raise ValueError("packed attention query groups must be non-empty")
             if group.kv_indices.numel() <= 0:
                 raise ValueError("packed attention KV groups must be non-empty")
-            q_part = query[batch_index, group.query_start : group.query_end]
-            k_part = key[batch_index].index_select(0, group.kv_indices)
-            v_part = value[batch_index].index_select(0, group.kv_indices)
-            query_parts.append(q_part)
+            k_part = _select_packed_kv_part(key, batch_index, group)
+            v_part = _select_packed_kv_part(value, batch_index, group)
+            if not query_matches_input_order:
+                q_part = query[batch_index, group.query_start : group.query_end]
+                query_parts.append(q_part)
+            else:
+                q_part = query[batch_index, group.query_start : group.query_end]
             key_parts.append(k_part)
             value_parts.append(v_part)
 
@@ -383,7 +489,11 @@ def build_wan_s2v_stream_r1_packed_attention_workspace(
             )
 
     return WanS2VStreamR1PackedAttentionWorkspace(
-        query=torch.cat(query_parts, dim=0).contiguous(),
+        query=(
+            _flatten_query_for_packed_attention(query)
+            if query_matches_input_order
+            else torch.cat(query_parts, dim=0).contiguous()
+        ),
         key=torch.cat(key_parts, dim=0).contiguous(),
         value=torch.cat(value_parts, dim=0).contiguous(),
         cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=query.device),
@@ -391,6 +501,7 @@ def build_wan_s2v_stream_r1_packed_attention_workspace(
         max_seqlen_q=max_q,
         max_seqlen_k=max_k,
         segments=tuple(segments),
+        query_matches_input_order=query_matches_input_order,
     )
 
 
@@ -399,6 +510,8 @@ def _unpack_wan_s2v_stream_r1_packed_attention(
     workspace: WanS2VStreamR1PackedAttentionWorkspace,
     output_shape: torch.Size,
 ) -> torch.Tensor:
+    if workspace.query_matches_input_order:
+        return packed_output.reshape(output_shape)
     output = packed_output.new_empty(output_shape)
     for segment in workspace.segments:
         output[
