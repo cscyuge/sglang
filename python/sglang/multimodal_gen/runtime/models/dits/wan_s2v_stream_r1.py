@@ -47,6 +47,23 @@ def _stream_r1_attention_backend() -> str:
     )
 
 
+def _stream_r1_flash_attention_version() -> str:
+    value = (
+        os.getenv("SGLANG_STREAM_R1_FLASH_ATTENTION_VERSION", "sm120").strip().lower()
+    )
+    value = value.replace("-", "_")
+    if value in ("3", "fa3"):
+        return "3"
+    if value in ("4", "fa4"):
+        return "4"
+    if value in ("sm120", "fa4_sm120", "hf_sm120", "flash_attn_4_sm120"):
+        return "sm120"
+    raise ValueError(
+        "Unsupported SGLANG_STREAM_R1_FLASH_ATTENTION_VERSION="
+        f"{value!r}; expected 3, 4, or sm120"
+    )
+
+
 def wan_s2v_stream_r1_attention_backend() -> str:
     return _stream_r1_attention_backend()
 
@@ -238,9 +255,7 @@ class WanS2VStreamR1AttentionPlan:
                 visible_noisy = (noisy_kv_abs >= self.current_start) & (
                     noisy_kv_abs < current_noisy_end
                 )
-                noisy_indices = torch.nonzero(
-                    visible_noisy, as_tuple=False
-                ).flatten()
+                noisy_indices = torch.nonzero(visible_noisy, as_tuple=False).flatten()
                 if condition_indices.numel() > 0:
                     kv_indices = torch.cat([noisy_indices, condition_indices])
                 else:
@@ -401,23 +416,33 @@ def _run_wan_s2v_stream_r1_packed_torch_attention(
 ) -> torch.Tensor:
     output = workspace.query.new_empty(output_shape)
     for segment in workspace.segments:
-        q = workspace.query[
-            segment.packed_query_start : segment.packed_query_end
-        ].transpose(0, 1).unsqueeze(0)
-        k = workspace.key[segment.packed_kv_start : segment.packed_kv_end].transpose(
-            0, 1
-        ).unsqueeze(0)
-        v = workspace.value[segment.packed_kv_start : segment.packed_kv_end].transpose(
-            0, 1
-        ).unsqueeze(0)
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=softmax_scale,
-        ).squeeze(0).transpose(0, 1)
+        q = (
+            workspace.query[segment.packed_query_start : segment.packed_query_end]
+            .transpose(0, 1)
+            .unsqueeze(0)
+        )
+        k = (
+            workspace.key[segment.packed_kv_start : segment.packed_kv_end]
+            .transpose(0, 1)
+            .unsqueeze(0)
+        )
+        v = (
+            workspace.value[segment.packed_kv_start : segment.packed_kv_end]
+            .transpose(0, 1)
+            .unsqueeze(0)
+        )
+        out = (
+            F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=softmax_scale,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
         output[
             segment.batch_index,
             segment.query_start : segment.query_end,
@@ -449,25 +474,48 @@ def stream_r1_packed_varlen_attention(
             softmax_scale=softmax_scale,
         )
 
-    try:
-        from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
-    except Exception as exc:  # pragma: no cover - depends on optional kernels
-        raise RuntimeError(
-            "SGLANG_STREAM_R1_ATTENTION_BACKEND=packed_varlen requires "
-            "flash_attn_varlen_func on CUDA"
-        ) from exc
+    flash_attention_version = _stream_r1_flash_attention_version()
+    if flash_attention_version == "sm120":
+        try:
+            from flash_attn_4_sm120 import flash_attn_varlen_func
+        except Exception as exc:  # pragma: no cover - depends on optional kernels
+            raise RuntimeError(
+                "SGLANG_STREAM_R1_FLASH_ATTENTION_VERSION=sm120 requires "
+                "flash_attn_4_sm120 on PYTHONPATH"
+            ) from exc
 
-    result = flash_attn_varlen_func(
-        workspace.query,
-        workspace.key,
-        workspace.value,
-        workspace.cu_seqlens_q,
-        workspace.cu_seqlens_k,
-        max_seqlen_q=workspace.max_seqlen_q,
-        max_seqlen_k=workspace.max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=False,
-    )
+        result = flash_attn_varlen_func(
+            workspace.query,
+            workspace.key,
+            workspace.value,
+            cu_seqlens_q=workspace.cu_seqlens_q,
+            cu_seqlens_k=workspace.cu_seqlens_k,
+            max_seqlen_q=workspace.max_seqlen_q,
+            max_seqlen_k=workspace.max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=False,
+        )
+    else:
+        try:
+            from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+        except Exception as exc:  # pragma: no cover - depends on optional kernels
+            raise RuntimeError(
+                "SGLANG_STREAM_R1_ATTENTION_BACKEND=packed_varlen requires "
+                "flash_attn_varlen_func on CUDA"
+            ) from exc
+
+        result = flash_attn_varlen_func(
+            workspace.query,
+            workspace.key,
+            workspace.value,
+            workspace.cu_seqlens_q,
+            workspace.cu_seqlens_k,
+            max_seqlen_q=workspace.max_seqlen_q,
+            max_seqlen_k=workspace.max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=False,
+            ver=int(flash_attention_version),
+        )
     packed_output = result[0] if isinstance(result, tuple) else result
     return _unpack_wan_s2v_stream_r1_packed_attention(
         packed_output,
@@ -707,6 +755,7 @@ class WanS2VStreamR1MixedKVView:
     def total_seq_len(self) -> int:
         return self.cached_noisy_seq_len + self.condition_seq_len
 
+
 def update_wan_s2v_stream_r1_noisy_kv_cache(
     kv_cache: WanS2VKVCacheBlock,
     key: torch.Tensor,
@@ -728,9 +777,7 @@ def update_wan_s2v_stream_r1_noisy_kv_cache(
     if local_end < 0 or local_end > cache_k.shape[1]:
         raise ValueError("KV cache local_end_index is outside cache capacity")
     if local_end > update.required_cache_tokens:
-        raise ValueError(
-            "KV cache local_end_index exceeds the Stream-R1 local window"
-        )
+        raise ValueError("KV cache local_end_index exceeds the Stream-R1 local window")
     if update.current_start > global_end:
         raise ValueError("KV cache update cannot skip noisy-token ranges")
     if update.current_end < global_end:
@@ -741,45 +788,41 @@ def update_wan_s2v_stream_r1_noisy_kv_cache(
         and update.noisy_seq_len + local_end > cache_k.shape[1]
     ):
         num_evicted_tokens = update.noisy_seq_len + local_end - cache_k.shape[1]
-        num_rolled_tokens = max(
-            0, local_end - num_evicted_tokens - update.sink_tokens
-        )
+        num_rolled_tokens = max(0, local_end - num_evicted_tokens - update.sink_tokens)
         evicted_start = update.sink_tokens
         evicted_end = update.sink_tokens + num_evicted_tokens
         evicted_k = cache_k[:, evicted_start:evicted_end].clone()
         evicted_v = cache_v[:, evicted_start:evicted_end].clone()
 
         if num_rolled_tokens > 0:
-            cache_k[
-                :, update.sink_tokens : update.sink_tokens + num_rolled_tokens
-            ] = cache_k[
-                :,
-                update.sink_tokens
-                + num_evicted_tokens : update.sink_tokens
-                + num_evicted_tokens
-                + num_rolled_tokens,
-            ].clone()
-            cache_v[
-                :, update.sink_tokens : update.sink_tokens + num_rolled_tokens
-            ] = cache_v[
-                :,
-                update.sink_tokens
-                + num_evicted_tokens : update.sink_tokens
-                + num_evicted_tokens
-                + num_rolled_tokens,
-            ].clone()
+            cache_k[:, update.sink_tokens : update.sink_tokens + num_rolled_tokens] = (
+                cache_k[
+                    :,
+                    update.sink_tokens
+                    + num_evicted_tokens : update.sink_tokens
+                    + num_evicted_tokens
+                    + num_rolled_tokens,
+                ].clone()
+            )
+            cache_v[:, update.sink_tokens : update.sink_tokens + num_rolled_tokens] = (
+                cache_v[
+                    :,
+                    update.sink_tokens
+                    + num_evicted_tokens : update.sink_tokens
+                    + num_evicted_tokens
+                    + num_rolled_tokens,
+                ].clone()
+            )
 
         local_end = local_end + update.current_end - global_end - num_evicted_tokens
         if update.sink_tokens > 0 and evicted_k.numel() > 0:
             if evicted_k.shape[1] == update.sink_tokens:
                 cache_k[:, : update.sink_tokens] = (
-                    _STREAM_R1_SINK_COMPRESSION_ALPHA
-                    * cache_k[:, : update.sink_tokens]
+                    _STREAM_R1_SINK_COMPRESSION_ALPHA * cache_k[:, : update.sink_tokens]
                     + (1 - _STREAM_R1_SINK_COMPRESSION_ALPHA) * evicted_k
                 )
                 cache_v[:, : update.sink_tokens] = (
-                    _STREAM_R1_SINK_COMPRESSION_ALPHA
-                    * cache_v[:, : update.sink_tokens]
+                    _STREAM_R1_SINK_COMPRESSION_ALPHA * cache_v[:, : update.sink_tokens]
                     + (1 - _STREAM_R1_SINK_COMPRESSION_ALPHA) * evicted_v
                 )
             else:
@@ -1201,8 +1244,7 @@ def validate_wan_s2v_stream_r1_forward_cache(
     if crossattn_cache is not None:
         if not stream_r1_mode:
             raise ValueError(
-                "Wan S2V crossattn_cache is only supported when "
-                "stream_r1_mode=True"
+                "Wan S2V crossattn_cache is only supported when " "stream_r1_mode=True"
             )
         if not isinstance(crossattn_cache, list):
             raise ValueError(
@@ -1224,13 +1266,9 @@ def validate_wan_s2v_stream_r1_forward_cache(
     if kv_cache is None:
         return
     if not stream_r1_mode:
-        raise ValueError(
-            "Wan S2V kv_cache is only supported when stream_r1_mode=True"
-        )
+        raise ValueError("Wan S2V kv_cache is only supported when stream_r1_mode=True")
     if not isinstance(kv_cache, list):
-        raise ValueError(
-            "Wan S2V kv_cache must be a list of per-block cache entries"
-        )
+        raise ValueError("Wan S2V kv_cache must be a list of per-block cache entries")
     if len(kv_cache) != num_transformer_blocks:
         raise ValueError(
             "Wan S2V kv_cache length must match the number of transformer "
@@ -1247,9 +1285,7 @@ def _validate_noisy_kv_update_inputs(
 ) -> None:
     _validate_key_value_pair(key, value, name="key/value")
     if key.shape[1] != update.noisy_seq_len:
-        raise ValueError(
-            "key/value sequence length must match update.noisy_seq_len"
-        )
+        raise ValueError("key/value sequence length must match update.noisy_seq_len")
     cache_k = kv_cache["k"]
     cache_v = kv_cache["v"]
     if cache_k.shape != cache_v.shape:

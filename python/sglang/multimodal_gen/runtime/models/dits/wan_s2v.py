@@ -34,18 +34,18 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
-    WanT2VCrossAttention,
-    WanTimeTextImageEmbedding,
-    WanTransformer3DModel,
-    WanTransformerBlock,
-)
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VKVCacheBlock,
     WanS2VStreamR1AttentionLayout,
     run_wan_s2v_stream_r1_cached_self_attention,
     validate_wan_s2v_stream_r1_forward_cache,
     wan_s2v_stream_r1_uses_head_sharded_sp_kv_cache,
+)
+from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
+    WanT2VCrossAttention,
+    WanTimeTextImageEmbedding,
+    WanTransformer3DModel,
+    WanTransformerBlock,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -64,10 +64,7 @@ def rope_params(max_seq_len: int, dim: int, theta: int = 10000) -> torch.Tensor:
     assert dim % 2 == 0
     freqs = torch.outer(
         torch.arange(max_seq_len),
-        1.0
-        / torch.pow(
-            theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)
-        ),
+        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
     )
     return torch.polar(torch.ones_like(freqs), freqs)
 
@@ -387,12 +384,16 @@ class FramePackMotioner(nn.Module):
             if overlap_frame > 0:
                 padd_lat[:, -overlap_frame:] = m[:, -overlap_frame:]
             if add_last_motion < 2 and self.drop_mode != "drop":
-                zero_end_frame = int(buckets[: len(buckets) - add_last_motion - 1].sum())
+                zero_end_frame = int(
+                    buckets[: len(buckets) - add_last_motion - 1].sum()
+                )
                 if zero_end_frame > 0:
                     padd_lat[:, -zero_end_frame:] = 0
 
             padd_lat = padd_lat.unsqueeze(0)
-            clean_4x, clean_2x, clean_post = padd_lat.split(list(buckets.cpu())[::-1], dim=2)
+            clean_4x, clean_2x, clean_post = padd_lat.split(
+                list(buckets.cpu())[::-1], dim=2
+            )
             clean_post = self.proj(clean_post).flatten(2).transpose(1, 2)
             clean_2x = self.proj_2x(clean_2x).flatten(2).transpose(1, 2)
             clean_4x = self.proj_4x(clean_4x).flatten(2).transpose(1, 2)
@@ -407,7 +408,9 @@ class FramePackMotioner(nn.Module):
             if not (add_last_motion < 2 and self.drop_mode == "drop"):
                 grid_sizes.append(
                     [
-                        torch.tensor([-buckets[:1].sum(), 0, 0], device=m.device).view(1, 3),
+                        torch.tensor([-buckets[:1].sum(), 0, 0], device=m.device).view(
+                            1, 3
+                        ),
                         torch.tensor(
                             [
                                 -buckets[:1].sum() + buckets[0],
@@ -425,7 +428,9 @@ class FramePackMotioner(nn.Module):
             if not (add_last_motion < 1 and self.drop_mode == "drop"):
                 grid_sizes.append(
                     [
-                        torch.tensor([-buckets[:2].sum(), 0, 0], device=m.device).view(1, 3),
+                        torch.tensor([-buckets[:2].sum(), 0, 0], device=m.device).view(
+                            1, 3
+                        ),
                         torch.tensor(
                             [
                                 -buckets[:2].sum() + buckets[1] // 2,
@@ -442,7 +447,9 @@ class FramePackMotioner(nn.Module):
                 )
             grid_sizes.append(
                 [
-                    torch.tensor([-buckets[:3].sum(), 0, 0], device=m.device).view(1, 3),
+                    torch.tensor([-buckets[:3].sum(), 0, 0], device=m.device).view(
+                        1, 3
+                    ),
                     torch.tensor(
                         [
                             -buckets[:3].sum() + buckets[2] // 4,
@@ -459,7 +466,10 @@ class FramePackMotioner(nn.Module):
             freqs = self.freqs.to(device=m.device)
             motion_rope_emb = _rope_precompute(
                 motion_lat.detach().view(
-                    1, motion_lat.shape[1], self.num_heads, self.inner_dim // self.num_heads
+                    1,
+                    motion_lat.shape[1],
+                    self.num_heads,
+                    self.inner_dim // self.num_heads,
                 ),
                 grid_sizes,
                 freqs,
@@ -500,9 +510,17 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
         if self.norm_q is not None:
-            query = tensor_parallel_rms_norm(query, self.norm_q) if self.tp_rmsnorm else self.norm_q(query)
+            query = (
+                tensor_parallel_rms_norm(query, self.norm_q)
+                if self.tp_rmsnorm
+                else self.norm_q(query)
+            )
         if self.norm_k is not None:
-            key = tensor_parallel_rms_norm(key, self.norm_k) if self.tp_rmsnorm else self.norm_k(key)
+            key = (
+                tensor_parallel_rms_norm(key, self.norm_k)
+                if self.tp_rmsnorm
+                else self.norm_k(key)
+            )
         query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
@@ -523,7 +541,9 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         else:
             attn_output = self.attn1(query, key, value, attn_mask=attn_mask).flatten(2)
         attn_output, _ = self.to_out(attn_output)
-        hidden_states = hidden_states + _segment_gate(attn_output.squeeze(1), gate_msa, seg_idx)
+        hidden_states = hidden_states + _segment_gate(
+            attn_output.squeeze(1), gate_msa, seg_idx
+        )
         hidden_states = hidden_states.to(orig_dtype)
 
         # Populate cross-attn K/V cache on first call so subsequent
@@ -589,10 +609,16 @@ class WanS2VAudioInjector(nn.Module):
             ]
         )
         self.injector_pre_norm_feat = nn.ModuleList(
-            [nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6) for _ in inject_layers]
+            [
+                nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+                for _ in inject_layers
+            ]
         )
         self.injector_pre_norm_vec = nn.ModuleList(
-            [nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6) for _ in inject_layers]
+            [
+                nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+                for _ in inject_layers
+            ]
         )
         if enable_adain:
             if AdaLayerNorm is None:
@@ -642,6 +668,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         except AssertionError:
             self.sp_size = 1
         self.use_context_parallel = False
+        self.sequence_shard_start = 0
 
         self.patch_embedding = PatchEmbed(
             in_chans=arch.in_channels,
@@ -663,7 +690,9 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
 
         attn_backend = get_global_server_args().attention_backend
         if attn_backend and attn_backend.lower() == "video_sparse_attn":
-            logger.warning("Wan S2V does not use video_sparse_attn; falling back to original attention")
+            logger.warning(
+                "Wan S2V does not use video_sparse_attn; falling back to original attention"
+            )
         self.blocks = nn.ModuleList(
             [
                 WanS2VTransformerBlock(
@@ -691,7 +720,9 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             bias=True,
             prefix="proj_out",
         )
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
+        self.scale_shift_table = nn.Parameter(
+            torch.randn(1, 2, inner_dim) / inner_dim**0.5
+        )
         self.trainable_cond_mask = nn.Embedding(3, inner_dim)
         self.casual_audio_encoder = CausalAudioEncoder(
             dim=arch.audio_dim,
@@ -785,30 +816,26 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             ]
         return x, seq_lens, rope_embs, mask_input
 
-    def _after_transformer_block(self, block_idx: int, hidden_states: torch.Tensor):
-        if block_idx not in self.audio_injector.injected_block_id:
-            return hidden_states
-
-        audio_attn_id = self.audio_injector.injected_block_id[block_idx]
-        audio_emb = self.merged_audio_emb
-        num_frames = audio_emb.shape[1]
-        if self.use_context_parallel:
-            hidden_states = sequence_model_parallel_all_gather(hidden_states, dim=1)
-
-        input_hidden_states = hidden_states[:, : self.original_seq_len].clone()
-        input_hidden_states = rearrange(input_hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
-
+    def _run_audio_injector(
+        self,
+        audio_attn_id: int,
+        input_hidden_states: torch.Tensor,
+        attn_audio_emb: torch.Tensor,
+        audio_global_temb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.enable_adain and self.adain_mode == "attn_norm":
-            audio_emb_global = rearrange(self.audio_emb_global, "b t n c -> (b t) n c")
-            attn_hidden_states = self.audio_injector.injector_adain_layers[audio_attn_id](
-                input_hidden_states, temb=audio_emb_global[:, 0]
-            )
+            if audio_global_temb is None:
+                raise ValueError(
+                    "audio_global_temb is required for Wan S2V AdaIN injection"
+                )
+            attn_hidden_states = self.audio_injector.injector_adain_layers[
+                audio_attn_id
+            ](input_hidden_states, temb=audio_global_temb)
         else:
-            attn_hidden_states = self.audio_injector.injector_pre_norm_feat[audio_attn_id](
-                input_hidden_states
-            )
-        attn_audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c", t=num_frames)
-        residual_out = self.audio_injector.injector[audio_attn_id](
+            attn_hidden_states = self.audio_injector.injector_pre_norm_feat[
+                audio_attn_id
+            ](input_hidden_states)
+        return self.audio_injector.injector[audio_attn_id](
             x=attn_hidden_states,
             context=attn_audio_emb,
             context_lens=torch.ones(
@@ -818,13 +845,85 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             )
             * attn_audio_emb.shape[1],
         )
+
+    def _after_transformer_block(self, block_idx: int, hidden_states: torch.Tensor):
+        if block_idx not in self.audio_injector.injected_block_id:
+            return hidden_states
+
+        audio_attn_id = self.audio_injector.injected_block_id[block_idx]
+        audio_emb = self.merged_audio_emb
+        num_frames = audio_emb.shape[1]
+        if self.use_context_parallel:
+            return self._after_transformer_block_sequence_shard(
+                audio_attn_id,
+                hidden_states,
+                audio_emb,
+                num_frames,
+            )
+
+        input_hidden_states = hidden_states[:, : self.original_seq_len].clone()
+        input_hidden_states = rearrange(
+            input_hidden_states, "b (t n) c -> (b t) n c", t=num_frames
+        )
+        attn_audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c", t=num_frames)
+        audio_global_temb = None
+        if self.enable_adain and self.adain_mode == "attn_norm":
+            audio_emb_global = rearrange(self.audio_emb_global, "b t n c -> (b t) n c")
+            audio_global_temb = audio_emb_global[:, 0]
+        residual_out = self._run_audio_injector(
+            audio_attn_id,
+            input_hidden_states,
+            attn_audio_emb,
+            audio_global_temb=audio_global_temb,
+        )
         residual_out = rearrange(residual_out, "(b t) n c -> b (t n) c", t=num_frames)
         hidden_states[:, : self.original_seq_len] = (
             hidden_states[:, : self.original_seq_len] + residual_out
         )
-        if self.use_context_parallel:
-            sp_rank = get_sp_group().rank_in_group
-            hidden_states = torch.chunk(hidden_states, get_sp_world_size(), dim=1)[sp_rank]
+        return hidden_states
+
+    def _after_transformer_block_sequence_shard(
+        self,
+        audio_attn_id: int,
+        hidden_states: torch.Tensor,
+        audio_emb: torch.Tensor,
+        num_frames: int,
+    ) -> torch.Tensor:
+        if self.original_seq_len % num_frames != 0:
+            raise ValueError(
+                "Wan S2V audio injection requires original_seq_len to be frame-aligned"
+            )
+
+        frame_seq_len = self.original_seq_len // num_frames
+        local_start_global = int(self.sequence_shard_start)
+        local_end_global = local_start_global + hidden_states.shape[1]
+        inject_start_global = max(local_start_global, 0)
+        inject_end_global = min(local_end_global, int(self.original_seq_len))
+        if inject_start_global >= inject_end_global:
+            return hidden_states
+
+        current_global = inject_start_global
+        while current_global < inject_end_global:
+            frame_idx = current_global // frame_seq_len
+            next_frame_global = (frame_idx + 1) * frame_seq_len
+            segment_end_global = min(inject_end_global, next_frame_global)
+            local_start = current_global - local_start_global
+            local_end = segment_end_global - local_start_global
+
+            input_hidden_states = hidden_states[:, local_start:local_end].clone()
+            audio_global_temb = None
+            if self.enable_adain and self.adain_mode == "attn_norm":
+                audio_global_temb = self.audio_emb_global[:, frame_idx, 0]
+            residual_out = self._run_audio_injector(
+                audio_attn_id,
+                input_hidden_states,
+                audio_emb[:, frame_idx],
+                audio_global_temb=audio_global_temb,
+            )
+            hidden_states[:, local_start:local_end] = (
+                hidden_states[:, local_start:local_end] + residual_out
+            )
+            current_global = segment_end_global
         return hidden_states
 
     def set_stream_r1_attention(
@@ -974,7 +1073,9 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         )
         original_grid_sizes = deepcopy(grid_sizes)
         x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long, device=x[0].device)
+        seq_lens = torch.tensor(
+            [u.size(1) for u in x], dtype=torch.long, device=x[0].device
+        )
         grid_sizes_rope = _build_s2v_noisy_rope_grid_sizes(
             grid_sizes,
             stream_r1_mode=stream_r1_mode,
@@ -987,14 +1088,22 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         height, width = ref[0].shape[3], ref[0].shape[4]
         ref_grid_sizes = [
             [
-                torch.tensor([30, 0, 0], device=ref[0].device).view(1, 3).repeat(batch_size, 1),
-                torch.tensor([31, height, width], device=ref[0].device).view(1, 3).repeat(batch_size, 1),
-                torch.tensor([1, height, width], device=ref[0].device).view(1, 3).repeat(batch_size, 1),
+                torch.tensor([30, 0, 0], device=ref[0].device)
+                .view(1, 3)
+                .repeat(batch_size, 1),
+                torch.tensor([31, height, width], device=ref[0].device)
+                .view(1, 3)
+                .repeat(batch_size, 1),
+                torch.tensor([1, height, width], device=ref[0].device)
+                .view(1, 3)
+                .repeat(batch_size, 1),
             ]
         ]
         ref = [r.flatten(2).transpose(1, 2) for r in ref]
         self.original_seq_len = seq_lens[0].item()
-        seq_lens = seq_lens + torch.tensor([r.size(1) for r in ref], dtype=torch.long, device=seq_lens.device)
+        seq_lens = seq_lens + torch.tensor(
+            [r.size(1) for r in ref], dtype=torch.long, device=seq_lens.device
+        )
         grid_sizes_rope = grid_sizes_rope + ref_grid_sizes
         x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)]
 
@@ -1033,10 +1142,15 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
 
         if self.zero_timestep:
             timestep = torch.cat(
-                [timestep, torch.zeros([1], dtype=timestep.dtype, device=timestep.device)]
+                [
+                    timestep,
+                    torch.zeros([1], dtype=timestep.dtype, device=timestep.device),
+                ]
             )
         temb = self.condition_embedder.time_embedder(timestep)
-        timestep_proj = self.condition_embedder.time_modulation(temb).unflatten(1, (6, self.hidden_size))
+        timestep_proj = self.condition_embedder.time_modulation(temb).unflatten(
+            1, (6, self.hidden_size)
+        )
         if self.zero_timestep:
             temb = temb[:-1]
             zero_e0 = timestep_proj[-1:]
@@ -1068,6 +1182,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             and self.sp_size > 1
         )
         self.use_context_parallel = sequence_shard_enabled
+        self.sequence_shard_start = 0
         stream_r1_attn_mask = None
         stream_r1_attention_layout = None
         seq_len_before_sp_pad = int(x.shape[1])
@@ -1147,6 +1262,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             chunks = torch.chunk(x, sp_world_size, dim=1)
             sq_size = [u.shape[1] for u in chunks]
             sq_start_size = sum(sq_size[:sp_rank])
+            self.sequence_shard_start = int(sq_start_size)
             x = chunks[sp_rank]
             timestep_proj[1] = timestep_proj[1] - sq_start_size
             pre_compute_freqs = torch.chunk(pre_compute_freqs, sp_world_size, dim=1)[
@@ -1174,9 +1290,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                 ),
                 cache_start=cache_start,
                 stream_r1_sequence_shard_enabled=(
-                    sequence_shard_enabled
-                    and stream_r1_mode
-                    and kv_cache is not None
+                    sequence_shard_enabled and stream_r1_mode and kv_cache is not None
                 ),
                 stream_r1_sp_pad_tokens=seq_shard_pad,
                 crossattn_kv_cache=(
@@ -1187,19 +1301,23 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             )
             x = self._after_transformer_block(idx, x)
 
+        shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
+        x = self.norm_out(x, shift, scale)
+        x, _ = self.proj_out(x)
         if sequence_shard_enabled:
             x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
             if seq_shard_pad:
                 x = x[:, :seq_len_before_sp_pad]
         x = x[:, : self.original_seq_len]
 
-        shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
-        x = self.norm_out(x, shift, scale)
-        x, _ = self.proj_out(x)
         output = self._unpatchify(x, original_grid_sizes)
-        return torch.stack(output) if isinstance(hidden_states, torch.Tensor) else output
+        return (
+            torch.stack(output) if isinstance(hidden_states, torch.Tensor) else output
+        )
 
-    def _unpatchify(self, x: torch.Tensor, grid_sizes: torch.Tensor) -> list[torch.Tensor]:
+    def _unpatchify(
+        self, x: torch.Tensor, grid_sizes: torch.Tensor
+    ) -> list[torch.Tensor]:
         c = self.out_channels
         out = []
         for u, v in zip(x, grid_sizes.tolist()):

@@ -7,26 +7,27 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import WanS2VPipelineConfig
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v import (
+    WanS2VTransformer3DModel,
     _build_s2v_noisy_rope_grid_sizes,
     _pad_stream_r1_attention_mask_for_sp,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
-    WanS2VStreamR1AttentionPlan,
     WanS2VStreamR1AttentionLayout,
+    WanS2VStreamR1AttentionPlan,
     WanS2VStreamR1MixedKVView,
-    WanS2VStreamR1NoisyKVCacheView,
     WanS2VStreamR1NoisyKVCacheUpdate,
-    build_wan_s2v_stream_r1_packed_attention_workspace,
+    WanS2VStreamR1NoisyKVCacheView,
     build_wan_s2v_stream_r1_cached_noisy_kv_index,
     build_wan_s2v_stream_r1_mixed_kv_attention_mask,
     build_wan_s2v_stream_r1_mixed_kv_attention_plan,
+    build_wan_s2v_stream_r1_packed_attention_workspace,
     compose_wan_s2v_stream_r1_mixed_kv_view,
     pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp,
     run_wan_s2v_stream_r1_cached_self_attention,
-    stream_r1_packed_varlen_attention,
     split_wan_s2v_stream_r1_projected_kv,
+    stream_r1_packed_varlen_attention,
     update_wan_s2v_stream_r1_noisy_kv_cache,
     validate_wan_s2v_stream_r1_forward_cache,
 )
@@ -72,12 +73,8 @@ class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
         )
 
         start, end, span = rope_grid[0]
-        torch.testing.assert_close(
-            start, torch.tensor([[2, 0, 0]], dtype=torch.long)
-        )
-        torch.testing.assert_close(
-            end, torch.tensor([[5, 4, 5]], dtype=torch.long)
-        )
+        torch.testing.assert_close(start, torch.tensor([[2, 0, 0]], dtype=torch.long))
+        torch.testing.assert_close(end, torch.tensor([[5, 4, 5]], dtype=torch.long))
         torch.testing.assert_close(span, grid_sizes)
         torch.testing.assert_close(end - start, span)
 
@@ -149,6 +146,52 @@ class TestWanS2VSamplingParams(unittest.TestCase):
                 num_frame_per_block=7,
                 local_attn_size=3,
             )
+
+
+class TestWanS2VAudioInjectionSP(unittest.TestCase):
+    class _PreNorm:
+        def __call__(self, hidden_states):
+            return hidden_states * 2
+
+    class _Injector:
+        def __call__(self, *, x, context, context_lens):
+            return x + context[:, :1]
+
+    class _AudioInjector:
+        def __init__(self, outer):
+            self.injected_block_id = {0: 0}
+            self.injector_pre_norm_feat = [outer._PreNorm()]
+            self.injector = [outer._Injector()]
+
+    def _model(self):
+        model = WanS2VTransformer3DModel.__new__(WanS2VTransformer3DModel)
+        model.audio_injector = self._AudioInjector(self)
+        model.enable_adain = False
+        model.adain_mode = None
+        model.original_seq_len = 8
+        model.sequence_shard_start = 0
+        model.merged_audio_emb = torch.arange(1 * 4 * 3 * 2, dtype=torch.float32).view(
+            1, 4, 3, 2
+        )
+        return model
+
+    def test_sequence_sharded_audio_injection_matches_full_path(self):
+        hidden_states = torch.arange(1 * 10 * 2, dtype=torch.float32).view(1, 10, 2)
+
+        full_model = self._model()
+        full_model.use_context_parallel = False
+        expected = full_model._after_transformer_block(0, hidden_states.clone())
+
+        shard_model = self._model()
+        shard_model.use_context_parallel = True
+        outputs = []
+        start = 0
+        for shard in torch.split(hidden_states, [3, 3, 4], dim=1):
+            shard_model.sequence_shard_start = start
+            outputs.append(shard_model._after_transformer_block(0, shard.clone()))
+            start += shard.shape[1]
+
+        torch.testing.assert_close(torch.cat(outputs, dim=1), expected)
 
 
 class TestWanS2VConditionBundle(unittest.TestCase):
@@ -351,9 +394,7 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
     def test_split_projected_kv_separates_noisy_and_condition_ranges(self):
         key, value = self._kv(seq_len=5)
 
-        split = split_wan_s2v_stream_r1_projected_kv(
-            key, value, noisy_seq_len=3
-        )
+        split = split_wan_s2v_stream_r1_projected_kv(key, value, noisy_seq_len=3)
 
         self.assertEqual(split.noisy_seq_len, 3)
         self.assertEqual(split.condition_seq_len, 2)
@@ -367,25 +408,17 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         key, value = self._kv(seq_len=5)
 
         with self.assertRaisesRegex(ValueError, "same shape"):
-            split_wan_s2v_stream_r1_projected_kv(
-                key, value[:, :4], noisy_seq_len=3
-            )
+            split_wan_s2v_stream_r1_projected_kv(key, value[:, :4], noisy_seq_len=3)
 
         with self.assertRaisesRegex(ValueError, "positive"):
-            split_wan_s2v_stream_r1_projected_kv(
-                key, value, noisy_seq_len=0
-            )
+            split_wan_s2v_stream_r1_projected_kv(key, value, noisy_seq_len=0)
 
         with self.assertRaisesRegex(ValueError, "must not exceed"):
-            split_wan_s2v_stream_r1_projected_kv(
-                key, value, noisy_seq_len=6
-            )
+            split_wan_s2v_stream_r1_projected_kv(key, value, noisy_seq_len=6)
 
     def test_compose_mixed_kv_appends_current_condition_after_cached_noisy(self):
         key, value = self._kv(seq_len=5)
-        split = split_wan_s2v_stream_r1_projected_kv(
-            key, value, noisy_seq_len=3
-        )
+        split = split_wan_s2v_stream_r1_projected_kv(key, value, noisy_seq_len=3)
         cached_key = torch.full((1, 4, 2, 1), -1.0)
         cached_value = torch.full((1, 4, 2, 1), -2.0)
         noisy_view = WanS2VStreamR1NoisyKVCacheView(
@@ -413,9 +446,7 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
 
     def test_compose_mixed_kv_accepts_no_condition_tokens(self):
         key, value = self._kv(seq_len=3)
-        split = split_wan_s2v_stream_r1_projected_kv(
-            key, value, noisy_seq_len=3
-        )
+        split = split_wan_s2v_stream_r1_projected_kv(key, value, noisy_seq_len=3)
         noisy_view = WanS2VStreamR1NoisyKVCacheView(
             key=key,
             value=value,
@@ -433,9 +464,7 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
 
     def test_compose_mixed_kv_validates_cached_and_current_dimensions(self):
         key, value = self._kv(seq_len=4)
-        split = split_wan_s2v_stream_r1_projected_kv(
-            key, value, noisy_seq_len=2
-        )
+        split = split_wan_s2v_stream_r1_projected_kv(key, value, noisy_seq_len=2)
         noisy_view = WanS2VStreamR1NoisyKVCacheView(
             key=torch.zeros(1, 2, 1, 1),
             value=torch.zeros(1, 2, 1, 1),
@@ -460,9 +489,7 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
                 sink_size=1,
                 current_start=current_start,
             )
-            view = update_wan_s2v_stream_r1_noisy_kv_cache(
-                cache, key, value, update
-            )
+            view = update_wan_s2v_stream_r1_noisy_kv_cache(cache, key, value, update)
 
         index = build_wan_s2v_stream_r1_cached_noisy_kv_index(view, update)
 
@@ -572,9 +599,7 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "cached_noisy_seq_len"):
-            build_wan_s2v_stream_r1_mixed_kv_attention_mask(
-                noisy_view, mixed, update
-            )
+            build_wan_s2v_stream_r1_mixed_kv_attention_mask(noisy_view, mixed, update)
 
     def test_sp_mixed_kv_query_mask_padding_keeps_padded_queries_valid(self):
         mask = torch.tensor(
@@ -785,9 +810,7 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
         query = torch.zeros(1, 2, 1, 1)
         key_local = torch.tensor([0.0, 1.0]).view(1, 2, 1, 1)
         value_local = key_local + 100
-        key_padded_global = torch.tensor([0.0, 1.0, 100.0, 999.0]).view(
-            1, 4, 1, 1
-        )
+        key_padded_global = torch.tensor([0.0, 1.0, 100.0, 999.0]).view(1, 4, 1, 1)
         value_padded_global = key_padded_global + 100
 
         def fake_all_gather(tensor, dim):
@@ -899,9 +922,7 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
         query = torch.zeros(1, 2, 1, 1)
         key_local = torch.tensor([0.0, 1.0]).view(1, 2, 1, 1)
         value_local = key_local + 100
-        key_padded_global = torch.tensor([0.0, 1.0, 100.0, 999.0]).view(
-            1, 4, 1, 1
-        )
+        key_padded_global = torch.tensor([0.0, 1.0, 100.0, 999.0]).view(1, 4, 1, 1)
         value_padded_global = key_padded_global + 100
 
         def fake_all_gather(tensor, dim):
@@ -1188,9 +1209,7 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
         )
         key, value = self._kv(0, 4)
 
-        view = update_wan_s2v_stream_r1_noisy_kv_cache(
-            cache, key, value, update
-        )
+        view = update_wan_s2v_stream_r1_noisy_kv_cache(cache, key, value, update)
 
         self.assertEqual(view.global_end_index, 4)
         self.assertEqual(view.local_end_index, 4)
@@ -1229,9 +1248,7 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
                 sink_size=1,
                 current_start=current_start,
             )
-            view = update_wan_s2v_stream_r1_noisy_kv_cache(
-                cache, key, value, update
-            )
+            view = update_wan_s2v_stream_r1_noisy_kv_cache(cache, key, value, update)
 
         self.assertEqual(view.global_end_index, 4)
         self.assertEqual(view.local_end_index, 3)
@@ -1257,15 +1274,11 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
             cache_start=4,
         )
 
-        view = update_wan_s2v_stream_r1_noisy_kv_cache(
-            cache, key, value, update
-        )
+        view = update_wan_s2v_stream_r1_noisy_kv_cache(cache, key, value, update)
 
         self.assertEqual(view.global_end_index, 6)
         self.assertEqual(view.local_end_index, 2)
-        torch.testing.assert_close(
-            view.key[:, :, 0, 0], torch.tensor([[4.0, 5.0]])
-        )
+        torch.testing.assert_close(view.key[:, :, 0, 0], torch.tensor([[4.0, 5.0]]))
 
         key, value = self._kv(6, 2)
         update = WanS2VStreamR1NoisyKVCacheUpdate(
@@ -1276,9 +1289,7 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
             current_start=6,
             cache_start=4,
         )
-        view = update_wan_s2v_stream_r1_noisy_kv_cache(
-            cache, key, value, update
-        )
+        view = update_wan_s2v_stream_r1_noisy_kv_cache(cache, key, value, update)
 
         self.assertEqual(view.global_end_index, 8)
         self.assertEqual(view.local_end_index, 4)
@@ -1327,9 +1338,7 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
 
         small_cache = self._cache(tokens=2)
         with self.assertRaisesRegex(ValueError, "capacity"):
-            update_wan_s2v_stream_r1_noisy_kv_cache(
-                small_cache, key, value, update
-            )
+            update_wan_s2v_stream_r1_noisy_kv_cache(small_cache, key, value, update)
 
 
 class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
@@ -1373,9 +1382,7 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
 
     class _KVCapableTransformer:
         def __init__(self):
-            self.config = SimpleNamespace(
-                arch_config=SimpleNamespace(num_layers=2)
-            )
+            self.config = SimpleNamespace(arch_config=SimpleNamespace(num_layers=2))
             self.blocks = [
                 TestWanS2VStreamR1DenoisingStage._KVCapableBlock(),
                 TestWanS2VStreamR1DenoisingStage._KVCapableBlock(),

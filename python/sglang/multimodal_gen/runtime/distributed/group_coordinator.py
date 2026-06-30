@@ -5,6 +5,8 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import inspect
+import os
 import pickle
 from collections import namedtuple
 from contextlib import contextmanager
@@ -37,6 +39,42 @@ except ModuleNotFoundError:
 logger = init_logger(__name__)
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+
+def _comm_nvtx_enabled() -> bool:
+    value = os.getenv("SGLANG_STREAM_R1_COMM_NVTX", "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _comm_nvtx_caller() -> str:
+    frame = inspect.currentframe()
+    if frame is None:
+        return "caller=unknown"
+    frame = frame.f_back
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        if not (
+            filename.endswith("group_coordinator.py")
+            or filename.endswith("communication_op.py")
+        ):
+            return (
+                f"caller={os.path.basename(filename)}:"
+                f"{frame.f_lineno}:{frame.f_code.co_name}"
+            )
+        frame = frame.f_back
+    return "caller=unknown"
+
+
+@contextmanager
+def _comm_nvtx_range(message: str):
+    if not _comm_nvtx_enabled() or not torch.cuda.is_available():
+        yield
+        return
+    torch.cuda.nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 _group_name_counter: dict[str, int] = {}
@@ -349,9 +387,16 @@ class GroupCoordinator:
             input_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        caller = _comm_nvtx_caller() if _comm_nvtx_enabled() else ""
+        with _comm_nvtx_range(
+            "sgl_mm_all_gather "
+            f"group={self.unique_name} rank={self.rank_in_group}/{world_size} "
+            f"dim={dim} shape={tuple(input_.shape)} dtype={input_.dtype}"
+            f"{(' ' + caller) if caller else ''}"
+        ):
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
