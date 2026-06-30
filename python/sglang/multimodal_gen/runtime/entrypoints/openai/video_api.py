@@ -415,13 +415,120 @@ def _append_audio_delta_segment(
     return state
 
 
+def _first_real_offset_in_audio_delta_window(
+    state: dict[str, Any],
+    target_samples: int,
+) -> int | None:
+    remaining = target_samples
+    offset = 0
+    for segment in state.get("segments") or []:
+        audio = segment.get("audio")
+        if audio is None:
+            continue
+        take = min(remaining, len(audio))
+        if take <= 0:
+            continue
+        meta = segment.get("meta") or {}
+        if not bool(meta.get("is_silence")):
+            return offset
+        offset += take
+        remaining -= take
+        if remaining <= 0:
+            break
+    return None
+
+
+def _first_real_turn_id_in_audio_delta_window(
+    state: dict[str, Any],
+    target_samples: int,
+) -> str | None:
+    remaining = target_samples
+    for segment in state.get("segments") or []:
+        audio = segment.get("audio")
+        if audio is None:
+            continue
+        take = min(remaining, len(audio))
+        if take <= 0:
+            continue
+        meta = segment.get("meta") or {}
+        if not bool(meta.get("is_silence")):
+            turn_id = meta.get("turn_id")
+            return str(turn_id) if turn_id else None
+        remaining -= take
+        if remaining <= 0:
+            break
+    return None
+
+
+def _drop_audio_delta_leading_samples(
+    state: dict[str, Any],
+    samples_to_drop: int,
+) -> int:
+    remaining = max(0, int(samples_to_drop))
+    dropped = 0
+    while remaining > 0 and state.get("segments"):
+        segment = state["segments"][0]
+        audio = segment.get("audio")
+        if audio is None or len(audio) <= 0:
+            state["segments"].pop(0)
+            continue
+        take = min(remaining, len(audio))
+        meta = segment.get("meta") or {}
+        if take == len(audio):
+            state["segments"].pop(0)
+        else:
+            segment["audio"] = audio[take:]
+            try:
+                seg_pts = float(meta.get("pts_ms"))
+            except (TypeError, ValueError):
+                seg_pts = None
+            if seg_pts is not None:
+                meta["pts_ms"] = seg_pts + take / 16.0
+            try:
+                meta["duration_ms"] = max(0.0, float(meta.get("duration_ms")) - take / 16.0)
+            except (TypeError, ValueError):
+                meta["duration_ms"] = len(segment["audio"]) / 16.0
+        remaining -= take
+        dropped += take
+
+    state["buffered_samples"] = max(
+        0,
+        int(state.get("buffered_samples") or 0) - dropped,
+    )
+    return dropped
+
+
 def _pop_audio_delta_window(
     session: dict[str, Any],
     target_samples: int,
+    *,
+    realign_first_real: bool = False,
 ) -> tuple[np.ndarray, dict[str, Any]] | None:
     state = _session_audio_delta_state(session)
     if int(state.get("buffered_samples") or 0) < target_samples:
         return None
+
+    if realign_first_real:
+        first_real_offset = _first_real_offset_in_audio_delta_window(state, target_samples)
+        if first_real_offset and first_real_offset > 0:
+            dropped = _drop_audio_delta_leading_samples(state, first_real_offset)
+            if dropped > 0:
+                pending_realign = dict(state.get("pending_first_real_realign") or {})
+                total_dropped_ms = round(
+                    float(pending_realign.get("audio_delta_leading_silence_dropped_ms") or 0.0)
+                    + dropped / 16.0,
+                    3,
+                )
+                pending_realign["audio_delta_realign_applied"] = True
+                pending_realign["audio_delta_leading_silence_dropped_ms"] = total_dropped_ms
+                pending_realign["real_audio_offset_before_ms"] = total_dropped_ms
+                pending_realign["real_audio_offset_after_ms"] = 0.0
+                pending_realign["audio_delta_realign_waited_for_full_window"] = (
+                    int(state.get("buffered_samples") or 0) < target_samples
+                )
+                state["pending_first_real_realign"] = pending_realign
+            if int(state.get("buffered_samples") or 0) < target_samples:
+                return None
 
     remaining = target_samples
     parts: list[np.ndarray] = []
@@ -515,6 +622,9 @@ def _pop_audio_delta_window(
         "response_id": response_ids[-1] if response_ids else None,
         "sample_rate": 16000,
     }
+    pending_realign = state.pop("pending_first_real_realign", None)
+    if pending_realign and real_samples > 0:
+        meta.update(pending_realign)
     return audio_array, meta
 
 
@@ -1312,7 +1422,16 @@ async def push_session_audio_delta(
             if int(session.get("chunks_received") or 0) == 0
             else _audio_delta_chunk_samples()
         )
-        popped = _pop_audio_delta_window(session, target_samples)
+        candidate_turn_id = _first_real_turn_id_in_audio_delta_window(state, target_samples)
+        if candidate_turn_id:
+            realign_first_real = candidate_turn_id != state.get("last_real_turn_id")
+        else:
+            realign_first_real = int(state.get("real_chunks_assembled") or 0) == 0
+        popped = _pop_audio_delta_window(
+            session,
+            target_samples,
+            realign_first_real=realign_first_real,
+        )
         if popped is None:
             break
         audio_array, window_meta = popped
@@ -1322,14 +1441,23 @@ async def push_session_audio_delta(
             "response_id"
         )
         chunk_meta["client_audio_delta_mode"] = True
-        is_first_real_chunk = (
-            float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0
-            and int(state.get("real_chunks_assembled") or 0) == 0
-        )
+        has_real_audio = float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0
+        chunk_turn_id = chunk_meta.get("turn_id")
+        if has_real_audio and chunk_turn_id:
+            is_first_real_chunk = str(chunk_turn_id) != str(
+                state.get("last_real_turn_id") or ""
+            )
+        else:
+            is_first_real_chunk = (
+                has_real_audio and int(state.get("real_chunks_assembled") or 0) == 0
+            )
         chunk_meta["is_first_real_chunk"] = is_first_real_chunk
-        chunk_meta["allow_preempt_filler"] = float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0
+        chunk_meta["allow_preempt_filler"] = has_real_audio
         if is_first_real_chunk:
-            chunk_meta["turn_start_policy"] = "preempt_filler_reset_pts"
+            if chunk_meta.get("audio_delta_realign_applied"):
+                chunk_meta["turn_start_policy"] = "realign_first_real_window"
+            else:
+                chunk_meta["turn_start_policy"] = "preempt_filler_reset_pts"
 
         emit_chunk_timeline(
             chunk_timeline_path,
@@ -1353,8 +1481,10 @@ async def push_session_audio_delta(
             worker_received_wall_ms=worker_received_wall_ms,
         )
         assembled_chunks.append(assembled)
-        if float(chunk_meta.get("real_audio_ms") or 0.0) > 0.0:
+        if has_real_audio:
             state["real_chunks_assembled"] = int(state.get("real_chunks_assembled") or 0) + 1
+            if chunk_turn_id:
+                state["last_real_turn_id"] = str(chunk_turn_id)
 
     return {
         "success": True,
