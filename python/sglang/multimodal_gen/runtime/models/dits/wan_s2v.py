@@ -866,6 +866,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         crossattn_cache: list | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        audio_start_frame: int | None = None,
         motion_frames: list[int] | tuple[int, int] = (73, 19),
         add_last_motion: int = 2,
         drop_motion_frames: bool = False,
@@ -902,9 +903,14 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         frame_seq_length = (latent_h // self.patch_size[1]) * (
             latent_w // self.patch_size[2]
         )
-        audio_start_frame = (
-            int(current_start) // frame_seq_length if frame_seq_length else 0
-        )
+        if audio_start_frame is None:
+            audio_start_frame = (
+                int(current_start) // frame_seq_length if frame_seq_length else 0
+            )
+        else:
+            audio_start_frame = int(audio_start_frame)
+            if audio_start_frame < 0:
+                raise ValueError("audio_start_frame must be non-negative")
         ref_list = _as_list_4d(ref_latents)
         motion_list = _as_list_4d(motion_latents)
         if cond_states is None:

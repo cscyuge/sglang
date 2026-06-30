@@ -1014,6 +1014,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         autocast_enabled: bool = False,
         forward_batch: Req | None = None,
         crossattn_cache: list | None = None,
+        audio_start_frame: int | None = None,
     ) -> None:
         if not cache_state.enabled:
             return None
@@ -1048,6 +1049,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     crossattn_cache=crossattn_cache,
                     current_start=current_start,
                     cache_start=None,
+                    audio_start_frame=audio_start_frame,
                     stream_r1_mode=True,
                 )
                 return None
@@ -1073,6 +1075,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     crossattn_cache=crossattn_cache,
                     current_start=current_start,
                     cache_start=None,
+                    audio_start_frame=audio_start_frame,
                     stream_r1_mode=True,
                 )
         return None
@@ -1092,6 +1095,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         generator: torch.Generator | None,
         dit_dtype: torch.dtype,
         autocast_enabled: bool,
+        audio_start_frame: int | None = None,
     ) -> torch.Tensor:
         """Denoise one Stream-R1 S2V latent block.
 
@@ -1134,6 +1138,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     crossattn_cache=crossattn_cache,
                     current_start=current_start,
                     cache_start=None,
+                    audio_start_frame=audio_start_frame,
                     stream_r1_mode=True,
                 )
             noise_pred_btchw = noise_pred_bcthw.permute(0, 2, 1, 3, 4)

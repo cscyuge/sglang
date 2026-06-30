@@ -534,6 +534,7 @@ class WanS2VRealtimeSessionRunner:
                     generator=generator,
                     dit_dtype=dit_dtype,
                     autocast_enabled=autocast_enabled,
+                    audio_start_frame=0,
                 )
                 denoising_stage._clean_context_refresh(
                     block_latents=current_latents,
@@ -546,6 +547,7 @@ class WanS2VRealtimeSessionRunner:
                     autocast_enabled=autocast_enabled,
                     forward_batch=batch,
                     crossattn_cache=crossattn_cache,
+                    audio_start_frame=0,
                 )
                 batch.latents = current_latents
                 denoise_s = time.perf_counter() - denoise_started
