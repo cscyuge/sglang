@@ -2579,9 +2579,15 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                 0.005,
                 float(os.environ.get("FLASHTALK_SESSION_AUDIO_GRACE_POLL_S", "0.01")),
             )
+            _audio_delta_wait_default_s = _chunk_wall_time + 0.25
             _audio_delta_wait_s = max(
                 0.0,
-                float(os.environ.get("FLASHTALK_AUDIO_DELTA_WAIT_S", "1.0")),
+                float(
+                    os.environ.get(
+                        "FLASHTALK_AUDIO_DELTA_WAIT_S",
+                        str(_audio_delta_wait_default_s),
+                    )
+                ),
             )
             _max_filler_skip_chunks = max(
                 0,
@@ -3395,30 +3401,31 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     except Exception:
                         pass
                 _stage_start = time.perf_counter()
-                if not _skip_stream_push:
-                    self._save_streaming_frames(
-                        chunk_frames, chunk_idx, _frame_dir, _frame_executor,
-                        _frame_futures, _frames_per_chunk,
-                        rtmp_pusher=_stream_pusher, chunk_audio_data=chunk_audio_data,
-                        timeline_path=_chunk_timeline_path,
-                        audio_chunk_idx=_source_audio_chunk_idx,
-                        used_silence=_used_silence,
-                        audio_loaded=_loaded_from_client,
-                        audio_prefetched=_audio_prefetched,
-                        chunk_source=_chunk_source,
-                        is_filler=_is_filler_chunk,
-                        turn_id=_turn_id,
-                        session_id=_session_id,
-                        audio_chunk_meta={
-                            **_trace_meta,
-                            "audio_ms": _input_audio_ms,
-                            "video_frames": _generated_video_frames,
-                            "first_audio_pts": _first_audio_pts,
-                            "first_video_pts": _first_video_pts,
-                            "last_audio_pts": _last_audio_pts,
-                            "last_video_pts": _last_video_pts,
-                        },
-                    )
+                self._save_streaming_frames(
+                    chunk_frames, chunk_idx, _frame_dir, _frame_executor,
+                    _frame_futures, _frames_per_chunk,
+                    rtmp_pusher=None if _skip_stream_push else _stream_pusher,
+                    chunk_audio_data=chunk_audio_data,
+                    timeline_path=_chunk_timeline_path,
+                    audio_chunk_idx=_source_audio_chunk_idx,
+                    used_silence=_used_silence,
+                    audio_loaded=_loaded_from_client,
+                    audio_prefetched=_audio_prefetched,
+                    chunk_source=_chunk_source,
+                    is_filler=_is_filler_chunk,
+                    turn_id=_turn_id,
+                    session_id=_session_id,
+                    audio_chunk_meta={
+                        **_trace_meta,
+                        "audio_ms": _input_audio_ms,
+                        "video_frames": _generated_video_frames,
+                        "first_audio_pts": _first_audio_pts,
+                        "first_video_pts": _first_video_pts,
+                        "last_audio_pts": _last_audio_pts,
+                        "last_video_pts": _last_video_pts,
+                        "artc_push_skipped": _skip_stream_push,
+                    },
+                )
                 _timing_parts.append(
                     ("stream", time.perf_counter() - _stage_start)
                 )
