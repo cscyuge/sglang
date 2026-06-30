@@ -19,6 +19,8 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
 )
 
+_STREAM_R1_SINK_COMPRESSION_ALPHA = 0.999
+
 
 class WanS2VKVCacheBlock(TypedDict):
     k: torch.Tensor
@@ -124,6 +126,7 @@ class WanS2VStreamR1AttentionPlan:
     current_start: int = 0
     cache_start: int = 0
     noisy_kv_absolute_index: torch.Tensor | None = None
+    condition_queries_use_current_noisy_only: bool = False
 
     def __post_init__(self) -> None:
         if self.query_seq_len <= 0:
@@ -230,15 +233,29 @@ class WanS2VStreamR1AttentionPlan:
             query_start = query_end
 
         if self.condition_query_seq_len > 0:
+            if self.condition_queries_use_current_noisy_only:
+                current_noisy_end = self.current_start + self.query_block_tokens
+                visible_noisy = (noisy_kv_abs >= self.current_start) & (
+                    noisy_kv_abs < current_noisy_end
+                )
+                noisy_indices = torch.nonzero(
+                    visible_noisy, as_tuple=False
+                ).flatten()
+                if condition_indices.numel() > 0:
+                    kv_indices = torch.cat([noisy_indices, condition_indices])
+                else:
+                    kv_indices = noisy_indices
+            else:
+                kv_indices = torch.arange(
+                    self.kv_seq_len,
+                    dtype=torch.long,
+                    device=device,
+                )
             groups.append(
                 WanS2VStreamR1QueryGroup(
                     query_start=self.noisy_query_seq_len,
                     query_end=self.query_seq_len,
-                    kv_indices=torch.arange(
-                        self.kv_seq_len,
-                        dtype=torch.long,
-                        device=device,
-                    ),
+                    kv_indices=kv_indices,
                 )
             )
         return groups
@@ -690,95 +707,121 @@ class WanS2VStreamR1MixedKVView:
     def total_seq_len(self) -> int:
         return self.cached_noisy_seq_len + self.condition_seq_len
 
-
-@dataclass(frozen=True)
-class _KVSegment:
-    start: int
-    end: int
-    key: torch.Tensor
-    value: torch.Tensor
-
-
 def update_wan_s2v_stream_r1_noisy_kv_cache(
     kv_cache: WanS2VKVCacheBlock,
     key: torch.Tensor,
     value: torch.Tensor,
     update: WanS2VStreamR1NoisyKVCacheUpdate,
 ) -> WanS2VStreamR1NoisyKVCacheView:
-    """Mutate one layer's noisy-token KV cache using Stream-R1 S2V windows.
-
-    The cache layout is a fixed local-attention budget. When sink tokens are
-    enabled, they occupy the cache prefix and the remaining suffix rolls.
-    Condition-token K/V are intentionally out of scope; mixed-token attention
-    must still be wired separately before runtime KV support is enabled.
-    """
+    """Mutate one layer's noisy-token KV cache using Stream-R1 S2V windows."""
 
     _validate_noisy_kv_update_inputs(kv_cache, key, value, update)
 
     cache_k = kv_cache["k"]
     cache_v = kv_cache["v"]
-    old_global_end = int(kv_cache["global_end_index"].item())
-    old_local_end = int(kv_cache["local_end_index"].item())
-    if old_global_end == 0 and old_local_end == 0 and update.cache_start > 0:
-        old_global_end = update.cache_start
-    if old_global_end < update.cache_start:
+    global_end = int(kv_cache["global_end_index"].item())
+    local_end = int(kv_cache["local_end_index"].item())
+    if global_end == 0 and local_end == 0 and update.cache_start > 0:
+        global_end = update.cache_start
+    if global_end < update.cache_start:
         raise ValueError("KV cache global_end_index is before cache_start")
-    if old_local_end < 0 or old_local_end > cache_k.shape[1]:
+    if local_end < 0 or local_end > cache_k.shape[1]:
         raise ValueError("KV cache local_end_index is outside cache capacity")
-    if old_local_end > update.required_cache_tokens:
+    if local_end > update.required_cache_tokens:
         raise ValueError(
             "KV cache local_end_index exceeds the Stream-R1 local window"
         )
-    if update.current_start > old_global_end:
+    if update.current_start > global_end:
         raise ValueError("KV cache update cannot skip noisy-token ranges")
-    if update.current_end < old_global_end:
+    if update.current_end < global_end:
         raise ValueError("KV cache update cannot move global_end_index backwards")
 
-    old_segments = _collect_old_kv_segments(
-        kv_cache,
-        update=update,
-        old_global_end=old_global_end,
-        old_local_end=old_local_end,
+    if (
+        update.current_end > global_end
+        and update.noisy_seq_len + local_end > cache_k.shape[1]
+    ):
+        num_evicted_tokens = update.noisy_seq_len + local_end - cache_k.shape[1]
+        num_rolled_tokens = max(
+            0, local_end - num_evicted_tokens - update.sink_tokens
+        )
+        evicted_start = update.sink_tokens
+        evicted_end = update.sink_tokens + num_evicted_tokens
+        evicted_k = cache_k[:, evicted_start:evicted_end].clone()
+        evicted_v = cache_v[:, evicted_start:evicted_end].clone()
+
+        if num_rolled_tokens > 0:
+            cache_k[
+                :, update.sink_tokens : update.sink_tokens + num_rolled_tokens
+            ] = cache_k[
+                :,
+                update.sink_tokens
+                + num_evicted_tokens : update.sink_tokens
+                + num_evicted_tokens
+                + num_rolled_tokens,
+            ].clone()
+            cache_v[
+                :, update.sink_tokens : update.sink_tokens + num_rolled_tokens
+            ] = cache_v[
+                :,
+                update.sink_tokens
+                + num_evicted_tokens : update.sink_tokens
+                + num_evicted_tokens
+                + num_rolled_tokens,
+            ].clone()
+
+        local_end = local_end + update.current_end - global_end - num_evicted_tokens
+        if update.sink_tokens > 0 and evicted_k.numel() > 0:
+            if evicted_k.shape[1] == update.sink_tokens:
+                cache_k[:, : update.sink_tokens] = (
+                    _STREAM_R1_SINK_COMPRESSION_ALPHA
+                    * cache_k[:, : update.sink_tokens]
+                    + (1 - _STREAM_R1_SINK_COMPRESSION_ALPHA) * evicted_k
+                )
+                cache_v[:, : update.sink_tokens] = (
+                    _STREAM_R1_SINK_COMPRESSION_ALPHA
+                    * cache_v[:, : update.sink_tokens]
+                    + (1 - _STREAM_R1_SINK_COMPRESSION_ALPHA) * evicted_v
+                )
+            else:
+                copy_len = min(evicted_k.shape[1], update.sink_tokens)
+                cache_k[:, :copy_len] = evicted_k[:, :copy_len]
+                cache_v[:, :copy_len] = evicted_v[:, :copy_len]
+    else:
+        local_end = local_end + update.current_end - global_end
+
+    local_write_start = local_end - update.noisy_seq_len
+    cache_k[:, local_write_start:local_end] = key[:, : update.noisy_seq_len]
+    cache_v[:, local_write_start:local_end] = value[:, : update.noisy_seq_len]
+
+    kv_start = max(
+        update.sink_tokens,
+        local_end - update.local_tokens + update.sink_tokens,
     )
-    new_segment = _KVSegment(update.current_start, update.current_end, key, value)
-    source_segments = [new_segment, *old_segments]
-
-    final_global_end = update.current_end
-    sink_len = min(update.sink_tokens, final_global_end - update.cache_start)
-    local_start = max(update.sink_end, final_global_end - update.rolling_tokens)
-    local_len = max(0, final_global_end - local_start)
-
-    cache_k.zero_()
-    cache_v.zero_()
-    if sink_len > 0:
-        _copy_abs_range(
-            cache_k,
-            cache_v,
-            0,
-            update.cache_start,
-            update.cache_start + sink_len,
-            source_segments,
+    if update.sink_tokens > 0:
+        view_key = torch.cat(
+            [cache_k[:, : update.sink_tokens], cache_k[:, kv_start:local_end]],
+            dim=1,
         )
-    if local_len > 0:
-        _copy_abs_range(
-            cache_k,
-            cache_v,
-            update.sink_tokens,
-            local_start,
-            final_global_end,
-            source_segments,
+        view_value = torch.cat(
+            [cache_v[:, : update.sink_tokens], cache_v[:, kv_start:local_end]],
+            dim=1,
         )
+    else:
+        view_key = cache_k[:, kv_start:local_end]
+        view_value = cache_v[:, kv_start:local_end]
 
-    local_end_index = update.sink_tokens + local_len if local_len > 0 else sink_len
-    kv_cache["global_end_index"].fill_(final_global_end)
+    local_suffix_len = max(0, local_end - kv_start)
+    local_start = update.current_end - local_suffix_len
+    local_end_index = int(view_key.shape[1])
+    kv_cache["global_end_index"].fill_(update.current_end)
     kv_cache["local_end_index"].fill_(local_end_index)
     return WanS2VStreamR1NoisyKVCacheView(
-        key=cache_k[:, :local_end_index],
-        value=cache_v[:, :local_end_index],
-        global_end_index=final_global_end,
+        key=view_key,
+        value=view_value,
+        global_end_index=update.current_end,
         local_end_index=local_end_index,
         local_start=local_start,
-        local_end=final_global_end,
+        local_end=update.current_end,
     )
 
 
@@ -942,6 +985,7 @@ def build_wan_s2v_stream_r1_mixed_kv_attention_plan(
         current_start=update.current_start,
         cache_start=update.cache_start,
         noisy_kv_absolute_index=cached_noisy_index,
+        condition_queries_use_current_noisy_only=True,
     )
 
 
@@ -1314,85 +1358,3 @@ def _validate_mixed_view_for_noisy_view(
 
 def _noisy_view_local_len(noisy_view: WanS2VStreamR1NoisyKVCacheView) -> int:
     return max(0, noisy_view.local_end - noisy_view.local_start)
-
-
-def _collect_old_kv_segments(
-    kv_cache: WanS2VKVCacheBlock,
-    *,
-    update: WanS2VStreamR1NoisyKVCacheUpdate,
-    old_global_end: int,
-    old_local_end: int,
-) -> list[_KVSegment]:
-    if old_global_end <= update.cache_start or old_local_end == 0:
-        return []
-
-    segments: list[_KVSegment] = []
-    old_sink_len = min(
-        update.sink_tokens,
-        old_global_end - update.cache_start,
-        old_local_end,
-    )
-    if old_sink_len > 0:
-        segments.append(
-            _KVSegment(
-                update.cache_start,
-                update.cache_start + old_sink_len,
-                kv_cache["k"][:, :old_sink_len].clone(),
-                kv_cache["v"][:, :old_sink_len].clone(),
-            )
-        )
-
-    old_local_len = max(0, old_local_end - update.sink_tokens)
-    if old_local_len > 0:
-        old_local_start = old_global_end - old_local_len
-        if old_local_start < update.sink_end:
-            raise ValueError("KV cache local window overlaps the sink prefix")
-        segments.append(
-            _KVSegment(
-                old_local_start,
-                old_global_end,
-                kv_cache["k"][
-                    :, update.sink_tokens : update.sink_tokens + old_local_len
-                ].clone(),
-                kv_cache["v"][
-                    :, update.sink_tokens : update.sink_tokens + old_local_len
-                ].clone(),
-            )
-        )
-    return segments
-
-
-def _copy_abs_range(
-    dest_k: torch.Tensor,
-    dest_v: torch.Tensor,
-    dest_start: int,
-    abs_start: int,
-    abs_end: int,
-    source_segments: list[_KVSegment],
-) -> None:
-    cursor = abs_start
-    while cursor < abs_end:
-        segment = _find_segment_containing(source_segments, cursor)
-        if segment is None:
-            raise ValueError(
-                "KV cache update source data is missing for absolute token "
-                f"range starting at {cursor}"
-            )
-        copy_end = min(abs_end, segment.end)
-        src_start = cursor - segment.start
-        src_end = copy_end - segment.start
-        dst_start = dest_start + cursor - abs_start
-        dst_end = dst_start + copy_end - cursor
-        dest_k[:, dst_start:dst_end] = segment.key[:, src_start:src_end]
-        dest_v[:, dst_start:dst_end] = segment.value[:, src_start:src_end]
-        cursor = copy_end
-
-
-def _find_segment_containing(
-    segments: list[_KVSegment],
-    position: int,
-) -> _KVSegment | None:
-    for segment in segments:
-        if segment.start <= position < segment.end:
-            return segment
-    return None

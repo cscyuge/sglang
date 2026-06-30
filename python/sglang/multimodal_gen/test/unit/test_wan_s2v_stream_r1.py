@@ -449,15 +449,15 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
             compose_wan_s2v_stream_r1_mixed_kv_view(noisy_view, split)
 
     def test_cached_noisy_kv_index_tracks_sink_and_rolling_ranges(self):
-        cache = self._cache(tokens=4)
+        cache = self._cache(tokens=3)
 
-        for current_start in (0, 3, 6):
-            key, value = self._abs_kv(current_start, 3)
+        for current_start in (0, 1, 2, 3):
+            key, value = self._abs_kv(current_start, 1)
             update = WanS2VStreamR1NoisyKVCacheUpdate(
-                noisy_seq_len=3,
+                noisy_seq_len=1,
                 frame_seq_length=1,
-                local_attn_size=4,
-                sink_size=2,
+                local_attn_size=3,
+                sink_size=1,
                 current_start=current_start,
             )
             view = update_wan_s2v_stream_r1_noisy_kv_cache(
@@ -466,10 +466,10 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
 
         index = build_wan_s2v_stream_r1_cached_noisy_kv_index(view, update)
 
-        self.assertEqual(index.tolist(), [0, 1, 7, 8])
+        self.assertEqual(index.tolist(), [0, 2, 3])
         torch.testing.assert_close(
             view.key[:, :, 0, 0],
-            torch.tensor([[0.0, 1.0, 7.0, 8.0]]),
+            torch.tensor([[0.001, 2.0, 3.0]]),
         )
 
     def test_mixed_kv_attention_mask_uses_cached_index_and_condition_tokens(self):
@@ -525,7 +525,7 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
             [
                 (0, 2, [0, 1, 2, 5, 6]),
                 (2, 4, [0, 2, 3, 4, 5, 6]),
-                (4, 6, [0, 1, 2, 3, 4, 5, 6]),
+                (4, 6, [1, 2, 3, 4, 5, 6]),
             ],
         )
         torch.testing.assert_close(plan.to_dense_mask(torch.device("cpu"))[0], mask)
@@ -538,7 +538,10 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
             torch.nonzero(mask[2], as_tuple=False).flatten().tolist(),
             [0, 2, 3, 4, 5, 6],
         )
-        self.assertTrue(mask[4].all())
+        self.assertEqual(
+            torch.nonzero(mask[4], as_tuple=False).flatten().tolist(),
+            [1, 2, 3, 4, 5, 6],
+        )
 
     def test_mixed_kv_attention_mask_validates_mixed_view_metadata(self):
         update = WanS2VStreamR1NoisyKVCacheUpdate(
@@ -1214,41 +1217,41 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
             torch.tensor([[-101.0, -102.0, -103.0, -104.0]]),
         )
 
-    def test_update_preserves_sink_and_rolls_local_window(self):
-        cache = self._cache(tokens=4)
+    def test_update_compresses_evicted_tokens_into_sink_and_rolls_local_window(self):
+        cache = self._cache(tokens=3)
 
-        for current_start in (0, 3, 6):
-            key, value = self._kv(current_start, 3)
+        for current_start in (0, 1, 2, 3):
+            key, value = self._kv(current_start, 1)
             update = WanS2VStreamR1NoisyKVCacheUpdate(
-                noisy_seq_len=3,
+                noisy_seq_len=1,
                 frame_seq_length=1,
-                local_attn_size=4,
-                sink_size=2,
+                local_attn_size=3,
+                sink_size=1,
                 current_start=current_start,
             )
             view = update_wan_s2v_stream_r1_noisy_kv_cache(
                 cache, key, value, update
             )
 
-        self.assertEqual(view.global_end_index, 9)
-        self.assertEqual(view.local_end_index, 4)
-        self.assertEqual(view.local_start, 7)
+        self.assertEqual(view.global_end_index, 4)
+        self.assertEqual(view.local_end_index, 3)
+        self.assertEqual(view.local_start, 2)
         torch.testing.assert_close(
             view.key[:, :, 0, 0],
-            torch.tensor([[0.0, 1.0, 7.0, 8.0]]),
+            torch.tensor([[0.001, 2.0, 3.0]]),
         )
         torch.testing.assert_close(
             view.value[:, :, 0, 0],
-            torch.tensor([[100.0, 101.0, 107.0, 108.0]]),
+            torch.tensor([[100.001, 102.0, 103.0]]),
         )
 
     def test_update_supports_cache_start_offset(self):
         cache = self._cache(tokens=4)
-        key, value = self._kv(4, 4)
+        key, value = self._kv(4, 2)
         update = WanS2VStreamR1NoisyKVCacheUpdate(
-            noisy_seq_len=4,
-            frame_seq_length=2,
-            local_attn_size=2,
+            noisy_seq_len=2,
+            frame_seq_length=1,
+            local_attn_size=4,
             sink_size=1,
             current_start=4,
             cache_start=4,
@@ -1258,31 +1261,31 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
             cache, key, value, update
         )
 
-        self.assertEqual(view.global_end_index, 8)
-        self.assertEqual(view.local_end_index, 4)
+        self.assertEqual(view.global_end_index, 6)
+        self.assertEqual(view.local_end_index, 2)
         torch.testing.assert_close(
-            view.key[:, :, 0, 0], torch.tensor([[4.0, 5.0, 6.0, 7.0]])
+            view.key[:, :, 0, 0], torch.tensor([[4.0, 5.0]])
         )
 
-        key, value = self._kv(8, 4)
+        key, value = self._kv(6, 2)
         update = WanS2VStreamR1NoisyKVCacheUpdate(
-            noisy_seq_len=4,
-            frame_seq_length=2,
-            local_attn_size=2,
+            noisy_seq_len=2,
+            frame_seq_length=1,
+            local_attn_size=4,
             sink_size=1,
-            current_start=8,
+            current_start=6,
             cache_start=4,
         )
         view = update_wan_s2v_stream_r1_noisy_kv_cache(
             cache, key, value, update
         )
 
-        self.assertEqual(view.global_end_index, 12)
+        self.assertEqual(view.global_end_index, 8)
         self.assertEqual(view.local_end_index, 4)
-        self.assertEqual(view.local_start, 10)
+        self.assertEqual(view.local_start, 5)
         torch.testing.assert_close(
             view.key[:, :, 0, 0],
-            torch.tensor([[4.0, 5.0, 10.0, 11.0]]),
+            torch.tensor([[4.0, 5.0, 6.0, 7.0]]),
         )
 
     def test_update_rejects_gaps_backwards_and_small_cache(self):
@@ -1759,6 +1762,7 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
                 "crossattn_cache",
                 "current_start",
                 "cache_start",
+                "audio_start_frame",
                 "stream_r1_mode",
             },
         )
