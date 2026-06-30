@@ -210,6 +210,13 @@ class InputValidationStage(PipelineStage):
             sp = batch.sampling_params
             user_w = getattr(sp, "width", None) if sp else None
             user_h = getattr(sp, "height", None) if sp else None
+            force_requested_size = bool(
+                getattr(
+                    server_args.pipeline_config,
+                    "force_condition_image_to_requested_size",
+                    False,
+                )
+            )
             user_provided = (
                 user_w is not None
                 and user_h is not None
@@ -218,7 +225,15 @@ class InputValidationStage(PipelineStage):
                 and user_w % mod_value == 0
                 and user_h % mod_value == 0
             )
-            if user_provided:
+            if force_requested_size and batch.width is not None and batch.height is not None:
+                width, height = int(batch.width), int(batch.height)
+                if width % mod_value != 0 or height % mod_value != 0:
+                    raise ValueError(
+                        "force_condition_image_to_requested_size requires width and "
+                        f"height divisible by {mod_value}, got {width}x{height}"
+                    )
+                user_provided = True
+            elif user_provided:
                 width, height = user_w, user_h
             else:
                 # Allow one-sided width/height overrides to control target scale
@@ -258,7 +273,9 @@ class InputValidationStage(PipelineStage):
                 condition_image_height / condition_image_width,
                 mod_value,
             )
-            batch.condition_image = batch.condition_image.resize((width, height))
+            batch.condition_image = batch.condition_image.resize(
+                (width, height), Image.BICUBIC
+            )
             batch.height = height
             batch.width = width
 

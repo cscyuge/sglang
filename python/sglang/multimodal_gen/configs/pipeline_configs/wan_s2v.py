@@ -26,6 +26,7 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     audio_encoder_precision: str = "fp32"
     audio_encoder_path: str | None = None
     max_area: int = 1024 * 704
+    force_condition_image_to_requested_size: bool = True
     stream_r1_mode: bool = False
     stream_r1_kv_cache: bool = False
     num_frame_per_block: int = 7

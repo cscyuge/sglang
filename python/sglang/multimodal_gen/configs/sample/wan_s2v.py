@@ -11,7 +11,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 class WanS2VSamplingParams(SamplingParams):
     num_frames: int = 81
     num_inference_steps: int = 40
-    guidance_scale: float = 4.5
+    guidance_scale: float = 1.0
+    negative_prompt: str | None = None
     flow_shift: float = 3.0
     audio_path: str | None = None
     audio_tensor: Any | None = None

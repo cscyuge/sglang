@@ -94,6 +94,12 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
         self.assertTrue(extra["init_first_frame"])
         self.assertTrue(extra["anchor_first_frame"])
 
+    def test_sampling_defaults_match_stream_r1_benchmark(self):
+        params = WanS2VSamplingParams()
+
+        self.assertEqual(params.guidance_scale, 1.0)
+        self.assertIsNone(params.negative_prompt)
+
     def test_init_first_frame_builds_motion_pixels(self):
         stage = object.__new__(ImageVAEEncodingStage)
         batch = SimpleNamespace(extra={"init_first_frame": [True, False]})

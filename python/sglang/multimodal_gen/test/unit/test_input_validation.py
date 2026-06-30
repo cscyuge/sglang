@@ -14,6 +14,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanI2V480PConfig,
     WanI2V720PConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import (
+    WanS2VPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -186,6 +189,17 @@ class TestPreprocessConditionImageResolution(unittest.TestCase):
         self.stage.preprocess_condition_image(batch, server_args, 1920, 1080)
         self.assertIsInstance(batch.condition_image, Image.Image)
         self.assertEqual((batch.width, batch.height), (1280, 720))
+
+    def test_wan_s2v_forces_reference_to_requested_resolution(self):
+        """Wan S2V matches the original repo's direct image.resize(width, height)."""
+        img = Image.new("RGB", (1489, 2592), color="blue")
+        batch = _make_batch(img, width=832, height=480)
+        server_args = _make_server_args(WanS2VPipelineConfig())
+
+        self.stage.preprocess_condition_image(batch, server_args, img.width, img.height)
+
+        self.assertEqual((batch.width, batch.height), (832, 480))
+        self.assertEqual(batch.condition_image.size, (832, 480))
 
 
 class TestFlux2ConditionImagePreprocess(unittest.TestCase):
