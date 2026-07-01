@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     split_wan_s2v_stream_r1_projected_kv,
     stream_r1_segmented_packed_varlen_attention,
     stream_r1_packed_varlen_attention,
+    update_wan_s2v_stream_r1_cached_self_attention_kv_cache,
     update_wan_s2v_stream_r1_noisy_kv_cache,
     validate_wan_s2v_stream_r1_forward_cache,
 )
@@ -1109,6 +1110,36 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
         )
         self.assertEqual(calls[-1]["attn_mask"].shape, (1, 3, 5))
 
+    def test_cache_update_only_updates_cache_without_attention_callable(self):
+        cache = self._cache(tokens=4)
+        query = torch.zeros(1, 3, 1, 1)
+        key, value = self._indexed_kv([0, 1, 100])
+        layout = WanS2VStreamR1AttentionLayout(
+            noisy_seq_len=2,
+            total_seq_len=3,
+            frame_seq_length=1,
+            num_frame_per_block=2,
+            local_attn_size=4,
+            sink_size=1,
+            current_start=0,
+        )
+
+        update_wan_s2v_stream_r1_cached_self_attention_kv_cache(
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=cache,
+            layout=layout,
+            cache_start=None,
+        )
+
+        self.assertEqual(cache["global_end_index"].item(), 2)
+        self.assertEqual(cache["local_end_index"].item(), 2)
+        torch.testing.assert_close(cache["k"][:, :2, 0, 0], torch.tensor([[0.0, 1.0]]))
+        torch.testing.assert_close(
+            cache["v"][:, :2, 0, 0], torch.tensor([[100.0, 101.0]])
+        )
+
     def test_cached_branch_gathers_kv_and_uses_replicated_kv_for_sp(self):
         cache = self._cache(tokens=4)
         calls = []
@@ -2140,6 +2171,7 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
                 "cache_start",
                 "audio_start_frame",
                 "stream_r1_mode",
+                "stream_r1_refresh_only",
             },
         )
         self.assertIs(call["hidden_states"], block_latents)
@@ -2159,6 +2191,7 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(call["current_start"], 15)
         self.assertIsNone(call["cache_start"])
         self.assertTrue(call["stream_r1_mode"])
+        self.assertTrue(call["stream_r1_refresh_only"])
 
     def test_clean_context_refresh_forwards_crossattn_cache(self):
         stage = self._stage()

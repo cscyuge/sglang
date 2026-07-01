@@ -1052,6 +1052,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     cache_start=None,
                     audio_start_frame=audio_start_frame,
                     stream_r1_mode=True,
+                    stream_r1_refresh_only=True,
                 )
                 return None
 
@@ -1078,6 +1079,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     cache_start=None,
                     audio_start_frame=audio_start_frame,
                     stream_r1_mode=True,
+                    stream_r1_refresh_only=True,
                 )
         return None
 

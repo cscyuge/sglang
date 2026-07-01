@@ -1562,6 +1562,8 @@ class WanS2VRealtimeSessionRunner:
                     audio_start_frame=0,
                     step_noises_btchw=block_step_noises,
                 )
+                denoise_loop_s = time.perf_counter() - denoise_started
+                clean_refresh_started = time.perf_counter()
                 denoising_stage._clean_context_refresh(
                     block_latents=current_latents,
                     prompt_embeds=prompt_embeds,
@@ -1575,8 +1577,9 @@ class WanS2VRealtimeSessionRunner:
                     crossattn_cache=crossattn_cache,
                     audio_start_frame=0,
                 )
+                clean_refresh_s = time.perf_counter() - clean_refresh_started
                 batch.latents = current_latents
-                denoise_s = time.perf_counter() - denoise_started
+                denoise_s = denoise_loop_s + clean_refresh_s
 
                 if prefetch_after_denoise_event is not None:
                     prefetch_after_denoise_event.record(
@@ -1632,11 +1635,13 @@ class WanS2VRealtimeSessionRunner:
                 total_s = time.perf_counter() - loop_started
                 logger.info(
                     "Wan S2V realtime block %d: audio=%.3fs latent=%.3fs "
-                    "denoise=%.3fs decode=%.3fs stream=%.3fs total=%.3fs",
+                    "denoise_loop=%.3fs refresh=%.3fs decode=%.3fs "
+                    "stream=%.3fs total=%.3fs",
                     block_idx,
                     audio_s,
                     latent_s,
-                    denoise_s,
+                    denoise_loop_s,
+                    clean_refresh_s,
                     decode_s,
                     stream_s,
                     total_s,
@@ -1680,6 +1685,8 @@ class WanS2VRealtimeSessionRunner:
                         "step_noise_ms": round(step_noise_s * 1000, 3),
                         "condition_ms": round(condition_s * 1000, 3),
                         "denoise_ms": round(denoise_s * 1000, 3),
+                        "denoise_loop_ms": round(denoise_loop_s * 1000, 3),
+                        "clean_refresh_ms": round(clean_refresh_s * 1000, 3),
                         "decode_ms": round(decode_s * 1000, 3),
                         "stream_ms": round(stream_s * 1000, 3),
                         "total_ms": round(total_s * 1000, 3),

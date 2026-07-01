@@ -2122,8 +2122,18 @@ def pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp(
     return padded_mask
 
 
-def run_wan_s2v_stream_r1_cached_self_attention(
-    attention: Callable[..., torch.Tensor],
+@dataclass(frozen=True)
+class _WanS2VCachedAttentionInputs:
+    query_for_attention: torch.Tensor
+    current_kv: WanS2VStreamR1ProjectedKVSplit
+    noisy_view: WanS2VStreamR1NoisyKVCacheView
+    update: WanS2VStreamR1NoisyKVCacheUpdate
+    attention_backend: str
+    selected_backend: str
+    use_sp_head_sharded_packed_attention: bool
+
+
+def _prepare_wan_s2v_stream_r1_cached_attention_inputs(
     *,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2131,11 +2141,10 @@ def run_wan_s2v_stream_r1_cached_self_attention(
     kv_cache: WanS2VKVCacheBlock | None,
     layout: WanS2VStreamR1AttentionLayout | None,
     cache_start: int | None,
-    sequence_shard_enabled: bool = False,
-    sp_pad_tokens: int = 0,
-) -> torch.Tensor:
-    """Run one guarded Stream-R1 S2V cached self-attention step."""
-
+    sequence_shard_enabled: bool,
+    sp_pad_tokens: int,
+    profile: _StreamR1Profile,
+) -> _WanS2VCachedAttentionInputs:
     if kv_cache is None:
         raise ValueError("Stream-R1 S2V cached attention requires kv_cache")
     if layout is None:
@@ -2148,10 +2157,7 @@ def run_wan_s2v_stream_r1_cached_self_attention(
         raise ValueError("query and key/value batch/head dimensions must match")
     if value.shape[0] != key.shape[0] or value.shape[2:] != key.shape[2:]:
         raise ValueError("key and value batch/head dimensions must match")
-    profile = _StreamR1Profile(
-        tag="stream_r1_cached_self_attention",
-        device=query.device,
-    )
+
     attention_backend = _stream_r1_attention_backend()
     selected_backend = attention_backend
     use_sp_head_sharded_packed_attention = False
@@ -2223,6 +2229,93 @@ def run_wan_s2v_stream_r1_cached_self_attention(
             current_kv.noisy_value,
             update,
         )
+    return _WanS2VCachedAttentionInputs(
+        query_for_attention=query_for_attention,
+        current_kv=current_kv,
+        noisy_view=noisy_view,
+        update=update,
+        attention_backend=attention_backend,
+        selected_backend=selected_backend,
+        use_sp_head_sharded_packed_attention=use_sp_head_sharded_packed_attention,
+    )
+
+
+def update_wan_s2v_stream_r1_cached_self_attention_kv_cache(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: WanS2VKVCacheBlock | None,
+    layout: WanS2VStreamR1AttentionLayout | None,
+    cache_start: int | None,
+    sequence_shard_enabled: bool = False,
+    sp_pad_tokens: int = 0,
+) -> None:
+    """Update cached Stream-R1 noisy K/V without computing attention output."""
+
+    profile = _StreamR1Profile(
+        tag="stream_r1_cached_self_attention_cache_update",
+        device=query.device,
+    )
+    prepared = _prepare_wan_s2v_stream_r1_cached_attention_inputs(
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        layout=layout,
+        cache_start=cache_start,
+        sequence_shard_enabled=sequence_shard_enabled,
+        sp_pad_tokens=sp_pad_tokens,
+        profile=profile,
+    )
+    profile.log(
+        attention_backend=prepared.selected_backend,
+        query_seq_len=query.shape[1],
+        cached_noisy_seq_len=prepared.noisy_view.key.shape[1],
+        sequence_shard_enabled=sequence_shard_enabled,
+        sp_pad_tokens=sp_pad_tokens,
+        cache_update_only=True,
+    )
+
+
+def run_wan_s2v_stream_r1_cached_self_attention(
+    attention: Callable[..., torch.Tensor],
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: WanS2VKVCacheBlock | None,
+    layout: WanS2VStreamR1AttentionLayout | None,
+    cache_start: int | None,
+    sequence_shard_enabled: bool = False,
+    sp_pad_tokens: int = 0,
+) -> torch.Tensor:
+    """Run one guarded Stream-R1 S2V cached self-attention step."""
+
+    profile = _StreamR1Profile(
+        tag="stream_r1_cached_self_attention",
+        device=query.device,
+    )
+    prepared = _prepare_wan_s2v_stream_r1_cached_attention_inputs(
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        layout=layout,
+        cache_start=cache_start,
+        sequence_shard_enabled=sequence_shard_enabled,
+        sp_pad_tokens=sp_pad_tokens,
+        profile=profile,
+    )
+    query_for_attention = prepared.query_for_attention
+    current_kv = prepared.current_kv
+    noisy_view = prepared.noisy_view
+    attention_backend = prepared.attention_backend
+    selected_backend = prepared.selected_backend
+    use_sp_head_sharded_packed_attention = (
+        prepared.use_sp_head_sharded_packed_attention
+    )
+    update = prepared.update
     use_segmented_packed_attention = use_sp_head_sharded_packed_attention or (
         attention_backend == "packed_varlen" and not sequence_shard_enabled
     )

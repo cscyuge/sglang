@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VKVCacheBlock,
     WanS2VStreamR1AttentionLayout,
     run_wan_s2v_stream_r1_cached_self_attention,
+    update_wan_s2v_stream_r1_cached_self_attention_kv_cache,
     validate_wan_s2v_stream_r1_forward_cache,
     wan_s2v_stream_r1_uses_head_sharded_sp_kv_cache,
 )
@@ -492,6 +493,7 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         cache_start: int | None = None,
         stream_r1_sequence_shard_enabled: bool = False,
         stream_r1_sp_pad_tokens: int = 0,
+        stream_r1_cache_update_only: bool = False,
         crossattn_kv_cache: dict | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
@@ -526,6 +528,22 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         query = _rope_apply_precomputed(query, freqs_cis).to(orig_dtype)
         key = _rope_apply_precomputed(key, freqs_cis).to(orig_dtype)
+        if stream_r1_cache_update_only:
+            if stream_r1_kv_cache is None or stream_r1_attention_layout is None:
+                raise ValueError(
+                    "Stream-R1 cache-update-only block requires KV cache and layout"
+                )
+            update_wan_s2v_stream_r1_cached_self_attention_kv_cache(
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=stream_r1_kv_cache,
+                layout=stream_r1_attention_layout,
+                cache_start=cache_start,
+                sequence_shard_enabled=stream_r1_sequence_shard_enabled,
+                sp_pad_tokens=stream_r1_sp_pad_tokens,
+            )
+            return hidden_states.to(orig_dtype)
         if stream_r1_kv_cache is not None or stream_r1_attention_layout is not None:
             attn_output = run_wan_s2v_stream_r1_cached_self_attention(
                 self.attn1,
@@ -970,6 +988,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         add_last_motion: int = 2,
         drop_motion_frames: bool = False,
         stream_r1_mode: bool = False,
+        stream_r1_refresh_only: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         timestep = timestep if timestep is not None else t
@@ -986,6 +1005,10 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                 "Stream-R1 S2V KV cache was configured, but no KV cache was "
                 "provided to the transformer. S2V attention-kernel cache "
                 "mutation is not implemented in this phase."
+            )
+        if stream_r1_refresh_only and (not stream_r1_mode or kv_cache is None):
+            raise ValueError(
+                "Wan S2V refresh-only forward requires stream_r1_mode=True and kv_cache"
             )
         if cache_start is not None and kv_cache is None:
             logger.debug("Wan S2V cache_start is ignored while KV cache is disabled")
@@ -1274,6 +1297,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                 )[sp_rank]
 
         for idx, block in enumerate(self.blocks):
+            refresh_last_block = stream_r1_refresh_only and idx == len(self.blocks) - 1
             x = block(
                 x,
                 context,
@@ -1293,13 +1317,19 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                     sequence_shard_enabled and stream_r1_mode and kv_cache is not None
                 ),
                 stream_r1_sp_pad_tokens=seq_shard_pad,
+                stream_r1_cache_update_only=refresh_last_block,
                 crossattn_kv_cache=(
                     crossattn_cache[idx]
                     if stream_r1_mode and crossattn_cache is not None
                     else None
                 ),
             )
+            if refresh_last_block:
+                return x
             x = self._after_transformer_block(idx, x)
+
+        if stream_r1_refresh_only:
+            return x
 
         shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
         x = self.norm_out(x, shift, scale)
