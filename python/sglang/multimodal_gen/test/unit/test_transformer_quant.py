@@ -67,6 +67,10 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
 )
+from sglang.multimodal_gen.tools.build_wan_s2v_nvfp4_model import (
+    _nvfp4_quant_config,
+    _should_quantize_tensor,
+)
 
 
 class _FakeFluxTransformer:
@@ -405,6 +409,78 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             updated["quantization_config"]["ignore"],
             ["single_transformer_blocks.*.proj_mlp*"],
         )
+
+    def test_wan_s2v_nvfp4_quantizes_middle_block_linears_only(self):
+        weight = torch.empty((32, 32), dtype=torch.bfloat16)
+
+        self.assertTrue(
+            _should_quantize_tensor(
+                "blocks.3.self_attn.q.weight",
+                weight,
+                block_start=3,
+                block_end=37,
+            )
+        )
+        self.assertTrue(
+            _should_quantize_tensor(
+                "blocks.36.ffn.2.weight",
+                weight,
+                block_start=3,
+                block_end=37,
+            )
+        )
+        self.assertFalse(
+            _should_quantize_tensor(
+                "blocks.2.self_attn.q.weight",
+                weight,
+                block_start=3,
+                block_end=37,
+            )
+        )
+        self.assertFalse(
+            _should_quantize_tensor(
+                "blocks.37.self_attn.q.weight",
+                weight,
+                block_start=3,
+                block_end=37,
+            )
+        )
+        self.assertFalse(
+            _should_quantize_tensor(
+                "audio_injector.injector.0.q.weight",
+                weight,
+                block_start=3,
+                block_end=37,
+            )
+        )
+        self.assertFalse(
+            _should_quantize_tensor(
+                "blocks.3.self_attn.norm_q.weight",
+                torch.empty((32,), dtype=torch.bfloat16),
+                block_start=3,
+                block_end=37,
+            )
+        )
+
+    def test_wan_s2v_nvfp4_config_keeps_audio_and_boundary_blocks_bf16(self):
+        quant = _nvfp4_quant_config(block_start=3, block_end=37, group_size=16)
+
+        self.assertEqual(quant["quant_method"], "modelopt")
+        self.assertEqual(quant["quant_algo"], "NVFP4")
+        self.assertEqual(
+            quant["config_groups"]["group_0"]["weights"]["group_size"],
+            16,
+        )
+        for pattern in [
+            "blocks.0.*",
+            "blocks.37.*",
+            "audio_injector*",
+            "casual_audio_encoder*",
+            "frame_packer*",
+            "patch_embedding*",
+            "proj_out*",
+        ]:
+            self.assertIn(pattern, quant["ignore"])
 
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_rank", return_value=0)
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_size", return_value=1)

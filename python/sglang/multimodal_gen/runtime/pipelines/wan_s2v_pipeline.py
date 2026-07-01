@@ -242,10 +242,20 @@ class WanS2VPipeline(FlashTalkPipeline):
             load_model_from_full_model_state_dict,
         )
         from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+        from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+            ModelOptFp4Config,
+        )
         from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
         with open(os.path.join(model_path, "config.json")) as f:
             raw_config = json.load(f)
+        quant_config_dict = raw_config.get("quantization_config") or {}
+        dit_quant_config = None
+        if (
+            quant_config_dict.get("quant_method") == "modelopt"
+            and quant_config_dict.get("quant_algo") == "NVFP4"
+        ):
+            dit_quant_config = ModelOptFp4Config.from_config(quant_config_dict)
 
         dit_config = server_args.pipeline_config.dit_config
         arch = dit_config.arch_config
@@ -300,9 +310,11 @@ class WanS2VPipeline(FlashTalkPipeline):
         )
 
         with set_default_torch_dtype(default_dtype), torch.device("meta"):
-            model = WanS2VTransformer3DModel(config=dit_config)
+            model = WanS2VTransformer3DModel(
+                config=dit_config,
+                quant_config=dit_quant_config,
+            )
 
-        quant_config_dict = raw_config.get("quantization_config")
         if quant_config_dict and quant_config_dict.get("quant_method") == "fp8":
             fp8_config = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
