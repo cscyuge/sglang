@@ -788,6 +788,37 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         self.assertTrue(workspace.query_matches_input_order)
         self.assertEqual(workspace.query.data_ptr(), query.data_ptr())
 
+    def test_packed_attention_workspace_flattens_full_input_order_kv(self):
+        plan = WanS2VStreamR1AttentionPlan(
+            query_seq_len=6,
+            kv_seq_len=6,
+            noisy_query_seq_len=4,
+            noisy_kv_seq_len=4,
+            condition_kv_seq_len=2,
+            frame_seq_length=1,
+            query_block_tokens=4,
+            local_attn_size=5,
+            sink_size=1,
+            noisy_kv_absolute_index=torch.arange(4),
+        )
+        query = torch.randn(2, 6, 2, 4)
+        key = torch.randn(2, 6, 2, 4)
+        value = torch.randn(2, 6, 2, 4)
+
+        workspace = build_wan_s2v_stream_r1_packed_attention_workspace(
+            query,
+            key,
+            value,
+            plan,
+        )
+
+        self.assertTrue(workspace.query_matches_input_order)
+        self.assertEqual(workspace.query.data_ptr(), query.data_ptr())
+        self.assertEqual(workspace.key.data_ptr(), key.data_ptr())
+        self.assertEqual(workspace.value.data_ptr(), value.data_ptr())
+        self.assertEqual(workspace.key.shape, (12, 2, 4))
+        self.assertEqual(workspace.value.shape, (12, 2, 4))
+
     def test_segmented_packed_attention_matches_materialized_workspace(self):
         update = WanS2VStreamR1NoisyKVCacheUpdate(
             noisy_seq_len=4,

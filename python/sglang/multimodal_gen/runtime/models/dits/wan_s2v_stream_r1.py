@@ -408,6 +408,19 @@ class WanS2VStreamR1PackedAttentionSegment:
 
 
 @dataclass(frozen=True)
+class WanS2VStreamR1PackedKVCopyRange:
+    batch_index: int
+    packed_start: int
+    packed_end: int
+    source_start: int
+    source_end: int
+
+    @property
+    def length(self) -> int:
+        return self.packed_end - self.packed_start
+
+
+@dataclass(frozen=True)
 class WanS2VStreamR1PackedAttentionWorkspace:
     query: torch.Tensor
     key: torch.Tensor
@@ -431,6 +444,7 @@ class WanS2VStreamR1PackedAttentionMetadata:
     total_kv_tokens: int
     segments: tuple[WanS2VStreamR1PackedAttentionSegment, ...]
     query_matches_input_order: bool = False
+    kv_copy_ranges: tuple[WanS2VStreamR1PackedKVCopyRange, ...] | None = None
 
 
 _STREAM_R1_PACKED_METADATA_CACHE_LIMIT = 128
@@ -541,6 +555,44 @@ def _flatten_query_for_packed_attention(query: torch.Tensor) -> torch.Tensor:
     ).contiguous()
 
 
+def _flatten_bshd_for_packed_attention(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.is_contiguous():
+        return tensor.view(
+            tensor.shape[0] * tensor.shape[1],
+            tensor.shape[2],
+            tensor.shape[3],
+        )
+    return tensor.reshape(
+        tensor.shape[0] * tensor.shape[1],
+        tensor.shape[2],
+        tensor.shape[3],
+    ).contiguous()
+
+
+def _packed_kv_copy_ranges_match_input_order(
+    copy_ranges: tuple[WanS2VStreamR1PackedKVCopyRange, ...],
+    *,
+    batch_size: int,
+    seq_len: int,
+    total_tokens: int,
+) -> bool:
+    if total_tokens != batch_size * seq_len:
+        return False
+    if len(copy_ranges) != batch_size:
+        return False
+    for batch_index, copy_range in enumerate(copy_ranges):
+        packed_start = batch_index * seq_len
+        if copy_range.batch_index != batch_index:
+            return False
+        if copy_range.packed_start != packed_start:
+            return False
+        if copy_range.packed_end != packed_start + seq_len:
+            return False
+        if copy_range.source_start != 0 or copy_range.source_end != seq_len:
+            return False
+    return True
+
+
 def _select_packed_kv_parts(
     tensor: torch.Tensor,
     batch_index: int,
@@ -632,6 +684,8 @@ def _build_wan_s2v_stream_r1_packed_attention_metadata(
     cu_q = [0]
     cu_k = [0]
     segments: list[WanS2VStreamR1PackedAttentionSegment] = []
+    kv_copy_ranges: list[WanS2VStreamR1PackedKVCopyRange] = []
+    can_use_kv_copy_ranges = True
     max_q = 0
     max_k = 0
     for batch_index in range(query.shape[0]):
@@ -646,6 +700,7 @@ def _build_wan_s2v_stream_r1_packed_attention_metadata(
                     for range_start, range_end in group.kv_ranges
                 )
             else:
+                can_use_kv_copy_ranges = False
                 k_part_len = int(group.kv_indices.numel())
             if k_part_len <= 0:
                 raise ValueError("packed attention KV groups must be non-empty")
@@ -669,6 +724,24 @@ def _build_wan_s2v_stream_r1_packed_attention_metadata(
                     packed_kv_end=k_end,
                 )
             )
+            if group.kv_ranges:
+                packed_offset = k_start
+                for range_start, range_end in group.kv_ranges:
+                    if range_end <= range_start:
+                        continue
+                    range_len = range_end - range_start
+                    kv_copy_ranges.append(
+                        WanS2VStreamR1PackedKVCopyRange(
+                            batch_index=batch_index,
+                            packed_start=packed_offset,
+                            packed_end=packed_offset + range_len,
+                            source_start=range_start,
+                            source_end=range_end,
+                        )
+                    )
+                    packed_offset += range_len
+                if packed_offset != k_end:
+                    raise ValueError("packed attention KV range length mismatch")
 
     return WanS2VStreamR1PackedAttentionMetadata(
         query_groups=tuple(query_groups),
@@ -680,6 +753,7 @@ def _build_wan_s2v_stream_r1_packed_attention_metadata(
         total_kv_tokens=cu_k[-1],
         segments=tuple(segments),
         query_matches_input_order=query_matches_input_order,
+        kv_copy_ranges=tuple(kv_copy_ranges) if can_use_kv_copy_ranges else None,
     )
 
 
@@ -722,6 +796,109 @@ def _cat_packed_attention_parts(
     return buffer
 
 
+def _pack_query_for_packed_attention(
+    query: torch.Tensor,
+    metadata: WanS2VStreamR1PackedAttentionMetadata,
+) -> torch.Tensor:
+    if metadata.query_matches_input_order:
+        return _flatten_query_for_packed_attention(query)
+    query_parts = [
+        query[segment.batch_index, segment.query_start : segment.query_end]
+        for segment in metadata.segments
+    ]
+    return torch.cat(query_parts, dim=0).contiguous()
+
+
+def _pack_packed_kv_ranges(
+    tensor: torch.Tensor,
+    copy_ranges: tuple[WanS2VStreamR1PackedKVCopyRange, ...],
+    *,
+    name: str,
+    total_tokens: int,
+) -> torch.Tensor:
+    if _packed_kv_copy_ranges_match_input_order(
+        copy_ranges,
+        batch_size=tensor.shape[0],
+        seq_len=tensor.shape[1],
+        total_tokens=total_tokens,
+    ):
+        return _flatten_bshd_for_packed_attention(tensor)
+
+    parts = []
+    for copy_range in copy_ranges:
+        if copy_range.length <= 0:
+            raise ValueError("packed attention KV copy range must be non-empty")
+        if copy_range.source_end > tensor.shape[1]:
+            raise ValueError("packed attention KV copy range exceeds source length")
+        parts.append(
+            tensor[
+                copy_range.batch_index,
+                copy_range.source_start : copy_range.source_end,
+            ]
+        )
+    return _cat_packed_attention_parts(parts, name=name, total_tokens=total_tokens)
+
+
+def _pack_segmented_packed_kv_ranges(
+    noisy_tensor: torch.Tensor,
+    condition_tensor: torch.Tensor,
+    copy_ranges: tuple[WanS2VStreamR1PackedKVCopyRange, ...],
+    *,
+    name: str,
+    total_tokens: int,
+    noisy_seq_len: int,
+) -> torch.Tensor:
+    if condition_tensor.shape[1] == 0 and _packed_kv_copy_ranges_match_input_order(
+        copy_ranges,
+        batch_size=noisy_tensor.shape[0],
+        seq_len=noisy_tensor.shape[1],
+        total_tokens=total_tokens,
+    ):
+        return _flatten_bshd_for_packed_attention(noisy_tensor)
+
+    parts = []
+    for copy_range in copy_ranges:
+        dst_offset = copy_range.packed_start
+        for segment, segment_start, segment_end in _split_virtual_range_for_segmented_kv(
+            copy_range.source_start,
+            copy_range.source_end,
+            noisy_seq_len=noisy_seq_len,
+        ):
+            source = noisy_tensor if segment == "noisy" else condition_tensor
+            length = segment_end - segment_start
+            if length <= 0:
+                continue
+            if segment_end > source.shape[1]:
+                raise ValueError(
+                    "packed attention segmented KV copy range exceeds source length"
+                )
+            parts.append(source[copy_range.batch_index, segment_start:segment_end])
+            dst_offset += length
+        if dst_offset != copy_range.packed_end:
+            raise ValueError("packed attention segmented KV copy length mismatch")
+    return _cat_packed_attention_parts(parts, name=name, total_tokens=total_tokens)
+
+
+def _build_wan_s2v_stream_r1_packed_attention_workspace_from_packed_kv(
+    query: torch.Tensor,
+    metadata: WanS2VStreamR1PackedAttentionMetadata,
+    *,
+    packed_key: torch.Tensor,
+    packed_value: torch.Tensor,
+) -> WanS2VStreamR1PackedAttentionWorkspace:
+    return WanS2VStreamR1PackedAttentionWorkspace(
+        query=_pack_query_for_packed_attention(query, metadata),
+        key=packed_key,
+        value=packed_value,
+        cu_seqlens_q=metadata.cu_seqlens_q,
+        cu_seqlens_k=metadata.cu_seqlens_k,
+        max_seqlen_q=metadata.max_seqlen_q,
+        max_seqlen_k=metadata.max_seqlen_k,
+        segments=metadata.segments,
+        query_matches_input_order=metadata.query_matches_input_order,
+    )
+
+
 def _build_wan_s2v_stream_r1_packed_attention_workspace_from_parts(
     query: torch.Tensor,
     plan: WanS2VStreamR1AttentionPlan,
@@ -739,7 +916,6 @@ def _build_wan_s2v_stream_r1_packed_attention_workspace_from_parts(
     if query.shape[1] != plan.query_seq_len:
         raise ValueError("packed attention query length must match attention plan")
 
-    query_parts = []
     key_parts = []
     value_parts = []
     metadata = _get_wan_s2v_stream_r1_packed_attention_metadata(query, plan)
@@ -757,9 +933,6 @@ def _build_wan_s2v_stream_r1_packed_attention_workspace_from_parts(
                 raise ValueError("packed attention key/value part lengths must match")
             if k_part_len != segment.packed_kv_end - segment.packed_kv_start:
                 raise ValueError("packed attention metadata KV length mismatch")
-            if not metadata.query_matches_input_order:
-                q_part = query[batch_index, group.query_start : group.query_end]
-                query_parts.append(q_part)
             key_parts.extend(k_group_parts)
             value_parts.extend(v_group_parts)
     if segment_index != len(metadata.segments):
@@ -770,11 +943,7 @@ def _build_wan_s2v_stream_r1_packed_attention_workspace_from_parts(
         f"query_matches_input_order={metadata.query_matches_input_order} "
         f"groups={len(metadata.segments)} q_shape={tuple(query.shape)}"
     ):
-        packed_query = (
-            _flatten_query_for_packed_attention(query)
-            if metadata.query_matches_input_order
-            else torch.cat(query_parts, dim=0).contiguous()
-        )
+        packed_query = _pack_query_for_packed_attention(query, metadata)
     with _stream_r1_comm_nvtx_range(
         "stream_r1_packed_workspace.key_cat "
         f"parts={len(key_parts)} kv_seq_len={plan.kv_seq_len} shape={kv_source_shape}"
@@ -823,6 +992,37 @@ def build_wan_s2v_stream_r1_packed_attention_workspace(
     if key.shape[1] != plan.kv_seq_len:
         raise ValueError("packed attention key length must match attention plan")
 
+    metadata = _get_wan_s2v_stream_r1_packed_attention_metadata(query, plan)
+    if metadata.kv_copy_ranges is not None:
+        with _stream_r1_comm_nvtx_range(
+            "stream_r1_packed_workspace.key_copy_ranges "
+            f"ranges={len(metadata.kv_copy_ranges)} kv_seq_len={plan.kv_seq_len} "
+            f"shape={tuple(key.shape)}"
+        ):
+            packed_key = _pack_packed_kv_ranges(
+                key,
+                metadata.kv_copy_ranges,
+                name="stream_r1_packed_key",
+                total_tokens=metadata.total_kv_tokens,
+            )
+        with _stream_r1_comm_nvtx_range(
+            "stream_r1_packed_workspace.value_copy_ranges "
+            f"ranges={len(metadata.kv_copy_ranges)} kv_seq_len={plan.kv_seq_len} "
+            f"shape={tuple(value.shape)}"
+        ):
+            packed_value = _pack_packed_kv_ranges(
+                value,
+                metadata.kv_copy_ranges,
+                name="stream_r1_packed_value",
+                total_tokens=metadata.total_kv_tokens,
+            )
+        return _build_wan_s2v_stream_r1_packed_attention_workspace_from_packed_kv(
+            query,
+            metadata,
+            packed_key=packed_key,
+            packed_value=packed_value,
+        )
+
     def select_kv_parts(
         batch_index: int,
         group: WanS2VStreamR1QueryGroup,
@@ -870,6 +1070,43 @@ def build_wan_s2v_stream_r1_segmented_packed_attention_workspace(
         raise ValueError("packed attention query/key batch/head dimensions must match")
     if segmented_view.total_seq_len != plan.kv_seq_len:
         raise ValueError("segmented packed K/V length must match attention plan")
+
+    metadata = _get_wan_s2v_stream_r1_packed_attention_metadata(query, plan)
+    if metadata.kv_copy_ranges is not None:
+        with _stream_r1_comm_nvtx_range(
+            "stream_r1_segmented_packed_workspace.key_copy_ranges "
+            f"ranges={len(metadata.kv_copy_ranges)} kv_seq_len={plan.kv_seq_len} "
+            f"noisy={tuple(segmented_view.noisy_key.shape)} "
+            f"condition={tuple(segmented_view.condition_key.shape)}"
+        ):
+            packed_key = _pack_segmented_packed_kv_ranges(
+                segmented_view.noisy_key,
+                segmented_view.condition_key,
+                metadata.kv_copy_ranges,
+                name="stream_r1_packed_key",
+                total_tokens=metadata.total_kv_tokens,
+                noisy_seq_len=segmented_view.cached_noisy_seq_len,
+            )
+        with _stream_r1_comm_nvtx_range(
+            "stream_r1_segmented_packed_workspace.value_copy_ranges "
+            f"ranges={len(metadata.kv_copy_ranges)} kv_seq_len={plan.kv_seq_len} "
+            f"noisy={tuple(segmented_view.noisy_value.shape)} "
+            f"condition={tuple(segmented_view.condition_value.shape)}"
+        ):
+            packed_value = _pack_segmented_packed_kv_ranges(
+                segmented_view.noisy_value,
+                segmented_view.condition_value,
+                metadata.kv_copy_ranges,
+                name="stream_r1_packed_value",
+                total_tokens=metadata.total_kv_tokens,
+                noisy_seq_len=segmented_view.cached_noisy_seq_len,
+            )
+        return _build_wan_s2v_stream_r1_packed_attention_workspace_from_packed_kv(
+            query,
+            metadata,
+            packed_key=packed_key,
+            packed_value=packed_value,
+        )
 
     def select_kv_parts(
         batch_index: int,
