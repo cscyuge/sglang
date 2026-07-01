@@ -48,6 +48,10 @@ from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     LTX2VideoDecoder3d,
     _enable_ltx_decoder_spatial_parallel,
 )
+from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
+    WanDistCausalConv3d,
+    _ensure_recv_buf,
+)
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     WanDecoder3d,
     WanDistAttentionBlock,
@@ -77,6 +81,25 @@ class _DispatchProbeVAE(ParallelTiledVAE):
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):
+    def test_wan_halo_recv_buffer_replaces_inference_tensor(self):
+        with torch.inference_mode():
+            reference = torch.empty(1, 2, 3, 4, 5)
+            cached = torch.empty_like(reference)
+
+        self.assertTrue(cached.is_inference())
+
+        recv_buf = _ensure_recv_buf(cached, reference)
+
+        self.assertEqual(recv_buf.shape, reference.shape)
+        self.assertEqual(recv_buf.dtype, reference.dtype)
+        self.assertEqual(recv_buf.device, reference.device)
+        self.assertFalse(recv_buf.is_inference())
+        self.assertNotEqual(recv_buf.data_ptr(), cached.data_ptr())
+        self.assertEqual(
+            _ensure_recv_buf(recv_buf, reference).data_ptr(),
+            recv_buf.data_ptr(),
+        )
+
     def test_base_vae_config_defaults_to_auto_parallel_decode(self):
         config = VAEConfig()
 
@@ -345,12 +368,24 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.wanvae.get_decode_parallel_world_size",
+                "sglang.multimodal_gen.runtime.models.vaes.wanvae.get_sp_world_size",
                 return_value=2,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.wanvae.get_decode_parallel_rank",
+                "sglang.multimodal_gen.runtime.models.vaes.wanvae.get_sp_parallel_rank",
                 return_value=0,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils.get_sp_world_size",
+                return_value=2,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils.get_sp_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils.get_sp_group",
+                return_value=SimpleNamespace(all_gather=lambda x, dim: x),
             ),
             patch(
                 "sglang.multimodal_gen.runtime.layers.parallel_conv.get_decode_parallel_world_size",
@@ -373,7 +408,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
             )
 
         self.assertTrue(
-            any(isinstance(m, SpatialParallelCausalConv3d) for m in decoder.modules())
+            any(isinstance(m, WanDistCausalConv3d) for m in decoder.modules())
         )
         self.assertTrue(
             any(isinstance(m, WanDistAttentionBlock) for m in decoder.modules())

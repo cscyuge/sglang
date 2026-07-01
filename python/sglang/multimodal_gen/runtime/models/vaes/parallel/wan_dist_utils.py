@@ -121,13 +121,21 @@ def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
 def _ensure_recv_buf(
     recv_buf: torch.Tensor | None, reference: torch.Tensor
 ) -> torch.Tensor:
+    is_inference_tensor = False
+    if recv_buf is not None:
+        try:
+            is_inference_tensor = recv_buf.is_inference()
+        except AttributeError:
+            is_inference_tensor = False
     if (
         recv_buf is None
         or recv_buf.shape != reference.shape
         or recv_buf.dtype != reference.dtype
         or recv_buf.device != reference.device
+        or is_inference_tensor
     ):
-        return torch.empty_like(reference)
+        with torch.inference_mode(False):
+            return torch.empty_like(reference)
     return recv_buf
 
 

@@ -502,7 +502,7 @@ class WanS2VRealtimeSessionRunner:
         latent_stage: LatentPreparationStage,
         block_idx: int,
         block_public_frames: int,
-        timesteps: torch.Tensor,
+        timesteps: torch.Tensor | None,
         generator: torch.Generator | None,
         dit_dtype: torch.dtype,
         device: torch.device | str,
@@ -536,13 +536,17 @@ class WanS2VRealtimeSessionRunner:
             prepared_batch.latents = block_latents
             latent_s = time.perf_counter() - latent_started
 
-            step_noise_started = time.perf_counter()
-            step_noises = self._prepare_step_noises(
-                block_latents,
-                timesteps,
-                generator,
-            )
-            step_noise_s = time.perf_counter() - step_noise_started
+            if timesteps is None:
+                step_noises = ()
+                step_noise_s = 0.0
+            else:
+                step_noise_started = time.perf_counter()
+                step_noises = self._prepare_step_noises(
+                    block_latents,
+                    timesteps,
+                    generator,
+                )
+                step_noise_s = time.perf_counter() - step_noise_started
 
             condition_s = 0.0
             bundle = None
@@ -994,7 +998,6 @@ class WanS2VRealtimeSessionRunner:
             prepare_block_idx is not None
             and latent_stage is not None
             and block_public_frames is not None
-            and timesteps is not None
             and dit_dtype is not None
             and device is not None
         ):
@@ -1181,12 +1184,17 @@ class WanS2VRealtimeSessionRunner:
             torch.cuda.is_available() and use_streaming_vae_cache
         ):
             use_vae_cuda_graph = False
+        adaptive_step_config = denoising_stage._resolve_adaptive_step_config(
+            batch,
+            server_args,
+        )
+        use_adaptive_steps = bool(adaptive_step_config.enabled)
 
         logger.info(
             "Wan S2V realtime session start: session=%s block_latent_frames=%d "
             "block_public_frames=%d fps=%d audio_window=%.2fs idle_policy=%s "
             "wav2vec_cuda_graph=%s audio_overlap=%s streaming_vae_cache=%s "
-            "vae_cuda_graph=%s latent_condition_overlap=%s",
+            "vae_cuda_graph=%s latent_condition_overlap=%s adaptive_steps=%s",
             session_id,
             num_frame_per_block,
             block_public_frames,
@@ -1198,6 +1206,7 @@ class WanS2VRealtimeSessionRunner:
             use_streaming_vae_cache,
             use_vae_cuda_graph,
             use_latent_condition_overlap,
+            use_adaptive_steps,
         )
         emit_chunk_timeline(
             timeline_path,
@@ -1213,6 +1222,12 @@ class WanS2VRealtimeSessionRunner:
             streaming_vae_cache=use_streaming_vae_cache,
             vae_cuda_graph=use_vae_cuda_graph,
             latent_condition_overlap=use_latent_condition_overlap,
+            adaptive_steps=use_adaptive_steps,
+            adaptive_steps_log_only=adaptive_step_config.log_only,
+            adaptive_steps_threshold=adaptive_step_config.threshold,
+            adaptive_steps_aggressive_threshold=(
+                adaptive_step_config.aggressive_threshold
+            ),
         )
 
         batch = self._prepare_reference_and_prompt(
@@ -1478,15 +1493,6 @@ class WanS2VRealtimeSessionRunner:
                         {} for _ in range(len(denoising_stage.transformer.blocks))
                     ]
 
-                if block_step_noises is None:
-                    step_noise_started = time.perf_counter()
-                    block_step_noises = self._prepare_step_noises(
-                        block_latents,
-                        timesteps,
-                        generator,
-                    )
-                    step_noise_s = time.perf_counter() - step_noise_started
-
                 if bundle is None:
                     condition_started = time.perf_counter()
                     bundle = build_wan_s2v_condition_bundle(
@@ -1505,6 +1511,27 @@ class WanS2VRealtimeSessionRunner:
                     dtype=dit_dtype,
                     autocast_enabled=autocast_enabled,
                 )
+                step_decision = denoising_stage._select_adaptive_timesteps(
+                    batch=batch,
+                    server_args=server_args,
+                    block_bundle=bundle,
+                    timesteps=timesteps,
+                    block_index=block_idx,
+                )
+                block_timesteps = step_decision.timesteps
+                if block_step_noises is not None and len(block_step_noises) != max(
+                    int(block_timesteps.numel()) - 1,
+                    0,
+                ):
+                    block_step_noises = None
+                if block_step_noises is None:
+                    step_noise_started = time.perf_counter()
+                    block_step_noises = self._prepare_step_noises(
+                        block_latents,
+                        block_timesteps,
+                        generator,
+                    )
+                    step_noise_s = time.perf_counter() - step_noise_started
                 latent_s = time.perf_counter() - latent_started
 
                 if audio_prefetch_pool is not None and prefetched_audio_future is None:
@@ -1538,7 +1565,7 @@ class WanS2VRealtimeSessionRunner:
                             block_idx + 1 if use_latent_condition_overlap else None
                         ),
                         block_public_frames=block_public_frames,
-                        timesteps=timesteps,
+                        timesteps=None if use_adaptive_steps else timesteps,
                         generator=generator,
                         dit_dtype=dit_dtype,
                         device=device,
@@ -1552,7 +1579,7 @@ class WanS2VRealtimeSessionRunner:
                     block_bundle=bundle,
                     block_start=block_idx * num_frame_per_block,
                     frame_seq_length=frame_seq_length,
-                    timesteps=timesteps,
+                    timesteps=block_timesteps,
                     prompt_embeds=prompt_embeds,
                     cache_state=cache_state,
                     crossattn_cache=crossattn_cache,
@@ -1635,11 +1662,13 @@ class WanS2VRealtimeSessionRunner:
                 total_s = time.perf_counter() - loop_started
                 logger.info(
                     "Wan S2V realtime block %d: audio=%.3fs latent=%.3fs "
-                    "denoise_loop=%.3fs refresh=%.3fs decode=%.3fs "
-                    "stream=%.3fs total=%.3fs",
+                    "steps=%d/%d denoise_loop=%.3fs refresh=%.3fs "
+                    "decode=%.3fs stream=%.3fs total=%.3fs",
                     block_idx,
                     audio_s,
                     latent_s,
+                    step_decision.step_count,
+                    step_decision.base_step_count,
                     denoise_loop_s,
                     clean_refresh_s,
                     decode_s,
@@ -1654,6 +1683,21 @@ class WanS2VRealtimeSessionRunner:
                     frame_count=frame_count,
                     frame_start_idx=frame_start_idx - frame_count,
                     vae_decode_mode=stream_vae_state.last_decode_mode,
+                    adaptive_steps={
+                        "enabled": step_decision.enabled,
+                        "log_only": step_decision.log_only,
+                        "reduced": step_decision.reduced,
+                        "reason": step_decision.reason,
+                        "rel_l1": (
+                            step_decision.rel_l1
+                            if step_decision.rel_l1 is not None
+                            and np.isfinite(step_decision.rel_l1)
+                            else None
+                        ),
+                        "step_count": step_decision.step_count,
+                        "base_step_count": step_decision.base_step_count,
+                        "target_step_count": step_decision.target_step_count,
+                    },
                     timings={
                         "audio_ms": round(audio_s * 1000, 3),
                         "audio_cpu_ms": round(audio_cpu_s * 1000, 3),

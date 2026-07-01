@@ -52,6 +52,13 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_wav2vec_cuda_graph: bool = False
     wan_s2v_streaming_vae_cache: bool = True
     wan_s2v_vae_cuda_graph: bool = False
+    wan_s2v_adaptive_steps: bool = False
+    wan_s2v_adaptive_steps_threshold: float = 0.08
+    wan_s2v_adaptive_steps_aggressive_threshold: float = 0.0
+    wan_s2v_adaptive_steps_reduced_step_count: int = 2
+    wan_s2v_adaptive_steps_aggressive_step_count: int = 1
+    wan_s2v_adaptive_steps_warmup_blocks: int = 1
+    wan_s2v_adaptive_steps_log_only: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -84,6 +91,22 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
             raise ValueError("wan_s2v_idle_policy must be either 'hold' or 'silence'")
         if self.wan_s2v_max_silence_blocks < 0:
             raise ValueError("wan_s2v_max_silence_blocks must be non-negative")
+        if self.wan_s2v_adaptive_steps_threshold < 0:
+            raise ValueError("wan_s2v_adaptive_steps_threshold must be non-negative")
+        if self.wan_s2v_adaptive_steps_aggressive_threshold < 0:
+            raise ValueError(
+                "wan_s2v_adaptive_steps_aggressive_threshold must be non-negative"
+            )
+        if self.wan_s2v_adaptive_steps_reduced_step_count <= 0:
+            raise ValueError(
+                "wan_s2v_adaptive_steps_reduced_step_count must be positive"
+            )
+        if self.wan_s2v_adaptive_steps_aggressive_step_count <= 0:
+            raise ValueError(
+                "wan_s2v_adaptive_steps_aggressive_step_count must be positive"
+            )
+        if self.wan_s2v_adaptive_steps_warmup_blocks < 0:
+            raise ValueError("wan_s2v_adaptive_steps_warmup_blocks must be non-negative")
 
     def postprocess_image_latent(self, latent_condition, batch):
         return latent_condition

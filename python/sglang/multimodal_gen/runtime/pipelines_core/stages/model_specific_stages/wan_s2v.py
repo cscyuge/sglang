@@ -10,6 +10,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
+    get_sp_group,
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -170,6 +171,30 @@ class WanS2VStreamR1CacheState:
         for block_cache in self.kv_cache:
             block_cache["global_end_index"].zero_()
             block_cache["local_end_index"].zero_()
+
+
+@dataclass(frozen=True)
+class WanS2VAdaptiveStepConfig:
+    enabled: bool
+    threshold: float
+    aggressive_threshold: float
+    reduced_step_count: int
+    aggressive_step_count: int
+    warmup_blocks: int
+    log_only: bool
+
+
+@dataclass(frozen=True)
+class WanS2VAdaptiveStepDecision:
+    timesteps: torch.Tensor
+    base_step_count: int
+    step_count: int
+    target_step_count: int
+    reduced: bool
+    enabled: bool
+    log_only: bool
+    rel_l1: float | None = None
+    reason: str = "disabled"
 
 
 @dataclass
@@ -438,6 +463,46 @@ def _has_negative_prompt_embeds(batch: Req) -> bool:
     return True
 
 
+def _collect_tensors(value: Any) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        return [value] if value.numel() > 0 else []
+    if isinstance(value, dict):
+        tensors: list[torch.Tensor] = []
+        for key in sorted(value):
+            tensors.extend(_collect_tensors(value[key]))
+        return tensors
+    if isinstance(value, (list, tuple)):
+        tensors = []
+        for item in value:
+            tensors.extend(_collect_tensors(item))
+        return tensors
+    return []
+
+
+def _select_wan_s2v_adaptive_timesteps(
+    timesteps: torch.Tensor,
+    step_count: int,
+) -> torch.Tensor:
+    base_step_count = int(timesteps.numel())
+    if step_count <= 0:
+        raise ValueError("adaptive step_count must be positive")
+    if step_count >= base_step_count:
+        return timesteps
+    if step_count == 1:
+        return timesteps[:1]
+
+    positions = torch.linspace(
+        0,
+        base_step_count - 1,
+        steps=step_count,
+        device=timesteps.device,
+    ).round()
+    indices = positions.to(dtype=torch.long)
+    indices[0] = 0
+    indices[-1] = base_step_count - 1
+    return timesteps.index_select(0, indices)
+
+
 class WanS2VAudioEncodingStage(AudioEncodingStage):
     """Encode audio into raw Wav2Vec hidden states consumed by WanModel_S2V."""
 
@@ -634,6 +699,11 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
     def __init__(self, transformer, scheduler) -> None:
         super().__init__(transformer, scheduler)
         self.cache_state = WanS2VStreamR1CacheState.disabled()
+        self._adaptive_prev_audio_feature: tuple[torch.Tensor, ...] | None = None
+        self._adaptive_prev_request_id: str | None = None
+        self._adaptive_total_blocks: int = 0
+        self._adaptive_reduced_blocks: int = 0
+        self._last_adaptive_step_decision: WanS2VAdaptiveStepDecision | None = None
 
     def _prepare_timesteps(
         self,
@@ -704,6 +774,263 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         timesteps = timesteps.to(device=device)
         self.log_info("Using Stream-R1 S2V timesteps: %s", timesteps)
         return timesteps
+
+    def _reset_adaptive_step_state(self, request_id: str | None) -> None:
+        self._adaptive_prev_audio_feature = None
+        self._adaptive_prev_request_id = request_id
+        self._adaptive_total_blocks = 0
+        self._adaptive_reduced_blocks = 0
+        self._last_adaptive_step_decision = None
+
+    def _resolve_adaptive_step_config(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> WanS2VAdaptiveStepConfig:
+        return WanS2VAdaptiveStepConfig(
+            enabled=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "adaptive_steps",
+                    "wan_s2v_adaptive_steps",
+                    False,
+                )
+            ),
+            threshold=float(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "adaptive_steps_threshold",
+                    "wan_s2v_adaptive_steps_threshold",
+                    0.08,
+                )
+            ),
+            aggressive_threshold=float(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "adaptive_steps_aggressive_threshold",
+                    "wan_s2v_adaptive_steps_aggressive_threshold",
+                    0.0,
+                )
+            ),
+            reduced_step_count=int(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "adaptive_steps_reduced_step_count",
+                    "wan_s2v_adaptive_steps_reduced_step_count",
+                    2,
+                )
+            ),
+            aggressive_step_count=int(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "adaptive_steps_aggressive_step_count",
+                    "wan_s2v_adaptive_steps_aggressive_step_count",
+                    1,
+                )
+            ),
+            warmup_blocks=int(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "adaptive_steps_warmup_blocks",
+                    "wan_s2v_adaptive_steps_warmup_blocks",
+                    1,
+                )
+            ),
+            log_only=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "adaptive_steps_log_only",
+                    "wan_s2v_adaptive_steps_log_only",
+                    False,
+                )
+            ),
+        )
+
+    def _extract_adaptive_audio_feature(
+        self,
+        bundle: WanS2VConditionBundle,
+    ) -> tuple[torch.Tensor, ...] | None:
+        tensors = _collect_tensors(bundle.audio_emb)
+        if tensors:
+            tensors = [
+                self._slice_adaptive_audio_emb_tensor(tensor, bundle)
+                for tensor in tensors
+            ]
+        else:
+            tensors = _collect_tensors(bundle.audio_input)
+            tensors = [
+                self._slice_adaptive_audio_input_tensor(tensor, bundle)
+                for tensor in tensors
+            ]
+        if not tensors:
+            return None
+        return tuple(t.detach().to(dtype=torch.float32).clone() for t in tensors)
+
+    def _slice_adaptive_audio_emb_tensor(
+        self,
+        tensor: torch.Tensor,
+        bundle: WanS2VConditionBundle,
+    ) -> torch.Tensor:
+        if tensor.dim() < 2 or bundle.chunk_frames is None:
+            return tensor
+        start = int(bundle.motion_frames[1]) + int(bundle.chunk_start)
+        end = start + int(bundle.chunk_frames)
+        if start < 0 or end > tensor.shape[1]:
+            return tensor
+        return tensor[:, start:end]
+
+    def _slice_adaptive_audio_input_tensor(
+        self,
+        tensor: torch.Tensor,
+        bundle: WanS2VConditionBundle,
+    ) -> torch.Tensor:
+        if tensor.dim() == 0 or bundle.chunk_frames is None:
+            return tensor
+        start = int(bundle.chunk_start) * 4
+        end = start + int(bundle.chunk_frames) * 4
+        if start < 0 or end > tensor.shape[-1]:
+            return tensor
+        return tensor[..., start:end]
+
+    def _relative_audio_feature_l1(
+        self,
+        current: tuple[torch.Tensor, ...],
+        previous: tuple[torch.Tensor, ...],
+    ) -> float | None:
+        if len(current) != len(previous):
+            return None
+        diff_sum = None
+        prev_sum = None
+        for cur, prev in zip(current, previous):
+            if cur.shape != prev.shape:
+                return None
+            cur = cur.to(device=prev.device)
+            diff = (cur - prev).abs().sum(dtype=torch.float32)
+            denom = prev.abs().sum(dtype=torch.float32)
+            diff_sum = diff if diff_sum is None else diff_sum + diff
+            prev_sum = denom if prev_sum is None else prev_sum + denom
+        if diff_sum is None or prev_sum is None:
+            return None
+        if float(prev_sum.item()) <= 0:
+            return float("inf")
+        return float((diff_sum / prev_sum.clamp_min(1e-6)).item())
+
+    def _broadcast_adaptive_step_count(self, step_count: int) -> int:
+        if _safe_sp_world_size() <= 1:
+            return step_count
+        step_count_tensor = torch.tensor([step_count], dtype=torch.int32)
+        torch.distributed.broadcast(
+            step_count_tensor,
+            src=0,
+            group=get_sp_group().cpu_group,
+        )
+        return int(step_count_tensor.item())
+
+    def _select_adaptive_timesteps(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        block_bundle: WanS2VConditionBundle,
+        timesteps: torch.Tensor,
+        block_index: int,
+    ) -> WanS2VAdaptiveStepDecision:
+        base_step_count = int(timesteps.numel())
+        config = self._resolve_adaptive_step_config(batch, server_args)
+        request_id = getattr(batch, "request_id", None)
+        if block_index == 0 or request_id != self._adaptive_prev_request_id:
+            self._reset_adaptive_step_state(request_id)
+
+        if not config.enabled or base_step_count <= 1:
+            decision = WanS2VAdaptiveStepDecision(
+                timesteps=timesteps,
+                base_step_count=base_step_count,
+                step_count=base_step_count,
+                target_step_count=base_step_count,
+                reduced=False,
+                enabled=config.enabled,
+                log_only=config.log_only,
+                reason="disabled" if not config.enabled else "single_step",
+            )
+            self._last_adaptive_step_decision = decision
+            return decision
+
+        self._adaptive_total_blocks += 1
+        feature = self._extract_adaptive_audio_feature(block_bundle)
+        rel_l1 = None
+        target_step_count = base_step_count
+        reason = "missing_audio_feature"
+        if feature is not None:
+            if self._adaptive_prev_audio_feature is None:
+                reason = "first_block"
+            elif block_index < config.warmup_blocks:
+                reason = "warmup"
+            else:
+                rel_l1 = self._relative_audio_feature_l1(
+                    feature,
+                    self._adaptive_prev_audio_feature,
+                )
+                if rel_l1 is None:
+                    reason = "feature_shape_changed"
+                elif (
+                    config.aggressive_threshold > 0
+                    and rel_l1 < config.aggressive_threshold
+                ):
+                    target_step_count = min(
+                        config.aggressive_step_count,
+                        base_step_count,
+                    )
+                    reason = "aggressive_audio_match"
+                elif rel_l1 < config.threshold:
+                    target_step_count = min(config.reduced_step_count, base_step_count)
+                    reason = "similar_audio"
+                else:
+                    reason = "audio_changed"
+            self._adaptive_prev_audio_feature = feature
+
+        target_step_count = max(1, min(target_step_count, base_step_count))
+        effective_step_count = base_step_count if config.log_only else target_step_count
+        effective_step_count = self._broadcast_adaptive_step_count(effective_step_count)
+        effective_step_count = max(1, min(effective_step_count, base_step_count))
+        reduced = effective_step_count < base_step_count
+        if reduced:
+            self._adaptive_reduced_blocks += 1
+        if config.log_only and target_step_count < base_step_count:
+            reason = f"{reason}_log_only"
+        selected_timesteps = _select_wan_s2v_adaptive_timesteps(
+            timesteps,
+            effective_step_count,
+        )
+        decision = WanS2VAdaptiveStepDecision(
+            timesteps=selected_timesteps,
+            base_step_count=base_step_count,
+            step_count=effective_step_count,
+            target_step_count=target_step_count,
+            reduced=reduced,
+            enabled=True,
+            log_only=config.log_only,
+            rel_l1=rel_l1,
+            reason=reason,
+        )
+        self._last_adaptive_step_decision = decision
+        self.log_info(
+            "Wan S2V adaptive steps block %d: steps=%d/%d target=%d "
+            "rel_l1=%s reason=%s",
+            block_index,
+            effective_step_count,
+            base_step_count,
+            target_step_count,
+            "n/a" if rel_l1 is None else f"{rel_l1:.6f}",
+            reason,
+        )
+        return decision
 
     def _train_timesteps(self) -> int:
         scheduler_config = getattr(self.scheduler, "config", None)
@@ -1292,19 +1619,27 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             )
             for block_start in range(0, latent_frames, num_frame_per_block):
                 block_end = block_start + num_frame_per_block
+                block_index = block_start // num_frame_per_block
                 block_bundle = bundle.slice(
                     block_start,
                     num_frame_per_block,
                     policy=bundle.control_policy,
                 )
                 current_latents = latents[:, :, block_start:block_end, :, :]
+                step_decision = self._select_adaptive_timesteps(
+                    batch=batch,
+                    server_args=server_args,
+                    block_bundle=block_bundle,
+                    timesteps=timesteps,
+                    block_index=block_index,
+                )
                 current_latents = self.denoise_stream_r1_block(
                     batch=batch,
                     block_latents=current_latents,
                     block_bundle=block_bundle,
                     block_start=block_start,
                     frame_seq_length=frame_seq_length,
-                    timesteps=timesteps,
+                    timesteps=step_decision.timesteps,
                     prompt_embeds=prompt_embeds,
                     cache_state=cache_state,
                     crossattn_cache=crossattn_cache,

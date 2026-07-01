@@ -33,6 +33,13 @@ class WanS2VSamplingParams(SamplingParams):
     anchor_first_frame: bool | None = None
     cache_audio_embeddings: bool | None = None
     use_stream_r1_ema: bool | None = None
+    adaptive_steps: bool | None = None
+    adaptive_steps_threshold: float | None = None
+    adaptive_steps_aggressive_threshold: float | None = None
+    adaptive_steps_reduced_step_count: int | None = None
+    adaptive_steps_aggressive_step_count: int | None = None
+    adaptive_steps_warmup_blocks: int | None = None
+    adaptive_steps_log_only: bool | None = None
     disable_sp_frame_padding: bool = True
 
     def __post_init__(self) -> None:
@@ -71,6 +78,28 @@ class WanS2VSamplingParams(SamplingParams):
             raise ValueError("audio_lookahead_frames must be non-negative")
         if self.denoising_steps is not None and len(self.denoising_steps) == 0:
             raise ValueError("denoising_steps must not be empty")
+        if self.adaptive_steps_threshold is not None and self.adaptive_steps_threshold < 0:
+            raise ValueError("adaptive_steps_threshold must be non-negative")
+        if (
+            self.adaptive_steps_aggressive_threshold is not None
+            and self.adaptive_steps_aggressive_threshold < 0
+        ):
+            raise ValueError("adaptive_steps_aggressive_threshold must be non-negative")
+        if (
+            self.adaptive_steps_reduced_step_count is not None
+            and self.adaptive_steps_reduced_step_count <= 0
+        ):
+            raise ValueError("adaptive_steps_reduced_step_count must be positive")
+        if (
+            self.adaptive_steps_aggressive_step_count is not None
+            and self.adaptive_steps_aggressive_step_count <= 0
+        ):
+            raise ValueError("adaptive_steps_aggressive_step_count must be positive")
+        if (
+            self.adaptive_steps_warmup_blocks is not None
+            and self.adaptive_steps_warmup_blocks < 0
+        ):
+            raise ValueError("adaptive_steps_warmup_blocks must be non-negative")
 
         super().__post_init__()
 
@@ -96,6 +125,13 @@ class WanS2VSamplingParams(SamplingParams):
             "anchor_first_frame",
             "cache_audio_embeddings",
             "use_stream_r1_ema",
+            "adaptive_steps",
+            "adaptive_steps_threshold",
+            "adaptive_steps_aggressive_threshold",
+            "adaptive_steps_reduced_step_count",
+            "adaptive_steps_aggressive_step_count",
+            "adaptive_steps_warmup_blocks",
+            "adaptive_steps_log_only",
         ):
             value = getattr(self, field_name)
             if value is not None:

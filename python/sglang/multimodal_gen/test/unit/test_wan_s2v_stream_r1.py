@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     WanS2VStreamR1CacheState,
     WanS2VStreamR1DenoisingStage,
     _has_negative_prompt_embeds,
+    _select_wan_s2v_adaptive_timesteps,
 )
 
 
@@ -1822,6 +1823,11 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         stage.cache_state = WanS2VStreamR1CacheState.disabled()
         stage.log_info = lambda *args, **kwargs: None
         stage._s2v_kv_attention_kernel_supported = False
+        stage._adaptive_prev_audio_feature = None
+        stage._adaptive_prev_request_id = None
+        stage._adaptive_total_blocks = 0
+        stage._adaptive_reduced_blocks = 0
+        stage._last_adaptive_step_decision = None
         return stage
 
     def _metadata(self) -> WanS2VStreamR1CacheMetadata:
@@ -2234,6 +2240,95 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
 
         self.assertEqual(len(recorder.calls), 1)
         self.assertIs(recorder.forward_batch, forward_batch)
+
+    def test_adaptive_timestep_subset_preserves_first_and_last(self):
+        timesteps = torch.tensor([1000, 750, 500, 250])
+
+        torch.testing.assert_close(
+            _select_wan_s2v_adaptive_timesteps(timesteps, 3),
+            torch.tensor([1000, 500, 250]),
+        )
+        torch.testing.assert_close(
+            _select_wan_s2v_adaptive_timesteps(timesteps, 2),
+            torch.tensor([1000, 250]),
+        )
+
+    def test_adaptive_steps_reduce_for_similar_audio(self):
+        stage = self._stage()
+        server_args = SimpleNamespace(
+            pipeline_config=WanS2VPipelineConfig(
+                wan_s2v_adaptive_steps=True,
+                wan_s2v_adaptive_steps_threshold=0.2,
+                wan_s2v_adaptive_steps_reduced_step_count=2,
+                wan_s2v_adaptive_steps_warmup_blocks=1,
+            )
+        )
+        batch = SimpleNamespace(extra={}, request_id="request-a")
+        timesteps = torch.tensor([1000, 750, 500, 250])
+        first = self._block_bundle()
+        second = self._block_bundle()
+        second.audio_input = first.audio_input * 1.01
+
+        first_decision = stage._select_adaptive_timesteps(
+            batch=batch,
+            server_args=server_args,
+            block_bundle=first,
+            timesteps=timesteps,
+            block_index=0,
+        )
+        second_decision = stage._select_adaptive_timesteps(
+            batch=batch,
+            server_args=server_args,
+            block_bundle=second,
+            timesteps=timesteps,
+            block_index=1,
+        )
+
+        self.assertFalse(first_decision.reduced)
+        self.assertTrue(second_decision.reduced)
+        self.assertEqual(second_decision.reason, "similar_audio")
+        self.assertEqual(second_decision.step_count, 2)
+        torch.testing.assert_close(
+            second_decision.timesteps,
+            torch.tensor([1000, 250]),
+        )
+
+    def test_adaptive_steps_log_only_keeps_base_timesteps(self):
+        stage = self._stage()
+        server_args = SimpleNamespace(
+            pipeline_config=WanS2VPipelineConfig(
+                wan_s2v_adaptive_steps=True,
+                wan_s2v_adaptive_steps_log_only=True,
+                wan_s2v_adaptive_steps_threshold=0.2,
+                wan_s2v_adaptive_steps_reduced_step_count=2,
+            )
+        )
+        batch = SimpleNamespace(extra={}, request_id="request-a")
+        timesteps = torch.tensor([1000, 750, 500, 250])
+        first = self._block_bundle()
+        second = self._block_bundle()
+
+        stage._select_adaptive_timesteps(
+            batch=batch,
+            server_args=server_args,
+            block_bundle=first,
+            timesteps=timesteps,
+            block_index=0,
+        )
+        decision = stage._select_adaptive_timesteps(
+            batch=batch,
+            server_args=server_args,
+            block_bundle=second,
+            timesteps=timesteps,
+            block_index=1,
+        )
+
+        self.assertFalse(decision.reduced)
+        self.assertTrue(decision.log_only)
+        self.assertEqual(decision.target_step_count, 2)
+        self.assertEqual(decision.step_count, 4)
+        self.assertEqual(decision.reason, "similar_audio_log_only")
+        torch.testing.assert_close(decision.timesteps, timesteps)
 
     def test_audio_embedding_cache_precomputes_encoder_once_with_motion_prefix(self):
         stage = self._stage()

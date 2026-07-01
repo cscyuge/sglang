@@ -457,6 +457,37 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
 
         self.assertTrue(cfg.wan_s2v_vae_cuda_graph)
 
+    def test_adaptive_steps_config_is_available(self):
+        cfg = WanS2VPipelineConfig(
+            wan_s2v_adaptive_steps=True,
+            wan_s2v_adaptive_steps_threshold=0.12,
+            wan_s2v_adaptive_steps_reduced_step_count=2,
+            wan_s2v_adaptive_steps_log_only=True,
+        )
+
+        self.assertTrue(cfg.wan_s2v_adaptive_steps)
+        self.assertEqual(cfg.wan_s2v_adaptive_steps_threshold, 0.12)
+        self.assertEqual(cfg.wan_s2v_adaptive_steps_reduced_step_count, 2)
+        self.assertTrue(cfg.wan_s2v_adaptive_steps_log_only)
+
+        with self.assertRaisesRegex(ValueError, "adaptive_steps_threshold"):
+            WanS2VPipelineConfig(wan_s2v_adaptive_steps_threshold=-0.1)
+
+    def test_adaptive_steps_controls_are_forwarded_in_request_extra(self):
+        params = WanS2VSamplingParams(
+            adaptive_steps=True,
+            adaptive_steps_threshold=0.11,
+            adaptive_steps_reduced_step_count=2,
+            adaptive_steps_log_only=True,
+        )
+
+        extra = params.build_request_extra()
+
+        self.assertTrue(extra["adaptive_steps"])
+        self.assertEqual(extra["adaptive_steps_threshold"], 0.11)
+        self.assertEqual(extra["adaptive_steps_reduced_step_count"], 2)
+        self.assertTrue(extra["adaptive_steps_log_only"])
+
     def test_stream_r1_config_defaults_to_baseline_flow_shift(self):
         self.assertEqual(WanS2VPipelineConfig().flow_shift, 3.0)
         self.assertEqual(WanS2VPipelineConfig(stream_r1_mode=True).flow_shift, 5.0)
