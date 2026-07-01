@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import atexit
+import json
 import logging
 import os
+import threading
+import time
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -56,6 +60,237 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
+
+_FP8_GEMM_PROFILE_ENABLED: Optional[bool] = None
+_FP8_GEMM_PROFILE_LOCK = threading.Lock()
+_FP8_GEMM_PROFILE_STATS: dict[tuple, dict] = {}
+_FP8_GEMM_PROFILE_REGISTERED = False
+_FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_LOCK = threading.Lock()
+_FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE: dict[tuple, torch.Tensor] = {}
+_FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_MAX_SIZE = 4096
+
+
+def _fp8_gemm_profile_enabled() -> bool:
+    global _FP8_GEMM_PROFILE_ENABLED, _FP8_GEMM_PROFILE_REGISTERED
+    if _FP8_GEMM_PROFILE_ENABLED is None:
+        value = os.environ.get("SGLANG_FP8_GEMM_PROFILE", "").strip().lower()
+        _FP8_GEMM_PROFILE_ENABLED = value in ("1", "true", "yes", "y", "on")
+    if _FP8_GEMM_PROFILE_ENABLED and not _FP8_GEMM_PROFILE_REGISTERED:
+        atexit.register(_dump_fp8_gemm_profile)
+        _FP8_GEMM_PROFILE_REGISTERED = True
+    return bool(_FP8_GEMM_PROFILE_ENABLED)
+
+
+def _fp8_gemm_profile_path() -> str:
+    base_path = os.environ.get(
+        "SGLANG_FP8_GEMM_PROFILE_PATH",
+        "/tmp/sglang_fp8_gemm_profile.json",
+    )
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+    pid = os.getpid()
+    if "{rank}" in base_path or "{pid}" in base_path:
+        return base_path.format(rank=rank, pid=pid)
+    root, ext = os.path.splitext(base_path)
+    ext = ext or ".json"
+    return f"{root}.rank{rank}.pid{pid}{ext}"
+
+
+def _fp8_gemm_profile_time_start(device: torch.device | None):
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return ("cuda", start, end)
+    return ("cpu", time.perf_counter())
+
+
+def _fp8_gemm_profile_time_stop(timer) -> float:
+    if timer[0] == "cuda":
+        _, start, end = timer
+        end.record()
+        end.synchronize()
+        return float(start.elapsed_time(end))
+    return float((time.perf_counter() - timer[1]) * 1000.0)
+
+
+def _record_fp8_gemm_profile(
+    backend: str,
+    input_2d_shape: torch.Size | tuple[int, int],
+    weight_shape: torch.Size | tuple[int, int],
+    block_size: List[int],
+    input_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    *,
+    input_scale_present: bool,
+    bias_present: bool,
+    total_ms: Optional[float] = None,
+    quant_ms: Optional[float] = None,
+    gemm_ms: Optional[float] = None,
+    bias_ms: Optional[float] = None,
+) -> None:
+    if not _fp8_gemm_profile_enabled():
+        return
+    m = int(input_2d_shape[0])
+    k = int(input_2d_shape[1])
+    n = int(weight_shape[0])
+    key = (
+        backend,
+        m,
+        n,
+        k,
+        tuple(int(v) for v in block_size),
+        str(input_dtype).replace("torch.", ""),
+        str(weight_dtype).replace("torch.", ""),
+        bool(input_scale_present),
+        bool(bias_present),
+    )
+    with _FP8_GEMM_PROFILE_LOCK:
+        stat = _FP8_GEMM_PROFILE_STATS.get(key)
+        if stat is None:
+            stat = {
+                "backend": backend,
+                "M": m,
+                "N": n,
+                "K": k,
+                "block_size": list(block_size),
+                "input_dtype": str(input_dtype).replace("torch.", ""),
+                "weight_dtype": str(weight_dtype).replace("torch.", ""),
+                "input_scale_present": bool(input_scale_present),
+                "bias_present": bool(bias_present),
+                "count": 0,
+                "total_ms": 0.0,
+                "quant_ms": 0.0,
+                "gemm_ms": 0.0,
+                "bias_ms": 0.0,
+                "max_total_ms": 0.0,
+                "min_total_ms": None,
+            }
+            _FP8_GEMM_PROFILE_STATS[key] = stat
+        stat["count"] += 1
+        if total_ms is not None:
+            total_ms = float(total_ms)
+            stat["total_ms"] += total_ms
+            stat["max_total_ms"] = max(float(stat["max_total_ms"]), total_ms)
+            stat["min_total_ms"] = (
+                total_ms
+                if stat["min_total_ms"] is None
+                else min(float(stat["min_total_ms"]), total_ms)
+            )
+        if quant_ms is not None:
+            stat["quant_ms"] += float(quant_ms)
+        if gemm_ms is not None:
+            stat["gemm_ms"] += float(gemm_ms)
+        if bias_ms is not None:
+            stat["bias_ms"] += float(bias_ms)
+
+
+def _dump_fp8_gemm_profile() -> None:
+    if not _FP8_GEMM_PROFILE_STATS:
+        return
+    path = _fp8_gemm_profile_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with _FP8_GEMM_PROFILE_LOCK:
+        rows = []
+        for stat in _FP8_GEMM_PROFILE_STATS.values():
+            row = dict(stat)
+            count = int(row["count"])
+            if count > 0:
+                for field in ("total_ms", "quant_ms", "gemm_ms", "bias_ms"):
+                    row[f"avg_{field}"] = float(row[field]) / count
+            rows.append(row)
+    rows.sort(key=lambda row: float(row.get("total_ms") or 0.0), reverse=True)
+    payload = {
+        "pid": os.getpid(),
+        "rank": os.environ.get("RANK"),
+        "local_rank": os.environ.get("LOCAL_RANK"),
+        "world_size": os.environ.get("WORLD_SIZE"),
+        "created_unix": time.time(),
+        "rows": rows,
+    }
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fout:
+        json.dump(payload, fout, indent=2)
+        fout.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _wrap_profiled_fp8_backend(backend: str, fn: Callable) -> Callable:
+    if not _fp8_gemm_profile_enabled():
+        return fn
+
+    def profiled(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        block_size: List[int],
+        weight_scale: torch.Tensor,
+        input_scale: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input_2d_shape = input.view(-1, input.shape[-1]).shape
+        timer = _fp8_gemm_profile_time_start(input.device)
+        output = fn(input, weight, block_size, weight_scale, input_scale, bias)
+        total_ms = _fp8_gemm_profile_time_stop(timer)
+        _record_fp8_gemm_profile(
+            backend,
+            input_2d_shape,
+            weight.shape,
+            block_size,
+            input.dtype,
+            weight.dtype,
+            input_scale_present=input_scale is not None,
+            bias_present=bias is not None,
+            total_ms=total_ms,
+        )
+        return output
+
+    return profiled
+
+
+def _fp8_gemm_profile_backend_name(fn: Callable) -> str:
+    name = getattr(fn, "__name__", type(fn).__name__)
+    for suffix in (
+        "_w8a8_block_fp8_linear_with_fallback",
+        "_w8a8_block_fp8_linear",
+        "_block_fp8_linear",
+    ):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _cached_flashinfer_cutlass_weight_scale(
+    weight_scale: torch.Tensor,
+    expected_shape: tuple[int, int],
+) -> torch.Tensor:
+    if tuple(weight_scale.shape) == expected_shape and weight_scale.is_contiguous():
+        return weight_scale
+
+    version = int(getattr(weight_scale, "_version", 0))
+    key = (
+        weight_scale.data_ptr(),
+        tuple(weight_scale.shape),
+        str(weight_scale.device),
+        str(weight_scale.dtype),
+        version,
+    )
+    with _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_LOCK:
+        cached = _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    if tuple(weight_scale.shape) == expected_shape:
+        prepared = weight_scale.contiguous()
+    else:
+        prepared = weight_scale.transpose(-1, -2).contiguous()
+
+    with _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_LOCK:
+        if (
+            len(_FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE)
+            >= _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_MAX_SIZE
+        ):
+            _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE.clear()
+        _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE[key] = prepared
+    return prepared
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -408,10 +643,15 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
-        return _dispatch_explicit_backend(backend)
+        return _wrap_profiled_fp8_backend(
+            backend.value, _dispatch_explicit_backend(backend)
+        )
 
     # Auto mode: Select based purely on hardware/backend availability
-    return _dispatch_auto_backend()
+    fn = _dispatch_auto_backend()
+    return _wrap_profiled_fp8_backend(
+        f"auto:{_fp8_gemm_profile_backend_name(fn)}", fn
+    )
 
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
@@ -570,10 +810,13 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    # TRTLLM uses the existing SGLang column-major scale layout.
-    # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
+    # TRTLLM uses the existing SGLang column-major scale layout. CUTLASS with
+    # scale_major_mode="MN" expects (k//block_k, m), so generate activation
+    # scales in column-major storage and transpose to the target shape as a view.
     q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=(backend == "trtllm")
+        input_2d,
+        block_size[1],
+        column_major_scales=(backend in ("cutlass", "trtllm")),
     )
     if backend == "cutlass":
         block_n, block_k = block_size
@@ -582,9 +825,17 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         expected_x_scale_shape = (k // block_k, m)
         expected_weight_scale_shape = (k // block_k, n // block_n)
         if x_scale.shape == (m, k // block_k):
-            x_scale = x_scale.transpose(-1, -2).contiguous()
+            x_scale = x_scale.transpose(-1, -2)
+            if not x_scale.is_contiguous():
+                x_scale = x_scale.contiguous()
         if weight_scale.shape == (n // block_n, k // block_k):
-            weight_scale = weight_scale.transpose(-1, -2).contiguous()
+            weight_scale = _cached_flashinfer_cutlass_weight_scale(
+                weight_scale, expected_weight_scale_shape
+            )
+        elif not weight_scale.is_contiguous():
+            weight_scale = _cached_flashinfer_cutlass_weight_scale(
+                weight_scale, expected_weight_scale_shape
+            )
         assert x_scale.shape == expected_x_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects A scale layout "
             f"(k//block_k, m) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
@@ -836,16 +1087,47 @@ def tilelang_w8a8_block_fp8_linear(
 
     tilelang_gemm_wrapper.assert_available()
 
+    profile_enabled = _fp8_gemm_profile_enabled()
+    quant_ms = None
+    gemm_ms = None
+    bias_ms = None
+    if profile_enabled:
+        timer = _fp8_gemm_profile_time_start(input.device)
     q_input, x_scale = per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=False
     )
+    if profile_enabled:
+        quant_ms = _fp8_gemm_profile_time_stop(timer)
+
     output = torch.empty((M, N), dtype=torch.bfloat16, device=input.device)
+    if profile_enabled:
+        timer = _fp8_gemm_profile_time_start(input.device)
     tilelang_gemm_wrapper.gemm_nt_f8f8bf16(
         (q_input, x_scale), (weight, weight_scale), output
     )
+    if profile_enabled:
+        gemm_ms = _fp8_gemm_profile_time_stop(timer)
 
     if bias is not None:
+        if profile_enabled:
+            timer = _fp8_gemm_profile_time_start(input.device)
         output += bias
+        if profile_enabled:
+            bias_ms = _fp8_gemm_profile_time_stop(timer)
+    if profile_enabled:
+        _record_fp8_gemm_profile(
+            "tilelang_segments",
+            input_2d.shape,
+            weight.shape,
+            block_size,
+            input.dtype,
+            weight.dtype,
+            input_scale_present=False,
+            bias_present=bias is not None,
+            quant_ms=quant_ms,
+            gemm_ms=gemm_ms,
+            bias_ms=bias_ms,
+        )
     return output.view(*output_shape)
 
 
