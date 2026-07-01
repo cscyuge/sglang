@@ -164,6 +164,11 @@ class SessionResponse(BaseModel):
     session_id: str
     object: str = "video.session"
     status: str = "created"  # created | running | ended | failed
+    runtime: Optional[str] = None
+    model_id: Optional[str] = None
+    wan_s2v_realtime: Optional[bool] = None
+    stream_r1_mode: Optional[bool] = None
+    num_frame_per_block: Optional[int] = None
     stream_url: Optional[str] = None
     events_url: Optional[str] = None
     webrtc_url: Optional[str] = None

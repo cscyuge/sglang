@@ -23,11 +23,90 @@ from sglang.multimodal_gen.runtime.models.schedulers.wan_s2v_scheduler import (
 )
 from sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime import (
     AudioRingBuffer,
+    WanS2VRealtimeSessionRunner,
+    _audio_window_after_extend,
     _wait_for_session_audio_chunk,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    InputValidationStage,
+    TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
+from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
+    write_flashtalk_audio_chunk_meta,
+)
+
+
+class _RecordingStage:
+    def __init__(
+        self,
+        name,
+        calls,
+        *,
+        require_latents=False,
+        set_image_latent=False,
+    ):
+        self.name = name
+        self.calls = calls
+        self.require_latents = require_latents
+        self.set_image_latent = set_image_latent
+
+    def __call__(self, batch, server_args):
+        self.calls.append(self.name)
+        if self.require_latents and batch.latents is None:
+            raise AssertionError("stage requires preallocated latents")
+        if self.set_image_latent:
+            batch.image_latent = torch.zeros(
+                1,
+                1,
+                1,
+                1,
+                1,
+                dtype=batch.latents.dtype,
+                device=batch.latents.device,
+            )
+        return batch
+
+
+class _FakeRealtimeRunner(WanS2VRealtimeSessionRunner):
+    def __init__(self, stages_by_type):
+        self.pipeline = None
+        self.stages = []
+        self.stages_by_type = stages_by_type
+
+    def _get_stage(self, stage_type):
+        return self.stages_by_type[stage_type]
+
+
+class _FakeAudioPrefetchRunner(_FakeRealtimeRunner):
+    def __init__(self):
+        super().__init__({})
+        self.seen_audio_window = None
+
+    def _next_audio_chunk(self, **kwargs):
+        return (
+            7,
+            np.array([4, 5], dtype=np.float32),
+            {"chunk_source": "mic"},
+            False,
+        )
+
+    def _encode_audio_window(
+        self,
+        batch,
+        server_args,
+        audio_stage,
+        audio_window,
+        *,
+        target_audio_frames,
+        audio_window_video_frames,
+        wav2vec_graph_runner=None,
+        ensure_loaded=True,
+    ):
+        self.seen_audio_window = np.asarray(audio_window, dtype=np.float32).copy()
+        return torch.ones(1, 2, 3, 4)
 
 
 class WanS2VRealtimeHelpersTest(unittest.TestCase):
@@ -38,7 +117,7 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
         ring.extend(np.array([4, 5, 6], dtype=np.float32))
 
         np.testing.assert_array_equal(
-            ring.snapshot(), np.array([2, 3, 4, 5, 6], dtype=np.float64)
+            ring.snapshot(), np.array([2, 3, 4, 5, 6], dtype=np.float32)
         )
 
     def test_audio_ring_buffer_keeps_last_capacity_samples(self):
@@ -47,7 +126,20 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
         ring.extend(np.arange(10, dtype=np.float32))
 
         np.testing.assert_array_equal(
-            ring.snapshot(), np.array([6, 7, 8, 9], dtype=np.float64)
+            ring.snapshot(), np.array([6, 7, 8, 9], dtype=np.float32)
+        )
+
+    def test_audio_window_after_extend_matches_ring_order(self):
+        window = np.array([0, 1, 2, 3, 4], dtype=np.float32)
+        samples = np.array([5, 6], dtype=np.float32)
+
+        np.testing.assert_array_equal(
+            _audio_window_after_extend(window, samples),
+            np.array([2, 3, 4, 5, 6], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            _audio_window_after_extend(window, np.arange(10, dtype=np.float32)),
+            np.array([5, 6, 7, 8, 9], dtype=np.float32),
         )
 
     def test_wait_for_session_audio_chunk_loads_existing_chunk(self):
@@ -69,6 +161,111 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
             actual = _wait_for_session_audio_chunk(tmp, 0, timeout=0.1)
 
         self.assertIsNone(actual)
+
+    def test_realtime_reference_vae_is_deferred_until_block_latents_exist(self):
+        calls = []
+        image_stage = _RecordingStage(
+            "image",
+            calls,
+            require_latents=True,
+            set_image_latent=True,
+        )
+        runner = _FakeRealtimeRunner(
+            {
+                InputValidationStage: _RecordingStage("input", calls),
+                TextEncodingStage: _RecordingStage("text", calls),
+                ImageVAEEncodingStage: image_stage,
+            }
+        )
+        batch = SimpleNamespace(
+            num_frames=597,
+            extra={},
+            image_latent=None,
+            latents=None,
+        )
+        server_args = SimpleNamespace()
+
+        batch = runner._prepare_reference_and_prompt(batch, server_args, 25)
+
+        self.assertEqual(calls, ["input", "text"])
+        self.assertEqual(batch.num_frames, 25)
+        self.assertEqual(batch.extra["wan_s2v_realtime_original_num_frames"], 597)
+        with self.assertRaisesRegex(RuntimeError, "requires block latents"):
+            runner._prepare_reference_latents_once(batch, server_args, image_stage)
+
+        batch.latents = torch.zeros(1, 16, 7, 4, 4, dtype=torch.float16)
+        batch = runner._prepare_reference_latents_once(batch, server_args, image_stage)
+
+        self.assertEqual(calls, ["input", "text", "image"])
+        self.assertIsNotNone(batch.image_latent)
+        self.assertEqual(batch.image_latent.dtype, torch.float16)
+
+        batch = runner._prepare_reference_latents_once(batch, server_args, image_stage)
+        self.assertEqual(calls, ["input", "text", "image"])
+
+    def test_next_audio_chunk_skips_filler_when_hold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            chunks_dir = os.path.join(tmp, "audio_chunks")
+            os.makedirs(chunks_dir)
+            np.save(os.path.join(chunks_dir, "chunk_0000.npy"), np.zeros(3))
+            np.save(os.path.join(chunks_dir, "chunk_0001.npy"), np.ones(4))
+            write_flashtalk_audio_chunk_meta(
+                tmp,
+                0,
+                {"is_filler": True, "chunk_source": "idle_silence"},
+            )
+            write_flashtalk_audio_chunk_meta(
+                tmp,
+                1,
+                {"is_filler": False, "chunk_source": "mic", "turn_id": "t1"},
+            )
+            runner = _FakeRealtimeRunner({})
+
+            chunk_idx, audio, meta, ended = runner._next_audio_chunk(
+                session_dir=tmp,
+                audio_chunk_idx=0,
+                cancel_file=None,
+                idle_policy="hold",
+                timeline_path=None,
+            )
+
+        self.assertFalse(ended)
+        self.assertEqual(chunk_idx, 1)
+        np.testing.assert_array_equal(audio, np.ones(4, dtype=np.float32))
+        self.assertEqual(meta["chunk_source"], "mic")
+        self.assertEqual(meta["turn_id"], "t1")
+
+    def test_prefetch_next_audio_chunk_uses_snapshot_plus_next_audio(self):
+        runner = _FakeAudioPrefetchRunner()
+
+        prefetched = runner._prefetch_next_audio_chunk(
+            batch=SimpleNamespace(),
+            server_args=SimpleNamespace(),
+            audio_stage=SimpleNamespace(),
+            session_dir="/tmp/session",
+            audio_chunk_idx=7,
+            cancel_file=None,
+            idle_policy="hold",
+            timeline_path=None,
+            audio_window_snapshot=np.array([0, 1, 2, 3], dtype=np.float32),
+            target_audio_frames=12,
+            audio_window_video_frames=128,
+            wav2vec_graph_runner=None,
+            overlap_stream=None,
+            after_denoise_event=None,
+        )
+
+        self.assertFalse(prefetched.end_requested)
+        self.assertEqual(prefetched.audio_chunk_idx, 7)
+        np.testing.assert_array_equal(
+            prefetched.audio,
+            np.array([4, 5], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            runner.seen_audio_window,
+            np.array([2, 3, 4, 5], dtype=np.float32),
+        )
+        torch.testing.assert_close(prefetched.audio_input, torch.ones(1, 2, 3, 4))
 
     def test_realtime_config_validation(self):
         cfg = WanS2VPipelineConfig(

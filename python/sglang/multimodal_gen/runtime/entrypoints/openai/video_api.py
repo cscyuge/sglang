@@ -921,6 +921,7 @@ async def create_session(
     reference_url: Optional[str] = Form(None),
     seed: Optional[int] = Form(1024),
     size: Optional[str] = Form(None),
+    fps: Optional[int] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     guidance_scale: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
@@ -988,6 +989,7 @@ async def create_session(
         input_reference=input_path,
         seed=seed,
         size=size or "",
+        fps=fps,
         seconds=4,  # placeholder; session runs indefinitely
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
@@ -1008,12 +1010,30 @@ async def create_session(
     batch.extra["artc_channel"] = artc_channel
     batch.extra["artc_userid"] = artc_userid
     batch.extra["audio_delta_mode"] = bool(audio_delta_mode)
+    pipeline_config = server_args.pipeline_config
+    wan_s2v_realtime = bool(getattr(pipeline_config, "wan_s2v_realtime", False))
+    stream_r1_mode = bool(getattr(pipeline_config, "stream_r1_mode", False))
+    realtime_runtime = "wan_s2v_realtime" if wan_s2v_realtime else "session"
+    model_id = (
+        getattr(server_args, "model_id", None)
+        or getattr(server_args, "model_path", None)
+        or ""
+    )
+    num_frame_per_block = getattr(pipeline_config, "num_frame_per_block", None)
+    batch.extra["runtime"] = realtime_runtime
+    batch.extra["wan_s2v_realtime"] = wan_s2v_realtime
+    batch.extra["stream_r1_mode"] = stream_r1_mode
 
     # Store session metadata
     session_data = {
         "session_id": session_id,
         "object": "video.session",
         "status": "created",
+        "runtime": realtime_runtime,
+        "model_id": model_id,
+        "wan_s2v_realtime": wan_s2v_realtime,
+        "stream_r1_mode": stream_r1_mode,
+        "num_frame_per_block": num_frame_per_block,
         "stream_url": f"/v1/videos/{session_id}/stream",
         "events_url": f"/v1/videos/{session_id}/events",
         "webrtc_url": f"/v1/videos/{session_id}/webrtc",
@@ -1033,6 +1053,11 @@ async def create_session(
         artc_userid=artc_userid,
         audio_delta_mode=bool(audio_delta_mode),
         session_dir=session_dir,
+        runtime=realtime_runtime,
+        model_id=model_id,
+        wan_s2v_realtime=wan_s2v_realtime,
+        stream_r1_mode=stream_r1_mode,
+        num_frame_per_block=num_frame_per_block,
     )
 
     # Also register as a video job so /stream and /events endpoints work
