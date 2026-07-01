@@ -8,13 +8,16 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
-KERNEL_TYPES = ("base", "swapAB", "splitK", "splitK_swapAB")
+KERNEL_TYPES = ("base", "base_ws", "swapAB", "splitK", "splitK_swapAB")
 SPLIT_K_KERNEL_TYPES = {"splitK", "splitK_swapAB"}
 SWAP_AB_KERNEL_TYPES = {"swapAB", "splitK_swapAB"}
+WARP_SPECIALIZED_KERNEL_TYPES = {"base_ws"}
 AUTOTUNE_SEARCH_POLICIES = ("full", "family_pruned", "fast_sm90")
 SCHEMA_VERSION = 1
 _BLOCK_M_VALUES = (64, 128)
 _BLOCK_N_VALUES = (16, 32, 64, 128)
+_WS_BLOCK_M_VALUES = (64, 128)
+_WS_BLOCK_N_VALUES = (128,)
 _BLOCK_K_VALUES = (128,)
 _THREAD_VALUES = (128, 256)
 _MATMUL_STAGE_VALUES = (1, 2, 3, 4)
@@ -149,6 +152,39 @@ def _matmul_splitk_configs(M: int, N: int, K: int) -> List[dict]:
     return configs
 
 
+def _matmul_warp_specialized_configs(M: int, N: int, K: int) -> List[dict]:
+    del N, K
+    if M < 256:
+        return []
+
+    tiles_m = _WS_BLOCK_M_VALUES
+    tiles_n = _WS_BLOCK_N_VALUES
+    tiles_k = _BLOCK_K_VALUES
+    stages = _MATMUL_STAGE_VALUES
+    threads = _THREAD_VALUES
+    configs = []
+    for block_m in tiles_m:
+        for block_n in tiles_n:
+            for block_k in tiles_k:
+                for num_stages in stages:
+                    for num_threads in threads:
+                        if (block_m * block_k + block_n * block_k) * num_stages >= (
+                            256 * 1024
+                        ):
+                            continue
+                        configs.append(
+                            {
+                                "block_M": block_m,
+                                "block_N": block_n,
+                                "block_K": block_k,
+                                "num_stages": num_stages,
+                                "threads": num_threads,
+                                "split_k": 1,
+                            }
+                        )
+    return configs
+
+
 def validate_search_policy(search_policy: str) -> str:
     if search_policy not in AUTOTUNE_SEARCH_POLICIES:
         raise ValueError(
@@ -209,10 +245,24 @@ def config_compatibility_error(config: dict, M: int, N: int, K: int) -> Optional
     if error is not None:
         return error
 
-    if config["block_M"] not in _BLOCK_M_VALUES:
-        return f"block_M must be one of {_BLOCK_M_VALUES}; got {config['block_M']}"
-    if config["block_N"] not in _BLOCK_N_VALUES:
-        return f"block_N must be one of {_BLOCK_N_VALUES}; got {config['block_N']}"
+    if kernel_type in WARP_SPECIALIZED_KERNEL_TYPES:
+        if M < 256:
+            return f"{kernel_type} is only supported for M >= 256; got M={M}"
+        if config["block_M"] not in _WS_BLOCK_M_VALUES:
+            return (
+                f"{kernel_type} block_M must be one of {_WS_BLOCK_M_VALUES}; "
+                f"got {config['block_M']}"
+            )
+        if config["block_N"] not in _WS_BLOCK_N_VALUES:
+            return (
+                f"{kernel_type} block_N must be one of {_WS_BLOCK_N_VALUES}; "
+                f"got {config['block_N']}"
+            )
+    else:
+        if config["block_M"] not in _BLOCK_M_VALUES:
+            return f"block_M must be one of {_BLOCK_M_VALUES}; got {config['block_M']}"
+        if config["block_N"] not in _BLOCK_N_VALUES:
+            return f"block_N must be one of {_BLOCK_N_VALUES}; got {config['block_N']}"
     if config["block_K"] not in _BLOCK_K_VALUES:
         return f"block_K must be one of {_BLOCK_K_VALUES}; got {config['block_K']}"
     if config["threads"] not in _THREAD_VALUES:
@@ -228,8 +278,8 @@ def config_compatibility_error(config: dict, M: int, N: int, K: int) -> Optional
             "swizzle_order must be one of ('row', 'column'); "
             f"got {config['swizzle_order']}"
         )
-    if config["swizzle_panel"] > 0 and kernel_type != "base":
-        return "swizzle_panel is currently supported only by the base kernel"
+    if config["swizzle_panel"] > 0 and kernel_type not in ("base", "base_ws"):
+        return "swizzle_panel is currently supported only by base kernels"
 
     split_k = config["split_k"]
     if kernel_type in SPLIT_K_KERNEL_TYPES:
@@ -320,6 +370,20 @@ def _fast_sm90_candidate_filter(config: dict, M: int, N: int, K: int) -> bool:
     kernel_type = config["kernel_type"]
     if config["block_K"] != 128:
         return False
+
+    if kernel_type == "base_ws":
+        return (
+            M >= 256
+            and N >= 4096
+            and K >= 4096
+            and config["block_M"] in (64, 128)
+            and config["block_N"] == 128
+            and config["num_stages"] in (2, 3)
+            and config["threads"] in (128, 256)
+            and config["c_scale_local"]
+            and not config["a_scale_shm"]
+        )
+
     if config["threads"] != 128:
         return False
 
@@ -390,11 +454,12 @@ def generate_candidate_configs(
         if kernel_type_m_compatibility_error(kernel_type, M) is not None:
             continue
 
-        base_configs = (
-            _matmul_splitk_configs(M, N, K)
-            if kernel_type in SPLIT_K_KERNEL_TYPES
-            else _matmul_configs(M, N, K)
-        )
+        if kernel_type in SPLIT_K_KERNEL_TYPES:
+            base_configs = _matmul_splitk_configs(M, N, K)
+        elif kernel_type in WARP_SPECIALIZED_KERNEL_TYPES:
+            base_configs = _matmul_warp_specialized_configs(M, N, K)
+        else:
+            base_configs = _matmul_configs(M, N, K)
         scale_key = (
             "b_scale_shm" if kernel_type in SWAP_AB_KERNEL_TYPES else "a_scale_shm"
         )

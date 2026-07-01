@@ -140,6 +140,7 @@ def _get_kernel(
     assert_available()
 
     from sglang.srt.layers.tilelang_gemm_wrapper.kernels import (
+        fp8_blockwise_gemm_base_ws_kernel,
         fp8_blockwise_gemm_base_kernel,
         fp8_blockwise_gemm_split_k_kernel,
         fp8_blockwise_gemm_split_k_swap_ab_kernel,
@@ -161,6 +162,13 @@ def _get_kernel(
 
     if kernel_type == "base":
         return fp8_blockwise_gemm_base_kernel(
+            **common,
+            a_scale_shm=a_scale_shm,
+            swizzle_panel=swizzle_panel,
+            swizzle_order=swizzle_order,
+        )
+    if kernel_type == "base_ws":
+        return fp8_blockwise_gemm_base_ws_kernel(
             **common,
             a_scale_shm=a_scale_shm,
             swizzle_panel=swizzle_panel,

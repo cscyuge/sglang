@@ -14,6 +14,11 @@ if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
 elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
     _PASS_CONFIGS[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
 
+_WARP_SPECIALIZED_PASS_CONFIGS = dict(_PASS_CONFIGS)
+_WARP_SPECIALIZED_PASS_CONFIGS.pop(
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED, None
+)
+
 FP8_DTYPE = "float8_e4m3"
 BF16_DTYPE = "bfloat16"
 FP32_DTYPE = "float32"
@@ -26,6 +31,81 @@ GROUP_SIZE = 128
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
 def fp8_blockwise_gemm_base_kernel(
+    N: int,
+    K: int,
+    block_M: int = 128,
+    block_N: int = 128,
+    block_K: int = 128,
+    num_stages: int = 2,
+    threads: int = 128,
+    out_dtype: str = BF16_DTYPE,
+    accum_dtype: str = FP32_DTYPE,
+    c_scale_local: bool = False,
+    a_scale_shm: bool = False,
+    swizzle_panel: int = 0,
+    swizzle_order: str = "row",
+):
+    M = T.symbolic("M")
+    c_scale_alloc = T.alloc_fragment if c_scale_local else T.alloc_shared
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((M, K), FP8_DTYPE),
+        A_scale: T.Tensor((M, T.ceildiv(K, GROUP_SIZE)), FP32_DTYPE),
+        B: T.Tensor((N, K), FP8_DTYPE),
+        B_scale: T.Tensor(
+            (T.ceildiv(N, GROUP_SIZE), T.ceildiv(K, GROUP_SIZE)), FP32_DTYPE
+        ),
+        C: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(
+            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
+        ) as (pid_n, pid_m):
+            if swizzle_panel > 0:
+                T.use_swizzle(swizzle_panel, order=swizzle_order)
+
+            A_shared = T.alloc_shared((block_M, block_K), FP8_DTYPE)
+            B_shared = T.alloc_shared((block_N, block_K), FP8_DTYPE)
+            C_shared = T.alloc_shared((block_M, block_N), out_dtype)
+            C_scale = c_scale_alloc((block_M,), FP32_DTYPE)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            C_local_accum = T.alloc_fragment((block_M, block_N), accum_dtype)
+
+            if a_scale_shm:
+                A_scale_shared = T.alloc_shared((block_M,), FP32_DTYPE)
+
+            T.clear(C_local)
+            T.clear(C_local_accum)
+
+            for k_iter in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                T.copy(A[pid_m * block_M, k_iter * block_K], A_shared)
+                T.copy(B[pid_n * block_N, k_iter * block_K], B_shared)
+
+                if a_scale_shm:
+                    for i in T.Parallel(block_M):
+                        A_scale_shared[i] = A_scale[pid_m * block_M + i, k_iter]
+                    b_scale = B_scale[pid_n * block_N // GROUP_SIZE, k_iter]
+                    for i in T.Parallel(block_M):
+                        C_scale[i] = A_scale_shared[i] * b_scale
+                else:
+                    b_scale = B_scale[pid_n * block_N // GROUP_SIZE, k_iter]
+                    for i in T.Parallel(block_M):
+                        C_scale[i] = A_scale[pid_m * block_M + i, k_iter] * b_scale
+
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+
+                for i, j in T.Parallel(block_M, block_N):
+                    C_local_accum[i, j] += C_local[i, j] * C_scale[i]
+                T.clear(C_local)
+
+            T.copy(C_local_accum, C_shared)
+            T.copy(C_shared, C[pid_m * block_M, pid_n * block_N])
+
+    return kernel
+
+
+@tilelang.jit(pass_configs=_WARP_SPECIALIZED_PASS_CONFIGS)
+def fp8_blockwise_gemm_base_ws_kernel(
     N: int,
     K: int,
     block_M: int = 128,

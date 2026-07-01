@@ -7,6 +7,7 @@ from sglang.srt.layers.tilelang_gemm_wrapper import runtime
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
     DEFAULT_M_VALUES,
     SelectedConfigStore,
+    config_compatibility_error,
     generate_candidate_configs,
     validate_search_policy,
     write_selected_config_file,
@@ -38,6 +39,29 @@ def test_tilelang_gemm_autotune_search_policy_counts():
     )
     assert len(fast_prefill) == 12
     assert {config["kernel_type"] for config in fast_prefill} == {"base"}
+
+
+def test_tilelang_gemm_base_ws_candidates_are_large_m_only():
+    assert (
+        generate_candidate_configs(
+            1, 4096, 1024, kernel_types=["base_ws"], search_policy="full"
+        )
+        == []
+    )
+
+    full_candidates = generate_candidate_configs(
+        1070, 5120, 5120, kernel_types=["base_ws"], search_policy="full"
+    )
+    fast_candidates = generate_candidate_configs(
+        1070, 5120, 5120, kernel_types=["base_ws"], search_policy="fast_sm90"
+    )
+    assert len(full_candidates) == 64
+    assert len(fast_candidates) == 8
+    assert {config["kernel_type"] for config in full_candidates} == {"base_ws"}
+    assert {config["block_N"] for config in full_candidates} == {128}
+
+    invalid = {**full_candidates[0], "M": 1}
+    assert "M >= 256" in config_compatibility_error(invalid, 1, 5120, 5120)
 
 
 def test_tilelang_gemm_autotune_search_policy_validation():
