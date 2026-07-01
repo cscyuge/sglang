@@ -48,6 +48,7 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_idle_policy: str = "hold"
     wan_s2v_max_silence_blocks: int = 1
     wan_s2v_audio_overlap: bool = False
+    wan_s2v_latent_condition_overlap: bool = False
     wan_s2v_wav2vec_cuda_graph: bool = False
     wan_s2v_streaming_vae_cache: bool = True
     wan_s2v_vae_cuda_graph: bool = False

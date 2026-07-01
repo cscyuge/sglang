@@ -3,7 +3,7 @@
 
 import inspect
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -1097,6 +1097,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         dit_dtype: torch.dtype,
         autocast_enabled: bool,
         audio_start_frame: int | None = None,
+        step_noises_btchw: Sequence[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Denoise one Stream-R1 S2V latent block.
 
@@ -1108,6 +1109,14 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
         video_raw_latent_shape = noise_latents_btchw.shape
         current_start = block_start * frame_seq_length
+        if step_noises_btchw is not None and len(step_noises_btchw) != max(
+            int(timesteps.numel()) - 1, 0
+        ):
+            raise ValueError(
+                "Stream-R1 S2V precomputed step noise count does not match "
+                f"timesteps: got {len(step_noises_btchw)}, "
+                f"expected {max(int(timesteps.numel()) - 1, 0)}"
+            )
 
         for i, t_cur in enumerate(timesteps):
             t_expand = t_cur.reshape(1).repeat(current_latents.shape[0])
@@ -1154,12 +1163,25 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 next_timestep = (
                     timesteps[i + 1].reshape(1).to(device=current_latents.device)
                 )
-                noise = torch.randn(
-                    video_raw_latent_shape,
-                    dtype=pred_video_btchw.dtype,
-                    generator=generator,
-                    device=current_latents.device,
-                )
+                if step_noises_btchw is None:
+                    noise = torch.randn(
+                        video_raw_latent_shape,
+                        dtype=pred_video_btchw.dtype,
+                        generator=generator,
+                        device=current_latents.device,
+                    )
+                else:
+                    noise = step_noises_btchw[i]
+                    if noise.shape != video_raw_latent_shape:
+                        raise ValueError(
+                            "Stream-R1 S2V precomputed step noise shape mismatch: "
+                            f"got {tuple(noise.shape)}, "
+                            f"expected {tuple(video_raw_latent_shape)}"
+                        )
+                    if noise.device != current_latents.device:
+                        noise = noise.to(current_latents.device, non_blocking=True)
+                    if noise.dtype != pred_video_btchw.dtype:
+                        noise = noise.to(dtype=pred_video_btchw.dtype)
                 noise_latents_btchw = self.scheduler.add_noise(
                     pred_video_btchw.flatten(0, 1),
                     noise.flatten(0, 1),

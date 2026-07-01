@@ -70,7 +70,11 @@ def _usp_get_buffer(
     )
     buffer = _USP_BUFFER_CACHE.get(cache_key)
     if buffer is None:
-        buffer = like.new_empty(shape)
+        # Reused USP buffers are updated with copy_/out= writes across calls.
+        # Allocate them as normal tensors even when the caller is under
+        # torch.inference_mode(), otherwise PyTorch rejects later inplace writes.
+        with torch.inference_mode(False):
+            buffer = torch.empty(shape, dtype=like.dtype, device=like.device)
         _USP_BUFFER_CACHE[cache_key] = buffer
     return buffer
 

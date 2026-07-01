@@ -190,6 +190,28 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
             np.array([5, 6, 7, 8, 9], dtype=np.float32),
         )
 
+    def test_prepare_step_noises_matches_sequential_rng_draws(self):
+        runner = _FakeRealtimeRunner({})
+        latents = torch.zeros(1, 2, 3, 4, 5)
+        timesteps = torch.arange(4)
+        generator = torch.Generator(device="cpu").manual_seed(7)
+        expected_generator = torch.Generator(device="cpu").manual_seed(7)
+        expected_shape = latents.permute(0, 2, 1, 3, 4).shape
+
+        noises = runner._prepare_step_noises(latents, timesteps, generator)
+        expected = tuple(
+            torch.randn(expected_shape, generator=expected_generator)
+            for _ in range(3)
+        )
+
+        self.assertEqual(len(noises), 3)
+        for actual, expected_noise in zip(noises, expected):
+            torch.testing.assert_close(actual, expected_noise)
+        torch.testing.assert_close(
+            torch.randn((), generator=generator),
+            torch.randn((), generator=expected_generator),
+        )
+
     def test_wait_for_session_audio_chunk_loads_existing_chunk(self):
         with tempfile.TemporaryDirectory() as tmp:
             chunks_dir = os.path.join(tmp, "audio_chunks")

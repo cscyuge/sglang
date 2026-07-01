@@ -7,6 +7,7 @@ import gc
 import json
 import os
 import time
+from copy import copy
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event
@@ -33,6 +34,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_s2v import (
     WanS2VAudioEncodingStage,
+    WanS2VConditionBundle,
     WanS2VDenoisingDispatchStage,
     build_wan_s2v_condition_bundle,
 )
@@ -341,6 +343,21 @@ class _PrefetchedAudioChunk:
     audio_s: float = 0.0
     audio_cpu_s: float = 0.0
     audio_gpu_enqueue_s: float = 0.0
+    prepared_block: "_PreparedWanS2VBlock | None" = None
+
+
+@dataclass
+class _PreparedWanS2VBlock:
+    block_idx: int
+    latents: torch.Tensor
+    step_noises_btchw: tuple[torch.Tensor, ...]
+    bundle: WanS2VConditionBundle | None = None
+    prompt_embeds: torch.Tensor | None = None
+    event: Any = None
+    prepare_s: float = 0.0
+    latent_s: float = 0.0
+    step_noise_s: float = 0.0
+    condition_s: float = 0.0
 
 
 @dataclass
@@ -447,6 +464,147 @@ class WanS2VRealtimeSessionRunner:
         batch.latents = None
         batch = latent_stage(batch, server_args)
         return batch.latents
+
+    def _copy_batch_for_block_prepare(self, batch: Req) -> Req:
+        block_batch = copy(batch)
+        block_batch.extra = dict(batch.extra)
+        block_batch.latents = None
+        block_batch.latent_ids = None
+        block_batch.raw_latent_shape = None
+        return block_batch
+
+    def _prepare_step_noises(
+        self,
+        block_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, ...]:
+        num_noises = max(int(timesteps.numel()) - 1, 0)
+        if num_noises == 0:
+            return ()
+
+        noise_shape = tuple(block_latents.permute(0, 2, 1, 3, 4).shape)
+        return tuple(
+            torch.randn(
+                noise_shape,
+                dtype=block_latents.dtype,
+                generator=generator,
+                device=block_latents.device,
+            )
+            for _ in range(num_noises)
+        )
+
+    def _prepare_block_inputs(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        latent_stage: LatentPreparationStage,
+        block_idx: int,
+        block_public_frames: int,
+        timesteps: torch.Tensor,
+        generator: torch.Generator | None,
+        dit_dtype: torch.dtype,
+        device: torch.device | str,
+        audio_input: torch.Tensor | None,
+        build_condition: bool,
+        overlap_stream: torch.cuda.Stream | None = None,
+    ) -> _PreparedWanS2VBlock:
+        prepared_batch = self._copy_batch_for_block_prepare(batch)
+        if audio_input is not None:
+            prepared_batch.extra["audio_input"] = audio_input
+
+        started = time.perf_counter()
+        event = None
+
+        def prepare_on_current_stream() -> tuple[
+            torch.Tensor,
+            tuple[torch.Tensor, ...],
+            WanS2VConditionBundle | None,
+            torch.Tensor | None,
+            float,
+            float,
+            float,
+        ]:
+            latent_started = time.perf_counter()
+            block_latents = self._prepare_block_latents(
+                prepared_batch,
+                server_args,
+                latent_stage,
+                block_public_frames,
+            ).to(device=device, dtype=dit_dtype)
+            prepared_batch.latents = block_latents
+            latent_s = time.perf_counter() - latent_started
+
+            step_noise_started = time.perf_counter()
+            step_noises = self._prepare_step_noises(
+                block_latents,
+                timesteps,
+                generator,
+            )
+            step_noise_s = time.perf_counter() - step_noise_started
+
+            condition_s = 0.0
+            bundle = None
+            prompt_embeds = None
+            if build_condition:
+                condition_started = time.perf_counter()
+                bundle = build_wan_s2v_condition_bundle(
+                    prepared_batch,
+                    server_args,
+                    latents=block_latents,
+                    dtype=dit_dtype,
+                    device=device,
+                )
+                prompt_embeds = bundle.prompt_embeds
+                if isinstance(prompt_embeds, list):
+                    prompt_embeds = prompt_embeds[0]
+                condition_s = time.perf_counter() - condition_started
+            return (
+                block_latents,
+                step_noises,
+                bundle,
+                prompt_embeds,
+                latent_s,
+                step_noise_s,
+                condition_s,
+            )
+
+        if overlap_stream is not None and torch.cuda.is_available():
+            with torch.cuda.device(device), torch.cuda.stream(overlap_stream):
+                (
+                    block_latents,
+                    step_noises,
+                    bundle,
+                    prompt_embeds,
+                    latent_s,
+                    step_noise_s,
+                    condition_s,
+                ) = prepare_on_current_stream()
+                event = overlap_stream.record_event()
+        else:
+            (
+                block_latents,
+                step_noises,
+                bundle,
+                prompt_embeds,
+                latent_s,
+                step_noise_s,
+                condition_s,
+            ) = prepare_on_current_stream()
+
+        return _PreparedWanS2VBlock(
+            block_idx=block_idx,
+            latents=block_latents,
+            step_noises_btchw=step_noises,
+            bundle=bundle,
+            prompt_embeds=prompt_embeds,
+            event=event,
+            prepare_s=time.perf_counter() - started,
+            latent_s=latent_s,
+            step_noise_s=step_noise_s,
+            condition_s=condition_s,
+        )
 
     def _decode_block_frames(
         self,
@@ -759,6 +917,7 @@ class WanS2VRealtimeSessionRunner:
         batch: Req,
         server_args: ServerArgs,
         audio_stage: WanS2VAudioEncodingStage,
+        latent_stage: LatentPreparationStage | None = None,
         session_dir: str,
         audio_chunk_idx: int,
         cancel_file: str | None,
@@ -771,6 +930,13 @@ class WanS2VRealtimeSessionRunner:
         overlap_stream: torch.cuda.Stream | None,
         after_denoise_event: torch.cuda.Event | None,
         gpu_start_event: Event | None = None,
+        prepare_block_idx: int | None = None,
+        block_public_frames: int | None = None,
+        timesteps: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        dit_dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+        build_condition: bool = False,
     ) -> _PrefetchedAudioChunk:
         current_audio_idx, audio_chunk, audio_meta, end_requested = (
             self._next_audio_chunk(
@@ -823,6 +989,29 @@ class WanS2VRealtimeSessionRunner:
                 audio_window_video_frames=audio_window_video_frames,
                 wav2vec_graph_runner=wav2vec_graph_runner,
             )
+        prepared_block = None
+        if (
+            prepare_block_idx is not None
+            and latent_stage is not None
+            and block_public_frames is not None
+            and timesteps is not None
+            and dit_dtype is not None
+            and device is not None
+        ):
+            prepared_block = self._prepare_block_inputs(
+                batch=batch,
+                server_args=server_args,
+                latent_stage=latent_stage,
+                block_idx=prepare_block_idx,
+                block_public_frames=block_public_frames,
+                timesteps=timesteps,
+                generator=generator,
+                dit_dtype=dit_dtype,
+                device=device,
+                audio_input=audio_input,
+                build_condition=build_condition,
+                overlap_stream=overlap_stream,
+            )
         audio_gpu_enqueue_s = time.perf_counter() - audio_gpu_started
         audio_s = time.perf_counter() - audio_started
         return _PrefetchedAudioChunk(
@@ -835,6 +1024,7 @@ class WanS2VRealtimeSessionRunner:
             audio_s=audio_s,
             audio_cpu_s=audio_cpu_s,
             audio_gpu_enqueue_s=audio_gpu_enqueue_s,
+            prepared_block=prepared_block,
         )
 
     def _next_audio_chunk(
@@ -972,6 +1162,15 @@ class WanS2VRealtimeSessionRunner:
         )
         if use_audio_overlap and not torch.cuda.is_available():
             use_audio_overlap = False
+        use_latent_condition_overlap = bool(
+            _pipeline_config_value(
+                server_args,
+                "wan_s2v_latent_condition_overlap",
+                False,
+            )
+        )
+        if use_latent_condition_overlap and not torch.cuda.is_available():
+            use_latent_condition_overlap = False
         use_streaming_vae_cache = bool(
             _pipeline_config_value(server_args, "wan_s2v_streaming_vae_cache", True)
         )
@@ -987,7 +1186,7 @@ class WanS2VRealtimeSessionRunner:
             "Wan S2V realtime session start: session=%s block_latent_frames=%d "
             "block_public_frames=%d fps=%d audio_window=%.2fs idle_policy=%s "
             "wav2vec_cuda_graph=%s audio_overlap=%s streaming_vae_cache=%s "
-            "vae_cuda_graph=%s",
+            "vae_cuda_graph=%s latent_condition_overlap=%s",
             session_id,
             num_frame_per_block,
             block_public_frames,
@@ -998,6 +1197,7 @@ class WanS2VRealtimeSessionRunner:
             use_audio_overlap,
             use_streaming_vae_cache,
             use_vae_cuda_graph,
+            use_latent_condition_overlap,
         )
         emit_chunk_timeline(
             timeline_path,
@@ -1012,6 +1212,7 @@ class WanS2VRealtimeSessionRunner:
             audio_overlap=use_audio_overlap,
             streaming_vae_cache=use_streaming_vae_cache,
             vae_cuda_graph=use_vae_cuda_graph,
+            latent_condition_overlap=use_latent_condition_overlap,
         )
 
         batch = self._prepare_reference_and_prompt(
@@ -1057,13 +1258,17 @@ class WanS2VRealtimeSessionRunner:
         prefetched_audio_future: Future | None = None
         prefetch_after_denoise_event: torch.cuda.Event | None = None
         prefetch_gpu_start_event: Event | None = None
-        if use_audio_overlap:
+        if use_audio_overlap or use_latent_condition_overlap:
             audio_prefetch_pool = ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="wan-s2v-audio-prefetch",
             )
             audio_overlap_stream = torch.cuda.Stream(device=device)
-            logger.info("Wan S2V audio prefetch overlap enabled")
+            logger.info(
+                "Wan S2V prefetch overlap enabled: audio=%s latent_condition=%s",
+                use_audio_overlap,
+                use_latent_condition_overlap,
+            )
 
         cache_state = None
         attention_request = None
@@ -1093,6 +1298,13 @@ class WanS2VRealtimeSessionRunner:
                 audio_prefetch_wall_s = 0.0
                 audio_prefetch_gate_s = 0.0
                 audio_wait_s = 0.0
+                latent_prefetched = False
+                latent_wait_s = 0.0
+                latent_prepare_wall_s = 0.0
+                latent_prepare_gpu_s = 0.0
+                step_noise_s = 0.0
+                condition_s = 0.0
+                prepared_block = None
                 if prefetched_audio_future is not None:
                     audio_wait_started = time.perf_counter()
                     try:
@@ -1114,6 +1326,7 @@ class WanS2VRealtimeSessionRunner:
                     end_requested = prefetched.end_requested
                     audio_chunk = prefetched.audio
                     audio_meta = prefetched.meta
+                    prepared_block = prefetched.prepared_block
                     audio_chunk_idx = current_audio_idx + (0 if end_requested else 1)
                     if end_requested:
                         break
@@ -1132,6 +1345,12 @@ class WanS2VRealtimeSessionRunner:
                     )
                     audio_s = audio_wait_s
                     audio_prefetched = True
+                    if prepared_block is not None:
+                        latent_prefetched = True
+                        latent_prepare_wall_s = prepared_block.prepare_s
+                        latent_prepare_gpu_s = prepared_block.latent_s
+                        step_noise_s = prepared_block.step_noise_s
+                        condition_s = prepared_block.condition_s
                 else:
                     current_audio_idx, audio_chunk, audio_meta, end_requested = (
                         self._next_audio_chunk(
@@ -1159,28 +1378,6 @@ class WanS2VRealtimeSessionRunner:
                     )
                     audio_s = time.perf_counter() - audio_started
 
-                if audio_prefetch_pool is not None and prefetched_audio_future is None:
-                    prefetch_after_denoise_event = torch.cuda.Event()
-                    prefetch_gpu_start_event = Event()
-                    prefetched_audio_future = audio_prefetch_pool.submit(
-                        self._prefetch_next_audio_chunk,
-                        batch=batch,
-                        server_args=server_args,
-                        audio_stage=audio_stage,
-                        session_dir=session_dir,
-                        audio_chunk_idx=audio_chunk_idx,
-                        cancel_file=cancel_file,
-                        idle_policy=idle_policy,
-                        timeline_path=timeline_path,
-                        audio_window_snapshot=audio_ring.snapshot(),
-                        target_audio_frames=target_audio_frames,
-                        audio_window_video_frames=audio_window_video_frames,
-                        wav2vec_graph_runner=wav2vec_graph_runner,
-                        overlap_stream=audio_overlap_stream,
-                        after_denoise_event=prefetch_after_denoise_event,
-                        gpu_start_event=prefetch_gpu_start_event,
-                    )
-
                 emit_chunk_timeline(
                     timeline_path,
                     "wan_s2v_block_generation_start",
@@ -1197,15 +1394,38 @@ class WanS2VRealtimeSessionRunner:
                     is_filler=is_flashtalk_filler_audio_meta(audio_meta),
                     turn_id=audio_meta.get("turn_id"),
                     audio_prefetched=audio_prefetched,
+                    latent_prefetched=latent_prefetched,
                 )
 
                 latent_started = time.perf_counter()
-                block_latents = self._prepare_block_latents(
-                    batch,
-                    server_args,
-                    latent_stage,
-                    block_public_frames,
-                ).to(device=device, dtype=dit_dtype)
+                block_step_noises: tuple[torch.Tensor, ...] | None = None
+                bundle = None
+                if prepared_block is not None and prepared_block.block_idx == block_idx:
+                    latent_wait_started = time.perf_counter()
+                    if prepared_block.event is not None:
+                        torch.cuda.current_stream(device).wait_event(
+                            prepared_block.event
+                        )
+                    latent_wait_s = time.perf_counter() - latent_wait_started
+                    block_latents = prepared_block.latents
+                    block_step_noises = prepared_block.step_noises_btchw
+                    bundle = prepared_block.bundle
+                    prompt_embeds = prepared_block.prompt_embeds
+                else:
+                    if prepared_block is not None:
+                        logger.warning(
+                            "Dropping prefetched Wan S2V block %s while executing "
+                            "block %s",
+                            prepared_block.block_idx,
+                            block_idx,
+                        )
+                    block_latents = self._prepare_block_latents(
+                        batch,
+                        server_args,
+                        latent_stage,
+                        block_public_frames,
+                    ).to(device=device, dtype=dit_dtype)
+                    latent_prepare_gpu_s = time.perf_counter() - latent_started
                 batch.latents = block_latents
                 if not reference_latents_ready:
                     ref_started = time.perf_counter()
@@ -1224,7 +1444,6 @@ class WanS2VRealtimeSessionRunner:
                             3,
                         ),
                     )
-                latent_s = time.perf_counter() - latent_started
 
                 if attention_request is None:
                     attention_request = denoising_stage._resolve_attention_request(
@@ -1259,21 +1478,72 @@ class WanS2VRealtimeSessionRunner:
                         {} for _ in range(len(denoising_stage.transformer.blocks))
                     ]
 
-                bundle = build_wan_s2v_condition_bundle(
-                    batch,
-                    server_args,
-                    latents=block_latents,
-                    dtype=dit_dtype,
-                    device=device,
-                )
-                prompt_embeds = bundle.prompt_embeds
-                if isinstance(prompt_embeds, list):
-                    prompt_embeds = prompt_embeds[0]
+                if block_step_noises is None:
+                    step_noise_started = time.perf_counter()
+                    block_step_noises = self._prepare_step_noises(
+                        block_latents,
+                        timesteps,
+                        generator,
+                    )
+                    step_noise_s = time.perf_counter() - step_noise_started
+
+                if bundle is None:
+                    condition_started = time.perf_counter()
+                    bundle = build_wan_s2v_condition_bundle(
+                        batch,
+                        server_args,
+                        latents=block_latents,
+                        dtype=dit_dtype,
+                        device=device,
+                    )
+                    prompt_embeds = bundle.prompt_embeds
+                    if isinstance(prompt_embeds, list):
+                        prompt_embeds = prompt_embeds[0]
+                    condition_s = time.perf_counter() - condition_started
                 denoising_stage._maybe_cache_audio_embeddings(
                     bundle,
                     dtype=dit_dtype,
                     autocast_enabled=autocast_enabled,
                 )
+                latent_s = time.perf_counter() - latent_started
+
+                if audio_prefetch_pool is not None and prefetched_audio_future is None:
+                    if use_latent_condition_overlap:
+                        prefetch_after_denoise_event = None
+                        prefetch_gpu_start_event = None
+                    else:
+                        prefetch_after_denoise_event = torch.cuda.Event()
+                        prefetch_gpu_start_event = Event()
+                    prefetched_audio_future = audio_prefetch_pool.submit(
+                        self._prefetch_next_audio_chunk,
+                        batch=batch,
+                        server_args=server_args,
+                        audio_stage=audio_stage,
+                        latent_stage=(
+                            latent_stage if use_latent_condition_overlap else None
+                        ),
+                        session_dir=session_dir,
+                        audio_chunk_idx=audio_chunk_idx,
+                        cancel_file=cancel_file,
+                        idle_policy=idle_policy,
+                        timeline_path=timeline_path,
+                        audio_window_snapshot=audio_ring.snapshot(),
+                        target_audio_frames=target_audio_frames,
+                        audio_window_video_frames=audio_window_video_frames,
+                        wav2vec_graph_runner=wav2vec_graph_runner,
+                        overlap_stream=audio_overlap_stream,
+                        after_denoise_event=prefetch_after_denoise_event,
+                        gpu_start_event=prefetch_gpu_start_event,
+                        prepare_block_idx=(
+                            block_idx + 1 if use_latent_condition_overlap else None
+                        ),
+                        block_public_frames=block_public_frames,
+                        timesteps=timesteps,
+                        generator=generator,
+                        dit_dtype=dit_dtype,
+                        device=device,
+                        build_condition=use_latent_condition_overlap,
+                    )
 
                 denoise_started = time.perf_counter()
                 current_latents = denoising_stage.denoise_stream_r1_block(
@@ -1290,6 +1560,7 @@ class WanS2VRealtimeSessionRunner:
                     dit_dtype=dit_dtype,
                     autocast_enabled=autocast_enabled,
                     audio_start_frame=0,
+                    step_noises_btchw=block_step_noises,
                 )
                 denoising_stage._clean_context_refresh(
                     block_latents=current_latents,
@@ -1394,12 +1665,27 @@ class WanS2VRealtimeSessionRunner:
                             3,
                         ),
                         "latent_ms": round(latent_s * 1000, 3),
+                        "latent_prefetch_wait_ms": round(
+                            latent_wait_s * 1000,
+                            3,
+                        ),
+                        "latent_prefetch_wall_ms": round(
+                            latent_prepare_wall_s * 1000,
+                            3,
+                        ),
+                        "latent_prepare_ms": round(
+                            latent_prepare_gpu_s * 1000,
+                            3,
+                        ),
+                        "step_noise_ms": round(step_noise_s * 1000, 3),
+                        "condition_ms": round(condition_s * 1000, 3),
                         "denoise_ms": round(denoise_s * 1000, 3),
                         "decode_ms": round(decode_s * 1000, 3),
                         "stream_ms": round(stream_s * 1000, 3),
                         "total_ms": round(total_s * 1000, 3),
                     },
                     audio_prefetched=audio_prefetched,
+                    latent_prefetched=latent_prefetched,
                 )
                 block_idx += 1
         finally:

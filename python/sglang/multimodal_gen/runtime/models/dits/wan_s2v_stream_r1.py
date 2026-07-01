@@ -505,7 +505,12 @@ def _stream_r1_get_packed_buffer(
         or buffer.shape[0] < total_tokens
         or buffer.shape[1:] != wanted_shape[1:]
     ):
-        buffer = like.new_empty(wanted_shape)
+        # Packed buffers are mutated across denoise calls. Create a normal tensor
+        # even when the request runs under torch.inference_mode(); otherwise a
+        # later out= write from eager code can trip PyTorch's inference tensor
+        # inplace guard.
+        with torch.inference_mode(False):
+            buffer = torch.empty(wanted_shape, dtype=like.dtype, device=like.device)
         _STREAM_R1_PACKED_BUFFER_CACHE[cache_key] = buffer
     return buffer[:total_tokens]
 
