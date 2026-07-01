@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
@@ -24,6 +25,68 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+_USP_BUFFER_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+
+
+def _env_enabled(name: str, default: str = "1") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _usp_reuse_buffers_enabled() -> bool:
+    return _env_enabled(
+        "SGLANG_USP_REUSE_BUFFERS",
+        os.getenv("SGLANG_STREAM_R1_REUSE_PACKED_BUFFERS", "1"),
+    )
+
+
+def _usp_explicit_all_to_all_enabled() -> bool:
+    return _env_enabled("SGLANG_USP_EXPLICIT_ALL_TO_ALL", "1")
+
+
+def _usp_device_cache_key(device: torch.device) -> tuple[str, int]:
+    index = device.index
+    if device.type == "cuda" and index is None and torch.cuda.is_available():
+        index = torch.cuda.current_device()
+    return device.type, -1 if index is None else int(index)
+
+
+def _usp_get_buffer(
+    name: str,
+    like: torch.Tensor,
+    shape: tuple[int, ...],
+) -> torch.Tensor | None:
+    if like.device.type != "cuda":
+        return None
+    if not _usp_reuse_buffers_enabled():
+        return None
+    stream_key = int(torch.cuda.current_stream(like.device).cuda_stream)
+    cache_key = (
+        name,
+        *_usp_device_cache_key(like.device),
+        stream_key,
+        like.dtype,
+        shape,
+    )
+    buffer = _USP_BUFFER_CACHE.get(cache_key)
+    if buffer is None:
+        buffer = like.new_empty(shape)
+        _USP_BUFFER_CACHE[cache_key] = buffer
+    return buffer
+
+
+def _usp_permute_contiguous(
+    x: torch.Tensor,
+    order: tuple[int, ...],
+    *,
+    cache_name: str,
+) -> torch.Tensor:
+    permuted = x.permute(order)
+    out = _usp_get_buffer(cache_name, x, tuple(permuted.shape))
+    if out is None:
+        return permuted.contiguous()
+    out.copy_(permuted)
+    return out
 
 
 def _comm_nvtx_enabled() -> bool:
@@ -73,7 +136,11 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
+def _usp_all_to_all_single(
+    x: torch.Tensor,
+    *,
+    cache_name: str = "usp_all_to_all",
+) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
@@ -81,12 +148,21 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
         "sgl_mm_usp_all_to_all_single "
         f"shape={tuple(x_shape)} dtype={x.dtype} {_comm_nvtx_caller()}"
     ):
-        x = x.flatten()
-        x = ft_c.all_to_all_single(
-            x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
-        )
-        x = _maybe_wait(x)
-        x = x.reshape(x_shape)
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if _usp_explicit_all_to_all_enabled() and x.device.type == "cuda":
+            out = _usp_get_buffer(f"{cache_name}.out", x, tuple(x_shape))
+            if out is None:
+                out = torch.empty_like(x)
+            dist.all_to_all_single(out, x, group=ulysses_pg)
+            x = out
+        else:
+            flat = x.flatten()
+            x = ft_c.all_to_all_single(
+                flat, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
+            )
+            x = _maybe_wait(x)
+            x = x.reshape(x_shape)
     return x
 
 
@@ -135,8 +211,12 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         "sgl_mm_usp_input_prepack "
         f"head_dim={head_dim} {_tensor_desc('x', x)} {_comm_nvtx_caller()}"
     ):
-        x = x.permute(permute_order).contiguous()
-    x = _usp_all_to_all_single(x)
+        x = _usp_permute_contiguous(
+            x,
+            permute_order,
+            cache_name=f"usp_input_prepack.h{head_dim}",
+        )
+    x = _usp_all_to_all_single(x, cache_name="usp_input")
     x = x.reshape(world_size, h_local, b, s_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
@@ -146,18 +226,22 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
             "sgl_mm_usp_input_postunpack "
             f"head_dim={head_dim} world_size={world_size}"
         ):
-            x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(
-                b, h_local, s_global, d
-            )
+            x = _usp_permute_contiguous(
+                x,
+                (2, 1, 0, 3, 4),
+                cache_name=f"usp_input_postunpack.h{head_dim}",
+            ).reshape(b, h_local, s_global, d)
     else:  # head_dim == 2
         # Shape transition: [world_size, h_local, b, s_local, d] -> [b, world_size, s_local, h_local, d]
         with _comm_nvtx_range(
             "sgl_mm_usp_input_postunpack "
             f"head_dim={head_dim} world_size={world_size}"
         ):
-            x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(
-                b, s_global, h_local, d
-            )
+            x = _usp_permute_contiguous(
+                x,
+                (2, 0, 3, 1, 4),
+                cache_name=f"usp_input_postunpack.h{head_dim}",
+            ).reshape(b, s_global, h_local, d)
 
     return x
 
@@ -201,18 +285,31 @@ def _usp_input_all_to_all_qkv(
         "sgl_mm_usp_qkv_pack "
         f"world_size={world_size} {_tensor_desc('q', q)} {_comm_nvtx_caller()}"
     ):
-        packed = fused_pack_qkv_for_all_to_all(q, k, v)
+        packed_out = _usp_get_buffer(
+            "usp_qkv_pack",
+            q,
+            (3 * H_global, B, S_local, D),
+        )
+        packed = fused_pack_qkv_for_all_to_all(q, k, v, out=packed_out)
 
     # 2. Single NCCL all-to-all
-    packed = _usp_all_to_all_single(packed)
+    packed = _usp_all_to_all_single(packed, cache_name="usp_qkv")
 
     # 3. Fused unpack: packed [3*H, B, S_local, D] → q,k,v [B, S_global, H_local, D]
     with _comm_nvtx_range(
         "sgl_mm_usp_qkv_unpack "
         f"world_size={world_size} {_tensor_desc('packed', packed)}"
     ):
+        qkv_out_buffer = _usp_get_buffer(
+            "usp_qkv_unpack",
+            packed,
+            (3, B, S_local * world_size, H_local, D),
+        )
+        qkv_out = None
+        if qkv_out_buffer is not None:
+            qkv_out = (qkv_out_buffer[0], qkv_out_buffer[1], qkv_out_buffer[2])
         q, k, v = fused_unpack_qkv_from_all_to_all(
-            packed, B, S_local, H_local, D, world_size
+            packed, B, S_local, H_local, D, world_size, out=qkv_out
         )
 
     return q, k, v
@@ -263,8 +360,12 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         "sgl_mm_usp_output_prepack "
         f"head_dim={head_dim} {_tensor_desc('x', x)} {_comm_nvtx_caller()}"
     ):
-        x = x.permute(permute_order).contiguous()
-    x = _usp_all_to_all_single(x)
+        x = _usp_permute_contiguous(
+            x,
+            permute_order,
+            cache_name=f"usp_output_prepack.h{head_dim}",
+        )
+    x = _usp_all_to_all_single(x, cache_name="usp_output")
     x = x.reshape(world_size, s_local, b, h_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 'h_local' to merge them into 'h_global'
@@ -274,18 +375,22 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
             "sgl_mm_usp_output_postunpack "
             f"head_dim={head_dim} world_size={world_size}"
         ):
-            x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(
-                b, h_global, s_local, d
-            )
+            x = _usp_permute_contiguous(
+                x,
+                (2, 0, 3, 1, 4),
+                cache_name=f"usp_output_postunpack.h{head_dim}",
+            ).reshape(b, h_global, s_local, d)
     else:  # head_dim == 2
         # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
         with _comm_nvtx_range(
             "sgl_mm_usp_output_postunpack "
             f"head_dim={head_dim} world_size={world_size}"
         ):
-            x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(
-                b, s_local, h_global, d
-            )
+            x = _usp_permute_contiguous(
+                x,
+                (2, 1, 0, 3, 4),
+                cache_name=f"usp_output_postunpack.h{head_dim}",
+            ).reshape(b, s_local, h_global, d)
 
     return x
 

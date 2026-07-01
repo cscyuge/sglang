@@ -29,12 +29,15 @@ def _pack_qkv_kernel(
     stride_q_b,
     stride_q_s,
     stride_q_h,
+    stride_q_d,
     stride_k_b,
     stride_k_s,
     stride_k_h,
+    stride_k_d,
     stride_v_b,
     stride_v_s,
     stride_v_h,
+    stride_v_d,
     # out is contiguous [3*H, B, S, D]
     stride_o_hh,  # stride along dim0 (3*H)
     stride_o_b,
@@ -59,9 +62,9 @@ def _pack_qkv_kernel(
     src_base_k = k_ptr + b * stride_k_b + s * stride_k_s + h * stride_k_h
     src_base_v = v_ptr + b * stride_v_b + s * stride_v_s + h * stride_v_h
 
-    q_val = tl.load(src_base_q + d_offs)
-    k_val = tl.load(src_base_k + d_offs)
-    v_val = tl.load(src_base_v + d_offs)
+    q_val = tl.load(src_base_q + d_offs * stride_q_d)
+    k_val = tl.load(src_base_k + d_offs * stride_k_d)
+    v_val = tl.load(src_base_v + d_offs * stride_v_d)
 
     # Store to packed[3*h + t, b, s, :] for t in {0,1,2}
     out_base = out_ptr + b * stride_o_b + s * stride_o_s
@@ -132,21 +135,34 @@ def fused_pack_qkv_for_all_to_all(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pack q, k, v [B, S, H, D] into interleaved [3*H, B, S, D] for batched all-to-all.
 
     Returns a contiguous tensor ready for _usp_all_to_all_single.
     """
     B, S, H, D = q.shape
-    packed = torch.empty(3 * H, B, S, D, dtype=q.dtype, device=q.device)
+    packed_shape = (3 * H, B, S, D)
+    if out is None:
+        packed = torch.empty(packed_shape, dtype=q.dtype, device=q.device)
+    else:
+        if out.shape != packed_shape:
+            raise ValueError(
+                f"packed QKV output must have shape {packed_shape}, got {tuple(out.shape)}"
+            )
+        if out.dtype != q.dtype or out.device != q.device:
+            raise ValueError("packed QKV output dtype/device must match q")
+        if not out.is_contiguous():
+            raise ValueError("packed QKV output must be contiguous")
+        packed = out
 
     grid = (B * S * H,)
     _pack_qkv_kernel[grid](
         q, k, v, packed,
         B, S, H, D,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2),
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         packed.stride(0), packed.stride(1), packed.stride(2),
         num_warps=4,
     )
@@ -160,15 +176,31 @@ def fused_unpack_qkv_from_all_to_all(
     H_local: int,
     D: int,
     world_size: int,
+    out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Unpack packed [3*H_global, B, S_local, D] → q,k,v [B, S_global, H_local, D].
 
     Called after _usp_all_to_all_single on the packed buffer.
     """
     S_global = S_local * world_size
-    q = torch.empty(B, S_global, H_local, D, dtype=packed.dtype, device=packed.device)
-    k = torch.empty(B, S_global, H_local, D, dtype=packed.dtype, device=packed.device)
-    v = torch.empty(B, S_global, H_local, D, dtype=packed.dtype, device=packed.device)
+    out_shape = (B, S_global, H_local, D)
+    if out is None:
+        q = torch.empty(out_shape, dtype=packed.dtype, device=packed.device)
+        k = torch.empty(out_shape, dtype=packed.dtype, device=packed.device)
+        v = torch.empty(out_shape, dtype=packed.dtype, device=packed.device)
+    else:
+        q, k, v = out
+        for name, tensor in (("q", q), ("k", k), ("v", v)):
+            if tensor.shape != out_shape:
+                raise ValueError(
+                    f"unpacked {name} output must have shape {out_shape}, got {tuple(tensor.shape)}"
+                )
+            if tensor.dtype != packed.dtype or tensor.device != packed.device:
+                raise ValueError(
+                    f"unpacked {name} output dtype/device must match packed"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"unpacked {name} output must be contiguous")
 
     grid = (B * world_size * S_local * H_local,)
     _unpack_qkv_kernel[grid](

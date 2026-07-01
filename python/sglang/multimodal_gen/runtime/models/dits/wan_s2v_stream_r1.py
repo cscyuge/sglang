@@ -1793,9 +1793,9 @@ def run_wan_s2v_stream_r1_cached_self_attention(
             selected_backend = "packed_varlen_sp_head_sharded"
             with profile.span("usp_qkv_all_to_all"):
                 query_for_attention, key, value = _usp_input_all_to_all_qkv(
-                    query.contiguous(),
-                    key.contiguous(),
-                    value.contiguous(),
+                    query,
+                    key,
+                    value,
                 )
             query_for_attention = query_for_attention[
                 :, : layout.total_seq_len
@@ -1877,7 +1877,7 @@ def run_wan_s2v_stream_r1_cached_self_attention(
                 sp_pad_tokens=sp_pad_tokens,
             )
         with profile.span("usp_output_all_to_all"):
-            output = _usp_output_all_to_all(output.contiguous(), head_dim=2)
+            output = _usp_output_all_to_all(output, head_dim=2)
     elif attention_backend == "packed_varlen" and not sequence_shard_enabled:
         with profile.span("packed_varlen_attention"):
             output = stream_r1_segmented_packed_varlen_attention(
