@@ -403,6 +403,8 @@ def _get_config_info(
             config = maybe_download_model_index(model_path)
         pipeline_name = config.get("_class_name", "").lower()
     except (FileNotFoundError, KeyError, json.JSONDecodeError, ValueError, OSError):
+        if model_id is not None and not os.path.exists(model_path):
+            raise
         # model_index.json not found or malformed; still try model path detectors below
         pass
 
@@ -1008,6 +1010,8 @@ def _register_configs():
 
 
 _register_configs()
+
+
 def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
     model_path_lower = model_path.lower()
     return any(

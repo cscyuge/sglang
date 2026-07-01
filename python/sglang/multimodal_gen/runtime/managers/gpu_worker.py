@@ -32,7 +32,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
-from sglang.multimodal_gen.runtime.loader.weights_updater import (
+from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     WeightsUpdater,
     get_updatable_modules,
 )
@@ -46,8 +46,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
-    OffloadableDiTMixin,
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    configure_layerwise_offload_modules,
     iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -144,22 +144,13 @@ class GPUWorker:
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
         if self.server_args.dit_layerwise_offload:
-            # enable layerwise offload if possible
-            for module_name in [
-                "transformer",
-                "transformer_2",
-                "video_dit",
-                "video_dit_2",
-                "audio_dit",
-            ]:
-                dit = self.pipeline.get_module(module_name)
-                if dit:
-                    if isinstance(dit, OffloadableDiTMixin):
-                        dit.configure_layerwise_offload(self.server_args)
-                    else:
-                        logger.info(
-                            f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
-                        )
+            configure_layerwise_offload_modules(
+                self.pipeline.modules,
+                self.server_args,
+                warn_missing=self.server_args.is_arg_explicitly_set(
+                    "dit_layerwise_offload"
+                ),
+            )
 
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
@@ -584,7 +575,11 @@ def run_scheduler_process(
             local_rank=local_rank,
         )
         scheduler.process_warmup()
-        logger.info(f"Worker {rank}: Scheduler loop started.", main_process_only=False, local_main_process_only=False)
+        logger.info(
+            f"Worker {rank}: Scheduler loop started.",
+            main_process_only=False,
+            local_main_process_only=False,
+        )
         pipe_writer.send(
             {
                 "status": "ready",
@@ -603,4 +598,8 @@ def run_scheduler_process(
             torch.cuda.empty_cache()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
-        logger.info(f"Worker {rank}: Shutdown complete.", main_process_only=False, local_main_process_only=False)
+        logger.info(
+            f"Worker {rank}: Shutdown complete.",
+            main_process_only=False,
+            local_main_process_only=False,
+        )

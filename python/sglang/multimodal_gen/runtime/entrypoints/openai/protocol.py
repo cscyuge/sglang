@@ -2,7 +2,7 @@ import time
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -78,6 +78,8 @@ class VideoResponse(BaseModel):
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
     file_path: Optional[str] = None
+    file_paths: Optional[List[str]] = None
+    num_outputs: Optional[int] = None
     stream_url: Optional[str] = None
     events_url: Optional[str] = None
     webrtc_url: Optional[str] = None
@@ -88,10 +90,14 @@ class VideoResponse(BaseModel):
 
 
 class VideoGenerationsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt: str
     input_reference: Optional[str] = None
     reference_url: Optional[str] = None
     model: Optional[str] = None
+    n: Optional[int] = 1
+    num_outputs_per_prompt: Optional[int] = None
     seconds: Optional[int] = 4
     size: Optional[str] = ""
     fps: Optional[int] = None
@@ -108,6 +114,8 @@ class VideoGenerationsRequest(BaseModel):
         None  # for CFG vs guidance distillation (e.g., QwenImage)
     )
     negative_prompt: Optional[str] = None
+    max_sequence_length: Optional[int] = None
+    flow_shift: Optional[float] = None
     enable_teacache: Optional[bool] = False
     # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False
@@ -137,6 +145,32 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
+    type: Literal["init"]
+    # WebSocket does not support multipart/form-data image uploads.
+    first_frame: Optional[bytes | str] = None
+    condition_inputs: Optional[Dict[str, Any]] = None
+    max_chunks: Optional[int] = Field(default=None, ge=1)
+    seed: Optional[int] = 42
+    guidance_scale: Optional[float] = 1.0
+    size: Optional[str] = "832x480"
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
+    realtime_output_format: Optional[Literal["raw", "webp", "jpeg"]] = None
+    realtime_preview_max_width: Optional[int] = None
+    realtime_output_pacing: Optional[bool] = False
+    realtime_causal_sink_size: Optional[int] = None
+    realtime_causal_kv_cache_num_frames: Optional[int] = None
+
+
+class RealtimeEvent(BaseModel):
+    type: Literal["event"]
+    kind: str
+    payload: Any = None
+    event_id: Optional[int] = None
 
 
 class WebRTCIceServer(BaseModel):

@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import addict
 import yaml
@@ -73,8 +73,11 @@ logger = init_logger(__name__)
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = LTX2_TWO_STAGE_DEVICE_MODES
+LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+LORA_MERGE_MODES = ("auto", "merge", "dynamic")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -82,6 +85,10 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
         return None
     mode = mode.lower()
     return mode
+
+
+def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
+    return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
 
 
 class Backend(str, Enum):
@@ -168,6 +175,7 @@ class ServerArgs(DisaggArgsMixin):
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_merge_mode: str = "auto"
     lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
@@ -256,8 +264,14 @@ class ServerArgs(DisaggArgsMixin):
     base_gpu_id: int = 0
     disagg_role: RoleType = RoleType.MONOLITHIC
     disagg_timeout: int = 600
+    disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
+    disagg_instance_id: int = 0
+    disagg_max_slots_per_instance: int = 8
+    disagg_transfer_redundancy: float = 1.25
+    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
+    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
     disagg_server_addr: str | None = None
     encoder_urls: str | None = None
     denoiser_urls: str | None = None
@@ -267,12 +281,16 @@ class ServerArgs(DisaggArgsMixin):
     denoiser_sp: int | None = None
     denoiser_ulysses: int | None = None
     denoiser_ring: int | None = None
+    decoder_sp: int | None = None
     decoder_tp: int | None = None
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
     disagg_p2p_hostname: str = "127.0.0.1"
     disagg_ib_device: str | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
+    pool_control_endpoint: str | None = None
+    pool_control_advertised_endpoint: str | None = None
 
     # Logging
     log_level: str = "info"
@@ -303,12 +321,28 @@ class ServerArgs(DisaggArgsMixin):
         self._adjust_quant_config()
         self._adjust_warmup()
         self._adjust_network_ports()
+        self._adjust_disagg_parallelism_aliases()
         # adjust parallelism before attention backend
         self._adjust_parallelism()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_autocast()
         self.adjust_pipeline_config()
+
+    def _adjust_disagg_parallelism_aliases(self):
+        if self.decoder_tp is None:
+            return
+        if self.decoder_sp is not None and self.decoder_sp != self.decoder_tp:
+            raise ValueError(
+                "decoder_tp is deprecated in favor of decoder_sp; "
+                "please set only one of them or keep the same value."
+            )
+        if self.decoder_sp is None:
+            logger.warning(
+                "decoder_tp is deprecated and is treated as decoder_sp for "
+                "decoder/VAE parallel decode. Please use decoder_sp instead."
+            )
+            self.decoder_sp = self.decoder_tp
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -1072,6 +1106,18 @@ class ServerArgs(DisaggArgsMixin):
             type=float,
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
+        parser.add_argument(
+            "--lora-merge-mode",
+            type=str,
+            choices=LORA_MERGE_MODES,
+            default=ServerArgs.lora_merge_mode,
+            help=(
+                "How LoRA is applied: auto keeps static merge for regular weights "
+                "and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather; "
+                "merge always merges into base weights; dynamic always applies LoRA "
+                "at forward time."
+            ),
         )
         parser.add_argument(
             "--lora-weight-name",

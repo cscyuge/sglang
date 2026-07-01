@@ -6,6 +6,7 @@ from typing import Type
 import torch
 import torch.nn as nn
 
+from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import build_inv_indices
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
@@ -35,6 +36,27 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
+
+
+def build_varlen_mask_meta(
+    key_mask: torch.Tensor,
+) -> dict:
+    """Build varlen FA metadata from a ``[B, S]`` key mask."""
+    assert key_mask.dim() == 2, "key_mask must be [B, S]"
+    bs, seq = key_mask.shape
+    bool_mask = key_mask.to(dtype=torch.bool)
+    valid_lens = bool_mask.sum(dim=1, dtype=torch.int32)
+    indices = bool_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+    cu_seqlens = torch.zeros(bs + 1, dtype=torch.int32, device=key_mask.device)
+    cu_seqlens[1:] = torch.cumsum(valid_lens, dim=0)
+    inv_indices = build_inv_indices(indices, bs * seq)
+
+    return {
+        "cu_seqlens": cu_seqlens,
+        "indices": indices,
+        "inv_indices": inv_indices,
+        "max_seqlen": seq,
+    }
 
 
 class UlyssesAttention(nn.Module):
@@ -606,9 +628,7 @@ class USPAttention(nn.Module):
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        q_shard, k_shard, v_shard = _usp_input_all_to_all_qkv(
-            q_shard, k_shard, v_shard
-        )
+        q_shard, k_shard, v_shard = _usp_input_all_to_all_qkv(q_shard, k_shard, v_shard)
 
         h_local = q_shard.shape[2]
         h_start = sp_rank * h_local
