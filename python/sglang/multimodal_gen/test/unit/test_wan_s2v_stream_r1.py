@@ -908,6 +908,111 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         )
         torch.testing.assert_close(segmented_output, materialized_output)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_fused_segmented_kv_pack_matches_workspace(self):
+        from sglang.jit_kernel.diffusion.triton.stream_r1_segmented_pack import (
+            fused_pack_segmented_kv,
+        )
+
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=1,
+            local_attn_size=5,
+            sink_size=1,
+            current_start=4,
+        )
+        cached_key, cached_value = self._indexed_kv([0, 4, 5, 6, 7])
+        cached_key = cached_key.expand(1, -1, 2, 4).contiguous().cuda()
+        cached_value = cached_value.expand(1, -1, 2, 4).contiguous().cuda()
+        noisy_view = WanS2VStreamR1NoisyKVCacheView(
+            key=cached_key,
+            value=cached_value,
+            global_end_index=8,
+            local_end_index=5,
+            local_start=4,
+            local_end=8,
+        )
+        condition_key = torch.arange(16, dtype=torch.float32, device="cuda").view(
+            1, 2, 2, 4
+        )
+        condition_value = condition_key + 100
+        split = split_wan_s2v_stream_r1_projected_kv(
+            torch.cat([cached_key[:, -4:], condition_key], dim=1),
+            torch.cat([cached_value[:, -4:], condition_value], dim=1),
+            noisy_seq_len=4,
+        )
+        segmented = compose_wan_s2v_stream_r1_segmented_mixed_kv_view(
+            noisy_view,
+            split,
+        )
+        plan = build_wan_s2v_stream_r1_segmented_mixed_kv_attention_plan(
+            noisy_view,
+            segmented,
+            update,
+        )
+        query = torch.randn(1, 6, 2, 4, device="cuda")
+        groups = plan.query_groups(query.device)
+        self.assertEqual([group.kv_ranges for group in groups], [((0, 7),), ((1, 7),)])
+        expected_key = torch.cat(
+            [
+                segmented.noisy_key[0, :5],
+                segmented.condition_key[0, :2],
+                segmented.noisy_key[0, 1:5],
+                segmented.condition_key[0, :2],
+            ],
+            dim=0,
+        )
+        expected_value = torch.cat(
+            [
+                segmented.noisy_value[0, :5],
+                segmented.condition_value[0, :2],
+                segmented.noisy_value[0, 1:5],
+                segmented.condition_value[0, :2],
+            ],
+            dim=0,
+        )
+        batch_indices = torch.tensor([0, 0], dtype=torch.int64, device="cuda")
+        packed_starts = torch.tensor([0, 7], dtype=torch.int64, device="cuda")
+        source_starts = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+        lengths = torch.tensor([7, 6], dtype=torch.int64, device="cuda")
+        out_key = torch.empty_like(expected_key)
+        out_value = torch.empty_like(expected_value)
+
+        packed_key, packed_value = fused_pack_segmented_kv(
+            segmented.noisy_key,
+            segmented.noisy_value,
+            segmented.condition_key,
+            segmented.condition_value,
+            batch_indices,
+            packed_starts,
+            source_starts,
+            lengths,
+            total_tokens=13,
+            noisy_seq_len=segmented.cached_noisy_seq_len,
+            max_length=7,
+            out=(out_key, out_value),
+        )
+
+        self.assertEqual(packed_key.data_ptr(), out_key.data_ptr())
+        self.assertEqual(packed_value.data_ptr(), out_value.data_ptr())
+        torch.testing.assert_close(packed_key, expected_key)
+        torch.testing.assert_close(packed_value, expected_value)
+
+        with patch(
+            "sglang.jit_kernel.diffusion.triton.stream_r1_segmented_pack."
+            "fused_pack_segmented_kv",
+            wraps=fused_pack_segmented_kv,
+        ) as fused_pack_mock:
+            workspace = build_wan_s2v_stream_r1_segmented_packed_attention_workspace(
+                query,
+                segmented,
+                plan,
+            )
+
+        self.assertGreater(fused_pack_mock.call_count, 0)
+        torch.testing.assert_close(workspace.key, expected_key)
+        torch.testing.assert_close(workspace.value, expected_value)
+
 
 class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
     def _cache(self, tokens: int):

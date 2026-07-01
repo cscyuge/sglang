@@ -50,6 +50,11 @@ def _stream_r1_reuse_packed_buffers_enabled() -> bool:
     return value.lower() not in ("", "0", "false", "no", "off")
 
 
+def _stream_r1_fused_segmented_pack_enabled() -> bool:
+    value = os.getenv("SGLANG_STREAM_R1_FUSED_SEGMENTED_PACK", "1")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
 @contextmanager
 def _stream_r1_comm_nvtx_range(message: str):
     if not _stream_r1_comm_nvtx_enabled() or not torch.cuda.is_available():
@@ -421,6 +426,15 @@ class WanS2VStreamR1PackedKVCopyRange:
 
 
 @dataclass(frozen=True)
+class WanS2VStreamR1PackedKVCopyPlan:
+    batch_indices: torch.Tensor
+    packed_starts: torch.Tensor
+    source_starts: torch.Tensor
+    lengths: torch.Tensor
+    max_length: int
+
+
+@dataclass(frozen=True)
 class WanS2VStreamR1PackedAttentionWorkspace:
     query: torch.Tensor
     key: torch.Tensor
@@ -445,6 +459,7 @@ class WanS2VStreamR1PackedAttentionMetadata:
     segments: tuple[WanS2VStreamR1PackedAttentionSegment, ...]
     query_matches_input_order: bool = False
     kv_copy_ranges: tuple[WanS2VStreamR1PackedKVCopyRange, ...] | None = None
+    kv_copy_plan: WanS2VStreamR1PackedKVCopyPlan | None = None
 
 
 _STREAM_R1_PACKED_METADATA_CACHE_LIMIT = 128
@@ -591,6 +606,42 @@ def _packed_kv_copy_ranges_match_input_order(
         if copy_range.source_start != 0 or copy_range.source_end != seq_len:
             return False
     return True
+
+
+def _build_packed_kv_copy_plan(
+    copy_ranges: list[WanS2VStreamR1PackedKVCopyRange],
+    *,
+    device: torch.device,
+) -> WanS2VStreamR1PackedKVCopyPlan | None:
+    if not copy_ranges:
+        return None
+    batch_indices = torch.tensor(
+        [copy_range.batch_index for copy_range in copy_ranges],
+        dtype=torch.int64,
+        device=device,
+    )
+    packed_starts = torch.tensor(
+        [copy_range.packed_start for copy_range in copy_ranges],
+        dtype=torch.int64,
+        device=device,
+    )
+    source_starts = torch.tensor(
+        [copy_range.source_start for copy_range in copy_ranges],
+        dtype=torch.int64,
+        device=device,
+    )
+    lengths = torch.tensor(
+        [copy_range.length for copy_range in copy_ranges],
+        dtype=torch.int64,
+        device=device,
+    )
+    return WanS2VStreamR1PackedKVCopyPlan(
+        batch_indices=batch_indices,
+        packed_starts=packed_starts,
+        source_starts=source_starts,
+        lengths=lengths,
+        max_length=max(copy_range.length for copy_range in copy_ranges),
+    )
 
 
 def _select_packed_kv_parts(
@@ -743,6 +794,12 @@ def _build_wan_s2v_stream_r1_packed_attention_metadata(
                 if packed_offset != k_end:
                     raise ValueError("packed attention KV range length mismatch")
 
+    copy_ranges_tuple = tuple(kv_copy_ranges) if can_use_kv_copy_ranges else None
+    copy_plan = (
+        _build_packed_kv_copy_plan(kv_copy_ranges, device=query.device)
+        if can_use_kv_copy_ranges
+        else None
+    )
     return WanS2VStreamR1PackedAttentionMetadata(
         query_groups=tuple(query_groups),
         cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=query.device),
@@ -753,7 +810,8 @@ def _build_wan_s2v_stream_r1_packed_attention_metadata(
         total_kv_tokens=cu_k[-1],
         segments=tuple(segments),
         query_matches_input_order=query_matches_input_order,
-        kv_copy_ranges=tuple(kv_copy_ranges) if can_use_kv_copy_ranges else None,
+        kv_copy_ranges=copy_ranges_tuple,
+        kv_copy_plan=copy_plan,
     )
 
 
@@ -877,6 +935,70 @@ def _pack_segmented_packed_kv_ranges(
         if dst_offset != copy_range.packed_end:
             raise ValueError("packed attention segmented KV copy length mismatch")
     return _cat_packed_attention_parts(parts, name=name, total_tokens=total_tokens)
+
+
+def _try_fused_pack_segmented_kv_ranges(
+    noisy_key: torch.Tensor,
+    noisy_value: torch.Tensor,
+    condition_key: torch.Tensor,
+    condition_value: torch.Tensor,
+    metadata: WanS2VStreamR1PackedAttentionMetadata,
+    *,
+    noisy_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    copy_ranges = metadata.kv_copy_ranges
+    copy_plan = metadata.kv_copy_plan
+    if copy_ranges is None or copy_plan is None:
+        return None
+    if not _stream_r1_fused_segmented_pack_enabled():
+        return None
+    if noisy_key.device.type != "cuda":
+        return None
+    if condition_key.shape[1] == 0 and _packed_kv_copy_ranges_match_input_order(
+        copy_ranges,
+        batch_size=noisy_key.shape[0],
+        seq_len=noisy_key.shape[1],
+        total_tokens=metadata.total_kv_tokens,
+    ):
+        return (
+            _flatten_bshd_for_packed_attention(noisy_key),
+            _flatten_bshd_for_packed_attention(noisy_value),
+        )
+
+    try:
+        from sglang.jit_kernel.diffusion.triton.stream_r1_segmented_pack import (
+            fused_pack_segmented_kv,
+        )
+    except Exception:
+        return None
+
+    packed_key = _stream_r1_get_packed_buffer(
+        "stream_r1_packed_key",
+        noisy_key,
+        metadata.total_kv_tokens,
+    )
+    packed_value = _stream_r1_get_packed_buffer(
+        "stream_r1_packed_value",
+        noisy_value,
+        metadata.total_kv_tokens,
+    )
+    out = None
+    if packed_key is not None and packed_value is not None:
+        out = (packed_key, packed_value)
+    return fused_pack_segmented_kv(
+        noisy_key,
+        noisy_value,
+        condition_key,
+        condition_value,
+        copy_plan.batch_indices,
+        copy_plan.packed_starts,
+        copy_plan.source_starts,
+        copy_plan.lengths,
+        total_tokens=metadata.total_kv_tokens,
+        noisy_seq_len=noisy_seq_len,
+        max_length=copy_plan.max_length,
+        out=out,
+    )
 
 
 def _build_wan_s2v_stream_r1_packed_attention_workspace_from_packed_kv(
@@ -1073,6 +1195,29 @@ def build_wan_s2v_stream_r1_segmented_packed_attention_workspace(
 
     metadata = _get_wan_s2v_stream_r1_packed_attention_metadata(query, plan)
     if metadata.kv_copy_ranges is not None:
+        with _stream_r1_comm_nvtx_range(
+            "stream_r1_segmented_packed_workspace.fused_kv_pack "
+            f"ranges={len(metadata.kv_copy_ranges)} kv_seq_len={plan.kv_seq_len} "
+            f"noisy={tuple(segmented_view.noisy_key.shape)} "
+            f"condition={tuple(segmented_view.condition_key.shape)}"
+        ):
+            fused_packed_kv = _try_fused_pack_segmented_kv_ranges(
+                segmented_view.noisy_key,
+                segmented_view.noisy_value,
+                segmented_view.condition_key,
+                segmented_view.condition_value,
+                metadata,
+                noisy_seq_len=segmented_view.cached_noisy_seq_len,
+            )
+        if fused_packed_kv is not None:
+            packed_key, packed_value = fused_packed_kv
+            return _build_wan_s2v_stream_r1_packed_attention_workspace_from_packed_kv(
+                query,
+                metadata,
+                packed_key=packed_key,
+                packed_value=packed_value,
+            )
+
         with _stream_r1_comm_nvtx_range(
             "stream_r1_segmented_packed_workspace.key_copy_ranges "
             f"ranges={len(metadata.kv_copy_ranges)} kv_seq_len={plan.kv_seq_len} "
