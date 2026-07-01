@@ -409,9 +409,15 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
 
         self.assertTrue(state.initialized)
         self.assertEqual(state.decoded_latent_frames, 4)
+        self.assertEqual(state.last_decode_mode, "eager")
         self.assertEqual(vae.clear_cache_calls, 2)
         self.assertEqual(first.shape, (1, 1, 5, 1, 1))
         self.assertEqual(second.shape, (1, 1, 8, 1, 1))
+
+    def test_vae_cuda_graph_config_flag_is_available(self):
+        cfg = WanS2VPipelineConfig(wan_s2v_vae_cuda_graph=True)
+
+        self.assertTrue(cfg.wan_s2v_vae_cuda_graph)
 
     def test_stream_r1_config_defaults_to_baseline_flow_shift(self):
         self.assertEqual(WanS2VPipelineConfig().flow_shift, 3.0)
