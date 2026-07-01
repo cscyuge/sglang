@@ -9,6 +9,7 @@ import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from threading import Event
 from typing import Any
 
 import numpy as np
@@ -338,6 +339,8 @@ class _PrefetchedAudioChunk:
     audio_input: torch.Tensor | None = None
     event: Any = None
     audio_s: float = 0.0
+    audio_cpu_s: float = 0.0
+    audio_gpu_enqueue_s: float = 0.0
 
 
 @dataclass
@@ -608,19 +611,13 @@ class WanS2VRealtimeSessionRunner:
             stream_vae_state.last_decode_mode = "eager"
             return decoding_stage.decode(original_latents, server_args)
 
-    def _encode_audio_window(
+    def _prepare_audio_feature_cpu(
         self,
-        batch: Req,
-        server_args: ServerArgs,
         audio_stage: WanS2VAudioEncodingStage,
         audio_window: np.ndarray,
         *,
-        target_audio_frames: int,
-        audio_window_video_frames: int,
-        wav2vec_graph_runner: _WanS2VWav2VecCudaGraphRunner | None = None,
         ensure_loaded: bool = True,
     ) -> torch.Tensor:
-        device = get_local_torch_device()
         sample_rate = 16000
         if ensure_loaded:
             audio_stage.load_model()
@@ -634,12 +631,34 @@ class WanS2VRealtimeSessionRunner:
                     speech_array, sampling_rate=sample_rate
                 ).input_values
             )
-            audio_feature = (
-                torch.from_numpy(audio_feature_np).float().to(device).unsqueeze(0)
-            )
+            audio_feature_np = np.asarray(audio_feature_np, dtype=np.float32)
         else:
-            audio_feature = (
-                torch.from_numpy(speech_array).float().to(device).unsqueeze(0)
+            audio_feature_np = np.asarray(speech_array, dtype=np.float32)
+
+        audio_feature = torch.from_numpy(audio_feature_np).float().unsqueeze(0)
+        if torch.cuda.is_available():
+            try:
+                audio_feature = audio_feature.pin_memory()
+            except RuntimeError:
+                pass
+        return audio_feature
+
+    def _encode_audio_feature(
+        self,
+        audio_stage: WanS2VAudioEncodingStage,
+        audio_feature: torch.Tensor,
+        *,
+        target_audio_frames: int,
+        audio_window_video_frames: int,
+        wav2vec_graph_runner: _WanS2VWav2VecCudaGraphRunner | None = None,
+    ) -> torch.Tensor:
+        device = get_local_torch_device()
+        if audio_feature.device != torch.device(device):
+            audio_feature = audio_feature.to(
+                device,
+                non_blocking=bool(
+                    audio_feature.device.type == "cpu" and audio_feature.is_pinned()
+                ),
             )
 
         with set_forward_context(current_timestep=0, attn_metadata=None):
@@ -662,6 +681,31 @@ class WanS2VRealtimeSessionRunner:
             audio_features = audio_features[:, -target_audio_frames:]
 
         return audio_features.permute(0, 2, 3, 1).contiguous()
+
+    def _encode_audio_window(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        audio_stage: WanS2VAudioEncodingStage,
+        audio_window: np.ndarray,
+        *,
+        target_audio_frames: int,
+        audio_window_video_frames: int,
+        wav2vec_graph_runner: _WanS2VWav2VecCudaGraphRunner | None = None,
+        ensure_loaded: bool = True,
+    ) -> torch.Tensor:
+        audio_feature = self._prepare_audio_feature_cpu(
+            audio_stage,
+            audio_window,
+            ensure_loaded=ensure_loaded,
+        )
+        return self._encode_audio_feature(
+            audio_stage,
+            audio_feature,
+            target_audio_frames=target_audio_frames,
+            audio_window_video_frames=audio_window_video_frames,
+            wav2vec_graph_runner=wav2vec_graph_runner,
+        )
 
     def _prepare_wav2vec_cuda_graph(
         self,
@@ -726,6 +770,7 @@ class WanS2VRealtimeSessionRunner:
         wav2vec_graph_runner: _WanS2VWav2VecCudaGraphRunner | None,
         overlap_stream: torch.cuda.Stream | None,
         after_denoise_event: torch.cuda.Event | None,
+        gpu_start_event: Event | None = None,
     ) -> _PrefetchedAudioChunk:
         current_audio_idx, audio_chunk, audio_meta, end_requested = (
             self._next_audio_chunk(
@@ -746,35 +791,39 @@ class WanS2VRealtimeSessionRunner:
 
         audio_window = _audio_window_after_extend(audio_window_snapshot, audio_chunk)
         audio_started = time.perf_counter()
+        audio_feature = self._prepare_audio_feature_cpu(
+            audio_stage,
+            audio_window,
+            ensure_loaded=False,
+        )
+        audio_cpu_s = time.perf_counter() - audio_started
         done_event = None
+        if gpu_start_event is not None:
+            gpu_start_event.wait()
+        audio_gpu_started = time.perf_counter()
         if overlap_stream is not None and torch.cuda.is_available():
             device = get_local_torch_device()
             with torch.cuda.device(device):
                 if after_denoise_event is not None:
                     overlap_stream.wait_event(after_denoise_event)
                 with torch.cuda.stream(overlap_stream):
-                    audio_input = self._encode_audio_window(
-                        batch,
-                        server_args,
+                    audio_input = self._encode_audio_feature(
                         audio_stage,
-                        audio_window,
+                        audio_feature,
                         target_audio_frames=target_audio_frames,
                         audio_window_video_frames=audio_window_video_frames,
                         wav2vec_graph_runner=wav2vec_graph_runner,
-                        ensure_loaded=False,
                     )
                     done_event = overlap_stream.record_event()
         else:
-            audio_input = self._encode_audio_window(
-                batch,
-                server_args,
+            audio_input = self._encode_audio_feature(
                 audio_stage,
-                audio_window,
+                audio_feature,
                 target_audio_frames=target_audio_frames,
                 audio_window_video_frames=audio_window_video_frames,
                 wav2vec_graph_runner=wav2vec_graph_runner,
-                ensure_loaded=False,
             )
+        audio_gpu_enqueue_s = time.perf_counter() - audio_gpu_started
         audio_s = time.perf_counter() - audio_started
         return _PrefetchedAudioChunk(
             audio_chunk_idx=current_audio_idx,
@@ -784,6 +833,8 @@ class WanS2VRealtimeSessionRunner:
             audio_input=audio_input,
             event=done_event,
             audio_s=audio_s,
+            audio_cpu_s=audio_cpu_s,
+            audio_gpu_enqueue_s=audio_gpu_enqueue_s,
         )
 
     def _next_audio_chunk(
@@ -999,6 +1050,8 @@ class WanS2VRealtimeSessionRunner:
         audio_prefetch_pool: ThreadPoolExecutor | None = None
         audio_overlap_stream: torch.cuda.Stream | None = None
         prefetched_audio_future: Future | None = None
+        prefetch_after_denoise_event: torch.cuda.Event | None = None
+        prefetch_gpu_start_event: Event | None = None
         if use_audio_overlap:
             audio_prefetch_pool = ThreadPoolExecutor(
                 max_workers=1,
@@ -1030,7 +1083,13 @@ class WanS2VRealtimeSessionRunner:
             while True:
                 loop_started = time.perf_counter()
                 audio_prefetched = False
+                audio_cpu_s = 0.0
+                audio_gpu_enqueue_s = 0.0
+                audio_prefetch_wall_s = 0.0
+                audio_prefetch_gate_s = 0.0
+                audio_wait_s = 0.0
                 if prefetched_audio_future is not None:
+                    audio_wait_started = time.perf_counter()
                     try:
                         prefetched = prefetched_audio_future.result()
                     except Exception as exc:
@@ -1040,6 +1099,7 @@ class WanS2VRealtimeSessionRunner:
                             exc,
                         )
                         prefetched = None
+                    audio_wait_s = time.perf_counter() - audio_wait_started
                     prefetched_audio_future = None
                 else:
                     prefetched = None
@@ -1056,7 +1116,16 @@ class WanS2VRealtimeSessionRunner:
                         torch.cuda.current_stream(device).wait_event(prefetched.event)
                     audio_ring.extend(audio_chunk)
                     batch.extra["audio_input"] = prefetched.audio_input
-                    audio_s = prefetched.audio_s
+                    audio_cpu_s = prefetched.audio_cpu_s
+                    audio_gpu_enqueue_s = prefetched.audio_gpu_enqueue_s
+                    audio_prefetch_wall_s = prefetched.audio_s
+                    audio_prefetch_gate_s = max(
+                        0.0,
+                        prefetched.audio_s
+                        - prefetched.audio_cpu_s
+                        - prefetched.audio_gpu_enqueue_s,
+                    )
+                    audio_s = audio_wait_s
                     audio_prefetched = True
                 else:
                     current_audio_idx, audio_chunk, audio_meta, end_requested = (
@@ -1084,6 +1153,28 @@ class WanS2VRealtimeSessionRunner:
                         ensure_loaded=False,
                     )
                     audio_s = time.perf_counter() - audio_started
+
+                if audio_prefetch_pool is not None and prefetched_audio_future is None:
+                    prefetch_after_denoise_event = torch.cuda.Event()
+                    prefetch_gpu_start_event = Event()
+                    prefetched_audio_future = audio_prefetch_pool.submit(
+                        self._prefetch_next_audio_chunk,
+                        batch=batch,
+                        server_args=server_args,
+                        audio_stage=audio_stage,
+                        session_dir=session_dir,
+                        audio_chunk_idx=audio_chunk_idx,
+                        cancel_file=cancel_file,
+                        idle_policy=idle_policy,
+                        timeline_path=timeline_path,
+                        audio_window_snapshot=audio_ring.snapshot(),
+                        target_audio_frames=target_audio_frames,
+                        audio_window_video_frames=audio_window_video_frames,
+                        wav2vec_graph_runner=wav2vec_graph_runner,
+                        overlap_stream=audio_overlap_stream,
+                        after_denoise_event=prefetch_after_denoise_event,
+                        gpu_start_event=prefetch_gpu_start_event,
+                    )
 
                 emit_chunk_timeline(
                     timeline_path,
@@ -1211,26 +1302,14 @@ class WanS2VRealtimeSessionRunner:
                 batch.latents = current_latents
                 denoise_s = time.perf_counter() - denoise_started
 
-                if audio_prefetch_pool is not None and prefetched_audio_future is None:
-                    after_denoise_event = torch.cuda.Event()
-                    after_denoise_event.record(torch.cuda.current_stream(device))
-                    prefetched_audio_future = audio_prefetch_pool.submit(
-                        self._prefetch_next_audio_chunk,
-                        batch=batch,
-                        server_args=server_args,
-                        audio_stage=audio_stage,
-                        session_dir=session_dir,
-                        audio_chunk_idx=audio_chunk_idx,
-                        cancel_file=cancel_file,
-                        idle_policy=idle_policy,
-                        timeline_path=timeline_path,
-                        audio_window_snapshot=audio_ring.snapshot(),
-                        target_audio_frames=target_audio_frames,
-                        audio_window_video_frames=audio_window_video_frames,
-                        wav2vec_graph_runner=wav2vec_graph_runner,
-                        overlap_stream=audio_overlap_stream,
-                        after_denoise_event=after_denoise_event,
+                if prefetch_after_denoise_event is not None:
+                    prefetch_after_denoise_event.record(
+                        torch.cuda.current_stream(device)
                     )
+                    if prefetch_gpu_start_event is not None:
+                        prefetch_gpu_start_event.set()
+                    prefetch_after_denoise_event = None
+                    prefetch_gpu_start_event = None
 
                 decode_started = time.perf_counter()
                 frames = self._decode_block_frames(
@@ -1295,6 +1374,19 @@ class WanS2VRealtimeSessionRunner:
                     vae_decode_mode=stream_vae_state.last_decode_mode,
                     timings={
                         "audio_ms": round(audio_s * 1000, 3),
+                        "audio_cpu_ms": round(audio_cpu_s * 1000, 3),
+                        "audio_gpu_enqueue_ms": round(
+                            audio_gpu_enqueue_s * 1000,
+                            3,
+                        ),
+                        "audio_prefetch_wall_ms": round(
+                            audio_prefetch_wall_s * 1000,
+                            3,
+                        ),
+                        "audio_prefetch_gate_ms": round(
+                            audio_prefetch_gate_s * 1000,
+                            3,
+                        ),
                         "latent_ms": round(latent_s * 1000, 3),
                         "denoise_ms": round(denoise_s * 1000, 3),
                         "decode_ms": round(decode_s * 1000, 3),
@@ -1305,6 +1397,9 @@ class WanS2VRealtimeSessionRunner:
                 )
                 block_idx += 1
         finally:
+            if prefetch_gpu_start_event is not None:
+                prefetch_gpu_start_event.set()
+                prefetch_gpu_start_event = None
             if prefetched_audio_future is not None:
                 prefetched_audio_future.cancel()
                 prefetched_audio_future = None

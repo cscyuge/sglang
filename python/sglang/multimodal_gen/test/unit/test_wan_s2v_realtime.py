@@ -86,6 +86,7 @@ class _FakeAudioPrefetchRunner(_FakeRealtimeRunner):
     def __init__(self):
         super().__init__({})
         self.seen_audio_window = None
+        self.calls = []
 
     def _next_audio_chunk(self, **kwargs):
         return (
@@ -95,19 +96,28 @@ class _FakeAudioPrefetchRunner(_FakeRealtimeRunner):
             False,
         )
 
-    def _encode_audio_window(
+    def _prepare_audio_feature_cpu(
         self,
-        batch,
-        server_args,
         audio_stage,
         audio_window,
+        *,
+        ensure_loaded=True,
+    ):
+        self.calls.append("prepare_audio_feature_cpu")
+        self.seen_audio_window = np.asarray(audio_window, dtype=np.float32).copy()
+        return torch.ones(1, 4)
+
+    def _encode_audio_feature(
+        self,
+        audio_stage,
+        audio_feature,
         *,
         target_audio_frames,
         audio_window_video_frames,
         wav2vec_graph_runner=None,
-        ensure_loaded=True,
     ):
-        self.seen_audio_window = np.asarray(audio_window, dtype=np.float32).copy()
+        self.calls.append("encode_audio_feature")
+        torch.testing.assert_close(audio_feature, torch.ones(1, 4))
         return torch.ones(1, 2, 3, 4)
 
 
@@ -303,7 +313,13 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
             runner.seen_audio_window,
             np.array([2, 3, 4, 5], dtype=np.float32),
         )
+        self.assertEqual(
+            runner.calls,
+            ["prepare_audio_feature_cpu", "encode_audio_feature"],
+        )
         torch.testing.assert_close(prefetched.audio_input, torch.ones(1, 2, 3, 4))
+        self.assertGreaterEqual(prefetched.audio_cpu_s, 0.0)
+        self.assertGreaterEqual(prefetched.audio_gpu_enqueue_s, 0.0)
 
     def test_realtime_config_validation(self):
         cfg = WanS2VPipelineConfig(
