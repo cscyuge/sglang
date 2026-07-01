@@ -372,6 +372,7 @@ def _save_chunk_frames_for_streaming(
     frame_dir: str,
     chunk_idx: int,
     frames_per_chunk: int,
+    frame_start_idx: int | None = None,
 ) -> None:
     """Save per-chunk frames as individual JPEGs for real-time MJPEG streaming.
 
@@ -383,10 +384,16 @@ def _save_chunk_frames_for_streaming(
         frame_dir: Directory to write frame_NNNNN.jpg files into.
         chunk_idx: Zero-based chunk index (used to compute global frame offset).
         frames_per_chunk: Number of frames per chunk (typically 28).
+        frame_start_idx: Optional explicit global frame index. This is used by
+            pipelines with variable per-chunk frame counts.
     """
     import imageio
 
-    base_idx = chunk_idx * frames_per_chunk
+    base_idx = (
+        chunk_idx * frames_per_chunk
+        if frame_start_idx is None
+        else int(frame_start_idx)
+    )
     for i in range(frames_np.shape[0]):
         path = os.path.join(frame_dir, f"frame_{base_idx + i:05d}.jpg")
         imageio.imwrite(path, frames_np[i])
@@ -1864,6 +1871,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         turn_id: str | None = None,
         session_id: str | None = None,
         audio_chunk_meta: dict[str, Any] | None = None,
+        frame_start_idx: int | None = None,
     ) -> None:
         """Save per-chunk JPEG frames for streaming and optionally push via RTMP/SRT.
 
@@ -1914,6 +1922,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         frame_dir,
                         chunk_idx,
                         frames_per_chunk,
+                        frame_start_idx,
                     )
                 )
             except Exception as e:

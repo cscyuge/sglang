@@ -49,6 +49,7 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_max_silence_blocks: int = 1
     wan_s2v_audio_overlap: bool = False
     wan_s2v_wav2vec_cuda_graph: bool = False
+    wan_s2v_streaming_vae_cache: bool = True
     wan_s2v_vae_cuda_graph: bool = False
 
     def __post_init__(self) -> None:

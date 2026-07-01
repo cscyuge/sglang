@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     WanS2VDenoisingDispatchStage,
     build_wan_s2v_condition_bundle,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
     emit_chunk_timeline,
@@ -216,6 +217,13 @@ class _PrefetchedAudioChunk:
     audio_s: float = 0.0
 
 
+@dataclass
+class _WanS2VStreamingVAEState:
+    enabled: bool
+    initialized: bool = False
+    decoded_latent_frames: int = 0
+
+
 class WanS2VRealtimeSessionRunner:
     """Consume session audio chunks and emit Wan S2V frames block-by-block.
 
@@ -246,6 +254,25 @@ class WanS2VRealtimeSessionRunner:
                 4,
             )
         )
+        return max(1, (num_frame_per_block - 1) * temporal + 1)
+
+    def _block_output_frames(
+        self,
+        server_args: ServerArgs,
+        num_frame_per_block: int,
+        block_idx: int,
+        *,
+        use_streaming_vae_cache: bool,
+    ) -> int:
+        temporal = int(
+            getattr(
+                server_args.pipeline_config.vae_config.arch_config,
+                "scale_factor_temporal",
+                4,
+            )
+        )
+        if use_streaming_vae_cache and block_idx > 0:
+            return max(1, num_frame_per_block * temporal)
         return max(1, (num_frame_per_block - 1) * temporal + 1)
 
     def _prepare_reference_and_prompt(
@@ -293,6 +320,100 @@ class WanS2VRealtimeSessionRunner:
         batch.latents = None
         batch = latent_stage(batch, server_args)
         return batch.latents
+
+    def _decode_block_frames(
+        self,
+        decoding_stage: DecodingStage,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+        stream_vae_state: _WanS2VStreamingVAEState,
+    ) -> torch.Tensor:
+        if not stream_vae_state.enabled:
+            return decoding_stage.decode(latents, server_args)
+
+        original_latents = latents
+        vae = decoding_stage.vae
+        required_attrs = (
+            "use_feature_cache",
+            "clear_cache",
+            "post_quant_conv",
+            "decoder",
+            "config",
+        )
+        if not all(hasattr(vae, attr) for attr in required_attrs) or not bool(
+            getattr(vae, "use_feature_cache", False)
+        ):
+            stream_vae_state.enabled = False
+            return decoding_stage.decode(original_latents, server_args)
+
+        try:
+            from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+                feat_idx as wan_vae_feat_idx,
+                first_chunk as wan_vae_first_chunk,
+                forward_context as wan_vae_forward_context,
+                unpatchify as wan_vae_unpatchify,
+            )
+
+            device = get_local_torch_device()
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            vae = vae.to(device=device, dtype=vae_dtype)
+            latents = latents.to(device=device)
+            latents = decoding_stage.scale_and_shift(latents, server_args)
+            latents = server_args.pipeline_config.preprocess_decoding(
+                latents, server_args, vae=vae
+            )
+            vae_autocast_enabled = (
+                vae_dtype != torch.float32
+            ) and not server_args.disable_autocast
+
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast_enabled,
+            ):
+                if not vae_autocast_enabled:
+                    latents = latents.to(vae_dtype)
+                else:
+                    latents = latents.to(dtype=vae_dtype)
+
+                if not stream_vae_state.initialized:
+                    vae.clear_cache()
+
+                x = vae.post_quant_conv(latents)
+                outputs = []
+                with wan_vae_forward_context(
+                    feat_cache_arg=vae._feat_map,
+                    feat_idx_arg=vae._conv_idx,
+                ):
+                    for idx in range(x.shape[2]):
+                        wan_vae_feat_idx.set(0)
+                        wan_vae_first_chunk.set(
+                            bool(not stream_vae_state.initialized and idx == 0)
+                        )
+                        outputs.append(vae.decoder(x[:, :, idx : idx + 1, :, :]))
+
+                image = torch.cat(outputs, dim=2)
+                if getattr(vae.config, "patch_size", None) is not None:
+                    image = wan_vae_unpatchify(
+                        image, patch_size=getattr(vae.config, "patch_size")
+                    )
+                image = image.float().clamp(-1.0, 1.0)
+
+            stream_vae_state.initialized = True
+            stream_vae_state.decoded_latent_frames += int(latents.shape[2])
+            return (image / 2 + 0.5).clamp(0, 1)
+        except Exception as exc:
+            logger.warning(
+                "Wan S2V streaming VAE cache disabled after decode failure: %s",
+                exc,
+            )
+            try:
+                vae.clear_cache()
+            except Exception:
+                pass
+            stream_vae_state.enabled = False
+            stream_vae_state.initialized = False
+            return decoding_stage.decode(original_latents, server_args)
 
     def _encode_audio_window(
         self,
@@ -531,6 +652,8 @@ class WanS2VRealtimeSessionRunner:
             "num_chunks": None,
             "fps": batch.fps or 24,
             "frames_per_chunk": frames_per_chunk,
+            "frames_per_first_chunk": frames_per_chunk,
+            "variable_frames_per_chunk": True,
             "width": batch.width,
             "height": batch.height,
             "session": True,
@@ -605,11 +728,14 @@ class WanS2VRealtimeSessionRunner:
         )
         if use_audio_overlap and not torch.cuda.is_available():
             use_audio_overlap = False
+        use_streaming_vae_cache = bool(
+            _pipeline_config_value(server_args, "wan_s2v_streaming_vae_cache", True)
+        )
 
         logger.info(
             "Wan S2V realtime session start: session=%s block_latent_frames=%d "
             "block_public_frames=%d fps=%d audio_window=%.2fs idle_policy=%s "
-            "wav2vec_cuda_graph=%s audio_overlap=%s",
+            "wav2vec_cuda_graph=%s audio_overlap=%s streaming_vae_cache=%s",
             session_id,
             num_frame_per_block,
             block_public_frames,
@@ -618,6 +744,7 @@ class WanS2VRealtimeSessionRunner:
             idle_policy,
             use_wav2vec_cuda_graph,
             use_audio_overlap,
+            use_streaming_vae_cache,
         )
         emit_chunk_timeline(
             timeline_path,
@@ -630,6 +757,7 @@ class WanS2VRealtimeSessionRunner:
             idle_policy=idle_policy,
             wav2vec_cuda_graph=use_wav2vec_cuda_graph,
             audio_overlap=use_audio_overlap,
+            streaming_vae_cache=use_streaming_vae_cache,
         )
 
         batch = self._prepare_reference_and_prompt(
@@ -683,9 +811,11 @@ class WanS2VRealtimeSessionRunner:
         timesteps = None
         prompt_embeds = None
         reference_latents_ready = False
+        stream_vae_state = _WanS2VStreamingVAEState(enabled=use_streaming_vae_cache)
 
         audio_chunk_idx = 0
         block_idx = 0
+        frame_start_idx = 0
         end_requested = False
 
         decoding_stage.load_model()
@@ -755,6 +885,12 @@ class WanS2VRealtimeSessionRunner:
                     block_idx=block_idx,
                     audio_chunk_idx=current_audio_idx,
                     samples=int(len(audio_chunk)),
+                    expected_output_frames=self._block_output_frames(
+                        server_args,
+                        num_frame_per_block,
+                        block_idx,
+                        use_streaming_vae_cache=stream_vae_state.enabled,
+                    ),
                     chunk_source=audio_meta.get("chunk_source"),
                     is_filler=is_flashtalk_filler_audio_meta(audio_meta),
                     turn_id=audio_meta.get("turn_id"),
@@ -891,9 +1027,15 @@ class WanS2VRealtimeSessionRunner:
                     )
 
                 decode_started = time.perf_counter()
-                frames = decoding_stage.decode(batch.latents, server_args)
+                frames = self._decode_block_frames(
+                    decoding_stage,
+                    batch.latents,
+                    server_args,
+                    stream_vae_state,
+                )
                 frames = server_args.pipeline_config.post_decoding(frames, server_args)
                 decode_s = time.perf_counter() - decode_started
+                frame_count = int(frames.shape[2])
 
                 stream_started = time.perf_counter()
                 self.pipeline._save_streaming_frames(
@@ -902,7 +1044,7 @@ class WanS2VRealtimeSessionRunner:
                     frame_dir,
                     frame_executor,
                     frame_futures,
-                    int(frames.shape[2]),
+                    frame_count,
                     chunk_audio_data=audio_chunk,
                     timeline_path=timeline_path,
                     audio_chunk_idx=current_audio_idx,
@@ -912,8 +1054,10 @@ class WanS2VRealtimeSessionRunner:
                     chunk_source=audio_meta.get("chunk_source") or "audio",
                     is_filler=is_flashtalk_filler_audio_meta(audio_meta),
                     turn_id=audio_meta.get("turn_id"),
+                    frame_start_idx=frame_start_idx,
                 )
                 stream_s = time.perf_counter() - stream_started
+                frame_start_idx += frame_count
 
                 if _safe_world_rank() == 0:
                     try:
@@ -939,6 +1083,8 @@ class WanS2VRealtimeSessionRunner:
                     "wan_s2v_block_generation_done",
                     block_idx=block_idx,
                     audio_chunk_idx=current_audio_idx,
+                    frame_count=frame_count,
+                    frame_start_idx=frame_start_idx - frame_count,
                     timings={
                         "audio_ms": round(audio_s * 1000, 3),
                         "latent_ms": round(latent_s * 1000, 3),
@@ -964,6 +1110,11 @@ class WanS2VRealtimeSessionRunner:
                     audio_overlap_stream.synchronize()
                 except Exception:
                     pass
+            try:
+                if stream_vae_state.initialized:
+                    decoding_stage.vae.clear_cache()
+            except Exception:
+                pass
             try:
                 denoising_stage.offload_model()
             except Exception:

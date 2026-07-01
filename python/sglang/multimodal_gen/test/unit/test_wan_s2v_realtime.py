@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.wan_s2v_scheduler import (
 from sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime import (
     AudioRingBuffer,
     WanS2VRealtimeSessionRunner,
+    _WanS2VStreamingVAEState,
     _audio_window_after_extend,
     _wait_for_session_audio_chunk,
 )
@@ -107,6 +109,42 @@ class _FakeAudioPrefetchRunner(_FakeRealtimeRunner):
     ):
         self.seen_audio_window = np.asarray(audio_window, dtype=np.float32).copy()
         return torch.ones(1, 2, 3, 4)
+
+
+class _FakeWanDecoder(torch.nn.Module):
+    def forward(self, x):
+        from sglang.multimodal_gen.runtime.models.vaes.wanvae import first_chunk
+
+        frames = 1 if bool(first_chunk.get()) else 4
+        return x.new_zeros(x.shape[0], 1, frames, x.shape[3], x.shape[4])
+
+
+class _FakeWanVAE(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.use_feature_cache = True
+        self.post_quant_conv = torch.nn.Identity()
+        self.decoder = _FakeWanDecoder()
+        self.config = SimpleNamespace(patch_size=None)
+        self.clear_cache_calls = 0
+        self.clear_cache()
+
+    def clear_cache(self):
+        self.clear_cache_calls += 1
+        self._feat_map = [None]
+        self._conv_idx = 0
+
+
+class _FakePipelineConfig:
+    vae_precision = "fp32"
+    vae_tiling = False
+    vae_config = SimpleNamespace(arch_config=SimpleNamespace(scale_factor_temporal=4))
+
+    def get_decode_scale_and_shift(self, device, dtype, vae):
+        return 1.0, None
+
+    def preprocess_decoding(self, latents, server_args, vae=None):
+        return latents
 
 
 class WanS2VRealtimeHelpersTest(unittest.TestCase):
@@ -305,6 +343,75 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
 
         self.assertEqual(params.guidance_scale, 1.0)
         self.assertIsNone(params.negative_prompt)
+
+    def test_streaming_vae_output_frame_cadence(self):
+        runner = _FakeRealtimeRunner({})
+        server_args = SimpleNamespace(pipeline_config=_FakePipelineConfig())
+
+        self.assertEqual(
+            runner._block_output_frames(
+                server_args,
+                3,
+                0,
+                use_streaming_vae_cache=True,
+            ),
+            9,
+        )
+        self.assertEqual(
+            runner._block_output_frames(
+                server_args,
+                3,
+                1,
+                use_streaming_vae_cache=True,
+            ),
+            12,
+        )
+        self.assertEqual(
+            runner._block_output_frames(
+                server_args,
+                3,
+                1,
+                use_streaming_vae_cache=False,
+            ),
+            9,
+        )
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_local_torch_device",
+        return_value=torch.device("cpu"),
+    )
+    def test_streaming_vae_decode_keeps_temporal_cache(self, _device):
+        runner = _FakeRealtimeRunner({})
+        vae = _FakeWanVAE()
+        decoding_stage = SimpleNamespace(
+            vae=vae,
+            scale_and_shift=lambda latents, server_args: latents,
+            decode=lambda latents, server_args: torch.empty(0),
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=_FakePipelineConfig(),
+            disable_autocast=True,
+        )
+        state = _WanS2VStreamingVAEState(enabled=True)
+
+        first = runner._decode_block_frames(
+            decoding_stage,
+            torch.zeros(1, 1, 2, 1, 1),
+            server_args,
+            state,
+        )
+        second = runner._decode_block_frames(
+            decoding_stage,
+            torch.zeros(1, 1, 2, 1, 1),
+            server_args,
+            state,
+        )
+
+        self.assertTrue(state.initialized)
+        self.assertEqual(state.decoded_latent_frames, 4)
+        self.assertEqual(vae.clear_cache_calls, 2)
+        self.assertEqual(first.shape, (1, 1, 5, 1, 1))
+        self.assertEqual(second.shape, (1, 1, 8, 1, 1))
 
     def test_stream_r1_config_defaults_to_baseline_flow_shift(self):
         self.assertEqual(WanS2VPipelineConfig().flow_shift, 3.0)
