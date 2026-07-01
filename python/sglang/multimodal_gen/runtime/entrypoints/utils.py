@@ -383,7 +383,9 @@ def prepare_request(
     )
     sampling_params.apply_request_extra(req)
 
-    req.adjust_size(server_args)
+    adjust_size = getattr(req, "adjust_size", None)
+    if callable(adjust_size):
+        adjust_size(server_args)
 
     if not isinstance(req.prompt, str):
         raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")

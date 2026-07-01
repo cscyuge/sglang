@@ -193,6 +193,7 @@ class GroupCoordinator:
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
         use_device_communicator: bool = True,
+        use_srt_custom_allreduce: bool = False,
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
@@ -249,6 +250,7 @@ class GroupCoordinator:
                 )
 
         self.mq_broadcaster = None
+        self.srt_custom_allreduce = None
 
         # TODO(will): check if this is needed
         # self.use_custom_op_call = current_platform.is_cuda_alike()

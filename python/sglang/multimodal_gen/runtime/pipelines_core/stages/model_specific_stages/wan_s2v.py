@@ -130,37 +130,38 @@ class WanS2VStreamR1CacheState:
         cls, metadata: WanS2VStreamR1CacheMetadata
     ) -> "WanS2VStreamR1CacheState":
         kv_cache: list[WanS2VKVCacheBlock] = []
-        for _ in range(metadata.num_layers):
-            kv_cache.append(
-                {
-                    "k": torch.zeros(
-                        (
-                            metadata.batch_size,
-                            metadata.cache_tokens,
-                            metadata.local_num_attention_heads,
-                            metadata.attention_head_dim,
+        with torch.inference_mode(False):
+            for _ in range(metadata.num_layers):
+                kv_cache.append(
+                    {
+                        "k": torch.zeros(
+                            (
+                                metadata.batch_size,
+                                metadata.cache_tokens,
+                                metadata.local_num_attention_heads,
+                                metadata.attention_head_dim,
+                            ),
+                            dtype=metadata.dtype,
+                            device=metadata.device,
                         ),
-                        dtype=metadata.dtype,
-                        device=metadata.device,
-                    ),
-                    "v": torch.zeros(
-                        (
-                            metadata.batch_size,
-                            metadata.cache_tokens,
-                            metadata.local_num_attention_heads,
-                            metadata.attention_head_dim,
+                        "v": torch.zeros(
+                            (
+                                metadata.batch_size,
+                                metadata.cache_tokens,
+                                metadata.local_num_attention_heads,
+                                metadata.attention_head_dim,
+                            ),
+                            dtype=metadata.dtype,
+                            device=metadata.device,
                         ),
-                        dtype=metadata.dtype,
-                        device=metadata.device,
-                    ),
-                    "global_end_index": torch.zeros(
-                        (1,), dtype=torch.long, device=metadata.device
-                    ),
-                    "local_end_index": torch.zeros(
-                        (1,), dtype=torch.long, device=metadata.device
-                    ),
-                }
-            )
+                        "global_end_index": torch.zeros(
+                            (1,), dtype=torch.long, device=metadata.device
+                        ),
+                        "local_end_index": torch.zeros(
+                            (1,), dtype=torch.long, device=metadata.device
+                        ),
+                    }
+                )
         return cls(metadata=metadata, kv_cache=kv_cache)
 
     def reset(self) -> None:

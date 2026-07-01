@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
 )
+from sglang.multimodal_gen.runtime.server_warmup import should_return_warmup_result
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
@@ -293,11 +294,13 @@ class Scheduler(SchedulerDisaggMixin):
         output_batch: OutputBatch,
         identity: bytes | None = None,
         is_warmup: bool = False,
+        req_or_group: Any | None = None,
     ):
         """
         replies to client, only on rank 0
         """
-        if not is_warmup and self.receiver is not None and identity is not None:
+        should_send = not is_warmup or should_return_warmup_result(req_or_group)
+        if should_send and self.receiver is not None and identity is not None:
             self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
     def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
@@ -661,7 +664,12 @@ class Scheduler(SchedulerDisaggMixin):
                             logger.info("Warmup req processing failed")
 
                 # TODO: Support sending back to multiple identities if batched
-                self.return_result(output_batch, identities[0], is_warmup=is_warmup)
+                self.return_result(
+                    output_batch,
+                    identities[0],
+                    is_warmup=is_warmup,
+                    req_or_group=processed_req,
+                )
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")

@@ -96,6 +96,37 @@ def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
 class TestWarmupReqCfgParallel(unittest.TestCase):
     """Warmup request construction and req-based warmup guards."""
 
+    def test_return_result_skips_regular_warmup_reply(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.receiver = MagicMock()
+        req = Req(data_type=ModelTaskType.T2V.data_type(), prompt="warmup")
+        req.set_as_warmup(1)
+
+        scheduler.return_result(
+            OutputBatch(),
+            b"client",
+            is_warmup=True,
+            req_or_group=req,
+        )
+
+        scheduler.receiver.send_multipart.assert_not_called()
+
+    def test_return_result_sends_server_warmup_reply(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.receiver = MagicMock()
+        req = Req(data_type=ModelTaskType.T2V.data_type(), prompt="warmup")
+        req.set_as_warmup(1)
+        req.extra["return_warmup_result"] = True
+
+        scheduler.return_result(
+            OutputBatch(),
+            b"client",
+            is_warmup=True,
+            req_or_group=req,
+        )
+
+        scheduler.receiver.send_multipart.assert_called_once()
+
     def test_warmup_req_cfg_parallel_sets_do_cfg(self):
         server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args
         sampling_defaults = SamplingParams()
@@ -621,6 +652,82 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             )
 
         self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
+
+    def test_server_based_warmup_adds_audio_for_audio_encoder_pipeline(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.component_paths = {}
+        server_args.pipeline_config = SimpleNamespace(
+            task_type=ModelTaskType.I2V,
+            audio_encoder_path="/tmp/audio_encoder",
+            num_frame_per_block=3,
+        )
+        sampling_defaults = SamplingParams(
+            width=480,
+            height=832,
+            num_frames=17,
+            fps=16,
+            negative_prompt=None,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual(req.image_path, ["/tmp/warmup.png"])
+        self.assertIn("audio_tensor", req.extra)
+        self.assertEqual(req.extra["audio_tensor"].dtype.name, "float32")
+        self.assertGreaterEqual(
+            req.extra["audio_tensor"].shape[-1],
+            int(17 / 16 * 16000),
+        )
+
+    def test_server_based_warmup_aligns_stream_r1_s2v_latent_frames(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.component_paths = {}
+        server_args.pipeline_config = SimpleNamespace(
+            task_type=ModelTaskType.I2V,
+            audio_encoder_path="/tmp/audio_encoder",
+            stream_r1_mode=True,
+            num_frame_per_block=3,
+        )
+        sampling_defaults = SamplingParams(
+            width=480,
+            height=832,
+            num_frames=17,
+            fps=16,
+            negative_prompt=None,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual(req.num_frames, 9)
+        self.assertIn("audio_tensor", req.extra)
+        self.assertGreaterEqual(
+            req.extra["audio_tensor"].shape[-1],
+            int(9 / 16 * 16000),
+        )
 
 
 class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):

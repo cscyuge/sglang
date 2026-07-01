@@ -1574,6 +1574,28 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(state.kv_cache[0]["global_end_index"].item(), 0)
         self.assertEqual(state.kv_cache[1]["local_end_index"].item(), 0)
 
+    def test_kv_cache_state_allocates_normal_tensors_in_inference_mode(self):
+        metadata = WanS2VStreamR1CacheMetadata(
+            batch_size=1,
+            num_layers=1,
+            frame_seq_length=2,
+            local_num_attention_heads=1,
+            attention_head_dim=4,
+            local_attn_size=2,
+            sink_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        with torch.inference_mode():
+            state = WanS2VStreamR1CacheState.allocate(metadata)
+
+        self.assertFalse(state.kv_cache[0]["global_end_index"].is_inference())
+        self.assertFalse(state.kv_cache[0]["k"].is_inference())
+        state.kv_cache[0]["global_end_index"].fill_(3)
+        state.reset()
+        self.assertEqual(state.kv_cache[0]["global_end_index"].item(), 0)
+
     def test_stage_prepares_metadata_but_guards_unsupported_kv(self):
         stage = self._stage()
         request = WanS2VStreamR1AttentionRequest(

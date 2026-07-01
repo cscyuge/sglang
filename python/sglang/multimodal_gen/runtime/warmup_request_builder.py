@@ -13,6 +13,7 @@ callers send them through the scheduler client so warmup exercises the same
 request transport path as real generation.
 """
 
+import math
 from copy import copy
 from typing import Any
 
@@ -42,6 +43,8 @@ SERVER_WARMUP_VIDEO_MAX_AREA = 832 * 480
 SERVER_WARMUP_MAX_VIDEO_FRAMES = 17
 SERVER_WARMUP_IMAGE_STEPS = 2
 SERVER_WARMUP_VIDEO_STEPS = 2
+WARMUP_AUDIO_SAMPLE_RATE = 16000
+WARMUP_AUDIO_MIN_SECONDS = 1.0
 
 
 def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
@@ -241,7 +244,88 @@ def _resolve_warmup_num_frames(
         # use default num frames
         return num_frames
 
-    return min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
+    warmup_num_frames = min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
+    return _align_stream_r1_warmup_num_frames(server_args, warmup_num_frames)
+
+
+def _get_temporal_scale_factor(server_args: ServerArgs) -> int:
+    arch_config = getattr(
+        getattr(
+            getattr(server_args.pipeline_config, "vae_config", None),
+            "arch_config",
+            None,
+        ),
+        "scale_factor_temporal",
+        None,
+    )
+    if arch_config is not None:
+        return max(1, int(arch_config))
+    return 4
+
+
+def _align_stream_r1_warmup_num_frames(
+    server_args: ServerArgs,
+    num_frames: int,
+) -> int:
+    pipeline_config = server_args.pipeline_config
+    if not getattr(pipeline_config, "stream_r1_mode", False):
+        return num_frames
+
+    block_size = int(getattr(pipeline_config, "num_frame_per_block", 0) or 0)
+    if block_size <= 1:
+        return num_frames
+
+    temporal_scale = _get_temporal_scale_factor(server_args)
+    latent_frames = max(1, (num_frames - 1) // temporal_scale + 1)
+    aligned_latent_frames = max(block_size, (latent_frames // block_size) * block_size)
+    return (aligned_latent_frames - 1) * temporal_scale + 1
+
+
+def _should_include_warmup_audio(
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+) -> bool:
+    pipeline_config = server_args.pipeline_config
+    component_paths = getattr(server_args, "component_paths", None)
+    component_audio_encoder_path = (
+        component_paths.get("audio_encoder")
+        if isinstance(component_paths, dict)
+        else None
+    )
+    audio_encoder_path = (
+        getattr(pipeline_config, "audio_encoder_path", None)
+        or component_audio_encoder_path
+    )
+    return audio_encoder_path is not None or hasattr(sampling_defaults, "audio_tensor")
+
+
+def _attach_warmup_audio(
+    req: Req,
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+) -> None:
+    if not _should_include_warmup_audio(server_args, sampling_defaults):
+        return
+
+    import numpy as np
+
+    fps = int(getattr(req, "fps", None) or getattr(sampling_defaults, "fps", 16) or 16)
+    num_frames = int(
+        getattr(req, "num_frames", None)
+        or getattr(sampling_defaults, "num_frames", SERVER_WARMUP_MAX_VIDEO_FRAMES)
+        or SERVER_WARMUP_MAX_VIDEO_FRAMES
+    )
+    # Keep startup bounded, while providing enough samples for audio-conditioned
+    # video pipelines to enter their normal audio encoding path.
+    min_audio_video_frames = max(
+        num_frames,
+        int(getattr(server_args.pipeline_config, "num_frame_per_block", 1) or 1),
+    )
+    num_audio_samples = max(
+        int(WARMUP_AUDIO_MIN_SECONDS * WARMUP_AUDIO_SAMPLE_RATE),
+        int(math.ceil(min_audio_video_frames / fps * WARMUP_AUDIO_SAMPLE_RATE)),
+    )
+    req.extra["audio_tensor"] = np.zeros(num_audio_samples, dtype=np.float32)
 
 
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
@@ -354,6 +438,7 @@ def build_warmup_reqs(
             req_kwargs["do_classifier_free_guidance"] = True
 
         req = Req(**req_kwargs)
+        _attach_warmup_audio(req, server_args, sampling_defaults)
         req.set_as_warmup(warmup_steps)
         if return_warmup_result:
             req.extra["return_warmup_result"] = True

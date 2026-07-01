@@ -78,6 +78,7 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
+WARMUP_MODES = ("off", "request", "server")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -198,6 +199,7 @@ class ServerArgs(DisaggArgsMixin):
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
+    _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -206,7 +208,9 @@ class ServerArgs(DisaggArgsMixin):
     enable_torch_compile: bool = False
 
     # warmup
+    warmup_mode: str | None = None
     warmup: bool = False
+    server_warmup: bool = False
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
 
@@ -295,6 +299,11 @@ class ServerArgs(DisaggArgsMixin):
     # Logging
     log_level: str = "info"
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
+    enable_layerwise_nvtx_marker: bool = False
+
+    # Tracing
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
 
     # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
@@ -534,13 +543,48 @@ class ServerArgs(DisaggArgsMixin):
             self._set_default_attention_backend()
 
     def _adjust_warmup(self):
+        mode_explicit = self.is_arg_explicitly_set("warmup_mode")
+        legacy_explicit = self.is_arg_explicitly_set(
+            "warmup"
+        ) or self.is_arg_explicitly_set("server_warmup")
+        if self.warmup_mode is not None:
+            if self.warmup_mode not in WARMUP_MODES:
+                raise ValueError(
+                    f"Invalid --warmup-mode {self.warmup_mode!r}; "
+                    f"expected one of {WARMUP_MODES}."
+                )
+            if mode_explicit and legacy_explicit:
+                logger.warning(
+                    "Both --warmup-mode and the deprecated --warmup/--server-warmup "
+                    "were set; --warmup-mode=%s takes precedence.",
+                    self.warmup_mode,
+                )
+            if mode_explicit or not legacy_explicit:
+                self.warmup = self.warmup_mode != "off"
+                self.server_warmup = self.warmup_mode == "server"
+            elif self.warmup:
+                self.server_warmup = self.server_warmup or self.warmup_mode == "server"
+
         if self.warmup_resolutions is not None:
             self.warmup = True
+
+        if self.disagg_role != RoleType.MONOLITHIC:
+            self.server_warmup = False
+
+        if not self.warmup:
+            self.server_warmup = False
+
+        self.warmup_mode = (
+            "off" if not self.warmup else "server" if self.server_warmup else "request"
+        )
 
         if self.warmup:
             logger.info(
                 "Warmup enabled, the launch time is expected to be longer than usual"
             )
+
+    def is_arg_explicitly_set(self, arg_name: str) -> bool:
+        return arg_name in self._explicit_arg_names
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -939,6 +983,16 @@ class ServerArgs(DisaggArgsMixin):
 
         # warmup
         parser.add_argument(
+            "--warmup-mode",
+            type=str,
+            choices=list(WARMUP_MODES),
+            default=ServerArgs.warmup_mode,
+            help=(
+                "Warmup mode. One of: off, request, server. "
+                "Takes precedence over --warmup/--server-warmup."
+            ),
+        )
+        parser.add_argument(
             "--warmup",
             action=StoreBoolean,
             default=ServerArgs.warmup,
@@ -958,6 +1012,12 @@ class ServerArgs(DisaggArgsMixin):
             type=int,
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
+        )
+        parser.add_argument(
+            "--server-warmup",
+            action=StoreBoolean,
+            default=ServerArgs.server_warmup,
+            help="[Deprecated] Run warmup as a server startup task.",
         )
 
         parser.add_argument(
@@ -1136,6 +1196,24 @@ class ServerArgs(DisaggArgsMixin):
             help="The logging level of all loggers.",
         )
         parser.add_argument(
+            "--enable-layerwise-nvtx-marker",
+            action="store_true",
+            default=ServerArgs.enable_layerwise_nvtx_marker,
+            help="Enable layerwise NVTX profiling annotations for the model.",
+        )
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            default=ServerArgs.enable_trace,
+            help="Enable OpenTelemetry tracing.",
+        )
+        parser.add_argument(
+            "--otlp-traces-endpoint",
+            type=str,
+            default=ServerArgs.otlp_traces_endpoint,
+            help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
             type=str,
             nargs="*",
@@ -1254,7 +1332,10 @@ class ServerArgs(DisaggArgsMixin):
 
     @classmethod
     def from_cli_args(
-        cls, args: argparse.Namespace, unknown_args: list[str] | None = None
+        cls,
+        args: argparse.Namespace,
+        unknown_args: list[str] | None = None,
+        default_args: dict[str, Any] | None = None,
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
@@ -1265,18 +1346,26 @@ class ServerArgs(DisaggArgsMixin):
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
 
         provided_args = cls.get_provided_args(args, unknown_args)
+        explicit_arg_names = set(provided_args)
 
         # Handle config file
         config_file = provided_args.get("config")
         if config_file:
             config_args = cls.load_config_file(config_file)
+            explicit_arg_names.update(config_args)
             provided_args = {**config_args, **provided_args}
+
+        if default_args:
+            for key, value in default_args.items():
+                provided_args.setdefault(key, value)
 
         if dynamic_paths:
             existing = dict(provided_args.get("component_paths") or {})
             existing.update(dynamic_paths)
             provided_args["component_paths"] = existing
+            explicit_arg_names.add("component_paths")
 
+        provided_args["_explicit_arg_names"] = explicit_arg_names
         return cls.from_dict(provided_args)
 
     @classmethod
@@ -1284,13 +1373,19 @@ class ServerArgs(DisaggArgsMixin):
         """Create a ServerArgs object from a dictionary."""
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
+        explicit_arg_names = kwargs.get("_explicit_arg_names")
+        if explicit_arg_names is None:
+            explicit_arg_names = set(kwargs)
+        server_args_kwargs["_explicit_arg_names"] = set(explicit_arg_names)
 
         component_paths = dict(kwargs.get("component_paths") or {})
         if component_paths:
             server_args_kwargs["component_paths"] = component_paths
 
         for attr in attrs:
-            if attr == "pipeline_config":
+            if attr == "_explicit_arg_names":
+                continue
+            elif attr == "pipeline_config":
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
@@ -1323,6 +1418,8 @@ class ServerArgs(DisaggArgsMixin):
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
+        explicit_arg_names = set(kwargs)
+
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
@@ -1331,6 +1428,7 @@ class ServerArgs(DisaggArgsMixin):
         convert_disagg_role_string(kwargs)
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
+        kwargs["_explicit_arg_names"] = explicit_arg_names
         return cls(**kwargs)
 
     @staticmethod
