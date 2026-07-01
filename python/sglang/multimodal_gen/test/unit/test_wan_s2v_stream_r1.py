@@ -19,14 +19,18 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VStreamR1MixedKVView,
     WanS2VStreamR1NoisyKVCacheUpdate,
     WanS2VStreamR1NoisyKVCacheView,
+    build_wan_s2v_stream_r1_segmented_mixed_kv_attention_plan,
     build_wan_s2v_stream_r1_cached_noisy_kv_index,
     build_wan_s2v_stream_r1_mixed_kv_attention_mask,
     build_wan_s2v_stream_r1_mixed_kv_attention_plan,
     build_wan_s2v_stream_r1_packed_attention_workspace,
+    build_wan_s2v_stream_r1_segmented_packed_attention_workspace,
+    compose_wan_s2v_stream_r1_segmented_mixed_kv_view,
     compose_wan_s2v_stream_r1_mixed_kv_view,
     pad_wan_s2v_stream_r1_mixed_kv_query_mask_for_sp,
     run_wan_s2v_stream_r1_cached_self_attention,
     split_wan_s2v_stream_r1_projected_kv,
+    stream_r1_segmented_packed_varlen_attention,
     stream_r1_packed_varlen_attention,
     update_wan_s2v_stream_r1_noisy_kv_cache,
     validate_wan_s2v_stream_r1_forward_cache,
@@ -462,6 +466,35 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         self.assertIs(mixed.value, noisy_view.value)
         self.assertEqual(mixed.condition_seq_len, 0)
 
+    def test_segmented_mixed_kv_keeps_noisy_and_condition_sources(self):
+        key, value = self._kv(seq_len=5)
+        split = split_wan_s2v_stream_r1_projected_kv(key, value, noisy_seq_len=3)
+        cached_key = torch.full((1, 4, 2, 1), -1.0)
+        cached_value = torch.full((1, 4, 2, 1), -2.0)
+        noisy_view = WanS2VStreamR1NoisyKVCacheView(
+            key=cached_key,
+            value=cached_value,
+            global_end_index=7,
+            local_end_index=4,
+            local_start=3,
+            local_end=7,
+        )
+
+        segmented = compose_wan_s2v_stream_r1_segmented_mixed_kv_view(
+            noisy_view,
+            split,
+        )
+
+        self.assertIs(segmented.noisy_key, cached_key)
+        self.assertIs(segmented.noisy_value, cached_value)
+        self.assertIs(segmented.condition_key, split.condition_key)
+        self.assertIs(segmented.condition_value, split.condition_value)
+        self.assertEqual(segmented.cached_noisy_seq_len, 4)
+        self.assertEqual(segmented.condition_seq_len, 2)
+        self.assertEqual(segmented.condition_start_index, 4)
+        self.assertEqual(segmented.total_seq_len, 6)
+        self.assertFalse(hasattr(segmented, "key"))
+
     def test_compose_mixed_kv_validates_cached_and_current_dimensions(self):
         key, value = self._kv(seq_len=4)
         split = split_wan_s2v_stream_r1_projected_kv(key, value, noisy_seq_len=2)
@@ -699,6 +732,95 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         self.assertTrue(workspace.query_matches_input_order)
         self.assertEqual(workspace.query.data_ptr(), query.data_ptr())
 
+    def test_segmented_packed_attention_matches_materialized_workspace(self):
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=1,
+            local_attn_size=5,
+            sink_size=1,
+            current_start=4,
+        )
+        cached_key, cached_value = self._indexed_kv([0, 4, 5, 6, 7])
+        cached_key = cached_key.expand(1, -1, 2, 4).contiguous()
+        cached_value = cached_value.expand(1, -1, 2, 4).contiguous()
+        noisy_view = WanS2VStreamR1NoisyKVCacheView(
+            key=cached_key,
+            value=cached_value,
+            global_end_index=8,
+            local_end_index=5,
+            local_start=4,
+            local_end=8,
+        )
+        condition_key = torch.arange(16, dtype=torch.float32).view(1, 2, 2, 4)
+        condition_value = condition_key + 100
+        split = split_wan_s2v_stream_r1_projected_kv(
+            torch.cat([cached_key[:, -4:], condition_key], dim=1),
+            torch.cat([cached_value[:, -4:], condition_value], dim=1),
+            noisy_seq_len=4,
+        )
+        segmented = compose_wan_s2v_stream_r1_segmented_mixed_kv_view(
+            noisy_view,
+            split,
+        )
+        mixed = compose_wan_s2v_stream_r1_mixed_kv_view(noisy_view, split)
+        segmented_plan = build_wan_s2v_stream_r1_segmented_mixed_kv_attention_plan(
+            noisy_view,
+            segmented,
+            update,
+        )
+        materialized_plan = build_wan_s2v_stream_r1_mixed_kv_attention_plan(
+            noisy_view,
+            mixed,
+            update,
+        )
+        query = torch.randn(1, 6, 2, 4)
+
+        segmented_workspace = (
+            build_wan_s2v_stream_r1_segmented_packed_attention_workspace(
+                query,
+                segmented,
+                segmented_plan,
+            )
+        )
+        materialized_workspace = build_wan_s2v_stream_r1_packed_attention_workspace(
+            query,
+            mixed.key,
+            mixed.value,
+            materialized_plan,
+        )
+        segmented_output = stream_r1_segmented_packed_varlen_attention(
+            query,
+            segmented,
+            segmented_plan,
+            softmax_scale=0.5,
+            force_torch=True,
+        )
+        materialized_output = stream_r1_packed_varlen_attention(
+            query,
+            mixed.key,
+            mixed.value,
+            materialized_plan,
+            softmax_scale=0.5,
+            force_torch=True,
+        )
+
+        torch.testing.assert_close(
+            segmented_plan.to_dense_mask(query.device),
+            materialized_plan.to_dense_mask(query.device),
+        )
+        torch.testing.assert_close(segmented_workspace.query, materialized_workspace.query)
+        torch.testing.assert_close(segmented_workspace.key, materialized_workspace.key)
+        torch.testing.assert_close(segmented_workspace.value, materialized_workspace.value)
+        self.assertEqual(
+            segmented_workspace.cu_seqlens_q.tolist(),
+            materialized_workspace.cu_seqlens_q.tolist(),
+        )
+        self.assertEqual(
+            segmented_workspace.cu_seqlens_k.tolist(),
+            materialized_workspace.cu_seqlens_k.tolist(),
+        )
+        torch.testing.assert_close(segmented_output, materialized_output)
+
 
 class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
     def _cache(self, tokens: int):
@@ -897,6 +1019,10 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "compose_wan_s2v_stream_r1_mixed_kv_view",
+            side_effect=AssertionError("packed backend should use segmented K/V"),
         ):
             output = run_wan_s2v_stream_r1_cached_self_attention(
                 FailingAttention(),
@@ -1040,6 +1166,10 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
             "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
             "sequence_model_parallel_all_gather",
             side_effect=fail_all_gather,
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+            "compose_wan_s2v_stream_r1_mixed_kv_view",
+            side_effect=AssertionError("SP packed backend should use segmented K/V"),
         ):
             output = run_wan_s2v_stream_r1_cached_self_attention(
                 FailingAttention(),
@@ -1302,6 +1432,27 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
             view.key[:, :, 0, 0],
             torch.tensor([[4.0, 5.0, 6.0, 7.0]]),
         )
+
+    def test_update_reuses_contiguous_sink_view_without_cat(self):
+        cache = self._cache(tokens=8)
+        key, value = self._kv(0, 4)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=2,
+            local_attn_size=4,
+            sink_size=1,
+            current_start=0,
+        )
+
+        view = update_wan_s2v_stream_r1_noisy_kv_cache(cache, key, value, update)
+
+        self.assertEqual(view.local_end_index, 4)
+        self.assertEqual(view.key.data_ptr(), cache["k"].data_ptr())
+        self.assertEqual(view.value.data_ptr(), cache["v"].data_ptr())
+        cache["k"][0, 0, 0, 0] = 123.0
+        cache["v"][0, 0, 0, 0] = 456.0
+        self.assertEqual(view.key[0, 0, 0, 0].item(), 123.0)
+        self.assertEqual(view.value[0, 0, 0, 0].item(), 456.0)
 
     def test_update_rejects_gaps_backwards_and_small_cache(self):
         cache = self._cache(tokens=3)

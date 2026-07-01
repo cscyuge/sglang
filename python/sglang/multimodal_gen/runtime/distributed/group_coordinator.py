@@ -465,12 +465,19 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         # Broadcast.
-        torch.distributed.broadcast(
-            input_,
-            src=self.ranks[src],
-            group=self.device_group,
-            async_op=async_op,
-        )
+        caller = _comm_nvtx_caller() if _comm_nvtx_enabled() else ""
+        with _comm_nvtx_range(
+            "sgl_mm_broadcast "
+            f"group={self.unique_name} rank={self.rank_in_group}/{self.world_size} "
+            f"src={src} shape={tuple(input_.shape)} dtype={input_.dtype}"
+            f"{(' ' + caller) if caller else ''}"
+        ):
+            torch.distributed.broadcast(
+                input_,
+                src=self.ranks[src],
+                group=self.device_group,
+                async_op=async_op,
+            )
         return input_
 
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
@@ -617,14 +624,24 @@ class GroupCoordinator:
                     continue
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
-                    handle = torch.distributed.broadcast(
-                        tensor, src=src, group=metadata_group, async_op=True
-                    )
+                    with _comm_nvtx_range(
+                        "sgl_mm_broadcast_tensor_dict "
+                        f"group=metadata rank={self.rank_in_group}/{self.world_size} "
+                        f"src={src} shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+                    ):
+                        handle = torch.distributed.broadcast(
+                            tensor, src=src, group=metadata_group, async_op=True
+                        )
                 else:
                     # use group for GPU tensors
-                    handle = torch.distributed.broadcast(
-                        tensor, src=src, group=group, async_op=True
-                    )
+                    with _comm_nvtx_range(
+                        "sgl_mm_broadcast_tensor_dict "
+                        f"group=device rank={self.rank_in_group}/{self.world_size} "
+                        f"src={src} shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+                    ):
+                        handle = torch.distributed.broadcast(
+                            tensor, src=src, group=group, async_op=True
+                        )
                 async_handles.append(handle)
             for async_handle in async_handles:
                 async_handle.wait()
@@ -644,14 +661,24 @@ class GroupCoordinator:
                         continue
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
-                        handle = torch.distributed.broadcast(
-                            tensor, src=src, group=metadata_group, async_op=True
-                        )
+                        with _comm_nvtx_range(
+                            "sgl_mm_broadcast_tensor_dict "
+                            f"group=metadata rank={self.rank_in_group}/{self.world_size} "
+                            f"src={src} shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+                        ):
+                            handle = torch.distributed.broadcast(
+                                tensor, src=src, group=metadata_group, async_op=True
+                            )
                     else:
                         # use group for GPU tensors
-                        handle = torch.distributed.broadcast(
-                            tensor, src=src, group=group, async_op=True
-                        )
+                        with _comm_nvtx_range(
+                            "sgl_mm_broadcast_tensor_dict "
+                            f"group=device rank={self.rank_in_group}/{self.world_size} "
+                            f"src={src} shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+                        ):
+                            handle = torch.distributed.broadcast(
+                                tensor, src=src, group=group, async_op=True
+                            )
                     async_handles.append(handle)
                     _update_nested_dict(tensor_dict, key, tensor)
                 else:
