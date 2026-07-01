@@ -3,6 +3,7 @@
 
 import os
 import time
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Callable, TypedDict
@@ -36,6 +37,16 @@ def _stream_r1_profile_enabled() -> bool:
 
 def _stream_r1_comm_nvtx_enabled() -> bool:
     value = os.getenv("SGLANG_STREAM_R1_COMM_NVTX", "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _stream_r1_reuse_packed_metadata_enabled() -> bool:
+    value = os.getenv("SGLANG_STREAM_R1_REUSE_PACKED_METADATA", "1")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _stream_r1_reuse_packed_buffers_enabled() -> bool:
+    value = os.getenv("SGLANG_STREAM_R1_REUSE_PACKED_BUFFERS", "1")
     return value.lower() not in ("", "0", "false", "no", "off")
 
 
@@ -219,6 +230,15 @@ class WanS2VStreamR1AttentionPlan:
     def sink_end(self) -> int:
         return self.cache_start + self.sink_tokens
 
+    def _uses_single_noisy_block_query_groups(self) -> bool:
+        return (
+            self.noisy_kv_absolute_index is not None
+            and self.noisy_query_seq_len > 0
+            and self.query_block_tokens == self.noisy_query_seq_len
+            and self.local_tokens >= self.noisy_kv_seq_len
+            and self.current_start % self.noisy_query_seq_len == 0
+        )
+
     def noisy_kv_index(self, device: torch.device) -> torch.Tensor:
         if self.noisy_kv_absolute_index is not None:
             return self.noisy_kv_absolute_index.to(device=device)
@@ -229,12 +249,7 @@ class WanS2VStreamR1AttentionPlan:
         )
 
     def query_groups(self, device: torch.device) -> list["WanS2VStreamR1QueryGroup"]:
-        if (
-            self.noisy_kv_absolute_index is not None
-            and self.query_block_tokens == self.noisy_query_seq_len
-            and self.local_tokens >= self.noisy_kv_seq_len
-            and self.current_start % self.noisy_query_seq_len == 0
-        ):
+        if self._uses_single_noisy_block_query_groups():
             return self._single_noisy_block_query_groups(device)
 
         groups: list[WanS2VStreamR1QueryGroup] = []
@@ -304,29 +319,41 @@ class WanS2VStreamR1AttentionPlan:
         self,
         device: torch.device,
     ) -> list["WanS2VStreamR1QueryGroup"]:
-        groups: list[WanS2VStreamR1QueryGroup] = []
         full_kv_indices = torch.arange(
             self.kv_seq_len,
             dtype=torch.long,
             device=device,
         )
-        groups.append(
+        condition_kv_start = 0
+        if (
+            self.condition_query_seq_len > 0
+            and self.condition_queries_use_current_noisy_only
+        ):
+            condition_kv_start = max(
+                0,
+                self.noisy_kv_seq_len - self.noisy_query_seq_len,
+            )
+
+        if self.condition_query_seq_len > 0 and condition_kv_start == 0:
+            return [
+                WanS2VStreamR1QueryGroup(
+                    query_start=0,
+                    query_end=self.query_seq_len,
+                    kv_indices=full_kv_indices,
+                    kv_ranges=((0, self.kv_seq_len),),
+                )
+            ]
+
+        groups = [
             WanS2VStreamR1QueryGroup(
                 query_start=0,
                 query_end=self.noisy_query_seq_len,
                 kv_indices=full_kv_indices,
                 kv_ranges=((0, self.kv_seq_len),),
             )
-        )
+        ]
 
         if self.condition_query_seq_len > 0:
-            if self.condition_queries_use_current_noisy_only:
-                condition_kv_start = max(
-                    0,
-                    self.noisy_kv_seq_len - self.noisy_query_seq_len,
-                )
-            else:
-                condition_kv_start = 0
             condition_kv_indices = torch.arange(
                 condition_kv_start,
                 self.kv_seq_len,
@@ -391,6 +418,96 @@ class WanS2VStreamR1PackedAttentionWorkspace:
     max_seqlen_k: int
     segments: tuple[WanS2VStreamR1PackedAttentionSegment, ...]
     query_matches_input_order: bool = False
+
+
+@dataclass(frozen=True)
+class WanS2VStreamR1PackedAttentionMetadata:
+    query_groups: tuple[WanS2VStreamR1QueryGroup, ...]
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    total_query_tokens: int
+    total_kv_tokens: int
+    segments: tuple[WanS2VStreamR1PackedAttentionSegment, ...]
+    query_matches_input_order: bool = False
+
+
+_STREAM_R1_PACKED_METADATA_CACHE_LIMIT = 128
+_STREAM_R1_PACKED_METADATA_CACHE: OrderedDict[
+    tuple[object, ...],
+    WanS2VStreamR1PackedAttentionMetadata,
+] = OrderedDict()
+_STREAM_R1_PACKED_BUFFER_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+
+
+def _stream_r1_device_cache_key(device: torch.device) -> tuple[str, int]:
+    index = device.index
+    if device.type == "cuda" and index is None and torch.cuda.is_available():
+        index = torch.cuda.current_device()
+    return device.type, -1 if index is None else int(index)
+
+
+def _stream_r1_packed_metadata_cache_key(
+    plan: WanS2VStreamR1AttentionPlan,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[object, ...] | None:
+    if device.type != "cuda":
+        return None
+    if not _stream_r1_reuse_packed_metadata_enabled():
+        return None
+    if not plan._uses_single_noisy_block_query_groups():
+        return None
+    return (
+        *_stream_r1_device_cache_key(device),
+        batch_size,
+        plan.query_seq_len,
+        plan.kv_seq_len,
+        plan.noisy_query_seq_len,
+        plan.noisy_kv_seq_len,
+        plan.condition_kv_seq_len,
+        plan.frame_seq_length,
+        plan.query_block_tokens,
+        plan.local_attn_size,
+        plan.sink_size,
+        plan.current_start,
+        plan.cache_start,
+        plan.condition_queries_use_current_noisy_only,
+    )
+
+
+def _stream_r1_get_packed_buffer(
+    name: str,
+    like: torch.Tensor,
+    total_tokens: int,
+) -> torch.Tensor | None:
+    if like.device.type != "cuda":
+        return None
+    if not _stream_r1_reuse_packed_buffers_enabled():
+        return None
+    if total_tokens <= 0:
+        raise ValueError("packed attention buffer token count must be positive")
+    stream_key = int(torch.cuda.current_stream(like.device).cuda_stream)
+    cache_key = (
+        name,
+        *_stream_r1_device_cache_key(like.device),
+        stream_key,
+        like.dtype,
+        like.shape[-2],
+        like.shape[-1],
+    )
+    wanted_shape = (total_tokens, like.shape[-2], like.shape[-1])
+    buffer = _STREAM_R1_PACKED_BUFFER_CACHE.get(cache_key)
+    if (
+        buffer is None
+        or buffer.shape[0] < total_tokens
+        or buffer.shape[1:] != wanted_shape[1:]
+    ):
+        buffer = like.new_empty(wanted_shape)
+        _STREAM_R1_PACKED_BUFFER_CACHE[cache_key] = buffer
+    return buffer[:total_tokens]
 
 
 def _query_groups_match_input_order(
@@ -498,6 +615,108 @@ def _select_segmented_packed_kv_parts(
     return parts
 
 
+def _build_wan_s2v_stream_r1_packed_attention_metadata(
+    query: torch.Tensor,
+    plan: WanS2VStreamR1AttentionPlan,
+) -> WanS2VStreamR1PackedAttentionMetadata:
+    query_groups = plan.query_groups(query.device)
+    query_matches_input_order = _query_groups_match_input_order(
+        query_groups,
+        plan.query_seq_len,
+    )
+    cu_q = [0]
+    cu_k = [0]
+    segments: list[WanS2VStreamR1PackedAttentionSegment] = []
+    max_q = 0
+    max_k = 0
+    for batch_index in range(query.shape[0]):
+        for group in query_groups:
+            if group.query_len <= 0:
+                raise ValueError("packed attention query groups must be non-empty")
+            if group.kv_indices.numel() <= 0:
+                raise ValueError("packed attention KV groups must be non-empty")
+            if group.kv_ranges:
+                k_part_len = sum(
+                    max(0, range_end - range_start)
+                    for range_start, range_end in group.kv_ranges
+                )
+            else:
+                k_part_len = int(group.kv_indices.numel())
+            if k_part_len <= 0:
+                raise ValueError("packed attention KV groups must be non-empty")
+
+            q_start = cu_q[-1]
+            k_start = cu_k[-1]
+            q_end = q_start + group.query_len
+            k_end = k_start + k_part_len
+            cu_q.append(q_end)
+            cu_k.append(k_end)
+            max_q = max(max_q, group.query_len)
+            max_k = max(max_k, k_part_len)
+            segments.append(
+                WanS2VStreamR1PackedAttentionSegment(
+                    batch_index=batch_index,
+                    query_start=group.query_start,
+                    query_end=group.query_end,
+                    packed_query_start=q_start,
+                    packed_query_end=q_end,
+                    packed_kv_start=k_start,
+                    packed_kv_end=k_end,
+                )
+            )
+
+    return WanS2VStreamR1PackedAttentionMetadata(
+        query_groups=tuple(query_groups),
+        cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=query.device),
+        cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=query.device),
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        total_query_tokens=cu_q[-1],
+        total_kv_tokens=cu_k[-1],
+        segments=tuple(segments),
+        query_matches_input_order=query_matches_input_order,
+    )
+
+
+def _get_wan_s2v_stream_r1_packed_attention_metadata(
+    query: torch.Tensor,
+    plan: WanS2VStreamR1AttentionPlan,
+) -> WanS2VStreamR1PackedAttentionMetadata:
+    cache_key = _stream_r1_packed_metadata_cache_key(
+        plan,
+        batch_size=query.shape[0],
+        device=query.device,
+    )
+    if cache_key is None:
+        return _build_wan_s2v_stream_r1_packed_attention_metadata(query, plan)
+
+    metadata = _STREAM_R1_PACKED_METADATA_CACHE.get(cache_key)
+    if metadata is not None:
+        _STREAM_R1_PACKED_METADATA_CACHE.move_to_end(cache_key)
+        return metadata
+
+    metadata = _build_wan_s2v_stream_r1_packed_attention_metadata(query, plan)
+    _STREAM_R1_PACKED_METADATA_CACHE[cache_key] = metadata
+    if len(_STREAM_R1_PACKED_METADATA_CACHE) > _STREAM_R1_PACKED_METADATA_CACHE_LIMIT:
+        _STREAM_R1_PACKED_METADATA_CACHE.popitem(last=False)
+    return metadata
+
+
+def _cat_packed_attention_parts(
+    parts: list[torch.Tensor],
+    *,
+    name: str,
+    total_tokens: int,
+) -> torch.Tensor:
+    if not parts:
+        raise ValueError("packed attention parts must be non-empty")
+    buffer = _stream_r1_get_packed_buffer(name, parts[0], total_tokens)
+    if buffer is None:
+        return torch.cat(parts, dim=0).contiguous()
+    torch.cat(parts, dim=0, out=buffer)
+    return buffer
+
+
 def _build_wan_s2v_stream_r1_packed_attention_workspace_from_parts(
     query: torch.Tensor,
     plan: WanS2VStreamR1AttentionPlan,
@@ -518,22 +737,12 @@ def _build_wan_s2v_stream_r1_packed_attention_workspace_from_parts(
     query_parts = []
     key_parts = []
     value_parts = []
-    cu_q = [0]
-    cu_k = [0]
-    segments: list[WanS2VStreamR1PackedAttentionSegment] = []
-    max_q = 0
-    max_k = 0
-    query_groups = plan.query_groups(query.device)
-    query_matches_input_order = _query_groups_match_input_order(
-        query_groups,
-        plan.query_seq_len,
-    )
+    metadata = _get_wan_s2v_stream_r1_packed_attention_metadata(query, plan)
+    segment_index = 0
     for batch_index in range(query.shape[0]):
-        for group in query_groups:
-            if group.query_len <= 0:
-                raise ValueError("packed attention query groups must be non-empty")
-            if group.kv_indices.numel() <= 0:
-                raise ValueError("packed attention KV groups must be non-empty")
+        for group in metadata.query_groups:
+            segment = metadata.segments[segment_index]
+            segment_index += 1
             k_group_parts, v_group_parts = select_kv_parts(batch_index, group)
             k_part_len = sum(part.shape[0] for part in k_group_parts)
             v_part_len = sum(part.shape[0] for part in v_group_parts)
@@ -541,65 +750,55 @@ def _build_wan_s2v_stream_r1_packed_attention_workspace_from_parts(
                 raise ValueError("packed attention KV groups must be non-empty")
             if k_part_len != v_part_len:
                 raise ValueError("packed attention key/value part lengths must match")
-            if not query_matches_input_order:
+            if k_part_len != segment.packed_kv_end - segment.packed_kv_start:
+                raise ValueError("packed attention metadata KV length mismatch")
+            if not metadata.query_matches_input_order:
                 q_part = query[batch_index, group.query_start : group.query_end]
                 query_parts.append(q_part)
-            else:
-                q_part = query[batch_index, group.query_start : group.query_end]
             key_parts.extend(k_group_parts)
             value_parts.extend(v_group_parts)
-
-            q_start = cu_q[-1]
-            k_start = cu_k[-1]
-            q_end = q_start + q_part.shape[0]
-            k_end = k_start + k_part_len
-            cu_q.append(q_end)
-            cu_k.append(k_end)
-            max_q = max(max_q, q_part.shape[0])
-            max_k = max(max_k, k_part_len)
-            segments.append(
-                WanS2VStreamR1PackedAttentionSegment(
-                    batch_index=batch_index,
-                    query_start=group.query_start,
-                    query_end=group.query_end,
-                    packed_query_start=q_start,
-                    packed_query_end=q_end,
-                    packed_kv_start=k_start,
-                    packed_kv_end=k_end,
-                )
-            )
+    if segment_index != len(metadata.segments):
+        raise ValueError("packed attention metadata segment count mismatch")
 
     with _stream_r1_comm_nvtx_range(
         "stream_r1_packed_workspace.query "
-        f"query_matches_input_order={query_matches_input_order} "
-        f"groups={len(segments)} q_shape={tuple(query.shape)}"
+        f"query_matches_input_order={metadata.query_matches_input_order} "
+        f"groups={len(metadata.segments)} q_shape={tuple(query.shape)}"
     ):
         packed_query = (
             _flatten_query_for_packed_attention(query)
-            if query_matches_input_order
+            if metadata.query_matches_input_order
             else torch.cat(query_parts, dim=0).contiguous()
         )
     with _stream_r1_comm_nvtx_range(
         "stream_r1_packed_workspace.key_cat "
         f"parts={len(key_parts)} kv_seq_len={plan.kv_seq_len} shape={kv_source_shape}"
     ):
-        packed_key = torch.cat(key_parts, dim=0).contiguous()
+        packed_key = _cat_packed_attention_parts(
+            key_parts,
+            name="stream_r1_packed_key",
+            total_tokens=metadata.total_kv_tokens,
+        )
     with _stream_r1_comm_nvtx_range(
         "stream_r1_packed_workspace.value_cat "
         f"parts={len(value_parts)} kv_seq_len={plan.kv_seq_len} shape={kv_source_shape}"
     ):
-        packed_value = torch.cat(value_parts, dim=0).contiguous()
+        packed_value = _cat_packed_attention_parts(
+            value_parts,
+            name="stream_r1_packed_value",
+            total_tokens=metadata.total_kv_tokens,
+        )
 
     return WanS2VStreamR1PackedAttentionWorkspace(
         query=packed_query,
         key=packed_key,
         value=packed_value,
-        cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=query.device),
-        cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=query.device),
-        max_seqlen_q=max_q,
-        max_seqlen_k=max_k,
-        segments=tuple(segments),
-        query_matches_input_order=query_matches_input_order,
+        cu_seqlens_q=metadata.cu_seqlens_q,
+        cu_seqlens_k=metadata.cu_seqlens_k,
+        max_seqlen_q=metadata.max_seqlen_q,
+        max_seqlen_k=metadata.max_seqlen_k,
+        segments=metadata.segments,
+        query_matches_input_order=metadata.query_matches_input_order,
     )
 
 

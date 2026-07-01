@@ -707,6 +707,62 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
 
         torch.testing.assert_close(packed, dense, rtol=1e-5, atol=1e-5)
 
+    def test_single_noisy_block_plan_merges_full_kv_condition_queries(self):
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=1,
+            local_attn_size=5,
+            sink_size=1,
+            current_start=0,
+        )
+        cached_key, cached_value = self._indexed_kv([0, 1, 2, 3])
+        cached_key = cached_key.expand(1, -1, 2, 4).contiguous()
+        cached_value = cached_value.expand(1, -1, 2, 4).contiguous()
+        noisy_view = WanS2VStreamR1NoisyKVCacheView(
+            key=cached_key,
+            value=cached_value,
+            global_end_index=4,
+            local_end_index=4,
+            local_start=1,
+            local_end=4,
+        )
+        condition_key = torch.arange(16, dtype=torch.float32).view(1, 2, 2, 4)
+        condition_value = condition_key + 100
+        split = split_wan_s2v_stream_r1_projected_kv(
+            torch.cat([cached_key, condition_key], dim=1),
+            torch.cat([cached_value, condition_value], dim=1),
+            noisy_seq_len=4,
+        )
+        segmented = compose_wan_s2v_stream_r1_segmented_mixed_kv_view(
+            noisy_view,
+            split,
+        )
+        plan = build_wan_s2v_stream_r1_segmented_mixed_kv_attention_plan(
+            noisy_view,
+            segmented,
+            update,
+        )
+        query = torch.randn(1, 6, 2, 4)
+
+        groups = plan.query_groups(torch.device("cpu"))
+        workspace = build_wan_s2v_stream_r1_segmented_packed_attention_workspace(
+            query,
+            segmented,
+            plan,
+        )
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].query_start, 0)
+        self.assertEqual(groups[0].query_end, 6)
+        self.assertEqual(groups[0].kv_ranges, ((0, 6),))
+        self.assertEqual(workspace.cu_seqlens_q.tolist(), [0, 6])
+        self.assertEqual(workspace.cu_seqlens_k.tolist(), [0, 6])
+        self.assertEqual(len(workspace.segments), 1)
+        self.assertEqual(workspace.max_seqlen_q, 6)
+        self.assertEqual(workspace.max_seqlen_k, 6)
+        self.assertTrue(workspace.query_matches_input_order)
+        self.assertTrue(plan.to_dense_mask(torch.device("cpu")).all().item())
+
     def test_packed_attention_workspace_records_segments(self):
         layout = WanS2VStreamR1AttentionLayout(
             noisy_seq_len=4,
