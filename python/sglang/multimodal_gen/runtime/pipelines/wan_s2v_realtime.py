@@ -1027,6 +1027,11 @@ class WanS2VRealtimeSessionRunner:
         gc.disable()
 
         device = get_local_torch_device()
+        output_stream = (
+            torch.cuda.Stream(device=device)
+            if frame_executor is not None and torch.cuda.is_available()
+            else None
+        )
         dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
         generator = (
             batch.generator[0] if isinstance(batch.generator, list) else batch.generator
@@ -1341,6 +1346,7 @@ class WanS2VRealtimeSessionRunner:
                     is_filler=is_flashtalk_filler_audio_meta(audio_meta),
                     turn_id=audio_meta.get("turn_id"),
                     frame_start_idx=frame_start_idx,
+                    output_stream=output_stream,
                 )
                 stream_s = time.perf_counter() - stream_started
                 frame_start_idx += frame_count

@@ -399,6 +399,138 @@ def _save_chunk_frames_for_streaming(
         imageio.imwrite(path, frames_np[i])
 
 
+def _save_streaming_audio_chunk(
+    frame_dir: str,
+    chunk_idx: int,
+    chunk_audio_data,
+) -> None:
+    try:
+        if not os.path.isdir(frame_dir):
+            raise FileNotFoundError(frame_dir)
+        audio_path = os.path.join(frame_dir, f"audio_{chunk_idx:05d}.npy")
+        tmp_path = audio_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            np.save(
+                f,
+                np.asarray(chunk_audio_data, dtype=np.float32),
+                allow_pickle=False,
+            )
+        os.replace(tmp_path, audio_path)
+    except FileNotFoundError:
+        logger.debug(
+            "Streaming frame dir disappeared before audio save for chunk %d",
+            chunk_idx,
+        )
+    except Exception as e:
+        logger.warning("Streaming audio save failed for chunk %d: %s", chunk_idx, e)
+
+
+def _save_streaming_chunk_outputs(
+    frames_np: np.ndarray | None,
+    frame_dir: str | None,
+    chunk_idx: int,
+    frames_per_chunk: int,
+    chunk_audio_data=None,
+    rtmp_pusher=None,
+    timeline_path: str | None = None,
+    audio_chunk_idx: int | None = None,
+    used_silence: bool | None = None,
+    audio_loaded: bool | None = None,
+    audio_prefetched: bool | None = None,
+    chunk_source: str | None = None,
+    is_filler: bool | None = None,
+    turn_id: str | None = None,
+    session_id: str | None = None,
+    audio_chunk_meta: dict[str, Any] | None = None,
+    frame_start_idx: int | None = None,
+) -> None:
+    if frame_dir and chunk_audio_data is not None:
+        _save_streaming_audio_chunk(frame_dir, chunk_idx, chunk_audio_data)
+
+    if frames_np is not None and frame_dir:
+        try:
+            _save_chunk_frames_for_streaming(
+                frames_np,
+                frame_dir,
+                chunk_idx,
+                frames_per_chunk,
+                frame_start_idx,
+            )
+        except Exception as e:
+            logger.warning("Streaming frame save failed for chunk %d: %s", chunk_idx, e)
+
+    if frames_np is not None and rtmp_pusher is not None and not rtmp_pusher.failed:
+        try:
+            if not rtmp_pusher.start_requested:
+                rtmp_pusher.start_async()
+                logger.info("Stream pusher async startup launched on first chunk")
+            if not rtmp_pusher._started:
+                logger.info(
+                    "Stream pusher not ready yet; queueing chunk %d while ARTC startup completes",
+                    chunk_idx,
+                )
+            submit_started = time.monotonic()
+            emit_chunk_timeline(
+                timeline_path,
+                "artc_submit_start",
+                **compact_chunk_trace_fields(
+                    session_id=session_id,
+                    meta=audio_chunk_meta,
+                    chunk_idx=chunk_idx,
+                    audio_chunk_idx=audio_chunk_idx,
+                    pts=round(chunk_idx * frames_per_chunk * 40.0, 3),
+                ),
+                used_silence=used_silence,
+                audio_loaded=audio_loaded,
+                audio_prefetched=audio_prefetched,
+                frame_count=int(frames_np.shape[0]),
+                audio_samples=(
+                    int(len(chunk_audio_data)) if chunk_audio_data is not None else 0
+                ),
+                pusher_started=bool(rtmp_pusher._started),
+            )
+            rtmp_pusher.push_chunk(
+                frames_np,
+                chunk_audio_data,
+                chunk_idx=chunk_idx,
+                audio_chunk_idx=audio_chunk_idx,
+                used_silence=used_silence,
+                audio_loaded=audio_loaded,
+                audio_prefetched=audio_prefetched,
+                chunk_source=chunk_source,
+                is_filler=is_filler,
+                turn_id=turn_id,
+                session_id=session_id,
+                audio_chunk_meta=audio_chunk_meta,
+            )
+            emit_chunk_timeline(
+                timeline_path,
+                "artc_submit_done",
+                **compact_chunk_trace_fields(
+                    session_id=session_id,
+                    meta=audio_chunk_meta,
+                    chunk_idx=chunk_idx,
+                    audio_chunk_idx=audio_chunk_idx,
+                    pts=round(chunk_idx * frames_per_chunk * 40.0, 3),
+                ),
+                submit_ms=round((time.monotonic() - submit_started) * 1000, 3),
+                pusher_started=bool(rtmp_pusher._started),
+            )
+        except Exception as e:
+            logger.warning("RTMP push failed for chunk %d: %s", chunk_idx, e)
+
+
+def _save_staged_streaming_outputs(
+    frames_cpu: torch.Tensor,
+    ready_event,
+    *args,
+    **kwargs,
+) -> None:
+    if ready_event is not None:
+        ready_event.synchronize()
+    _save_streaming_chunk_outputs(frames_cpu.numpy(), *args, **kwargs)
+
+
 def _wait_for_session_audio_chunk(
     session_dir: str,
     chunk_idx: int,
@@ -1872,17 +2004,83 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
         session_id: str | None = None,
         audio_chunk_meta: dict[str, Any] | None = None,
         frame_start_idx: int | None = None,
+        output_stream: torch.cuda.Stream | None = None,
     ) -> None:
         """Save per-chunk JPEG frames for streaming and optionally push via RTMP/SRT.
 
-        D2H transfer happens on the calling thread (~1-2ms), then JPEG
-        encoding + disk I/O runs in a background thread so the GPU can
-        start the next chunk immediately.
+        By default D2H transfer happens on the calling thread, then JPEG
+        encoding + disk I/O runs in a background thread. When ``output_stream``
+        is provided for a CUDA tensor, GPU post-processing and D2H staging are
+        enqueued on that stream and the background worker waits for its event,
+        so the caller only pays enqueue cost.
         """
         need_frames_np = (
             (frame_dir and frame_executor is not None)
             or (rtmp_pusher is not None and not rtmp_pusher.failed)
         )
+        if (
+            need_frames_np
+            and output_stream is not None
+            and frame_executor is not None
+            and chunk_frames.is_cuda
+            and torch.cuda.is_available()
+        ):
+            try:
+                device = chunk_frames.device
+                with torch.cuda.device(device):
+                    output_stream.wait_stream(torch.cuda.current_stream(device))
+                    with torch.cuda.stream(output_stream):
+                        frames_u8 = (
+                            (chunk_frames[0] * 255)
+                            .clamp(0, 255)
+                            .to(torch.uint8)
+                            .permute(1, 2, 3, 0)
+                            .contiguous()
+                        )
+                        frames_cpu = torch.empty(
+                            frames_u8.shape,
+                            dtype=torch.uint8,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                        frames_cpu.copy_(frames_u8, non_blocking=True)
+                        ready_event = output_stream.record_event()
+                    try:
+                        chunk_frames.record_stream(output_stream)
+                        frames_u8.record_stream(output_stream)
+                    except RuntimeError:
+                        pass
+                frame_futures.append(
+                    frame_executor.submit(
+                        _save_staged_streaming_outputs,
+                        frames_cpu,
+                        ready_event,
+                        frame_dir,
+                        chunk_idx,
+                        frames_per_chunk,
+                        chunk_audio_data=chunk_audio_data,
+                        rtmp_pusher=rtmp_pusher,
+                        timeline_path=timeline_path,
+                        audio_chunk_idx=audio_chunk_idx,
+                        used_silence=used_silence,
+                        audio_loaded=audio_loaded,
+                        audio_prefetched=audio_prefetched,
+                        chunk_source=chunk_source,
+                        is_filler=is_filler,
+                        turn_id=turn_id,
+                        session_id=session_id,
+                        audio_chunk_meta=audio_chunk_meta,
+                        frame_start_idx=frame_start_idx,
+                    )
+                )
+                return
+            except Exception as e:
+                logger.warning(
+                    "Async streaming frame staging failed for chunk %d: %s",
+                    chunk_idx,
+                    e,
+                )
+
         frames_np = None
         if need_frames_np:
             try:
@@ -1892,27 +2090,8 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     "Frame conversion failed for chunk %d: %s", chunk_idx, e
                 )
         if frame_dir and chunk_audio_data is not None:
-            try:
-                if not os.path.isdir(frame_dir):
-                    raise FileNotFoundError(frame_dir)
-                audio_path = os.path.join(frame_dir, f"audio_{chunk_idx:05d}.npy")
-                tmp_path = audio_path + ".tmp"
-                with open(tmp_path, "wb") as f:
-                    np.save(
-                        f,
-                        np.asarray(chunk_audio_data, dtype=np.float32),
-                        allow_pickle=False,
-                    )
-                os.replace(tmp_path, audio_path)
-            except FileNotFoundError:
-                logger.debug(
-                    "Streaming frame dir disappeared before audio save for chunk %d",
-                    chunk_idx,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Streaming audio save failed for chunk %d: %s", chunk_idx, e
-                )
+            _save_streaming_audio_chunk(frame_dir, chunk_idx, chunk_audio_data)
+
         if frames_np is not None and frame_dir and frame_executor is not None:
             try:
                 frame_futures.append(
@@ -1922,7 +2101,7 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                         frame_dir,
                         chunk_idx,
                         frames_per_chunk,
-                        frame_start_idx,
+                        frame_start_idx=frame_start_idx,
                     )
                 )
             except Exception as e:
@@ -1930,68 +2109,25 @@ class FlashTalkPipeline(LoRAPipeline, ComposedPipelineBase):
                     "Streaming frame save failed for chunk %d: %s", chunk_idx, e
                 )
         if frames_np is not None and rtmp_pusher is not None and not rtmp_pusher.failed:
-            try:
-                if not rtmp_pusher.start_requested:
-                    rtmp_pusher.start_async()
-                    logger.info("Stream pusher async startup launched on first chunk")
-                if not rtmp_pusher._started:
-                    logger.info(
-                        "Stream pusher not ready yet; queueing chunk %d while ARTC startup completes",
-                        chunk_idx,
-                    )
-                submit_started = time.monotonic()
-                emit_chunk_timeline(
-                    timeline_path,
-                    "artc_submit_start",
-                    **compact_chunk_trace_fields(
-                        session_id=session_id,
-                        meta=audio_chunk_meta,
-                        chunk_idx=chunk_idx,
-                        audio_chunk_idx=audio_chunk_idx,
-                        pts=round(chunk_idx * frames_per_chunk * 40.0, 3),
-                    ),
-                    used_silence=used_silence,
-                    audio_loaded=audio_loaded,
-                    audio_prefetched=audio_prefetched,
-                    frame_count=int(frames_np.shape[0]),
-                    audio_samples=(
-                        int(len(chunk_audio_data))
-                        if chunk_audio_data is not None
-                        else 0
-                    ),
-                    pusher_started=bool(rtmp_pusher._started),
-                )
-                rtmp_pusher.push_chunk(
-                    frames_np,
-                    chunk_audio_data,
-                    chunk_idx=chunk_idx,
-                    audio_chunk_idx=audio_chunk_idx,
-                    used_silence=used_silence,
-                    audio_loaded=audio_loaded,
-                    audio_prefetched=audio_prefetched,
-                    chunk_source=chunk_source,
-                    is_filler=is_filler,
-                    turn_id=turn_id,
-                    session_id=session_id,
-                    audio_chunk_meta=audio_chunk_meta,
-                )
-                emit_chunk_timeline(
-                    timeline_path,
-                    "artc_submit_done",
-                    **compact_chunk_trace_fields(
-                        session_id=session_id,
-                        meta=audio_chunk_meta,
-                        chunk_idx=chunk_idx,
-                        audio_chunk_idx=audio_chunk_idx,
-                        pts=round(chunk_idx * frames_per_chunk * 40.0, 3),
-                    ),
-                    submit_ms=round((time.monotonic() - submit_started) * 1000, 3),
-                    pusher_started=bool(rtmp_pusher._started),
-                )
-            except Exception as e:
-                logger.warning(
-                    "RTMP push failed for chunk %d: %s", chunk_idx, e
-                )
+            _save_streaming_chunk_outputs(
+                frames_np,
+                None,
+                chunk_idx,
+                frames_per_chunk,
+                chunk_audio_data=chunk_audio_data,
+                rtmp_pusher=rtmp_pusher,
+                timeline_path=timeline_path,
+                audio_chunk_idx=audio_chunk_idx,
+                used_silence=used_silence,
+                audio_loaded=audio_loaded,
+                audio_prefetched=audio_prefetched,
+                chunk_source=chunk_source,
+                is_filler=is_filler,
+                turn_id=turn_id,
+                session_id=session_id,
+                audio_chunk_meta=audio_chunk_meta,
+                frame_start_idx=frame_start_idx,
+            )
 
     @staticmethod
     def _vae_decode_color_correct_motion_carry(
