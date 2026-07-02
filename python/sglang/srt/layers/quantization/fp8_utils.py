@@ -62,6 +62,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 logger = logging.getLogger(__name__)
 
 _FP8_GEMM_PROFILE_ENABLED: Optional[bool] = None
+_FP8_GEMM_PROFILE_SEGMENTS_ENABLED: Optional[bool] = None
 _FP8_GEMM_PROFILE_LOCK = threading.Lock()
 _FP8_GEMM_PROFILE_STATS: dict[tuple, dict] = {}
 _FP8_GEMM_PROFILE_REGISTERED = False
@@ -79,6 +80,16 @@ def _fp8_gemm_profile_enabled() -> bool:
         atexit.register(_dump_fp8_gemm_profile)
         _FP8_GEMM_PROFILE_REGISTERED = True
     return bool(_FP8_GEMM_PROFILE_ENABLED)
+
+
+def _fp8_gemm_profile_segments_enabled() -> bool:
+    global _FP8_GEMM_PROFILE_SEGMENTS_ENABLED
+    if not _fp8_gemm_profile_enabled():
+        return False
+    if _FP8_GEMM_PROFILE_SEGMENTS_ENABLED is None:
+        value = os.environ.get("SGLANG_FP8_GEMM_PROFILE_SEGMENTS", "").strip().lower()
+        _FP8_GEMM_PROFILE_SEGMENTS_ENABLED = value in ("1", "true", "yes", "y", "on")
+    return bool(_FP8_GEMM_PROFILE_SEGMENTS_ENABLED)
 
 
 def _fp8_gemm_profile_path() -> str:
@@ -125,6 +136,7 @@ def _record_fp8_gemm_profile(
     bias_present: bool,
     total_ms: Optional[float] = None,
     quant_ms: Optional[float] = None,
+    prep_ms: Optional[float] = None,
     gemm_ms: Optional[float] = None,
     bias_ms: Optional[float] = None,
 ) -> None:
@@ -160,6 +172,7 @@ def _record_fp8_gemm_profile(
                 "count": 0,
                 "total_ms": 0.0,
                 "quant_ms": 0.0,
+                "prep_ms": 0.0,
                 "gemm_ms": 0.0,
                 "bias_ms": 0.0,
                 "max_total_ms": 0.0,
@@ -178,6 +191,8 @@ def _record_fp8_gemm_profile(
             )
         if quant_ms is not None:
             stat["quant_ms"] += float(quant_ms)
+        if prep_ms is not None:
+            stat["prep_ms"] += float(prep_ms)
         if gemm_ms is not None:
             stat["gemm_ms"] += float(gemm_ms)
         if bias_ms is not None:
@@ -195,7 +210,7 @@ def _dump_fp8_gemm_profile() -> None:
             row = dict(stat)
             count = int(row["count"])
             if count > 0:
-                for field in ("total_ms", "quant_ms", "gemm_ms", "bias_ms"):
+                for field in ("total_ms", "quant_ms", "prep_ms", "gemm_ms", "bias_ms"):
                     row[f"avg_{field}"] = float(row[field]) / count
             rows.append(row)
     rows.sort(key=lambda row: float(row.get("total_ms") or 0.0), reverse=True)
@@ -265,7 +280,13 @@ def _cached_flashinfer_cutlass_weight_scale(
     if tuple(weight_scale.shape) == expected_shape and weight_scale.is_contiguous():
         return weight_scale
 
-    version = int(getattr(weight_scale, "_version", 0))
+    try:
+        version = int(weight_scale._version)
+    except RuntimeError:
+        # Tensors created inside torch.inference_mode() do not track version
+        # counters. FP8 weights/scales are immutable at inference time, so the
+        # remaining identity fields are sufficient for this cache.
+        version = -1
     key = (
         weight_scale.data_ptr(),
         tuple(weight_scale.shape),
@@ -810,6 +831,13 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
+    profile_segments = _fp8_gemm_profile_segments_enabled()
+    quant_ms = None
+    prep_ms = None
+    gemm_ms = None
+    bias_ms = None
+    if profile_segments:
+        timer = _fp8_gemm_profile_time_start(input.device)
     # TRTLLM uses the existing SGLang column-major scale layout. CUTLASS with
     # scale_major_mode="MN" expects (k//block_k, m), so generate activation
     # scales in column-major storage and transpose to the target shape as a view.
@@ -818,6 +846,9 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         block_size[1],
         column_major_scales=(backend in ("cutlass", "trtllm")),
     )
+    if profile_segments:
+        quant_ms = _fp8_gemm_profile_time_stop(timer)
+        timer = _fp8_gemm_profile_time_start(input.device)
     if backend == "cutlass":
         block_n, block_k = block_size
         m, k = input_2d.shape
@@ -858,7 +889,11 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             "FlashInfer CUTLASS groupwise FP8 expects weight_scale dtype float32, "
             f"got {weight_scale.dtype}."
         )
+    if profile_segments:
+        prep_ms = _fp8_gemm_profile_time_stop(timer)
     # TRTLLM path continues using the original quantized scale layout.
+    if profile_segments:
+        timer = _fp8_gemm_profile_time_start(input.device)
     output = gemm_fp8_nt_groupwise(
         q_input,
         weight,
@@ -866,9 +901,35 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         weight_scale,
         out_dtype=input_2d.dtype,
     )
+    if profile_segments:
+        gemm_ms = _fp8_gemm_profile_time_stop(timer)
 
     if bias is not None:
+        if profile_segments:
+            timer = _fp8_gemm_profile_time_start(input.device)
         output += bias
+        if profile_segments:
+            bias_ms = _fp8_gemm_profile_time_stop(timer)
+
+    if profile_segments:
+        total_ms = sum(
+            value for value in (quant_ms, prep_ms, gemm_ms, bias_ms) if value is not None
+        )
+        _record_fp8_gemm_profile(
+            f"flashinfer_{backend}_segments",
+            input_2d.shape,
+            weight.shape,
+            block_size,
+            input.dtype,
+            weight.dtype,
+            input_scale_present=input_scale is not None,
+            bias_present=bias is not None,
+            total_ms=total_ms,
+            quant_ms=quant_ms,
+            prep_ms=prep_ms,
+            gemm_ms=gemm_ms,
+            bias_ms=bias_ms,
+        )
 
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
