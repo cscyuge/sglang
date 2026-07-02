@@ -399,6 +399,73 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
+def _usp_output_all_to_all_packed_bshd(
+    packed: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+) -> torch.Tensor:
+    """Output all-to-all from packed BSHD order for the common batch=1 path.
+
+    ``packed`` is the varlen attention output in flattened ``[B*S, H_local, D]``
+    order. For Wan S2V realtime serving B is 1, so this tensor can be viewed as
+    ``[S, B, H_local, D]`` and sent directly to NCCL, skipping the generic
+    output prepack copy from ``[B, S, H, D]``.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return packed.reshape(batch_size, seq_len, packed.shape[-2], packed.shape[-1])
+
+    if packed.ndim != 3:
+        raise ValueError(
+            f"packed output must have shape [B*S, H, D], got {tuple(packed.shape)}"
+        )
+    if batch_size != 1:
+        return _usp_output_all_to_all(
+            packed.reshape(batch_size, seq_len, packed.shape[-2], packed.shape[-1]),
+            head_dim=2,
+        )
+    if packed.shape[0] != seq_len:
+        raise ValueError(
+            "packed output token count must match batch_size * seq_len: "
+            f"packed={packed.shape[0]} batch_size={batch_size} seq_len={seq_len}"
+        )
+    if seq_len % world_size != 0:
+        raise ValueError(
+            f"seq_len ({seq_len}) must be divisible by world_size ({world_size})"
+        )
+
+    if not packed.is_contiguous():
+        packed = packed.contiguous()
+
+    h_local = packed.shape[1]
+    d = packed.shape[2]
+    s_local = seq_len // world_size
+    h_global = h_local * world_size
+
+    with _comm_nvtx_range(
+        "sgl_mm_usp_output_prepack_packed_view "
+        f"seq_len={seq_len} h_local={h_local} dtype={packed.dtype} "
+        f"{_comm_nvtx_caller()}"
+    ):
+        x = packed.reshape(seq_len, batch_size, h_local, d)
+
+    x = _usp_all_to_all_single(x, cache_name="usp_output_packed")
+    x = x.reshape(world_size, s_local, batch_size, h_local, d)
+
+    with _comm_nvtx_range(
+        "sgl_mm_usp_output_postunpack "
+        f"head_dim=2 world_size={world_size} packed_bshd=True"
+    ):
+        x = _usp_permute_contiguous(
+            x,
+            (2, 1, 0, 3, 4),
+            cache_name="usp_output_postunpack.packed_bshd",
+        ).reshape(batch_size, s_local, h_global, d)
+
+    return x
+
+
 def ring_attn(
     query: torch.Tensor,
     key: torch.Tensor,

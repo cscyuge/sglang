@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all_qkv,
     _usp_output_all_to_all,
+    _usp_output_all_to_all_packed_bshd,
 )
 
 _STREAM_R1_SINK_COMPRESSION_ALPHA = 0.999
@@ -1349,8 +1350,11 @@ def _run_stream_r1_packed_varlen_attention_workspace(
     *,
     softmax_scale: float | None,
     force_torch: bool = False,
+    return_packed_output: bool = False,
 ) -> torch.Tensor:
     if force_torch or query.device.type != "cuda":
+        if return_packed_output:
+            raise ValueError("packed output fast path requires CUDA varlen attention")
         return _run_wan_s2v_stream_r1_packed_torch_attention(
             workspace,
             query.shape,
@@ -1409,6 +1413,10 @@ def _run_stream_r1_packed_varlen_attention_workspace(
                 ver=int(flash_attention_version),
             )
     packed_output = result[0] if isinstance(result, tuple) else result
+    if return_packed_output:
+        if not workspace.query_matches_input_order:
+            raise ValueError("packed output fast path requires input-order query")
+        return packed_output
     with _stream_r1_comm_nvtx_range(
         "stream_r1_packed_attention.output_unpack "
         f"packed={tuple(packed_output.shape)} out={tuple(query.shape)}"
@@ -1475,6 +1483,94 @@ def stream_r1_segmented_packed_varlen_attention(
         softmax_scale=softmax_scale,
         force_torch=force_torch,
     )
+
+
+def _pad_stream_r1_sp_packed_attention_output(
+    packed_output: torch.Tensor,
+    *,
+    batch_size: int,
+    total_seq_len: int,
+    sp_pad_tokens: int,
+) -> torch.Tensor:
+    if sp_pad_tokens <= 0:
+        return packed_output
+    if batch_size != 1:
+        raise ValueError("packed SP output padding fast path requires batch_size=1")
+    if packed_output.shape[0] != total_seq_len:
+        raise ValueError("Stream-R1 SP packed output length must be unpadded")
+    pad = packed_output.new_zeros(
+        sp_pad_tokens,
+        packed_output.shape[1],
+        packed_output.shape[2],
+    )
+    return torch.cat([packed_output, pad], dim=0)
+
+
+def stream_r1_segmented_packed_varlen_attention_sp_output_all_to_all(
+    query: torch.Tensor,
+    segmented_view: "WanS2VStreamR1SegmentedMixedKVView",
+    plan: WanS2VStreamR1AttentionPlan,
+    *,
+    softmax_scale: float | None,
+    total_seq_len: int,
+    sp_pad_tokens: int,
+    force_torch: bool = False,
+) -> torch.Tensor:
+    """Run SP packed attention and avoid the output prepack copy when possible."""
+
+    with _stream_r1_comm_nvtx_range(
+        "stream_r1_segmented_packed_attention.build_workspace "
+        f"q={tuple(query.shape)} noisy={tuple(segmented_view.noisy_key.shape)} "
+        f"condition={tuple(segmented_view.condition_key.shape)} sp_output=True"
+    ):
+        workspace = build_wan_s2v_stream_r1_segmented_packed_attention_workspace(
+            query,
+            segmented_view,
+            plan,
+        )
+
+    use_packed_output_fast_path = (
+        not force_torch
+        and query.device.type == "cuda"
+        and query.shape[0] == 1
+        and workspace.query_matches_input_order
+    )
+    if use_packed_output_fast_path:
+        with _stream_r1_comm_nvtx_range(
+            "stream_r1_packed_attention.output_all_to_all_packed "
+            f"total_seq_len={total_seq_len} sp_pad_tokens={sp_pad_tokens}"
+        ):
+            packed_output = _run_stream_r1_packed_varlen_attention_workspace(
+                query,
+                workspace,
+                softmax_scale=softmax_scale,
+                force_torch=force_torch,
+                return_packed_output=True,
+            )
+            packed_output = _pad_stream_r1_sp_packed_attention_output(
+                packed_output,
+                batch_size=query.shape[0],
+                total_seq_len=total_seq_len,
+                sp_pad_tokens=sp_pad_tokens,
+            )
+            return _usp_output_all_to_all_packed_bshd(
+                packed_output,
+                batch_size=query.shape[0],
+                seq_len=total_seq_len + sp_pad_tokens,
+            )
+
+    output = _run_stream_r1_packed_varlen_attention_workspace(
+        query,
+        workspace,
+        softmax_scale=softmax_scale,
+        force_torch=force_torch,
+    )
+    output = _pad_stream_r1_sp_attention_output(
+        output,
+        total_seq_len=total_seq_len,
+        sp_pad_tokens=sp_pad_tokens,
+    )
+    return _usp_output_all_to_all(output, head_dim=2)
 
 
 def _pad_stream_r1_sp_attention_output(
@@ -2343,21 +2439,15 @@ def run_wan_s2v_stream_r1_cached_self_attention(
                 device=query_for_attention.device,
             )
     if use_sp_head_sharded_packed_attention:
-        with profile.span("packed_varlen_attention"):
-            output = stream_r1_segmented_packed_varlen_attention(
+        with profile.span("packed_varlen_attention_sp_output_all_to_all"):
+            output = stream_r1_segmented_packed_varlen_attention_sp_output_all_to_all(
                 query_for_attention,
                 segmented_mixed_view,
                 mixed_plan,
                 softmax_scale=getattr(attention, "softmax_scale", None),
-            )
-        with profile.span("sp_output_pad"):
-            output = _pad_stream_r1_sp_attention_output(
-                output,
                 total_seq_len=layout.total_seq_len,
                 sp_pad_tokens=sp_pad_tokens,
             )
-        with profile.span("usp_output_all_to_all"):
-            output = _usp_output_all_to_all(output, head_dim=2)
     elif attention_backend == "packed_varlen" and not sequence_shard_enabled:
         with profile.span("packed_varlen_attention"):
             output = stream_r1_segmented_packed_varlen_attention(

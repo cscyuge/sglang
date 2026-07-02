@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     split_wan_s2v_stream_r1_projected_kv,
     stream_r1_segmented_packed_varlen_attention,
     stream_r1_packed_varlen_attention,
+    _pad_stream_r1_sp_packed_attention_output,
     update_wan_s2v_stream_r1_cached_self_attention_kv_cache,
     update_wan_s2v_stream_r1_noisy_kv_cache,
     validate_wan_s2v_stream_r1_forward_cache,
@@ -270,6 +271,31 @@ class TestWanS2VStreamR1AttentionLayout(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not match"):
             _pad_stream_r1_attention_mask_for_sp(mask, 3, 1)
+
+    def test_sp_packed_output_padding_appends_sequence_tokens(self):
+        packed = torch.arange(3 * 2, dtype=torch.float32).view(3, 2, 1)
+
+        padded = _pad_stream_r1_sp_packed_attention_output(
+            packed,
+            batch_size=1,
+            total_seq_len=3,
+            sp_pad_tokens=2,
+        )
+
+        self.assertEqual(padded.shape, (5, 2, 1))
+        torch.testing.assert_close(padded[:3], packed)
+        torch.testing.assert_close(padded[3:], torch.zeros(2, 2, 1))
+
+    def test_sp_packed_output_padding_rejects_non_batch_one(self):
+        packed = torch.zeros(3, 2, 1)
+
+        with self.assertRaisesRegex(ValueError, "batch_size=1"):
+            _pad_stream_r1_sp_packed_attention_output(
+                packed,
+                batch_size=2,
+                total_seq_len=3,
+                sp_pad_tokens=1,
+            )
 
     def test_no_kv_mask_limits_noisy_tokens_to_sink_local_and_condition(self):
         layout = WanS2VStreamR1AttentionLayout(
