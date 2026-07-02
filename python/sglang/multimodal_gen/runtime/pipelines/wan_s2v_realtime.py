@@ -1189,12 +1189,17 @@ class WanS2VRealtimeSessionRunner:
             server_args,
         )
         use_adaptive_steps = bool(adaptive_step_config.enabled)
+        latent_warm_start_config = denoising_stage._resolve_latent_warm_start_config(
+            batch,
+            server_args,
+        )
 
         logger.info(
             "Wan S2V realtime session start: session=%s block_latent_frames=%d "
             "block_public_frames=%d fps=%d audio_window=%.2fs idle_policy=%s "
             "wav2vec_cuda_graph=%s audio_overlap=%s streaming_vae_cache=%s "
-            "vae_cuda_graph=%s latent_condition_overlap=%s adaptive_steps=%s",
+            "vae_cuda_graph=%s latent_condition_overlap=%s adaptive_steps=%s "
+            "latent_warm_start=%s",
             session_id,
             num_frame_per_block,
             block_public_frames,
@@ -1207,6 +1212,7 @@ class WanS2VRealtimeSessionRunner:
             use_vae_cuda_graph,
             use_latent_condition_overlap,
             use_adaptive_steps,
+            latent_warm_start_config.enabled,
         )
         emit_chunk_timeline(
             timeline_path,
@@ -1228,6 +1234,14 @@ class WanS2VRealtimeSessionRunner:
             adaptive_steps_aggressive_threshold=(
                 adaptive_step_config.aggressive_threshold
             ),
+            latent_warm_start={
+                "enabled": latent_warm_start_config.enabled,
+                "alpha": latent_warm_start_config.alpha,
+                "mode": latent_warm_start_config.mode,
+                "warmup_blocks": latent_warm_start_config.warmup_blocks,
+                "timestep_index": latent_warm_start_config.timestep_index,
+                "effective_sigma": latent_warm_start_config.effective_sigma,
+            },
         )
 
         batch = self._prepare_reference_and_prompt(
@@ -1301,6 +1315,7 @@ class WanS2VRealtimeSessionRunner:
         block_idx = 0
         frame_start_idx = 0
         end_requested = False
+        previous_clean_latents: torch.Tensor | None = None
 
         decoding_stage.load_model()
         denoising_stage.load_model()
@@ -1319,6 +1334,8 @@ class WanS2VRealtimeSessionRunner:
                 latent_prepare_gpu_s = 0.0
                 step_noise_s = 0.0
                 condition_s = 0.0
+                latent_warm_start_s = 0.0
+                latent_warm_start_applied = False
                 prepared_block = None
                 if prefetched_audio_future is not None:
                     audio_wait_started = time.perf_counter()
@@ -1519,6 +1536,22 @@ class WanS2VRealtimeSessionRunner:
                     block_index=block_idx,
                 )
                 block_timesteps = step_decision.timesteps
+                latent_warm_start_started = time.perf_counter()
+                block_latents, latent_warm_start_applied = (
+                    denoising_stage.apply_stream_r1_latent_warm_start(
+                        batch=batch,
+                        server_args=server_args,
+                        block_latents=block_latents,
+                        previous_clean_latents=previous_clean_latents,
+                        timesteps=block_timesteps,
+                        block_index=block_idx,
+                        config=latent_warm_start_config,
+                    )
+                )
+                latent_warm_start_s = (
+                    time.perf_counter() - latent_warm_start_started
+                )
+                batch.latents = block_latents
                 if block_step_noises is not None and len(block_step_noises) != max(
                     int(block_timesteps.numel()) - 1,
                     0,
@@ -1606,6 +1639,7 @@ class WanS2VRealtimeSessionRunner:
                 )
                 clean_refresh_s = time.perf_counter() - clean_refresh_started
                 batch.latents = current_latents
+                previous_clean_latents = current_latents.detach()
                 denoise_s = denoise_loop_s + clean_refresh_s
 
                 if prefetch_after_denoise_event is not None:
@@ -1662,11 +1696,13 @@ class WanS2VRealtimeSessionRunner:
                 total_s = time.perf_counter() - loop_started
                 logger.info(
                     "Wan S2V realtime block %d: audio=%.3fs latent=%.3fs "
-                    "steps=%d/%d denoise_loop=%.3fs refresh=%.3fs "
-                    "decode=%.3fs stream=%.3fs total=%.3fs",
+                    "warm_start=%s/%.3fs steps=%d/%d denoise_loop=%.3fs "
+                    "refresh=%.3fs decode=%.3fs stream=%.3fs total=%.3fs",
                     block_idx,
                     audio_s,
                     latent_s,
+                    latent_warm_start_applied,
+                    latent_warm_start_s,
                     step_decision.step_count,
                     step_decision.base_step_count,
                     denoise_loop_s,
@@ -1698,6 +1734,14 @@ class WanS2VRealtimeSessionRunner:
                         "base_step_count": step_decision.base_step_count,
                         "target_step_count": step_decision.target_step_count,
                     },
+                    latent_warm_start={
+                        "enabled": latent_warm_start_config.enabled,
+                        "applied": latent_warm_start_applied,
+                        "alpha": latent_warm_start_config.alpha,
+                        "mode": latent_warm_start_config.mode,
+                        "timestep_index": latent_warm_start_config.timestep_index,
+                        "effective_sigma": latent_warm_start_config.effective_sigma,
+                    },
                     timings={
                         "audio_ms": round(audio_s * 1000, 3),
                         "audio_cpu_ms": round(audio_cpu_s * 1000, 3),
@@ -1728,6 +1772,10 @@ class WanS2VRealtimeSessionRunner:
                         ),
                         "step_noise_ms": round(step_noise_s * 1000, 3),
                         "condition_ms": round(condition_s * 1000, 3),
+                        "latent_warm_start_ms": round(
+                            latent_warm_start_s * 1000,
+                            3,
+                        ),
                         "denoise_ms": round(denoise_s * 1000, 3),
                         "denoise_loop_ms": round(denoise_loop_s * 1000, 3),
                         "clean_refresh_ms": round(clean_refresh_s * 1000, 3),

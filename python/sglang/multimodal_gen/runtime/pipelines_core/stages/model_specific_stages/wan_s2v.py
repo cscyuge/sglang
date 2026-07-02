@@ -185,6 +185,17 @@ class WanS2VAdaptiveStepConfig:
 
 
 @dataclass(frozen=True)
+class WanS2VLatentWarmStartConfig:
+    enabled: bool
+    alpha: float
+    mode: str
+    warmup_blocks: int
+    timestep_index: int
+    effective_sigma: float | None
+    log: bool
+
+
+@dataclass(frozen=True)
 class WanS2VAdaptiveStepDecision:
     timesteps: torch.Tensor
     base_step_count: int
@@ -1032,6 +1043,227 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         )
         return decision
 
+    def _resolve_latent_warm_start_config(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> WanS2VLatentWarmStartConfig:
+        alpha = float(
+            _resolve_request_value(
+                batch,
+                server_args,
+                "latent_warm_start_alpha",
+                "wan_s2v_latent_warm_start_alpha",
+                0.25,
+            )
+        )
+        mode = str(
+            _resolve_request_value(
+                batch,
+                server_args,
+                "latent_warm_start_mode",
+                "wan_s2v_latent_warm_start_mode",
+                "repeat_tail",
+            )
+        ).lower()
+        if mode not in {"repeat_tail", "linear"}:
+            mode = "repeat_tail"
+        return WanS2VLatentWarmStartConfig(
+            enabled=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "latent_warm_start",
+                    "wan_s2v_latent_warm_start",
+                    False,
+                )
+            ),
+            alpha=max(0.0, min(1.0, alpha)),
+            mode=mode,
+            warmup_blocks=max(
+                0,
+                int(
+                    _resolve_request_value(
+                        batch,
+                        server_args,
+                        "latent_warm_start_warmup_blocks",
+                        "wan_s2v_latent_warm_start_warmup_blocks",
+                        1,
+                    )
+                ),
+            ),
+            timestep_index=max(
+                0,
+                int(
+                    _resolve_request_value(
+                        batch,
+                        server_args,
+                        "latent_warm_start_timestep_index",
+                        "wan_s2v_latent_warm_start_timestep_index",
+                        1,
+                    )
+                ),
+            ),
+            effective_sigma=self._resolve_latent_warm_start_effective_sigma(
+                batch,
+                server_args,
+            ),
+            log=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "latent_warm_start_log",
+                    "wan_s2v_latent_warm_start_log",
+                    False,
+                )
+            ),
+        )
+
+    def _resolve_latent_warm_start_effective_sigma(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> float | None:
+        value = _resolve_request_value(
+            batch,
+            server_args,
+            "latent_warm_start_effective_sigma",
+            "wan_s2v_latent_warm_start_effective_sigma",
+            None,
+        )
+        if value is None:
+            return None
+        return max(0.0, min(1.0, float(value)))
+
+    def _predict_latent_warm_start(
+        self,
+        previous_clean_latents: torch.Tensor,
+        target_latents: torch.Tensor,
+        config: WanS2VLatentWarmStartConfig,
+    ) -> torch.Tensor | None:
+        if previous_clean_latents.dim() != 5 or target_latents.dim() != 5:
+            return None
+        if previous_clean_latents.shape[:2] != target_latents.shape[:2]:
+            return None
+        if previous_clean_latents.shape[3:] != target_latents.shape[3:]:
+            return None
+        if previous_clean_latents.shape[2] <= 0 or target_latents.shape[2] <= 0:
+            return None
+
+        prev = previous_clean_latents.to(
+            device=target_latents.device,
+            dtype=target_latents.dtype,
+            non_blocking=True,
+        )
+        target_frames = int(target_latents.shape[2])
+        last = prev[:, :, -1:, :, :]
+        if config.mode == "linear" and prev.shape[2] >= 2:
+            velocity = last - prev[:, :, -2:-1, :, :]
+            frames = [
+                last + velocity * float(i + 1) for i in range(target_frames)
+            ]
+            return torch.cat(frames, dim=2).contiguous()
+        return last.expand(-1, -1, target_frames, -1, -1).contiguous()
+
+    def _latent_warm_start_sigma_for_timestep(
+        self,
+        timestep: torch.Tensor,
+    ) -> float | None:
+        scheduler_timesteps = getattr(self.scheduler, "timesteps", None)
+        scheduler_sigmas = getattr(self.scheduler, "sigmas", None)
+        if scheduler_timesteps is None or scheduler_sigmas is None:
+            return None
+        target_timestep = timestep.detach().flatten()[0]
+        timesteps = scheduler_timesteps.detach().to(device=target_timestep.device)
+        sigmas = scheduler_sigmas.detach().to(device=target_timestep.device)
+        index = torch.argmin((timesteps - target_timestep).abs())
+        return float(sigmas[index].item())
+
+    def apply_stream_r1_latent_warm_start(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        block_latents: torch.Tensor,
+        previous_clean_latents: torch.Tensor | None,
+        timesteps: torch.Tensor,
+        block_index: int,
+        config: WanS2VLatentWarmStartConfig | None = None,
+    ) -> tuple[torch.Tensor, bool]:
+        if config is None:
+            config = self._resolve_latent_warm_start_config(batch, server_args)
+        if (
+            not config.enabled
+            or config.alpha <= 0.0
+            or block_index < config.warmup_blocks
+            or previous_clean_latents is None
+            or timesteps.numel() == 0
+        ):
+            return block_latents, False
+
+        warm_clean = self._predict_latent_warm_start(
+            previous_clean_latents,
+            block_latents,
+            config,
+        )
+        if warm_clean is None:
+            return block_latents, False
+
+        base_noise_btchw = block_latents.permute(0, 2, 1, 3, 4).contiguous()
+        warm_clean_btchw = warm_clean.permute(0, 2, 1, 3, 4).contiguous()
+        selected_timestep = None
+        sigma_value = config.effective_sigma
+        if sigma_value is None:
+            timestep_index = min(config.timestep_index, int(timesteps.numel()) - 1)
+            selected_timestep = timesteps[timestep_index : timestep_index + 1].to(
+                device=block_latents.device
+            )
+            if config.log:
+                sigma_value = self._latent_warm_start_sigma_for_timestep(
+                    selected_timestep
+                )
+            noised_warm_btchw = self.scheduler.add_noise(
+                warm_clean_btchw.flatten(0, 1),
+                base_noise_btchw.flatten(0, 1),
+                selected_timestep,
+            ).unflatten(0, warm_clean_btchw.shape[:2])
+        else:
+            sigma = torch.tensor(
+                sigma_value,
+                dtype=base_noise_btchw.dtype,
+                device=base_noise_btchw.device,
+            )
+            noised_warm_btchw = (1.0 - sigma) * warm_clean_btchw + (
+                sigma * base_noise_btchw
+            )
+        if config.alpha < 1.0:
+            noised_warm_btchw = base_noise_btchw + config.alpha * (
+                noised_warm_btchw - base_noise_btchw
+            )
+        warm_latents = noised_warm_btchw.permute(0, 2, 1, 3, 4).contiguous()
+        if config.log:
+            clean_weight = None
+            if sigma_value is not None:
+                clean_weight = config.alpha * (1.0 - sigma_value)
+            self.log_info(
+                "Wan S2V latent warm start block %d: mode=%s alpha=%.3f "
+                "warmup_blocks=%d timestep_index=%d timestep=%s sigma=%s "
+                "clean_weight=%s",
+                block_index,
+                config.mode,
+                config.alpha,
+                config.warmup_blocks,
+                min(config.timestep_index, int(timesteps.numel()) - 1),
+                (
+                    "explicit"
+                    if selected_timestep is None
+                    else f"{float(selected_timestep.flatten()[0].item()):.6f}"
+                ),
+                "n/a" if sigma_value is None else f"{sigma_value:.6f}",
+                "n/a" if clean_weight is None else f"{clean_weight:.6f}",
+            )
+        return warm_latents.to(dtype=block_latents.dtype), True
+
     def _train_timesteps(self) -> int:
         scheduler_config = getattr(self.scheduler, "config", None)
         return int(getattr(scheduler_config, "num_train_timesteps", 1000))
@@ -1617,6 +1849,11 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 if use_crossattn_cache
                 else None
             )
+            latent_warm_start_config = self._resolve_latent_warm_start_config(
+                batch,
+                server_args,
+            )
+            previous_clean_latents: torch.Tensor | None = None
             for block_start in range(0, latent_frames, num_frame_per_block):
                 block_end = block_start + num_frame_per_block
                 block_index = block_start // num_frame_per_block
@@ -1632,6 +1869,15 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     block_bundle=block_bundle,
                     timesteps=timesteps,
                     block_index=block_index,
+                )
+                current_latents, _ = self.apply_stream_r1_latent_warm_start(
+                    batch=batch,
+                    server_args=server_args,
+                    block_latents=current_latents,
+                    previous_clean_latents=previous_clean_latents,
+                    timesteps=step_decision.timesteps,
+                    block_index=block_index,
+                    config=latent_warm_start_config,
                 )
                 current_latents = self.denoise_stream_r1_block(
                     batch=batch,
@@ -1649,6 +1895,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 )
 
                 latents[:, :, block_start:block_end, :, :] = current_latents
+                previous_clean_latents = current_latents.detach()
                 self._clean_context_refresh(
                     block_latents=current_latents,
                     prompt_embeds=prompt_embeds,
