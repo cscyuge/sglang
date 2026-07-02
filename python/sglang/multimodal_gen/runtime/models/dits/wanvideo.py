@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -355,6 +356,7 @@ class WanTransformerBlock(nn.Module):
         attention_type: str = "original",
         sla_topk: float = 0.1,
         quant_config: QuantizationConfig | None = None,
+        fused_qkv: bool = False,
     ):
         super().__init__()
 
@@ -365,30 +367,41 @@ class WanTransformerBlock(nn.Module):
             elementwise_affine=False,
             dtype=torch.float32,
         )
-        self.to_q = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_q", prefix),
-        )
-        self.to_k = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_k", prefix),
-        )
-        self.to_v = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_v", prefix),
-        )
+        self.use_fused_qkv = bool(fused_qkv)
+        if self.use_fused_qkv:
+            self.to_qkv = MergedColumnParallelLinear(
+                dim,
+                [dim, dim, dim],
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_qkv", prefix),
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_q", prefix),
+            )
+            self.to_k = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_k", prefix),
+            )
+            self.to_v = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_v", prefix),
+            )
 
         self.to_out = RowParallelLinear(
             dim,
@@ -493,6 +506,21 @@ class WanTransformerBlock(nn.Module):
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+    def _project_self_attn_qkv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.use_fused_qkv:
+            qkv, _ = self.to_qkv(hidden_states)
+            split_sizes = [
+                divide(output_size, self.to_qkv.tp_size)
+                for output_size in self.to_qkv.output_sizes
+            ]
+            return qkv.split(split_sizes, dim=-1)
+        query, _ = self.to_q(hidden_states)
+        key, _ = self.to_k(hidden_states)
+        value, _ = self.to_v(hidden_states)
+        return query, key, value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -532,9 +560,7 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
+        query, key, value = self._project_self_attn_qkv(norm_hidden_states)
 
         if self.norm_q is not None:
             if self.tp_rmsnorm:

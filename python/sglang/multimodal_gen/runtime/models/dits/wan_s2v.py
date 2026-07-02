@@ -481,6 +481,10 @@ class FramePackMotioner(nn.Module):
 
 
 class WanS2VTransformerBlock(WanTransformerBlock):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("fused_qkv", True)
+        super().__init__(*args, **kwargs)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -508,9 +512,7 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         norm_hidden_states = _segment_modulate(
             self.norm1.norm(hidden_states), shift_msa, scale_msa, seg_idx
         ).to(orig_dtype)
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
+        query, key, value = self._project_self_attn_qkv(norm_hidden_states)
         if self.norm_q is not None:
             query = (
                 tensor_parallel_rms_norm(query, self.norm_q)
