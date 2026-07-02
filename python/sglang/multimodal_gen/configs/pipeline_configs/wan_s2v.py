@@ -29,7 +29,7 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     force_condition_image_to_requested_size: bool = True
     stream_r1_mode: bool = False
     stream_r1_kv_cache: bool = False
-    stream_r1_crossattn_cache: bool = False
+    stream_r1_crossattn_cache: bool = True
     num_frame_per_block: int = 7
     local_attn_size: int = 9
     sink_size: int = 3

@@ -1958,8 +1958,8 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     False,
                 )
             )
-            # Keep Stream-R1 baseline parity by default: the original
-            # benchmark path does not pass a cross-attention cache.
+            # Text context is constant across Stream-R1 chunks and refreshes, so
+            # cache cross-attention K/V unless explicitly disabled.
             crossattn_cache: list[dict] | None = (
                 [{} for _ in range(len(self.transformer.blocks))]
                 if use_crossattn_cache
