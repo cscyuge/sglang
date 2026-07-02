@@ -196,6 +196,14 @@ class WanS2VLatentWarmStartConfig:
 
 
 @dataclass(frozen=True)
+class WanS2VCleanContextRefreshConfig:
+    mode: str
+    interval: int
+    warmup_blocks: int
+    log: bool
+
+
+@dataclass(frozen=True)
 class WanS2VAdaptiveStepDecision:
     timesteps: torch.Tensor
     base_step_count: int
@@ -206,6 +214,14 @@ class WanS2VAdaptiveStepDecision:
     log_only: bool
     rel_l1: float | None = None
     reason: str = "disabled"
+
+
+@dataclass(frozen=True)
+class WanS2VCleanContextRefreshDecision:
+    refresh: bool
+    mode: str
+    reason: str
+    interval: int
 
 
 @dataclass
@@ -1043,6 +1059,106 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         )
         return decision
 
+    def _resolve_clean_context_refresh_config(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> WanS2VCleanContextRefreshConfig:
+        mode = str(
+            _resolve_request_value(
+                batch,
+                server_args,
+                "clean_context_refresh_mode",
+                "wan_s2v_clean_context_refresh_mode",
+                "interval",
+            )
+        ).lower()
+        if mode not in {"always", "interval", "never"}:
+            mode = "interval"
+        return WanS2VCleanContextRefreshConfig(
+            mode=mode,
+            interval=max(
+                1,
+                int(
+                    _resolve_request_value(
+                        batch,
+                        server_args,
+                        "clean_context_refresh_interval",
+                        "wan_s2v_clean_context_refresh_interval",
+                        2,
+                    )
+                ),
+            ),
+            warmup_blocks=max(
+                0,
+                int(
+                    _resolve_request_value(
+                        batch,
+                        server_args,
+                        "clean_context_refresh_warmup_blocks",
+                        "wan_s2v_clean_context_refresh_warmup_blocks",
+                        1,
+                    )
+                ),
+            ),
+            log=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "clean_context_refresh_log",
+                    "wan_s2v_clean_context_refresh_log",
+                    False,
+                )
+            ),
+        )
+
+    def select_clean_context_refresh(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        block_index: int,
+        config: WanS2VCleanContextRefreshConfig | None = None,
+    ) -> WanS2VCleanContextRefreshDecision:
+        if config is None:
+            config = self._resolve_clean_context_refresh_config(batch, server_args)
+
+        refresh = True
+        reason = "always"
+        if config.mode == "never":
+            refresh = False
+            reason = "never"
+        elif block_index < config.warmup_blocks:
+            refresh = True
+            reason = "warmup"
+        elif config.mode == "always":
+            refresh = True
+            reason = "always"
+        elif config.mode == "interval":
+            refresh = (block_index % config.interval) == 0
+            reason = "interval" if refresh else "interval_skip"
+
+        decision_reason = reason
+        if not refresh and not decision_reason.endswith("_skip"):
+            decision_reason = f"{decision_reason}_skip"
+        decision = WanS2VCleanContextRefreshDecision(
+            refresh=refresh,
+            mode=config.mode,
+            reason=decision_reason,
+            interval=config.interval,
+        )
+        if config.log:
+            self.log_info(
+                "Wan S2V clean refresh block %d: refresh=%s mode=%s reason=%s "
+                "interval=%d",
+                block_index,
+                decision.refresh,
+                decision.mode,
+                decision.reason,
+                decision.interval,
+            )
+        return decision
+
     def _resolve_latent_warm_start_config(
         self,
         batch: Req,
@@ -1853,6 +1969,10 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 batch,
                 server_args,
             )
+            clean_refresh_config = self._resolve_clean_context_refresh_config(
+                batch,
+                server_args,
+            )
             previous_clean_latents: torch.Tensor | None = None
             for block_start in range(0, latent_frames, num_frame_per_block):
                 block_end = block_start + num_frame_per_block
@@ -1896,18 +2016,25 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
 
                 latents[:, :, block_start:block_end, :, :] = current_latents
                 previous_clean_latents = current_latents.detach()
-                self._clean_context_refresh(
-                    block_latents=current_latents,
-                    prompt_embeds=prompt_embeds,
-                    block_bundle=block_bundle,
-                    current_start=block_start * frame_seq_length,
-                    attention_request=attention_request,
-                    cache_state=cache_state,
-                    dtype=dit_dtype,
-                    autocast_enabled=autocast_enabled,
-                    forward_batch=batch,
-                    crossattn_cache=crossattn_cache,
+                clean_refresh_decision = self.select_clean_context_refresh(
+                    batch=batch,
+                    server_args=server_args,
+                    block_index=block_index,
+                    config=clean_refresh_config,
                 )
+                if clean_refresh_decision.refresh:
+                    self._clean_context_refresh(
+                        block_latents=current_latents,
+                        prompt_embeds=prompt_embeds,
+                        block_bundle=block_bundle,
+                        current_start=block_start * frame_seq_length,
+                        attention_request=attention_request,
+                        cache_state=cache_state,
+                        dtype=dit_dtype,
+                        autocast_enabled=autocast_enabled,
+                        forward_batch=batch,
+                        crossattn_cache=crossattn_cache,
+                    )
         finally:
             self.offload_model()
 

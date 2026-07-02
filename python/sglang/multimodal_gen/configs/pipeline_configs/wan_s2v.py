@@ -66,6 +66,10 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_latent_warm_start_timestep_index: int = 1
     wan_s2v_latent_warm_start_effective_sigma: float | None = None
     wan_s2v_latent_warm_start_log: bool = False
+    wan_s2v_clean_context_refresh_mode: str = "interval"
+    wan_s2v_clean_context_refresh_interval: int = 2
+    wan_s2v_clean_context_refresh_warmup_blocks: int = 1
+    wan_s2v_clean_context_refresh_log: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -136,6 +140,24 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
         ):
             raise ValueError(
                 "wan_s2v_latent_warm_start_effective_sigma must be in [0, 1]"
+            )
+        self.wan_s2v_clean_context_refresh_mode = str(
+            self.wan_s2v_clean_context_refresh_mode
+        ).lower()
+        if self.wan_s2v_clean_context_refresh_mode not in (
+            "always",
+            "interval",
+            "never",
+        ):
+            raise ValueError(
+                "wan_s2v_clean_context_refresh_mode must be one of "
+                "'always', 'interval', or 'never'"
+            )
+        if self.wan_s2v_clean_context_refresh_interval <= 0:
+            raise ValueError("wan_s2v_clean_context_refresh_interval must be positive")
+        if self.wan_s2v_clean_context_refresh_warmup_blocks < 0:
+            raise ValueError(
+                "wan_s2v_clean_context_refresh_warmup_blocks must be non-negative"
             )
 
     def postprocess_image_latent(self, latent_condition, batch):

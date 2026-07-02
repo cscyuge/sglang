@@ -1193,13 +1193,19 @@ class WanS2VRealtimeSessionRunner:
             batch,
             server_args,
         )
+        clean_refresh_config = (
+            denoising_stage._resolve_clean_context_refresh_config(
+                batch,
+                server_args,
+            )
+        )
 
         logger.info(
             "Wan S2V realtime session start: session=%s block_latent_frames=%d "
             "block_public_frames=%d fps=%d audio_window=%.2fs idle_policy=%s "
             "wav2vec_cuda_graph=%s audio_overlap=%s streaming_vae_cache=%s "
             "vae_cuda_graph=%s latent_condition_overlap=%s adaptive_steps=%s "
-            "latent_warm_start=%s",
+            "latent_warm_start=%s clean_refresh=%s/%d",
             session_id,
             num_frame_per_block,
             block_public_frames,
@@ -1213,6 +1219,8 @@ class WanS2VRealtimeSessionRunner:
             use_latent_condition_overlap,
             use_adaptive_steps,
             latent_warm_start_config.enabled,
+            clean_refresh_config.mode,
+            clean_refresh_config.interval,
         )
         emit_chunk_timeline(
             timeline_path,
@@ -1241,6 +1249,11 @@ class WanS2VRealtimeSessionRunner:
                 "warmup_blocks": latent_warm_start_config.warmup_blocks,
                 "timestep_index": latent_warm_start_config.timestep_index,
                 "effective_sigma": latent_warm_start_config.effective_sigma,
+            },
+            clean_context_refresh={
+                "mode": clean_refresh_config.mode,
+                "interval": clean_refresh_config.interval,
+                "warmup_blocks": clean_refresh_config.warmup_blocks,
             },
         )
 
@@ -1336,6 +1349,7 @@ class WanS2VRealtimeSessionRunner:
                 condition_s = 0.0
                 latent_warm_start_s = 0.0
                 latent_warm_start_applied = False
+                clean_refresh_decision = None
                 prepared_block = None
                 if prefetched_audio_future is not None:
                     audio_wait_started = time.perf_counter()
@@ -1624,19 +1638,30 @@ class WanS2VRealtimeSessionRunner:
                 )
                 denoise_loop_s = time.perf_counter() - denoise_started
                 clean_refresh_started = time.perf_counter()
-                denoising_stage._clean_context_refresh(
-                    block_latents=current_latents,
-                    prompt_embeds=prompt_embeds,
-                    block_bundle=bundle,
-                    current_start=block_idx * num_frame_per_block * frame_seq_length,
-                    attention_request=attention_request,
-                    cache_state=cache_state,
-                    dtype=dit_dtype,
-                    autocast_enabled=autocast_enabled,
-                    forward_batch=batch,
-                    crossattn_cache=crossattn_cache,
-                    audio_start_frame=0,
+                clean_refresh_decision = (
+                    denoising_stage.select_clean_context_refresh(
+                        batch=batch,
+                        server_args=server_args,
+                        block_index=block_idx,
+                        config=clean_refresh_config,
+                    )
                 )
+                if clean_refresh_decision.refresh:
+                    denoising_stage._clean_context_refresh(
+                        block_latents=current_latents,
+                        prompt_embeds=prompt_embeds,
+                        block_bundle=bundle,
+                        current_start=(
+                            block_idx * num_frame_per_block * frame_seq_length
+                        ),
+                        attention_request=attention_request,
+                        cache_state=cache_state,
+                        dtype=dit_dtype,
+                        autocast_enabled=autocast_enabled,
+                        forward_batch=batch,
+                        crossattn_cache=crossattn_cache,
+                        audio_start_frame=0,
+                    )
                 clean_refresh_s = time.perf_counter() - clean_refresh_started
                 batch.latents = current_latents
                 previous_clean_latents = current_latents.detach()
@@ -1697,7 +1722,7 @@ class WanS2VRealtimeSessionRunner:
                 logger.info(
                     "Wan S2V realtime block %d: audio=%.3fs latent=%.3fs "
                     "warm_start=%s/%.3fs steps=%d/%d denoise_loop=%.3fs "
-                    "refresh=%.3fs decode=%.3fs stream=%.3fs total=%.3fs",
+                    "refresh=%s/%s/%.3fs decode=%.3fs stream=%.3fs total=%.3fs",
                     block_idx,
                     audio_s,
                     latent_s,
@@ -1706,6 +1731,8 @@ class WanS2VRealtimeSessionRunner:
                     step_decision.step_count,
                     step_decision.base_step_count,
                     denoise_loop_s,
+                    clean_refresh_decision.refresh,
+                    clean_refresh_decision.reason,
                     clean_refresh_s,
                     decode_s,
                     stream_s,
@@ -1741,6 +1768,12 @@ class WanS2VRealtimeSessionRunner:
                         "mode": latent_warm_start_config.mode,
                         "timestep_index": latent_warm_start_config.timestep_index,
                         "effective_sigma": latent_warm_start_config.effective_sigma,
+                    },
+                    clean_context_refresh={
+                        "mode": clean_refresh_decision.mode,
+                        "refresh": clean_refresh_decision.refresh,
+                        "reason": clean_refresh_decision.reason,
+                        "interval": clean_refresh_decision.interval,
                     },
                     timings={
                         "audio_ms": round(audio_s * 1000, 3),
