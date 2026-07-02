@@ -10,6 +10,7 @@ instead of a Diffusers ``transformer/`` subdirectory.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import gc
 import json
 import os
@@ -38,6 +39,19 @@ QUANTIZED_LINEAR_SUFFIXES = (
     ".ffn.0.weight",
     ".ffn.2.weight",
 )
+
+CHECKPOINT_TO_RUNTIME_MODULE_TYPES = {
+    "self_attn.q": "to_q",
+    "self_attn.k": "to_k",
+    "self_attn.v": "to_v",
+    "self_attn.o": "to_out",
+    "cross_attn.q": "attn2.to_q",
+    "cross_attn.k": "attn2.to_k",
+    "cross_attn.v": "attn2.to_v",
+    "cross_attn.o": "attn2.to_out",
+    "ffn.0": "ffn.fc_in",
+    "ffn.2": "ffn.fc_out",
+}
 
 NON_SHARD_IGNORE = shutil.ignore_patterns(
     "*.safetensors",
@@ -100,15 +114,83 @@ def _block_index(name: str) -> int | None:
         return None
 
 
+def _module_type_for_weight(name: str) -> str | None:
+    if not name.endswith(".weight"):
+        return None
+    parts = name.split(".")
+    if len(parts) < 4 or parts[0] != "blocks":
+        return None
+    return ".".join(parts[2:-1])
+
+
+def _matches_any_pattern(value: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatchcase(value, pattern) for pattern in patterns)
+
+
+def _parse_block_range(value: str) -> tuple[int, int]:
+    if ":" in value:
+        start_s, end_s = value.split(":", 1)
+    elif "-" in value:
+        start_s, end_s = value.split("-", 1)
+        end_s = str(int(end_s) + 1)
+    else:
+        start_s = value
+        end_s = str(int(value) + 1)
+    start = int(start_s)
+    end = int(end_s)
+    if start < 0 or end <= start:
+        raise ValueError(f"Invalid BF16 block range: {value!r}")
+    return start, end
+
+
+def _block_in_ranges(block_idx: int, ranges: tuple[tuple[int, int], ...]) -> bool:
+    return any(start <= block_idx < end for start, end in ranges)
+
+
+def _ignore_patterns_for_bf16_modules(
+    module_patterns: tuple[str, ...],
+    block_ranges: tuple[tuple[int, int], ...],
+    *,
+    num_layers: int = 40,
+) -> list[str]:
+    ignore: list[str] = []
+    seen: set[str] = set()
+
+    def append(pattern: str) -> None:
+        if pattern not in seen:
+            ignore.append(pattern)
+            seen.add(pattern)
+
+    for pattern in module_patterns:
+        append(f"blocks.*.{pattern}")
+        for source, target in CHECKPOINT_TO_RUNTIME_MODULE_TYPES.items():
+            if fnmatch.fnmatchcase(source, pattern):
+                append(f"blocks.*.{target}")
+    for start, end in block_ranges:
+        for idx in range(max(0, start), min(num_layers, end)):
+            append(f"blocks.{idx}.*")
+    return ignore
+
+
 def _should_quantize_tensor(
     name: str,
     tensor: torch.Tensor,
     *,
     block_start: int,
     block_end: int,
+    bf16_module_patterns: tuple[str, ...] = (),
+    bf16_block_ranges: tuple[tuple[int, int], ...] = (),
 ) -> bool:
     block_idx = _block_index(name)
     if block_idx is None or block_idx < block_start or block_idx >= block_end:
+        return False
+    if _block_in_ranges(block_idx, bf16_block_ranges):
+        return False
+    module_type = _module_type_for_weight(name)
+    if module_type is not None and _matches_any_pattern(
+        module_type,
+        bf16_module_patterns,
+    ):
         return False
     if tensor.ndim != 2 or tensor.shape[-1] % 16 != 0:
         return False
@@ -150,10 +232,16 @@ def _nvfp4_quant_config(
     block_start: int,
     block_end: int,
     group_size: int,
+    bf16_module_patterns: tuple[str, ...] = (),
+    bf16_block_ranges: tuple[tuple[int, int], ...] = (),
 ) -> dict[str, Any]:
     ignore = [
         *[f"blocks.{i}.*" for i in range(0, block_start)],
         *[f"blocks.{i}.*" for i in range(block_end, 40)],
+        *_ignore_patterns_for_bf16_modules(
+            bf16_module_patterns,
+            bf16_block_ranges,
+        ),
         "patch_embedding*",
         "cond_encoder*",
         "condition_embedder*",
@@ -229,6 +317,8 @@ def build_wan_s2v_nvfp4_model(
     group_size: int = 16,
     block_start: int = DEFAULT_QUANT_BLOCK_START,
     block_end: int = DEFAULT_QUANT_BLOCK_END,
+    bf16_module_patterns: tuple[str, ...] = (),
+    bf16_block_ranges: tuple[tuple[int, int], ...] = (),
     device: str = "cuda:0",
     overwrite: bool = False,
 ) -> dict[str, Any]:
@@ -265,6 +355,8 @@ def build_wan_s2v_nvfp4_model(
         block_start=block_start,
         block_end=block_end,
         group_size=group_size,
+        bf16_module_patterns=bf16_module_patterns,
+        bf16_block_ranges=bf16_block_ranges,
     )
     serialized_quant_config = json.dumps(quant_config, sort_keys=True)
 
@@ -296,6 +388,8 @@ def build_wan_s2v_nvfp4_model(
                     tensor,
                     block_start=block_start,
                     block_end=block_end,
+                    bf16_module_patterns=bf16_module_patterns,
+                    bf16_block_ranges=bf16_block_ranges,
                 ):
                     packed, weight_scale, weight_scale_2, input_scale = (
                         _nvfp4_quantize_weight(
@@ -355,6 +449,8 @@ def build_wan_s2v_nvfp4_model(
         "group_size": group_size,
         "quantized_block_start": block_start,
         "quantized_block_end": block_end,
+        "bf16_module_patterns": list(bf16_module_patterns),
+        "bf16_block_ranges": [list(item) for item in bf16_block_ranges],
         "total_size": total_size,
     }
     _copy_readme(output_path, stats)
@@ -374,6 +470,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, default=16)
     parser.add_argument("--quantized-block-start", type=int, default=3)
     parser.add_argument("--quantized-block-end", type=int, default=37)
+    parser.add_argument(
+        "--bf16-module-pattern",
+        action="append",
+        default=[],
+        help=(
+            "Keep matching block module types in BF16. Supports shell-style "
+            "patterns such as cross_attn.k, cross_attn.v, or cross_attn.*."
+        ),
+    )
+    parser.add_argument(
+        "--bf16-block-range",
+        action="append",
+        default=[],
+        help=(
+            "Keep a block range in BF16. Use start:end with an exclusive end "
+            "(for example 31:37), start-end with an inclusive end, or a single block."
+        ),
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -390,6 +504,10 @@ def main() -> None:
         group_size=args.group_size,
         block_start=args.quantized_block_start,
         block_end=args.quantized_block_end,
+        bf16_module_patterns=tuple(args.bf16_module_pattern or ()),
+        bf16_block_ranges=tuple(
+            _parse_block_range(value) for value in (args.bf16_block_range or ())
+        ),
         device=args.device,
         overwrite=args.overwrite,
     )
