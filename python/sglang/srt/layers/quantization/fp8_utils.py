@@ -66,9 +66,6 @@ _FP8_GEMM_PROFILE_SEGMENTS_ENABLED: Optional[bool] = None
 _FP8_GEMM_PROFILE_LOCK = threading.Lock()
 _FP8_GEMM_PROFILE_STATS: dict[tuple, dict] = {}
 _FP8_GEMM_PROFILE_REGISTERED = False
-_FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_LOCK = threading.Lock()
-_FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE: dict[tuple, torch.Tensor] = {}
-_FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_MAX_SIZE = 4096
 
 
 def _fp8_gemm_profile_enabled() -> bool:
@@ -272,46 +269,6 @@ def _fp8_gemm_profile_backend_name(fn: Callable) -> str:
             return name[: -len(suffix)]
     return name
 
-
-def _cached_flashinfer_cutlass_weight_scale(
-    weight_scale: torch.Tensor,
-    expected_shape: tuple[int, int],
-) -> torch.Tensor:
-    if tuple(weight_scale.shape) == expected_shape and weight_scale.is_contiguous():
-        return weight_scale
-
-    try:
-        version = int(weight_scale._version)
-    except RuntimeError:
-        # Tensors created inside torch.inference_mode() do not track version
-        # counters. FP8 weights/scales are immutable at inference time, so the
-        # remaining identity fields are sufficient for this cache.
-        version = -1
-    key = (
-        weight_scale.data_ptr(),
-        tuple(weight_scale.shape),
-        str(weight_scale.device),
-        str(weight_scale.dtype),
-        version,
-    )
-    with _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_LOCK:
-        cached = _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE.get(key)
-        if cached is not None:
-            return cached
-
-    if tuple(weight_scale.shape) == expected_shape:
-        prepared = weight_scale.contiguous()
-    else:
-        prepared = weight_scale.transpose(-1, -2).contiguous()
-
-    with _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_LOCK:
-        if (
-            len(_FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE)
-            >= _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE_MAX_SIZE
-        ):
-            _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE.clear()
-        _FLASHINFER_CUTLASS_WEIGHT_SCALE_CACHE[key] = prepared
-    return prepared
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -838,13 +795,13 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     bias_ms = None
     if profile_segments:
         timer = _fp8_gemm_profile_time_start(input.device)
-    # TRTLLM uses the existing SGLang column-major scale layout. CUTLASS with
-    # scale_major_mode="MN" expects (k//block_k, m), so generate activation
-    # scales in column-major storage and transpose to the target shape as a view.
+    # TRTLLM uses the existing SGLang column-major scale layout.
+    # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we
+    # normalize below.
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d,
         block_size[1],
-        column_major_scales=(backend in ("cutlass", "trtllm")),
+        column_major_scales=(backend == "trtllm"),
     )
     if profile_segments:
         quant_ms = _fp8_gemm_profile_time_stop(timer)
@@ -856,17 +813,9 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         expected_x_scale_shape = (k // block_k, m)
         expected_weight_scale_shape = (k // block_k, n // block_n)
         if x_scale.shape == (m, k // block_k):
-            x_scale = x_scale.transpose(-1, -2)
-            if not x_scale.is_contiguous():
-                x_scale = x_scale.contiguous()
+            x_scale = x_scale.transpose(-1, -2).contiguous()
         if weight_scale.shape == (n // block_n, k // block_k):
-            weight_scale = _cached_flashinfer_cutlass_weight_scale(
-                weight_scale, expected_weight_scale_shape
-            )
-        elif not weight_scale.is_contiguous():
-            weight_scale = _cached_flashinfer_cutlass_weight_scale(
-                weight_scale, expected_weight_scale_shape
-            )
+            weight_scale = weight_scale.transpose(-1, -2).contiguous()
         assert x_scale.shape == expected_x_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects A scale layout "
             f"(k//block_k, m) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
