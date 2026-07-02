@@ -84,8 +84,10 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
+    is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_musa,
@@ -367,6 +369,34 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
 
+    def _uses_flashinfer_cutlass_block_fp8(self) -> bool:
+        backend = get_fp8_gemm_runner_backend()
+        if backend.is_flashinfer_cutlass():
+            return True
+        return (
+            backend.is_auto()
+            and is_blackwell_supported()
+            and is_flashinfer_available()
+        )
+
+    def _process_block_fp8_linear_weight_scale(self, layer: Module) -> None:
+        if self.use_mxfp8 or not self._uses_flashinfer_cutlass_block_fp8():
+            return
+        block_n, block_k = self.quant_config.weight_block_size
+        n, k = layer.weight.shape
+        expected_shape = (k // block_k, n // block_n)
+        weight_scale = layer.weight_scale_inv.data
+        if tuple(weight_scale.shape) == expected_shape and weight_scale.is_contiguous():
+            prepared = weight_scale
+        else:
+            prepared = weight_scale.transpose(-1, -2).contiguous()
+        if tuple(prepared.shape) != expected_shape:
+            raise ValueError(
+                "FlashInfer CUTLASS block FP8 scale layout expected "
+                f"{expected_shape}, got {tuple(prepared.shape)}."
+            )
+        copy_or_rebind_param(layer, "weight_scale_inv_cutlass", prepared)
+
     def validate_block_quant_shapes(
         self,
         input_size: int,
@@ -553,6 +583,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+        self._process_block_fp8_linear_weight_scale(layer)
 
         if (
             _use_aiter_bpreshuffle_gfx95
@@ -811,20 +842,26 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
             if isinstance(x, tuple):
+                weight_scale = getattr(
+                    layer, "weight_scale_inv_cutlass", layer.weight_scale_inv
+                )
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
                     weight=layer.weight,
                     block_size=self.quant_config.weight_block_size,
-                    weight_scale=layer.weight_scale_inv,
+                    weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
                 )
 
+            weight_scale = getattr(
+                layer, "weight_scale_inv_cutlass", layer.weight_scale_inv
+            )
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
                 block_size=self.quant_config.weight_block_size,
-                weight_scale=layer.weight_scale_inv,
+                weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
             )

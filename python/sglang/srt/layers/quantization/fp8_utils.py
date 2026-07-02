@@ -795,13 +795,14 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     bias_ms = None
     if profile_segments:
         timer = _fp8_gemm_profile_time_start(input.device)
-    # TRTLLM uses the existing SGLang column-major scale layout.
-    # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we
-    # normalize below.
+    # TRTLLM uses the existing SGLang column-major scale layout. CUTLASS with
+    # scale_major_mode="MN" expects (k//block_k, m), so generate activation
+    # scales in column-major storage and transpose to the target shape as a
+    # contiguous view.
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d,
         block_size[1],
-        column_major_scales=(backend == "trtllm"),
+        column_major_scales=(backend in ("cutlass", "trtllm")),
     )
     if profile_segments:
         quant_ms = _fp8_gemm_profile_time_stop(timer)
@@ -813,7 +814,9 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         expected_x_scale_shape = (k // block_k, m)
         expected_weight_scale_shape = (k // block_k, n // block_n)
         if x_scale.shape == (m, k // block_k):
-            x_scale = x_scale.transpose(-1, -2).contiguous()
+            x_scale = x_scale.transpose(-1, -2)
+            if not x_scale.is_contiguous():
+                x_scale = x_scale.contiguous()
         if weight_scale.shape == (n // block_n, k // block_k):
             weight_scale = weight_scale.transpose(-1, -2).contiguous()
         assert x_scale.shape == expected_x_scale_shape, (
