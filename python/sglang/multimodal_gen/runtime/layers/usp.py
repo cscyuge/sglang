@@ -44,6 +44,40 @@ def _usp_explicit_all_to_all_enabled() -> bool:
     return _env_enabled("SGLANG_USP_EXPLICIT_ALL_TO_ALL", "1")
 
 
+def _usp_fp8_comm_scope() -> str:
+    raw = os.getenv("SGLANG_STREAM_R1_SP_COMM_FP8")
+    if raw is None:
+        raw = os.getenv("SGLANG_STREAM_R1_SP_COMM_FP8_SCOPE", "both")
+    value = raw.strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return ""
+    if value in ("output", "v_only", "qkv", "both"):
+        return value
+    if value in ("1", "true", "yes", "y", "on"):
+        return os.getenv("SGLANG_STREAM_R1_SP_COMM_FP8_SCOPE", "both").lower()
+    return os.getenv("SGLANG_STREAM_R1_SP_COMM_FP8_SCOPE", "both").lower()
+
+
+def _usp_fp8_comm_enabled(target: str) -> bool:
+    scope = _usp_fp8_comm_scope()
+    if target == "output":
+        return scope in ("output", "both")
+    if target == "qkv":
+        return scope in ("qkv", "both")
+    if target == "v_only":
+        return scope == "v_only"
+    return False
+
+
+def _usp_fp8_comm_block_size() -> int:
+    value = os.getenv("SGLANG_STREAM_R1_SP_COMM_FP8_BLOCK_SIZE", "128")
+    try:
+        block_size = int(value)
+    except ValueError:
+        block_size = 128
+    return block_size if block_size in (16, 32, 64, 128) else 128
+
+
 def _usp_device_cache_key(device: torch.device) -> tuple[str, int]:
     index = device.index
     if device.type == "cuda" and index is None and torch.cuda.is_available():
@@ -55,17 +89,20 @@ def _usp_get_buffer(
     name: str,
     like: torch.Tensor,
     shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor | None:
     if like.device.type != "cuda":
         return None
     if not _usp_reuse_buffers_enabled():
         return None
+    buffer_dtype = like.dtype if dtype is None else dtype
     stream_key = int(torch.cuda.current_stream(like.device).cuda_stream)
     cache_key = (
         name,
         *_usp_device_cache_key(like.device),
         stream_key,
-        like.dtype,
+        buffer_dtype,
         shape,
     )
     buffer = _USP_BUFFER_CACHE.get(cache_key)
@@ -74,7 +111,7 @@ def _usp_get_buffer(
         # Allocate them as normal tensors even when the caller is under
         # torch.inference_mode(), otherwise PyTorch rejects later inplace writes.
         with torch.inference_mode(False):
-            buffer = torch.empty(shape, dtype=like.dtype, device=like.device)
+            buffer = torch.empty(shape, dtype=buffer_dtype, device=like.device)
         _USP_BUFFER_CACHE[cache_key] = buffer
     return buffer
 
@@ -166,11 +203,89 @@ def _usp_all_to_all_single(
                 flat, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
             )
             x = _maybe_wait(x)
-            x = x.reshape(x_shape)
+        x = x.reshape(x_shape)
     return x
 
 
-def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_blockwise_fp8_all_to_all_single(
+    x: torch.Tensor,
+    *,
+    cache_name: str,
+) -> torch.Tensor:
+    if x.dtype not in (torch.bfloat16, torch.float16) or not x.is_contiguous():
+        return _usp_all_to_all_single(x, cache_name=cache_name)
+    group_size = _usp_fp8_comm_block_size()
+    if x.shape[-1] % group_size != 0:
+        return _usp_all_to_all_single(x, cache_name=cache_name)
+
+    from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+        blockwise_dequant_fp8,
+        blockwise_quant_fp8,
+    )
+
+    scale_shape = tuple(x.shape[:-1]) + (x.shape[-1] // group_size,)
+    with _comm_nvtx_range(
+        "sgl_mm_usp_fp8_comm_quant "
+        f"group_size={group_size} {_tensor_desc('x', x)} {_comm_nvtx_caller()}"
+    ):
+        q_out = _usp_get_buffer(
+            f"{cache_name}.fp8_quant",
+            x,
+            tuple(x.shape),
+            dtype=torch.float8_e4m3fn,
+        )
+        scale_out = _usp_get_buffer(
+            f"{cache_name}.fp8_scale_quant",
+            x,
+            scale_shape,
+            dtype=torch.float32,
+        )
+        x_q, x_scale = blockwise_quant_fp8(
+            x,
+            group_size=group_size,
+            out_q=q_out,
+            out_scale=scale_out,
+        )
+
+    with _comm_nvtx_range(
+        "sgl_mm_usp_fp8_comm_all_to_all "
+        f"group_size={group_size} shape={tuple(x.shape)} {_comm_nvtx_caller()}"
+    ):
+        x_q_bytes = _usp_all_to_all_single(
+            x_q.view(torch.uint8),
+            cache_name=f"{cache_name}.fp8_payload",
+        )
+        x_scale = _usp_all_to_all_single(
+            x_scale,
+            cache_name=f"{cache_name}.fp8_scale",
+        )
+        x_q = x_q_bytes.view(torch.float8_e4m3fn)
+
+    with _comm_nvtx_range(
+        "sgl_mm_usp_fp8_comm_dequant "
+        f"group_size={group_size} shape={tuple(x.shape)} {_comm_nvtx_caller()}"
+    ):
+        out = _usp_get_buffer(
+            f"{cache_name}.fp8_dequant",
+            x,
+            tuple(x.shape),
+            dtype=x.dtype,
+        )
+        return blockwise_dequant_fp8(
+            x_q,
+            x_scale,
+            group_size=group_size,
+            dtype=x.dtype,
+            out=out,
+        )
+
+
+def _usp_input_all_to_all(
+    x: torch.Tensor,
+    head_dim: int = 1,
+    *,
+    fp8_comm: bool = False,
+) -> torch.Tensor:
     """
     Perform Ulysses-style input all-to-all over the head dimension.
 
@@ -220,7 +335,10 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
             permute_order,
             cache_name=f"usp_input_prepack.h{head_dim}",
         )
-    x = _usp_all_to_all_single(x, cache_name="usp_input")
+    if fp8_comm:
+        x = _usp_blockwise_fp8_all_to_all_single(x, cache_name="usp_input_fp8")
+    else:
+        x = _usp_all_to_all_single(x, cache_name="usp_input")
     x = x.reshape(world_size, h_local, b, s_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
@@ -273,6 +391,12 @@ def _usp_input_all_to_all_qkv(
         v = _usp_input_all_to_all(v, head_dim=2)
         return q, k, v
 
+    if _usp_fp8_comm_enabled("v_only"):
+        q = _usp_input_all_to_all(q, head_dim=2)
+        k = _usp_input_all_to_all(k, head_dim=2)
+        v = _usp_input_all_to_all(v, head_dim=2, fp8_comm=True)
+        return q, k, v
+
     B, S_local, H_global, D = q.shape
     assert H_global % world_size == 0, (
         f"H_global ({H_global}) must be divisible by world_size ({world_size})"
@@ -296,8 +420,15 @@ def _usp_input_all_to_all_qkv(
         )
         packed = fused_pack_qkv_for_all_to_all(q, k, v, out=packed_out)
 
-    # 2. Single NCCL all-to-all
-    packed = _usp_all_to_all_single(packed, cache_name="usp_qkv")
+    # 2. Single NCCL all-to-all. When enabled, send blockwise FP8 payload
+    # plus FP32 scales, then dequantize before the existing unpack path.
+    if _usp_fp8_comm_enabled("qkv"):
+        packed = _usp_blockwise_fp8_all_to_all_single(
+            packed,
+            cache_name="usp_qkv_fp8",
+        )
+    else:
+        packed = _usp_all_to_all_single(packed, cache_name="usp_qkv")
 
     # 3. Fused unpack: packed [3*H, B, S_local, D] → q,k,v [B, S_global, H_local, D]
     with _comm_nvtx_range(
@@ -450,7 +581,13 @@ def _usp_output_all_to_all_packed_bshd(
     ):
         x = packed.reshape(seq_len, batch_size, h_local, d)
 
-    x = _usp_all_to_all_single(x, cache_name="usp_output_packed")
+    if _usp_fp8_comm_enabled("output"):
+        x = _usp_blockwise_fp8_all_to_all_single(
+            x,
+            cache_name="usp_output_packed_fp8",
+        )
+    else:
+        x = _usp_all_to_all_single(x, cache_name="usp_output_packed")
     x = x.reshape(world_size, s_local, batch_size, h_local, d)
 
     with _comm_nvtx_range(
