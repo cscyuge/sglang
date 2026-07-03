@@ -618,6 +618,11 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
         self.assertEqual(WanS2VPipelineConfig().flow_shift, 3.0)
         self.assertEqual(WanS2VPipelineConfig(stream_r1_mode=True).flow_shift, 5.0)
 
+    def test_pipeline_config_defaults_enable_timestep_cuda_graph_step0(self):
+        config = WanS2VPipelineConfig()
+        self.assertTrue(config.wan_s2v_timestep_cuda_graph)
+        self.assertEqual(config.wan_s2v_timestep_cuda_graph_indices, [0])
+
     def test_stream_r1_scheduler_matches_baseline_timesteps(self):
         scheduler = build_wan_s2v_scheduler(stream_r1_mode=True, flow_shift=5.0)
 

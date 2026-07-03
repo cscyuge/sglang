@@ -89,8 +89,10 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_timestep_ablation_value_tolerance: float = 1e-3
     wan_s2v_timestep_ablation_scale: float = 1.0
     wan_s2v_timestep_ablation_log: bool = False
-    wan_s2v_timestep_cuda_graph: bool = False
-    wan_s2v_timestep_cuda_graph_indices: list[int] | None = None
+    wan_s2v_timestep_cuda_graph: bool = True
+    wan_s2v_timestep_cuda_graph_indices: list[int] | None = field(
+        default_factory=lambda: [0]
+    )
     wan_s2v_timestep_cuda_graph_warmup_blocks: int = 2
     wan_s2v_timestep_cuda_graph_max_graphs: int = 16
     wan_s2v_timestep_cuda_graph_log: bool = False
