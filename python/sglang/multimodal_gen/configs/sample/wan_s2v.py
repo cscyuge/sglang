@@ -40,6 +40,18 @@ class WanS2VSamplingParams(SamplingParams):
     adaptive_steps_aggressive_step_count: int | None = None
     adaptive_steps_warmup_blocks: int | None = None
     adaptive_steps_log_only: bool | None = None
+    timestep_profile: bool | None = None
+    timestep_profile_log: bool | None = None
+    timestep_profile_nvtx: bool | None = None
+    timestep_profile_sync: bool | None = None
+    timestep_ablation_mode: str | None = None
+    timestep_ablation_indices: list[int] | None = None
+    timestep_ablation_values: list[float] | None = None
+    timestep_ablation_blocks: list[int] | None = None
+    timestep_ablation_warmup_blocks: int | None = None
+    timestep_ablation_value_tolerance: float | None = None
+    timestep_ablation_scale: float | None = None
+    timestep_ablation_log: bool | None = None
     disable_sp_frame_padding: bool = True
 
     def __post_init__(self) -> None:
@@ -78,7 +90,10 @@ class WanS2VSamplingParams(SamplingParams):
             raise ValueError("audio_lookahead_frames must be non-negative")
         if self.denoising_steps is not None and len(self.denoising_steps) == 0:
             raise ValueError("denoising_steps must not be empty")
-        if self.adaptive_steps_threshold is not None and self.adaptive_steps_threshold < 0:
+        if (
+            self.adaptive_steps_threshold is not None
+            and self.adaptive_steps_threshold < 0
+        ):
             raise ValueError("adaptive_steps_threshold must be non-negative")
         if (
             self.adaptive_steps_aggressive_threshold is not None
@@ -100,6 +115,30 @@ class WanS2VSamplingParams(SamplingParams):
             and self.adaptive_steps_warmup_blocks < 0
         ):
             raise ValueError("adaptive_steps_warmup_blocks must be non-negative")
+        if self.timestep_ablation_mode is not None:
+            self.timestep_ablation_mode = str(self.timestep_ablation_mode).lower()
+            if self.timestep_ablation_mode not in (
+                "off",
+                "skip_update",
+                "reuse_previous_pred",
+                "zero_pred",
+                "scale_pred",
+            ):
+                raise ValueError("timestep_ablation_mode is invalid")
+        if (
+            self.timestep_ablation_warmup_blocks is not None
+            and self.timestep_ablation_warmup_blocks < 0
+        ):
+            raise ValueError("timestep_ablation_warmup_blocks must be non-negative")
+        if (
+            self.timestep_ablation_value_tolerance is not None
+            and self.timestep_ablation_value_tolerance < 0
+        ):
+            raise ValueError("timestep_ablation_value_tolerance must be non-negative")
+        for field_name in ("timestep_ablation_indices", "timestep_ablation_blocks"):
+            values = getattr(self, field_name)
+            if values is not None and any(int(value) < 0 for value in values):
+                raise ValueError(f"{field_name} values must be non-negative")
 
         super().__post_init__()
 
@@ -132,6 +171,18 @@ class WanS2VSamplingParams(SamplingParams):
             "adaptive_steps_aggressive_step_count",
             "adaptive_steps_warmup_blocks",
             "adaptive_steps_log_only",
+            "timestep_profile",
+            "timestep_profile_log",
+            "timestep_profile_nvtx",
+            "timestep_profile_sync",
+            "timestep_ablation_mode",
+            "timestep_ablation_indices",
+            "timestep_ablation_values",
+            "timestep_ablation_blocks",
+            "timestep_ablation_warmup_blocks",
+            "timestep_ablation_value_tolerance",
+            "timestep_ablation_scale",
+            "timestep_ablation_log",
         ):
             value = getattr(self, field_name)
             if value is not None:

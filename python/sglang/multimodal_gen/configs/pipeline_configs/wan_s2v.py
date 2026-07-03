@@ -70,6 +70,18 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_clean_context_refresh_interval: int = 2
     wan_s2v_clean_context_refresh_warmup_blocks: int = 1
     wan_s2v_clean_context_refresh_log: bool = False
+    wan_s2v_timestep_profile: bool = False
+    wan_s2v_timestep_profile_log: bool = False
+    wan_s2v_timestep_profile_nvtx: bool = True
+    wan_s2v_timestep_profile_sync: bool = False
+    wan_s2v_timestep_ablation_mode: str = "off"
+    wan_s2v_timestep_ablation_indices: list[int] | None = None
+    wan_s2v_timestep_ablation_values: list[float] | None = None
+    wan_s2v_timestep_ablation_blocks: list[int] | None = None
+    wan_s2v_timestep_ablation_warmup_blocks: int = 0
+    wan_s2v_timestep_ablation_value_tolerance: float = 1e-3
+    wan_s2v_timestep_ablation_scale: float = 1.0
+    wan_s2v_timestep_ablation_log: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -117,7 +129,9 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
                 "wan_s2v_adaptive_steps_aggressive_step_count must be positive"
             )
         if self.wan_s2v_adaptive_steps_warmup_blocks < 0:
-            raise ValueError("wan_s2v_adaptive_steps_warmup_blocks must be non-negative")
+            raise ValueError(
+                "wan_s2v_adaptive_steps_warmup_blocks must be non-negative"
+            )
         if not (0.0 <= self.wan_s2v_latent_warm_start_alpha <= 1.0):
             raise ValueError("wan_s2v_latent_warm_start_alpha must be in [0, 1]")
         self.wan_s2v_latent_warm_start_mode = str(
@@ -159,6 +173,36 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
             raise ValueError(
                 "wan_s2v_clean_context_refresh_warmup_blocks must be non-negative"
             )
+        self.wan_s2v_timestep_ablation_mode = str(
+            self.wan_s2v_timestep_ablation_mode
+        ).lower()
+        if self.wan_s2v_timestep_ablation_mode not in (
+            "off",
+            "skip_update",
+            "reuse_previous_pred",
+            "zero_pred",
+            "scale_pred",
+        ):
+            raise ValueError(
+                "wan_s2v_timestep_ablation_mode must be one of 'off', "
+                "'skip_update', 'reuse_previous_pred', 'zero_pred', or "
+                "'scale_pred'"
+            )
+        if self.wan_s2v_timestep_ablation_warmup_blocks < 0:
+            raise ValueError(
+                "wan_s2v_timestep_ablation_warmup_blocks must be non-negative"
+            )
+        if self.wan_s2v_timestep_ablation_value_tolerance < 0:
+            raise ValueError(
+                "wan_s2v_timestep_ablation_value_tolerance must be non-negative"
+            )
+        for field_name in (
+            "wan_s2v_timestep_ablation_indices",
+            "wan_s2v_timestep_ablation_blocks",
+        ):
+            values = getattr(self, field_name)
+            if values is not None and any(int(value) < 0 for value in values):
+                raise ValueError(f"{field_name} values must be non-negative")
 
     def postprocess_image_latent(self, latent_condition, batch):
         return latent_condition

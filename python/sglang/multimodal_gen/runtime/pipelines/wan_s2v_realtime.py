@@ -1193,11 +1193,17 @@ class WanS2VRealtimeSessionRunner:
             batch,
             server_args,
         )
-        clean_refresh_config = (
-            denoising_stage._resolve_clean_context_refresh_config(
-                batch,
-                server_args,
-            )
+        clean_refresh_config = denoising_stage._resolve_clean_context_refresh_config(
+            batch,
+            server_args,
+        )
+        timestep_profile_config = denoising_stage._resolve_timestep_profile_config(
+            batch,
+            server_args,
+        )
+        timestep_ablation_config = denoising_stage._resolve_timestep_ablation_config(
+            batch,
+            server_args,
         )
 
         logger.info(
@@ -1205,7 +1211,8 @@ class WanS2VRealtimeSessionRunner:
             "block_public_frames=%d fps=%d audio_window=%.2fs idle_policy=%s "
             "wav2vec_cuda_graph=%s audio_overlap=%s streaming_vae_cache=%s "
             "vae_cuda_graph=%s latent_condition_overlap=%s adaptive_steps=%s "
-            "latent_warm_start=%s clean_refresh=%s/%d",
+            "latent_warm_start=%s clean_refresh=%s/%d timestep_profile=%s "
+            "timestep_ablation=%s",
             session_id,
             num_frame_per_block,
             block_public_frames,
@@ -1221,6 +1228,8 @@ class WanS2VRealtimeSessionRunner:
             latent_warm_start_config.enabled,
             clean_refresh_config.mode,
             clean_refresh_config.interval,
+            timestep_profile_config.enabled,
+            timestep_ablation_config.mode,
         )
         emit_chunk_timeline(
             timeline_path,
@@ -1254,6 +1263,23 @@ class WanS2VRealtimeSessionRunner:
                 "mode": clean_refresh_config.mode,
                 "interval": clean_refresh_config.interval,
                 "warmup_blocks": clean_refresh_config.warmup_blocks,
+            },
+            timestep_profile={
+                "enabled": timestep_profile_config.enabled,
+                "log": timestep_profile_config.log,
+                "nvtx": timestep_profile_config.nvtx,
+                "synchronize": timestep_profile_config.synchronize,
+            },
+            timestep_ablation={
+                "mode": timestep_ablation_config.mode,
+                "step_indices": list(timestep_ablation_config.step_indices),
+                "timestep_values": list(timestep_ablation_config.timestep_values),
+                "block_indices": list(timestep_ablation_config.block_indices),
+                "warmup_blocks": timestep_ablation_config.warmup_blocks,
+                "value_tolerance": timestep_ablation_config.value_tolerance,
+                "scale": timestep_ablation_config.scale,
+                "log": timestep_ablation_config.log,
+                "enabled": timestep_ablation_config.enabled,
             },
         )
 
@@ -1562,9 +1588,7 @@ class WanS2VRealtimeSessionRunner:
                         config=latent_warm_start_config,
                     )
                 )
-                latent_warm_start_s = (
-                    time.perf_counter() - latent_warm_start_started
-                )
+                latent_warm_start_s = time.perf_counter() - latent_warm_start_started
                 batch.latents = block_latents
                 if block_step_noises is not None and len(block_step_noises) != max(
                     int(block_timesteps.numel()) - 1,
@@ -1622,6 +1646,7 @@ class WanS2VRealtimeSessionRunner:
                 denoise_started = time.perf_counter()
                 current_latents = denoising_stage.denoise_stream_r1_block(
                     batch=batch,
+                    server_args=server_args,
                     block_latents=block_latents,
                     block_bundle=bundle,
                     block_start=block_idx * num_frame_per_block,
@@ -1635,16 +1660,18 @@ class WanS2VRealtimeSessionRunner:
                     autocast_enabled=autocast_enabled,
                     audio_start_frame=0,
                     step_noises_btchw=block_step_noises,
+                    block_index=block_idx,
+                )
+                timestep_profile_rows = list(
+                    getattr(denoising_stage, "_last_timestep_profile_rows", [])
                 )
                 denoise_loop_s = time.perf_counter() - denoise_started
                 clean_refresh_started = time.perf_counter()
-                clean_refresh_decision = (
-                    denoising_stage.select_clean_context_refresh(
-                        batch=batch,
-                        server_args=server_args,
-                        block_index=block_idx,
-                        config=clean_refresh_config,
-                    )
+                clean_refresh_decision = denoising_stage.select_clean_context_refresh(
+                    batch=batch,
+                    server_args=server_args,
+                    block_index=block_idx,
+                    config=clean_refresh_config,
                 )
                 if clean_refresh_decision.refresh:
                     denoising_stage._clean_context_refresh(
@@ -1775,6 +1802,7 @@ class WanS2VRealtimeSessionRunner:
                         "reason": clean_refresh_decision.reason,
                         "interval": clean_refresh_decision.interval,
                     },
+                    timestep_profile=timestep_profile_rows,
                     timings={
                         "audio_ms": round(audio_s * 1000, 3),
                         "audio_cpu_ms": round(audio_cpu_s * 1000, 3),

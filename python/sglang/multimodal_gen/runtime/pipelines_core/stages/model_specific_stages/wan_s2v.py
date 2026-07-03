@@ -2,6 +2,7 @@
 """Wan2.2-S2V specific pipeline stages."""
 
 import inspect
+import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -201,6 +203,30 @@ class WanS2VCleanContextRefreshConfig:
     interval: int
     warmup_blocks: int
     log: bool
+
+
+@dataclass(frozen=True)
+class WanS2VTimestepProfileConfig:
+    enabled: bool
+    log: bool
+    nvtx: bool
+    synchronize: bool
+
+
+@dataclass(frozen=True)
+class WanS2VTimestepAblationConfig:
+    mode: str
+    step_indices: tuple[int, ...]
+    timestep_values: tuple[float, ...]
+    block_indices: tuple[int, ...]
+    warmup_blocks: int
+    value_tolerance: float
+    scale: float
+    log: bool
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "off" and bool(self.step_indices or self.timestep_values)
 
 
 @dataclass(frozen=True)
@@ -466,6 +492,15 @@ def _safe_sp_world_size() -> int:
         return 1
 
 
+def _safe_distributed_rank() -> int:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return 0
+
+
 def _coerce_timestep_list(value: Any, field_name: str) -> list[int] | None:
     if value is None:
         return None
@@ -479,6 +514,30 @@ def _coerce_timestep_list(value: Any, field_name: str) -> list[int] | None:
     if not timesteps:
         raise ValueError(f"{field_name} must not be empty")
     return timesteps
+
+
+def _coerce_optional_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+    if value is None or value == "":
+        return ()
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    elif isinstance(value, str):
+        value = [part for part in value.replace(",", " ").split(" ") if part]
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{field_name} must be a list of integer values")
+    return tuple(int(item) for item in value)
+
+
+def _coerce_optional_float_tuple(value: Any, field_name: str) -> tuple[float, ...]:
+    if value is None or value == "":
+        return ()
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    elif isinstance(value, str):
+        value = [part for part in value.replace(",", " ").split(" ") if part]
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{field_name} must be a list of numeric values")
+    return tuple(float(item) for item in value)
 
 
 def _has_negative_prompt_embeds(batch: Req) -> bool:
@@ -731,6 +790,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         self._adaptive_total_blocks: int = 0
         self._adaptive_reduced_blocks: int = 0
         self._last_adaptive_step_decision: WanS2VAdaptiveStepDecision | None = None
+        self._last_timestep_profile_rows: list[dict[str, Any]] = []
 
     def _prepare_timesteps(
         self,
@@ -879,6 +939,199 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 )
             ),
         )
+
+    def _resolve_timestep_profile_config(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> WanS2VTimestepProfileConfig:
+        return WanS2VTimestepProfileConfig(
+            enabled=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_profile",
+                    "wan_s2v_timestep_profile",
+                    False,
+                )
+            ),
+            log=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_profile_log",
+                    "wan_s2v_timestep_profile_log",
+                    False,
+                )
+            ),
+            nvtx=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_profile_nvtx",
+                    "wan_s2v_timestep_profile_nvtx",
+                    True,
+                )
+            ),
+            synchronize=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_profile_sync",
+                    "wan_s2v_timestep_profile_sync",
+                    False,
+                )
+            ),
+        )
+
+    def _resolve_timestep_ablation_config(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> WanS2VTimestepAblationConfig:
+        mode = str(
+            _resolve_request_value(
+                batch,
+                server_args,
+                "timestep_ablation_mode",
+                "wan_s2v_timestep_ablation_mode",
+                "off",
+            )
+        ).lower()
+        valid_modes = {
+            "off",
+            "skip_update",
+            "reuse_previous_pred",
+            "zero_pred",
+            "scale_pred",
+        }
+        if mode not in valid_modes:
+            raise ValueError(
+                "wan_s2v_timestep_ablation_mode must be one of "
+                f"{sorted(valid_modes)}, got {mode!r}"
+            )
+        value_tolerance = float(
+            _resolve_request_value(
+                batch,
+                server_args,
+                "timestep_ablation_value_tolerance",
+                "wan_s2v_timestep_ablation_value_tolerance",
+                1e-3,
+            )
+        )
+        if value_tolerance < 0:
+            raise ValueError(
+                "wan_s2v_timestep_ablation_value_tolerance must be non-negative"
+            )
+        warmup_blocks = int(
+            _resolve_request_value(
+                batch,
+                server_args,
+                "timestep_ablation_warmup_blocks",
+                "wan_s2v_timestep_ablation_warmup_blocks",
+                0,
+            )
+        )
+        if warmup_blocks < 0:
+            raise ValueError(
+                "wan_s2v_timestep_ablation_warmup_blocks must be non-negative"
+            )
+        return WanS2VTimestepAblationConfig(
+            mode=mode,
+            step_indices=_coerce_optional_int_tuple(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_ablation_indices",
+                    "wan_s2v_timestep_ablation_indices",
+                    (),
+                ),
+                "wan_s2v_timestep_ablation_indices",
+            ),
+            timestep_values=_coerce_optional_float_tuple(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_ablation_values",
+                    "wan_s2v_timestep_ablation_values",
+                    (),
+                ),
+                "wan_s2v_timestep_ablation_values",
+            ),
+            block_indices=_coerce_optional_int_tuple(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_ablation_blocks",
+                    "wan_s2v_timestep_ablation_blocks",
+                    (),
+                ),
+                "wan_s2v_timestep_ablation_blocks",
+            ),
+            warmup_blocks=warmup_blocks,
+            value_tolerance=value_tolerance,
+            scale=float(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_ablation_scale",
+                    "wan_s2v_timestep_ablation_scale",
+                    1.0,
+                )
+            ),
+            log=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_ablation_log",
+                    "wan_s2v_timestep_ablation_log",
+                    False,
+                )
+            ),
+        )
+
+    def _select_timestep_ablation_action(
+        self,
+        config: WanS2VTimestepAblationConfig,
+        *,
+        block_index: int,
+        step_index: int,
+        timestep_value: float,
+    ) -> str:
+        if not config.enabled:
+            return "full"
+        if block_index < config.warmup_blocks:
+            return "full"
+        if config.block_indices and block_index not in config.block_indices:
+            return "full"
+
+        selected = step_index in config.step_indices
+        if not selected and config.timestep_values:
+            selected = any(
+                abs(timestep_value - target) <= config.value_tolerance
+                for target in config.timestep_values
+            )
+        return config.mode if selected else "full"
+
+    @staticmethod
+    def _maybe_sync_timestep_profile(
+        config: WanS2VTimestepProfileConfig,
+        device: torch.device,
+    ) -> None:
+        if (
+            config.synchronize
+            and torch.cuda.is_available()
+            and torch.device(device).type == "cuda"
+        ):
+            torch.cuda.synchronize(device)
+
+    def _timestep_profile_timestamp(
+        self,
+        config: WanS2VTimestepProfileConfig,
+        device: torch.device,
+    ) -> float:
+        self._maybe_sync_timestep_profile(config, device)
+        return time.perf_counter()
 
     def _extract_adaptive_audio_feature(
         self,
@@ -1275,9 +1528,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         last = prev[:, :, -1:, :, :]
         if config.mode == "linear" and prev.shape[2] >= 2:
             velocity = last - prev[:, :, -2:-1, :, :]
-            frames = [
-                last + velocity * float(i + 1) for i in range(target_frames)
-            ]
+            frames = [last + velocity * float(i + 1) for i in range(target_frames)]
             return torch.cat(frames, dim=2).contiguous()
         return last.expand(-1, -1, target_frames, -1, -1).contiguous()
 
@@ -1762,6 +2013,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         self,
         *,
         batch: Req,
+        server_args: ServerArgs,
         block_latents: torch.Tensor,
         block_bundle: WanS2VConditionBundle,
         block_start: int,
@@ -1775,6 +2027,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         autocast_enabled: bool,
         audio_start_frame: int | None = None,
         step_noises_btchw: Sequence[torch.Tensor] | None = None,
+        block_index: int | None = None,
     ) -> torch.Tensor:
         """Denoise one Stream-R1 S2V latent block.
 
@@ -1786,6 +2039,21 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
         video_raw_latent_shape = noise_latents_btchw.shape
         current_start = block_start * frame_seq_length
+        if block_index is None:
+            chunk_frames = block_bundle.chunk_frames or max(
+                int(current_latents.shape[2]), 1
+            )
+            block_index = int(block_start) // int(chunk_frames)
+        profile_config = self._resolve_timestep_profile_config(batch, server_args)
+        ablation_config = self._resolve_timestep_ablation_config(batch, server_args)
+        use_nvtx = bool(
+            profile_config.nvtx and (profile_config.enabled or ablation_config.enabled)
+        )
+        timestep_values = [
+            float(item) for item in timesteps.detach().cpu().reshape(-1).tolist()
+        ]
+        timestep_profile_rows: list[dict[str, Any]] = []
+        self._last_timestep_profile_rows = timestep_profile_rows
         if step_noises_btchw is not None and len(step_noises_btchw) != max(
             int(timesteps.numel()) - 1, 0
         ):
@@ -1795,78 +2063,174 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 f"expected {max(int(timesteps.numel()) - 1, 0)}"
             )
 
+        previous_noise_pred_btchw: torch.Tensor | None = None
         for i, t_cur in enumerate(timesteps):
+            timestep_value = timestep_values[i]
+            action = self._select_timestep_ablation_action(
+                ablation_config,
+                block_index=block_index,
+                step_index=i,
+                timestep_value=timestep_value,
+            )
+            effective_action = action
             t_expand = t_cur.reshape(1).repeat(current_latents.shape[0])
-            with (
-                torch.autocast(
-                    device_type=current_platform.device_type,
-                    dtype=dit_dtype,
-                    enabled=autocast_enabled,
-                ),
-                set_forward_context(
-                    current_timestep=i,
-                    attn_metadata=None,
-                    forward_batch=batch,
-                ),
-            ):
-                noise_pred_bcthw = self.transformer(
-                    hidden_states=current_latents,
-                    timestep=t_expand,
-                    encoder_hidden_states=prompt_embeds,
-                    ref_latents=block_bundle.ref_latents,
-                    motion_latents=block_bundle.motion_latents,
-                    cond_states=block_bundle.cond_states,
-                    audio_input=block_bundle.audio_input,
-                    audio_emb=block_bundle.audio_emb,
-                    motion_frames=block_bundle.motion_frames,
-                    add_last_motion=block_bundle.add_last_motion,
-                    drop_motion_frames=block_bundle.drop_motion_frames,
-                    kv_cache=cache_state.kv_cache,
-                    crossattn_cache=crossattn_cache,
-                    current_start=current_start,
-                    cache_start=None,
-                    audio_start_frame=audio_start_frame,
-                    stream_r1_mode=True,
-                )
-            noise_pred_btchw = noise_pred_bcthw.permute(0, 2, 1, 3, 4)
-            pred_video_btchw = pred_noise_to_pred_video(
-                pred_noise=noise_pred_btchw.flatten(0, 1),
-                noise_input_latent=noise_latents_btchw.flatten(0, 1),
-                timestep=t_cur.reshape(1),
-                scheduler=self.scheduler,
-            ).unflatten(0, noise_pred_btchw.shape[:2])
-
-            if i < timesteps.numel() - 1:
-                next_timestep = (
-                    timesteps[i + 1].reshape(1).to(device=current_latents.device)
-                )
-                if step_noises_btchw is None:
-                    noise = torch.randn(
-                        video_raw_latent_shape,
-                        dtype=pred_video_btchw.dtype,
-                        generator=generator,
-                        device=current_latents.device,
-                    )
+            step_marker = (
+                "wan_s2v_timestep "
+                f"block={block_index} step={i} timestep={timestep_value:.6g} "
+                f"action={action}"
+            )
+            transformer_ms = None
+            scheduler_ms = None
+            step_started = self._timestep_profile_timestamp(
+                profile_config, current_latents.device
+            )
+            with maybe_nvtx_range(step_marker, use_nvtx):
+                if action == "skip_update":
+                    noise_pred_btchw = None
+                elif (
+                    action == "reuse_previous_pred"
+                    and previous_noise_pred_btchw is not None
+                ):
+                    noise_pred_btchw = previous_noise_pred_btchw
+                elif action == "zero_pred":
+                    noise_pred_btchw = torch.zeros_like(noise_latents_btchw)
                 else:
-                    noise = step_noises_btchw[i]
-                    if noise.shape != video_raw_latent_shape:
-                        raise ValueError(
-                            "Stream-R1 S2V precomputed step noise shape mismatch: "
-                            f"got {tuple(noise.shape)}, "
-                            f"expected {tuple(video_raw_latent_shape)}"
+                    if action == "reuse_previous_pred":
+                        effective_action = "full_fallback_no_previous_pred"
+                    transformer_started = self._timestep_profile_timestamp(
+                        profile_config, current_latents.device
+                    )
+                    with maybe_nvtx_range(f"{step_marker} transformer", use_nvtx):
+                        with (
+                            torch.autocast(
+                                device_type=current_platform.device_type,
+                                dtype=dit_dtype,
+                                enabled=autocast_enabled,
+                            ),
+                            set_forward_context(
+                                current_timestep=i,
+                                attn_metadata=None,
+                                forward_batch=batch,
+                            ),
+                        ):
+                            noise_pred_bcthw = self.transformer(
+                                hidden_states=current_latents,
+                                timestep=t_expand,
+                                encoder_hidden_states=prompt_embeds,
+                                ref_latents=block_bundle.ref_latents,
+                                motion_latents=block_bundle.motion_latents,
+                                cond_states=block_bundle.cond_states,
+                                audio_input=block_bundle.audio_input,
+                                audio_emb=block_bundle.audio_emb,
+                                motion_frames=block_bundle.motion_frames,
+                                add_last_motion=block_bundle.add_last_motion,
+                                drop_motion_frames=block_bundle.drop_motion_frames,
+                                kv_cache=cache_state.kv_cache,
+                                crossattn_cache=crossattn_cache,
+                                current_start=current_start,
+                                cache_start=None,
+                                audio_start_frame=audio_start_frame,
+                                stream_r1_mode=True,
+                            )
+                    transformer_ms = (
+                        self._timestep_profile_timestamp(
+                            profile_config, current_latents.device
                         )
-                    if noise.device != current_latents.device:
-                        noise = noise.to(current_latents.device, non_blocking=True)
-                    if noise.dtype != pred_video_btchw.dtype:
-                        noise = noise.to(dtype=pred_video_btchw.dtype)
-                noise_latents_btchw = self.scheduler.add_noise(
-                    pred_video_btchw.flatten(0, 1),
-                    noise.flatten(0, 1),
-                    next_timestep,
-                ).unflatten(0, pred_video_btchw.shape[:2])
-                current_latents = noise_latents_btchw.permute(0, 2, 1, 3, 4)
-            else:
-                current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
+                        - transformer_started
+                    ) * 1000.0
+                    if action == "scale_pred":
+                        noise_pred_bcthw = noise_pred_bcthw * ablation_config.scale
+                    noise_pred_btchw = noise_pred_bcthw.permute(0, 2, 1, 3, 4)
+
+                if noise_pred_btchw is not None:
+                    previous_noise_pred_btchw = noise_pred_btchw
+                    scheduler_started = self._timestep_profile_timestamp(
+                        profile_config, current_latents.device
+                    )
+                    with maybe_nvtx_range(f"{step_marker} scheduler", use_nvtx):
+                        pred_video_btchw = pred_noise_to_pred_video(
+                            pred_noise=noise_pred_btchw.flatten(0, 1),
+                            noise_input_latent=noise_latents_btchw.flatten(0, 1),
+                            timestep=t_cur.reshape(1),
+                            scheduler=self.scheduler,
+                        ).unflatten(0, noise_pred_btchw.shape[:2])
+
+                        if i < timesteps.numel() - 1:
+                            next_timestep = (
+                                timesteps[i + 1]
+                                .reshape(1)
+                                .to(device=current_latents.device)
+                            )
+                            if step_noises_btchw is None:
+                                noise = torch.randn(
+                                    video_raw_latent_shape,
+                                    dtype=pred_video_btchw.dtype,
+                                    generator=generator,
+                                    device=current_latents.device,
+                                )
+                            else:
+                                noise = step_noises_btchw[i]
+                                if noise.shape != video_raw_latent_shape:
+                                    raise ValueError(
+                                        "Stream-R1 S2V precomputed step noise shape "
+                                        f"mismatch: got {tuple(noise.shape)}, "
+                                        f"expected {tuple(video_raw_latent_shape)}"
+                                    )
+                                if noise.device != current_latents.device:
+                                    noise = noise.to(
+                                        current_latents.device, non_blocking=True
+                                    )
+                                if noise.dtype != pred_video_btchw.dtype:
+                                    noise = noise.to(dtype=pred_video_btchw.dtype)
+                            noise_latents_btchw = self.scheduler.add_noise(
+                                pred_video_btchw.flatten(0, 1),
+                                noise.flatten(0, 1),
+                                next_timestep,
+                            ).unflatten(0, pred_video_btchw.shape[:2])
+                            current_latents = noise_latents_btchw.permute(0, 2, 1, 3, 4)
+                        else:
+                            current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
+                    scheduler_ms = (
+                        self._timestep_profile_timestamp(
+                            profile_config, current_latents.device
+                        )
+                        - scheduler_started
+                    ) * 1000.0
+
+            step_ms = (
+                self._timestep_profile_timestamp(profile_config, current_latents.device)
+                - step_started
+            ) * 1000.0
+            if profile_config.enabled or effective_action != "full":
+                row = {
+                    "rank": _safe_distributed_rank(),
+                    "block_idx": int(block_index),
+                    "step_idx": int(i),
+                    "timestep": round(timestep_value, 6),
+                    "action": effective_action,
+                    "transformer_ms": (
+                        None if transformer_ms is None else round(transformer_ms, 3)
+                    ),
+                    "scheduler_ms": (
+                        None if scheduler_ms is None else round(scheduler_ms, 3)
+                    ),
+                    "total_ms": round(step_ms, 3),
+                }
+                timestep_profile_rows.append(row)
+                if profile_config.log or (
+                    ablation_config.log and effective_action != "full"
+                ):
+                    self.log_info(
+                        "Wan S2V timestep block=%d step=%d timestep=%.6f "
+                        "action=%s transformer_ms=%s scheduler_ms=%s total_ms=%.3f",
+                        block_index,
+                        i,
+                        timestep_value,
+                        effective_action,
+                        "n/a" if transformer_ms is None else f"{transformer_ms:.3f}",
+                        "n/a" if scheduler_ms is None else f"{scheduler_ms:.3f}",
+                        step_ms,
+                    )
 
         anchor_first_frame = bool(
             _resolve_request_value(
@@ -2001,6 +2365,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 )
                 current_latents = self.denoise_stream_r1_block(
                     batch=batch,
+                    server_args=server_args,
                     block_latents=current_latents,
                     block_bundle=block_bundle,
                     block_start=block_start,
@@ -2012,6 +2377,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     generator=generator,
                     dit_dtype=dit_dtype,
                     autocast_enabled=autocast_enabled,
+                    block_index=block_index,
                 )
 
                 latents[:, :, block_start:block_end, :, :] = current_latents

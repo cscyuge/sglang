@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     WanS2VStreamR1CacheMetadata,
     WanS2VStreamR1CacheState,
     WanS2VStreamR1DenoisingStage,
+    WanS2VTimestepAblationConfig,
     _has_negative_prompt_embeds,
     _select_wan_s2v_adaptive_timesteps,
 )
@@ -134,6 +135,27 @@ class TestWanS2VSamplingParams(unittest.TestCase):
         self.assertTrue(extra["stream_r1_kv_cache"])
         self.assertEqual(extra["local_attn_size"], 9)
         self.assertEqual(extra["sink_size"], 3)
+
+    def test_timestep_profile_and_ablation_are_forwarded_in_extra(self):
+        params = WanS2VSamplingParams(
+            timestep_profile=True,
+            timestep_profile_sync=True,
+            timestep_ablation_mode="zero_pred",
+            timestep_ablation_indices=[1, 3],
+            timestep_ablation_blocks=[2],
+            timestep_ablation_values=[937.5],
+            timestep_ablation_log=True,
+        )
+
+        extra = params.build_request_extra()
+
+        self.assertTrue(extra["timestep_profile"])
+        self.assertTrue(extra["timestep_profile_sync"])
+        self.assertEqual(extra["timestep_ablation_mode"], "zero_pred")
+        self.assertEqual(extra["timestep_ablation_indices"], [1, 3])
+        self.assertEqual(extra["timestep_ablation_blocks"], [2])
+        self.assertEqual(extra["timestep_ablation_values"], [937.5])
+        self.assertTrue(extra["timestep_ablation_log"])
 
     def test_stream_r1_attention_values_are_cross_validated(self):
         with self.assertRaisesRegex(ValueError, "local_attn_size"):
@@ -923,9 +945,13 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
             segmented_plan.to_dense_mask(query.device),
             materialized_plan.to_dense_mask(query.device),
         )
-        torch.testing.assert_close(segmented_workspace.query, materialized_workspace.query)
+        torch.testing.assert_close(
+            segmented_workspace.query, materialized_workspace.query
+        )
         torch.testing.assert_close(segmented_workspace.key, materialized_workspace.key)
-        torch.testing.assert_close(segmented_workspace.value, materialized_workspace.value)
+        torch.testing.assert_close(
+            segmented_workspace.value, materialized_workspace.value
+        )
         self.assertEqual(
             segmented_workspace.cu_seqlens_q.tolist(),
             materialized_workspace.cu_seqlens_q.tolist(),
@@ -1854,6 +1880,7 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         stage._adaptive_total_blocks = 0
         stage._adaptive_reduced_blocks = 0
         stage._last_adaptive_step_decision = None
+        stage._last_timestep_profile_rows = []
         return stage
 
     def _metadata(self) -> WanS2VStreamR1CacheMetadata:
@@ -2355,6 +2382,106 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(decision.step_count, 4)
         self.assertEqual(decision.reason, "similar_audio_log_only")
         torch.testing.assert_close(decision.timesteps, timesteps)
+
+    def test_timestep_profile_config_resolves_from_pipeline_config(self):
+        stage = self._stage()
+        server_args = SimpleNamespace(
+            pipeline_config=WanS2VPipelineConfig(
+                wan_s2v_timestep_profile=True,
+                wan_s2v_timestep_profile_log=True,
+                wan_s2v_timestep_profile_nvtx=False,
+                wan_s2v_timestep_profile_sync=True,
+            )
+        )
+        batch = SimpleNamespace(extra={})
+
+        config = stage._resolve_timestep_profile_config(batch, server_args)
+
+        self.assertTrue(config.enabled)
+        self.assertTrue(config.log)
+        self.assertFalse(config.nvtx)
+        self.assertTrue(config.synchronize)
+
+    def test_timestep_ablation_config_selects_target_steps(self):
+        stage = self._stage()
+        server_args = SimpleNamespace(pipeline_config=WanS2VPipelineConfig())
+        batch = SimpleNamespace(
+            extra={
+                "timestep_ablation_mode": "zero_pred",
+                "timestep_ablation_indices": "1, 3",
+                "timestep_ablation_values": "625",
+                "timestep_ablation_blocks": [2],
+                "timestep_ablation_warmup_blocks": 1,
+            }
+        )
+
+        config = stage._resolve_timestep_ablation_config(batch, server_args)
+
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.mode, "zero_pred")
+        self.assertEqual(config.step_indices, (1, 3))
+        self.assertEqual(config.timestep_values, (625.0,))
+        self.assertEqual(config.block_indices, (2,))
+        self.assertEqual(
+            stage._select_timestep_ablation_action(
+                config,
+                block_index=0,
+                step_index=1,
+                timestep_value=937.5,
+            ),
+            "full",
+        )
+        self.assertEqual(
+            stage._select_timestep_ablation_action(
+                config,
+                block_index=2,
+                step_index=1,
+                timestep_value=937.5,
+            ),
+            "zero_pred",
+        )
+        self.assertEqual(
+            stage._select_timestep_ablation_action(
+                config,
+                block_index=2,
+                step_index=0,
+                timestep_value=625.0,
+            ),
+            "zero_pred",
+        )
+        self.assertEqual(
+            stage._select_timestep_ablation_action(
+                config,
+                block_index=3,
+                step_index=1,
+                timestep_value=937.5,
+            ),
+            "full",
+        )
+
+    def test_timestep_ablation_disabled_without_targets(self):
+        stage = self._stage()
+        config = WanS2VTimestepAblationConfig(
+            mode="skip_update",
+            step_indices=(),
+            timestep_values=(),
+            block_indices=(),
+            warmup_blocks=0,
+            value_tolerance=1e-3,
+            scale=1.0,
+            log=False,
+        )
+
+        self.assertFalse(config.enabled)
+        self.assertEqual(
+            stage._select_timestep_ablation_action(
+                config,
+                block_index=0,
+                step_index=0,
+                timestep_value=1000.0,
+            ),
+            "full",
+        )
 
     def test_audio_embedding_cache_precomputes_encoder_once_with_motion_prefix(self):
         stage = self._stage()

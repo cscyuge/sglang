@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/forward_context.py
 import time
+import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -49,16 +50,33 @@ class ForwardContext:
             self.attention_backend_cls = attention_backend_cls
 
 
+_forward_context_local = threading.local()
+
+# Compatibility fallback for code paths that still seed the context directly.
+# Runtime callers should use set_forward_context(), which is thread-local.
 _forward_context: Optional["ForwardContext"] = None
+
+
+def _get_thread_forward_context() -> Optional["ForwardContext"]:
+    return getattr(_forward_context_local, "value", None)
+
+
+def _set_thread_forward_context(context: Optional["ForwardContext"]) -> None:
+    if context is None:
+        if hasattr(_forward_context_local, "value"):
+            delattr(_forward_context_local, "value")
+        return
+    _forward_context_local.value = context
 
 
 def get_forward_context() -> "ForwardContext":
     """Get the current forward context."""
-    assert _forward_context is not None, (
+    context = _get_thread_forward_context() or _forward_context
+    assert context is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
     )
-    return _forward_context
+    return context
 
 
 # TODO(will): finalize the interface
@@ -74,12 +92,13 @@ def set_forward_context(
     need_to_track_batchsize = track_batchsize and attn_metadata is not None
     if need_to_track_batchsize:
         forward_start_time = time.perf_counter()
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = ForwardContext(
-        current_timestep=current_timestep,
-        attn_metadata=attn_metadata,
-        forward_batch=forward_batch,
+    prev_context = _get_thread_forward_context()
+    _set_thread_forward_context(
+        ForwardContext(
+            current_timestep=current_timestep,
+            attn_metadata=attn_metadata,
+            forward_batch=forward_batch,
+        )
     )
 
     try:
@@ -117,4 +136,4 @@ def set_forward_context(
                         ),
                         forward_stats,
                     )
-        _forward_context = prev_context
+        _set_thread_forward_context(prev_context)
