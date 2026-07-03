@@ -2402,6 +2402,36 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertFalse(config.nvtx)
         self.assertTrue(config.synchronize)
 
+    def test_timestep_ablation_defaults_to_step1_reuse(self):
+        stage = self._stage()
+        server_args = SimpleNamespace(pipeline_config=WanS2VPipelineConfig())
+        batch = SimpleNamespace(extra={})
+
+        config = stage._resolve_timestep_ablation_config(batch, server_args)
+
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.mode, "reuse_previous_pred")
+        self.assertEqual(config.step_indices, (1,))
+        self.assertEqual(config.warmup_blocks, 2)
+        self.assertEqual(
+            stage._select_timestep_ablation_action(
+                config,
+                block_index=1,
+                step_index=1,
+                timestep_value=937.5,
+            ),
+            "full",
+        )
+        self.assertEqual(
+            stage._select_timestep_ablation_action(
+                config,
+                block_index=2,
+                step_index=1,
+                timestep_value=937.5,
+            ),
+            "reuse_previous_pred",
+        )
+
     def test_timestep_ablation_config_selects_target_steps(self):
         stage = self._stage()
         server_args = SimpleNamespace(pipeline_config=WanS2VPipelineConfig())

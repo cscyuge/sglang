@@ -74,11 +74,13 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_timestep_profile_log: bool = False
     wan_s2v_timestep_profile_nvtx: bool = True
     wan_s2v_timestep_profile_sync: bool = False
-    wan_s2v_timestep_ablation_mode: str = "off"
-    wan_s2v_timestep_ablation_indices: list[int] | None = None
+    wan_s2v_timestep_ablation_mode: str = "reuse_previous_pred"
+    wan_s2v_timestep_ablation_indices: list[int] | None = field(
+        default_factory=lambda: [1]
+    )
     wan_s2v_timestep_ablation_values: list[float] | None = None
     wan_s2v_timestep_ablation_blocks: list[int] | None = None
-    wan_s2v_timestep_ablation_warmup_blocks: int = 0
+    wan_s2v_timestep_ablation_warmup_blocks: int = 2
     wan_s2v_timestep_ablation_value_tolerance: float = 1e-3
     wan_s2v_timestep_ablation_scale: float = 1.0
     wan_s2v_timestep_ablation_log: bool = False
