@@ -40,6 +40,12 @@ def test_tilelang_gemm_autotune_search_policy_counts():
     assert len(fast_prefill) == 12
     assert {config["kernel_type"] for config in fast_prefill} == {"base"}
 
+    sm120_large = generate_candidate_configs(
+        1070, 5120, 5120, search_policy="sm120"
+    )
+    assert len(sm120_large) == 28
+    assert {config["kernel_type"] for config in sm120_large} == {"base", "base_ws"}
+
 
 def test_tilelang_gemm_base_ws_candidates_are_large_m_only():
     assert (
@@ -64,8 +70,76 @@ def test_tilelang_gemm_base_ws_candidates_are_large_m_only():
     assert "M >= 256" in config_compatibility_error(invalid, 1, 5120, 5120)
 
 
+def test_tilelang_gemm_sm120_large_shape_candidates_include_warp_specialized_tile():
+    candidates = generate_candidate_configs(1070, 5120, 5120, search_policy="sm120")
+    assert {
+        "kernel_type": "base_ws",
+        "block_M": 128,
+        "block_N": 128,
+        "block_K": 128,
+        "num_stages": 2,
+        "threads": 256,
+        "split_k": 1,
+        "out_dtype": "bfloat16",
+        "accum_dtype": "float32",
+        "c_scale_local": True,
+        "a_scale_shm": False,
+        "b_scale_shm": False,
+        "swizzle_panel": 0,
+        "swizzle_order": "row",
+        "gemm_policy": "Square",
+        "M": 1070,
+        "N": 5120,
+        "K": 5120,
+    } in candidates
+
+    assert all(config["block_N"] == 128 for config in candidates)
+    assert all(config["c_scale_local"] for config in candidates)
+    assert all(not config["a_scale_shm"] for config in candidates)
+
+    top_swizzle_panels = {
+        config["swizzle_panel"]
+        for config in candidates
+        if config["kernel_type"] == "base_ws"
+        and config["block_M"] == 128
+        and config["block_N"] == 128
+        and config["num_stages"] == 2
+        and config["threads"] == 256
+        and config["gemm_policy"] == "Square"
+    }
+    assert top_swizzle_panels == {0, 4, 8, 16}
+
+    fullrow_swizzles = {
+        (config["swizzle_panel"], config["swizzle_order"])
+        for config in candidates
+        if config["kernel_type"] == "base_ws"
+        and config["block_M"] == 128
+        and config["block_N"] == 128
+        and config["num_stages"] == 2
+        and config["threads"] == 256
+        and config["gemm_policy"] == "FullRow"
+    }
+    assert fullrow_swizzles == {
+        (0, "row"),
+        (4, "row"),
+        (8, "row"),
+        (16, "row"),
+        (1, "column"),
+        (2, "column"),
+        (4, "column"),
+        (8, "column"),
+        (16, "column"),
+    }
+
+    invalid = {**candidates[0], "gemm_policy": "Diagonal"}
+    assert "gemm_policy must be one of" in config_compatibility_error(
+        invalid, 1070, 5120, 5120
+    )
+
+
 def test_tilelang_gemm_autotune_search_policy_validation():
     assert validate_search_policy("fast_sm90") == "fast_sm90"
+    assert validate_search_policy("sm120") == "sm120"
     with pytest.raises(ValueError, match="autotune search_policy"):
         validate_search_policy("unknown")
 

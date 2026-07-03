@@ -12,8 +12,9 @@ KERNEL_TYPES = ("base", "base_ws", "swapAB", "splitK", "splitK_swapAB")
 SPLIT_K_KERNEL_TYPES = {"splitK", "splitK_swapAB"}
 SWAP_AB_KERNEL_TYPES = {"swapAB", "splitK_swapAB"}
 WARP_SPECIALIZED_KERNEL_TYPES = {"base_ws"}
-AUTOTUNE_SEARCH_POLICIES = ("full", "family_pruned", "fast_sm90")
+AUTOTUNE_SEARCH_POLICIES = ("full", "family_pruned", "fast_sm90", "sm120")
 SCHEMA_VERSION = 1
+GEMM_WARP_POLICIES = ("Square", "FullRow", "FullCol")
 _BLOCK_M_VALUES = (64, 128)
 _BLOCK_N_VALUES = (16, 32, 64, 128)
 _WS_BLOCK_M_VALUES = (64, 128)
@@ -61,6 +62,7 @@ _BASE_CONFIG = {
     "b_scale_shm": False,
     "swizzle_panel": 0,
     "swizzle_order": "row",
+    "gemm_policy": "Square",
 }
 
 
@@ -75,6 +77,7 @@ def normalize_config(config: dict, M: int, N: int, K: int) -> dict:
         normalized[key] = bool(normalized[key])
     normalized["swizzle_panel"] = int(normalized["swizzle_panel"])
     normalized["swizzle_order"] = str(normalized["swizzle_order"])
+    normalized["gemm_policy"] = str(normalized["gemm_policy"])
 
     return normalized
 
@@ -220,6 +223,8 @@ def _select_kernel_types(
         return requested
     if search_policy == "full":
         return KERNEL_TYPES
+    if search_policy == "sm120" and _is_sm120_large_gemm_shape(M, N, K):
+        return ("base", "base_ws")
     return _pruned_kernel_types(M, N, K)
 
 
@@ -278,6 +283,13 @@ def config_compatibility_error(config: dict, M: int, N: int, K: int) -> Optional
             "swizzle_order must be one of ('row', 'column'); "
             f"got {config['swizzle_order']}"
         )
+    if config["gemm_policy"] not in GEMM_WARP_POLICIES:
+        return (
+            f"gemm_policy must be one of {GEMM_WARP_POLICIES}; "
+            f"got {config['gemm_policy']}"
+        )
+    if config["gemm_policy"] != "Square" and kernel_type not in ("base", "base_ws"):
+        return "non-Square gemm_policy is currently supported only by base kernels"
     if config["swizzle_panel"] > 0 and kernel_type not in ("base", "base_ws"):
         return "swizzle_panel is currently supported only by base kernels"
 
@@ -342,6 +354,10 @@ def _uses_stage1_large_k_candidate(M: int, N: int, K: int) -> bool:
     return K >= 16384 and N <= 5120 and M <= 1024
 
 
+def _is_sm120_large_gemm_shape(M: int, N: int, K: int) -> bool:
+    return M >= 256 and N >= 4096 and K >= 4096
+
+
 def _base_swizzle_options(
     M: int,
     N: int,
@@ -362,6 +378,72 @@ def _base_swizzle_options(
     ):
         options.append((_SWIZZLE_PANEL, "column"))
     return tuple(options)
+
+
+def _is_sm120_top_base_ws_candidate(
+    M: int,
+    N: int,
+    K: int,
+    kernel_type: str,
+    base: dict,
+    c_scale_local: bool,
+    scale_shm: bool,
+) -> bool:
+    return (
+        _is_sm120_large_gemm_shape(M, N, K)
+        and kernel_type == "base_ws"
+        and base["block_M"] == 128
+        and base["block_N"] == 128
+        and base["num_stages"] == 2
+        and base["threads"] == 256
+        and c_scale_local
+        and not scale_shm
+    )
+
+
+def _sm120_gemm_policy_options(
+    M: int,
+    N: int,
+    K: int,
+    kernel_type: str,
+    base: dict,
+    c_scale_local: bool,
+    scale_shm: bool,
+) -> Tuple[str, ...]:
+    if _is_sm120_top_base_ws_candidate(
+        M, N, K, kernel_type, base, c_scale_local, scale_shm
+    ):
+        return ("Square", "FullRow")
+    return ("Square",)
+
+
+def _sm120_swizzle_options(
+    M: int,
+    N: int,
+    K: int,
+    kernel_type: str,
+    base: dict,
+    c_scale_local: bool,
+    scale_shm: bool,
+    gemm_policy: str,
+) -> Tuple[Tuple[int, str], ...]:
+    if _is_sm120_top_base_ws_candidate(
+        M, N, K, kernel_type, base, c_scale_local, scale_shm
+    ):
+        if gemm_policy == "FullRow":
+            return (
+                (0, "row"),
+                (4, "row"),
+                (8, "row"),
+                (16, "row"),
+                (1, "column"),
+                (2, "column"),
+                (4, "column"),
+                (8, "column"),
+                (16, "column"),
+            )
+        return ((0, "row"), (4, "row"), (8, "row"), (16, "row"))
+    return ((0, "row"),)
 
 
 def _fast_sm90_candidate_filter(config: dict, M: int, N: int, K: int) -> bool:
@@ -432,6 +514,34 @@ def _fast_sm90_candidate_filter(config: dict, M: int, N: int, K: int) -> bool:
     return False
 
 
+def _sm120_candidate_filter(config: dict, M: int, N: int, K: int) -> bool:
+    """SM120 shortlist for large FP8 GEMMs.
+
+    Blackwell SM120 tuning for the Wan S2V hot shapes favors larger N tiles and
+    the warp-specialized TileLang path. Keep this policy separate from the older
+    SM90/H20-oriented fast_sm90 policy so the two search spaces can evolve
+    independently.
+    """
+
+    if not _is_sm120_large_gemm_shape(M, N, K):
+        return True
+
+    if config["block_K"] != 128:
+        return False
+    if not config["c_scale_local"] or config["a_scale_shm"]:
+        return False
+    if config["block_N"] != 128:
+        return False
+    if config["block_M"] not in (64, 128):
+        return False
+    if config["num_stages"] not in (2, 3):
+        return False
+    if config["threads"] not in (128, 256):
+        return False
+
+    return config["kernel_type"] in ("base", "base_ws")
+
+
 def generate_candidate_configs(
     M: int,
     N: int,
@@ -467,27 +577,57 @@ def generate_candidate_configs(
         for base in base_configs:
             for c_scale_local in (False, True):
                 for scale_shm in (False, True):
-                    swizzle_options = (
-                        _base_swizzle_options(M, N, K, base, c_scale_local, scale_shm)
-                        if kernel_type == "base"
-                        else ((0, "row"),)
-                    )
-                    for swizzle_panel, swizzle_order in swizzle_options:
-                        candidate = {
-                            **base,
-                            "kernel_type": kernel_type,
-                            "c_scale_local": c_scale_local,
-                            scale_key: scale_shm,
-                            "out_dtype": "bfloat16",
-                            "accum_dtype": "float32",
-                            "swizzle_panel": swizzle_panel,
-                            "swizzle_order": swizzle_order,
-                        }
-                        configs.append(normalize_config(candidate, M, N, K))
+                    if search_policy == "sm120":
+                        gemm_policy_options = _sm120_gemm_policy_options(
+                            M,
+                            N,
+                            K,
+                            kernel_type,
+                            base,
+                            c_scale_local,
+                            scale_shm,
+                        )
+                    else:
+                        gemm_policy_options = ("Square",)
+                    for gemm_policy in gemm_policy_options:
+                        if search_policy == "sm120":
+                            swizzle_options = _sm120_swizzle_options(
+                                M,
+                                N,
+                                K,
+                                kernel_type,
+                                base,
+                                c_scale_local,
+                                scale_shm,
+                                gemm_policy,
+                            )
+                        elif kernel_type == "base":
+                            swizzle_options = _base_swizzle_options(
+                                M, N, K, base, c_scale_local, scale_shm
+                            )
+                        else:
+                            swizzle_options = ((0, "row"),)
+                        for swizzle_panel, swizzle_order in swizzle_options:
+                            candidate = {
+                                **base,
+                                "kernel_type": kernel_type,
+                                "c_scale_local": c_scale_local,
+                                scale_key: scale_shm,
+                                "out_dtype": "bfloat16",
+                                "accum_dtype": "float32",
+                                "swizzle_panel": swizzle_panel,
+                                "swizzle_order": swizzle_order,
+                                "gemm_policy": gemm_policy,
+                            }
+                            configs.append(normalize_config(candidate, M, N, K))
 
     if search_policy == "fast_sm90":
         configs = [
             config for config in configs if _fast_sm90_candidate_filter(config, M, N, K)
+        ]
+    elif search_policy == "sm120":
+        configs = [
+            config for config in configs if _sm120_candidate_filter(config, M, N, K)
         ]
 
     return configs

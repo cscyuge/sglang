@@ -131,6 +131,7 @@ def _get_kernel(
     split_k: int,
     out_dtype: str,
     accum_dtype: str,
+    gemm_policy: str,
     c_scale_local: bool,
     a_scale_shm: bool,
     b_scale_shm: bool,
@@ -166,6 +167,7 @@ def _get_kernel(
             a_scale_shm=a_scale_shm,
             swizzle_panel=swizzle_panel,
             swizzle_order=swizzle_order,
+            gemm_policy=gemm_policy,
         )
     if kernel_type == "base_ws":
         return fp8_blockwise_gemm_base_ws_kernel(
@@ -173,6 +175,7 @@ def _get_kernel(
             a_scale_shm=a_scale_shm,
             swizzle_panel=swizzle_panel,
             swizzle_order=swizzle_order,
+            gemm_policy=gemm_policy,
         )
     if kernel_type == "swapAB":
         return fp8_blockwise_gemm_swap_ab_kernel(**common, b_scale_shm=b_scale_shm)
@@ -201,6 +204,7 @@ def _compile_from_config(config: dict):
         config["split_k"],
         config["out_dtype"],
         config["accum_dtype"],
+        config.get("gemm_policy", "Square"),
         config["c_scale_local"],
         config["a_scale_shm"],
         config["b_scale_shm"],

@@ -29,6 +29,14 @@ GROUP_SIZE = 128
 # different tensor signatures and launch orders.
 
 
+def _gemm_policy(name: str):
+    return {
+        "Square": T.GemmWarpPolicy.Square,
+        "FullRow": T.GemmWarpPolicy.FullRow,
+        "FullCol": T.GemmWarpPolicy.FullCol,
+    }[name]
+
+
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
 def fp8_blockwise_gemm_base_kernel(
     N: int,
@@ -44,9 +52,11 @@ def fp8_blockwise_gemm_base_kernel(
     a_scale_shm: bool = False,
     swizzle_panel: int = 0,
     swizzle_order: str = "row",
+    gemm_policy: str = "Square",
 ):
     M = T.symbolic("M")
     c_scale_alloc = T.alloc_fragment if c_scale_local else T.alloc_shared
+    policy = _gemm_policy(gemm_policy)
 
     @T.prim_func
     def kernel(
@@ -92,7 +102,13 @@ def fp8_blockwise_gemm_base_kernel(
                     for i in T.Parallel(block_M):
                         C_scale[i] = A_scale[pid_m * block_M + i, k_iter] * b_scale
 
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                T.gemm(
+                    A_shared,
+                    B_shared,
+                    C_local,
+                    transpose_B=True,
+                    policy=policy,
+                )
 
                 for i, j in T.Parallel(block_M, block_N):
                     C_local_accum[i, j] += C_local[i, j] * C_scale[i]
@@ -119,9 +135,11 @@ def fp8_blockwise_gemm_base_ws_kernel(
     a_scale_shm: bool = False,
     swizzle_panel: int = 0,
     swizzle_order: str = "row",
+    gemm_policy: str = "Square",
 ):
     M = T.symbolic("M")
     c_scale_alloc = T.alloc_fragment if c_scale_local else T.alloc_shared
+    policy = _gemm_policy(gemm_policy)
 
     @T.prim_func
     def kernel(
@@ -167,7 +185,13 @@ def fp8_blockwise_gemm_base_ws_kernel(
                     for i in T.Parallel(block_M):
                         C_scale[i] = A_scale[pid_m * block_M + i, k_iter] * b_scale
 
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                T.gemm(
+                    A_shared,
+                    B_shared,
+                    C_local,
+                    transpose_B=True,
+                    policy=policy,
+                )
 
                 for i, j in T.Parallel(block_M, block_N):
                     C_local_accum[i, j] += C_local[i, j] * C_scale[i]
