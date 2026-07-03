@@ -1260,62 +1260,11 @@ class WanS2VRealtimeSessionRunner:
                     "Wan S2V Wav2Vec CUDA graph startup prewarm failed: %s", exc
                 )
 
-        if not use_vae_cuda_graph:
-            return
-        try:
-            latent_stage = self._get_stage(LatentPreparationStage)
-            decoding_stage = self._get_stage(DecodingStage)
-            decoding_stage.load_model()
-            device = get_local_torch_device()
-            dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
-            sample_batch = self._copy_batch_for_block_prepare(batch)
-            sample_latents = self._prepare_block_latents(
-                sample_batch,
-                server_args,
-                latent_stage,
-                block_public_frames,
-            ).to(device=device, dtype=dit_dtype)
-            vae_graph_cache = self._vae_cuda_graph_cache()
-            if vae_graph_cache.get(sample_latents) is not None:
-                logger.info(
-                    "Wan S2V VAE decode CUDA graph reused during startup prewarm: "
-                    "input_shape=%s cached_graphs=%d",
-                    tuple(sample_latents.shape),
-                    vae_graph_cache.cached_graph_count,
-                )
-                return
-
-            stream_vae_state = _WanS2VStreamingVAEState(enabled=True)
-            self._decode_block_frames(
-                decoding_stage,
-                sample_latents,
-                server_args,
-                stream_vae_state,
-                vae_graph_cache=None,
-            )
-            self._decode_block_frames(
-                decoding_stage,
-                sample_latents,
-                server_args,
-                stream_vae_state,
-                vae_graph_cache=vae_graph_cache,
-            )
+        if use_vae_cuda_graph:
             logger.info(
-                "Wan S2V VAE decode CUDA graph startup prewarm done: "
-                "input_shape=%s cached_graphs=%d",
-                tuple(sample_latents.shape),
-                vae_graph_cache.cached_graph_count,
+                "Wan S2V VAE decode CUDA graph startup prewarm skipped: "
+                "streaming VAE graph state is session-local"
             )
-        except Exception as exc:
-            logger.warning(
-                "Wan S2V VAE decode CUDA graph startup prewarm failed: %s", exc
-            )
-        finally:
-            try:
-                torch.cuda.synchronize(get_local_torch_device())
-                self._get_stage(DecodingStage).vae.clear_cache()
-            except Exception:
-                pass
 
     def _prefetch_next_audio_chunk(
         self,
@@ -1748,7 +1697,9 @@ class WanS2VRealtimeSessionRunner:
         prompt_embeds = None
         reference_latents_ready = False
         stream_vae_state = _WanS2VStreamingVAEState(enabled=use_streaming_vae_cache)
-        vae_graph_cache = self._vae_cuda_graph_cache() if use_vae_cuda_graph else None
+        vae_graph_cache = (
+            _WanS2VStreamingVAECudaGraphCache() if use_vae_cuda_graph else None
+        )
 
         audio_chunk_idx = 0
         block_idx = 0
