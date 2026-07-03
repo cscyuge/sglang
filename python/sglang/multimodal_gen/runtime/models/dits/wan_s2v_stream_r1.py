@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Callable, TypedDict
+from typing import Any, Callable, NotRequired, TypedDict
 
 import torch
 import torch.nn.functional as F
@@ -24,11 +24,300 @@ from sglang.multimodal_gen.runtime.layers.usp import (
 _STREAM_R1_SINK_COMPRESSION_ALPHA = 0.999
 
 
+@dataclass
+class WanS2VStreamR1KVState:
+    """Host-owned Stream-R1 noisy KV cache state for one transformer layer."""
+
+    global_end_index: int = 0
+    local_end_index: int = 0
+
+    @classmethod
+    def from_cache_block(
+        cls, kv_cache: "WanS2VKVCacheBlock"
+    ) -> "WanS2VStreamR1KVState":
+        return cls(
+            global_end_index=_kv_cache_host_index(
+                kv_cache,
+                tensor_key="global_end_index",
+                host_key="global_end_index_host",
+            ),
+            local_end_index=_kv_cache_host_index(
+                kv_cache,
+                tensor_key="local_end_index",
+                host_key="local_end_index_host",
+            ),
+        )
+
+    def reset(self) -> None:
+        self.global_end_index = 0
+        self.local_end_index = 0
+
+    def apply_noisy_kv_cache_update_plan(
+        self, plan: "WanS2VStreamR1NoisyKVCacheUpdatePlan"
+    ) -> None:
+        if self.global_end_index != plan.input_global_end:
+            raise ValueError(
+                "KV state global_end_index does not match update plan: "
+                f"state={self.global_end_index}, plan={plan.input_global_end}"
+            )
+        if self.local_end_index != plan.input_local_end:
+            raise ValueError(
+                "KV state local_end_index does not match update plan: "
+                f"state={self.local_end_index}, plan={plan.input_local_end}"
+            )
+        self.global_end_index = plan.new_global_end
+        self.local_end_index = plan.new_local_end_index
+
+
 class WanS2VKVCacheBlock(TypedDict):
     k: torch.Tensor
     v: torch.Tensor
     global_end_index: torch.Tensor
     local_end_index: torch.Tensor
+    global_end_index_host: NotRequired[int]
+    local_end_index_host: NotRequired[int]
+    state: NotRequired[WanS2VStreamR1KVState]
+    update_plan_buffer: NotRequired["WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer"]
+
+
+def get_wan_s2v_stream_r1_kv_cache_state(
+    kv_cache: WanS2VKVCacheBlock,
+) -> WanS2VStreamR1KVState:
+    state = kv_cache.get("state")
+    if state is not None:
+        if not isinstance(state, WanS2VStreamR1KVState):
+            raise TypeError(
+                "Wan S2V Stream-R1 KV cache state must be "
+                "WanS2VStreamR1KVState"
+            )
+        return state
+    return WanS2VStreamR1KVState.from_cache_block(kv_cache)
+
+
+def sync_wan_s2v_stream_r1_kv_cache_host_shadow(
+    kv_cache: WanS2VKVCacheBlock,
+    state: WanS2VStreamR1KVState,
+) -> None:
+    kv_cache["global_end_index_host"] = int(state.global_end_index)
+    kv_cache["local_end_index_host"] = int(state.local_end_index)
+
+
+@dataclass(frozen=True)
+class WanS2VTimestepMetadataPlan:
+    """Dynamic scalar metadata for one Wan transformer timestep."""
+
+    step_index: int
+    current_start: int
+    cache_start: int | None
+    audio_start_frame: int | None
+    sequence_shard_enabled: bool
+    motion_frames: tuple[int, ...]
+    add_last_motion: int
+    drop_motion_frames: bool
+    stream_r1_mode: bool
+
+    @classmethod
+    def from_kwargs(
+        cls,
+        *,
+        kwargs: dict[str, Any],
+        step_index: int,
+        current_start: int,
+        audio_start_frame: int | None,
+        sequence_shard_enabled: bool,
+    ) -> "WanS2VTimestepMetadataPlan":
+        motion_frames = kwargs.get("motion_frames", ())
+        return cls(
+            step_index=int(step_index),
+            current_start=int(current_start),
+            cache_start=(
+                None if kwargs.get("cache_start") is None else int(kwargs["cache_start"])
+            ),
+            audio_start_frame=(
+                None if audio_start_frame is None else int(audio_start_frame)
+            ),
+            sequence_shard_enabled=bool(sequence_shard_enabled),
+            motion_frames=tuple(int(item) for item in motion_frames),
+            add_last_motion=int(kwargs.get("add_last_motion", 0)),
+            drop_motion_frames=bool(kwargs.get("drop_motion_frames", False)),
+            stream_r1_mode=bool(kwargs.get("stream_r1_mode", False)),
+        )
+
+    @property
+    def dynamic_key_signature(self) -> tuple[Any, ...]:
+        return (
+            int(self.current_start),
+            -1 if self.cache_start is None else int(self.cache_start),
+            -1 if self.audio_start_frame is None else int(self.audio_start_frame),
+            bool(self.sequence_shard_enabled),
+            tuple(self.motion_frames),
+            int(self.add_last_motion),
+            bool(self.drop_motion_frames),
+            bool(self.stream_r1_mode),
+        )
+
+    @property
+    def structure_key_signature(self) -> tuple[Any, ...]:
+        return (
+            bool(self.sequence_shard_enabled),
+            tuple(self.motion_frames),
+            int(self.add_last_motion),
+            bool(self.drop_motion_frames),
+            bool(self.stream_r1_mode),
+        )
+
+
+class WanS2VTimestepStaticMetadataBuffers:
+    """Stable-address scalar metadata buffers for one Wan timestep graph entry."""
+
+    SCALAR_KEYS = (
+        "step_index",
+        "current_start",
+        "cache_start",
+        "audio_start_frame",
+        "sequence_shard_enabled",
+        "add_last_motion",
+        "drop_motion_frames",
+        "stream_r1_mode",
+    )
+    SCALAR_INDEX = {key: index for index, key in enumerate(SCALAR_KEYS)}
+    NONE_SENTINEL = -1
+
+    def __init__(
+        self,
+        *,
+        scalar_values: torch.Tensor,
+        motion_frames: torch.Tensor,
+        host_plan: WanS2VTimestepMetadataPlan | None = None,
+    ) -> None:
+        self.scalar_values = scalar_values
+        self.motion_frames = motion_frames
+        self._host_plan = host_plan
+
+    @staticmethod
+    def device_from_kwargs(kwargs: dict[str, Any]) -> torch.device:
+        hidden_states = kwargs.get("hidden_states")
+        if isinstance(hidden_states, torch.Tensor):
+            return hidden_states.device
+        for value in kwargs.values():
+            if isinstance(value, torch.Tensor):
+                return value.device
+        return torch.device("cpu")
+
+    @classmethod
+    def _scalar_values_from_plan(
+        cls, plan: WanS2VTimestepMetadataPlan
+    ) -> tuple[int, ...]:
+        return (
+            int(plan.step_index),
+            int(plan.current_start),
+            cls.NONE_SENTINEL if plan.cache_start is None else int(plan.cache_start),
+            cls.NONE_SENTINEL
+            if plan.audio_start_frame is None
+            else int(plan.audio_start_frame),
+            int(plan.sequence_shard_enabled),
+            int(plan.add_last_motion),
+            int(plan.drop_motion_frames),
+            int(plan.stream_r1_mode),
+        )
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: WanS2VTimestepMetadataPlan,
+        *,
+        device: torch.device,
+    ) -> "WanS2VTimestepStaticMetadataBuffers":
+        with torch.inference_mode(False):
+            buffers = cls(
+                scalar_values=torch.empty(
+                    (len(cls.SCALAR_KEYS),),
+                    dtype=torch.long,
+                    device=device,
+                ),
+                motion_frames=torch.empty(
+                    (len(plan.motion_frames),),
+                    dtype=torch.long,
+                    device=device,
+                ),
+            )
+        buffers.copy_from_plan_(plan)
+        return buffers
+
+    @classmethod
+    def signature_from_plan(
+        cls,
+        plan: WanS2VTimestepMetadataPlan,
+        *,
+        device: torch.device,
+    ) -> tuple[Any, ...]:
+        return (
+            (len(cls.SCALAR_KEYS), str(torch.long), str(device)),
+            (len(plan.motion_frames), str(torch.long), str(device)),
+        )
+
+    def copy_from_plan_(self, plan: WanS2VTimestepMetadataPlan) -> None:
+        if self.motion_frames.numel() != len(plan.motion_frames):
+            raise ValueError("Wan timestep metadata motion_frames length mismatch")
+        self.scalar_values.copy_(
+            self.scalar_values.new_tensor(self._scalar_values_from_plan(plan))
+        )
+        self.motion_frames.copy_(self.motion_frames.new_tensor(plan.motion_frames))
+        self._host_plan = plan
+
+    def scalar_snapshot(self) -> dict[str, int]:
+        values = self.scalar_values.detach().cpu().tolist()
+        return dict(zip(self.SCALAR_KEYS, values))
+
+    def scalar_tensor(self, key: str) -> torch.Tensor:
+        try:
+            index = self.SCALAR_INDEX[key]
+        except KeyError as exc:
+            raise KeyError(f"unknown Wan timestep metadata scalar {key!r}") from exc
+        return self.scalar_values[index]
+
+    def to_forward_kwargs(self) -> dict[str, Any]:
+        """Materialize Python kwargs for the legacy Wan forward path.
+
+        This adapter is intentionally not the final graph body: while the
+        current transformer still needs Python scalars for slicing/control flow,
+        CUDA buffers cannot be materialized during graph capture.
+        """
+
+        plan = self._host_plan
+        if plan is not None:
+            return {
+                "current_start": int(plan.current_start),
+                "cache_start": plan.cache_start,
+                "audio_start_frame": plan.audio_start_frame,
+                "motion_frames": tuple(int(item) for item in plan.motion_frames),
+                "add_last_motion": int(plan.add_last_motion),
+                "drop_motion_frames": bool(plan.drop_motion_frames),
+                "stream_r1_mode": bool(plan.stream_r1_mode),
+            }
+
+        if self.scalar_values.device.type == "cuda" and _cuda_graph_capture_active():
+            raise RuntimeError(
+                "Wan timestep metadata buffers cannot be materialized as Python "
+                "scalars during CUDA graph capture"
+            )
+        scalars = self.scalar_snapshot()
+        motion_frames = tuple(int(item) for item in self.motion_frames.cpu().tolist())
+        cache_start = int(scalars["cache_start"])
+        audio_start_frame = int(scalars["audio_start_frame"])
+        return {
+            "current_start": int(scalars["current_start"]),
+            "cache_start": None
+            if cache_start == self.NONE_SENTINEL
+            else cache_start,
+            "audio_start_frame": None
+            if audio_start_frame == self.NONE_SENTINEL
+            else audio_start_frame,
+            "motion_frames": motion_frames,
+            "add_last_motion": int(scalars["add_last_motion"]),
+            "drop_motion_frames": bool(scalars["drop_motion_frames"]),
+            "stream_r1_mode": bool(scalars["stream_r1_mode"]),
+        }
 
 
 def _stream_r1_profile_enabled() -> bool:
@@ -54,6 +343,48 @@ def _stream_r1_reuse_packed_buffers_enabled() -> bool:
 def _stream_r1_fused_segmented_pack_enabled() -> bool:
     value = os.getenv("SGLANG_STREAM_R1_FUSED_SEGMENTED_PACK", "1")
     return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _cuda_graph_capture_active() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _kv_cache_host_index(
+    kv_cache: WanS2VKVCacheBlock,
+    *,
+    tensor_key: str,
+    host_key: str,
+) -> int:
+    if host_key in kv_cache:
+        return int(kv_cache[host_key])
+    if _cuda_graph_capture_active():
+        raise RuntimeError(
+            f"KV cache host shadow {host_key!r} is required during CUDA graph capture"
+        )
+    return int(kv_cache[tensor_key].item())
+
+
+def _graph_safe_int_tensor(
+    values: list[int],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if torch.device(device).type == "cuda" and _cuda_graph_capture_active():
+        if not values:
+            return torch.empty((0,), dtype=dtype, device=device)
+        return torch.stack(
+            [
+                torch.full((), int(value), dtype=dtype, device=device)
+                for value in values
+            ]
+        )
+    return torch.tensor(values, dtype=dtype, device=device)
 
 
 @contextmanager
@@ -113,18 +444,21 @@ class _StreamR1ProfileSpan:
         self._start_event: torch.cuda.Event | None = None
         self._end_event: torch.cuda.Event | None = None
         self._start_time: float | None = None
+        self._use_cuda_events = False
 
     def __enter__(self):
-        if self.profile.use_cuda_events:
+        self._start_time = time.perf_counter()
+        self._use_cuda_events = bool(
+            self.profile.use_cuda_events and not _cuda_graph_capture_active()
+        )
+        if self._use_cuda_events:
             self._start_event = torch.cuda.Event(enable_timing=True)
             self._end_event = torch.cuda.Event(enable_timing=True)
             self._start_event.record()
-        else:
-            self._start_time = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self.profile.use_cuda_events:
+        if self._use_cuda_events and not _cuda_graph_capture_active():
             assert self._start_event is not None
             assert self._end_event is not None
             self._end_event.record()
@@ -616,22 +950,22 @@ def _build_packed_kv_copy_plan(
 ) -> WanS2VStreamR1PackedKVCopyPlan | None:
     if not copy_ranges:
         return None
-    batch_indices = torch.tensor(
+    batch_indices = _graph_safe_int_tensor(
         [copy_range.batch_index for copy_range in copy_ranges],
         dtype=torch.int64,
         device=device,
     )
-    packed_starts = torch.tensor(
+    packed_starts = _graph_safe_int_tensor(
         [copy_range.packed_start for copy_range in copy_ranges],
         dtype=torch.int64,
         device=device,
     )
-    source_starts = torch.tensor(
+    source_starts = _graph_safe_int_tensor(
         [copy_range.source_start for copy_range in copy_ranges],
         dtype=torch.int64,
         device=device,
     )
-    lengths = torch.tensor(
+    lengths = _graph_safe_int_tensor(
         [copy_range.length for copy_range in copy_ranges],
         dtype=torch.int64,
         device=device,
@@ -803,8 +1137,12 @@ def _build_wan_s2v_stream_r1_packed_attention_metadata(
     )
     return WanS2VStreamR1PackedAttentionMetadata(
         query_groups=tuple(query_groups),
-        cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=query.device),
-        cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=query.device),
+        cu_seqlens_q=_graph_safe_int_tensor(
+            cu_q, dtype=torch.int32, device=query.device
+        ),
+        cu_seqlens_k=_graph_safe_int_tensor(
+            cu_k, dtype=torch.int32, device=query.device
+        ),
         max_seqlen_q=max_q,
         max_seqlen_k=max_k,
         total_query_tokens=cu_q[-1],
@@ -1759,6 +2097,488 @@ class WanS2VStreamR1NoisyKVCacheUpdate:
 
 
 @dataclass(frozen=True)
+class WanS2VStreamR1NoisyKVCacheUpdatePlan:
+    """Host-side plan for mutating one layer's noisy-token KV cache.
+
+    This is the first step toward making Stream-R1 KV cache updates graph
+    replay friendly: Python computes ranges once, then eager and future graph
+    paths apply the same explicit plan instead of re-deriving state inside the
+    transformer forward.
+    """
+
+    update: WanS2VStreamR1NoisyKVCacheUpdate
+    input_global_end: int
+    input_local_end: int
+    effective_global_end: int
+    previous_local_end: int
+    cache_capacity: int
+    append_tokens: int
+    evict: bool
+    num_evicted_tokens: int
+    num_rolled_tokens: int
+    evicted_start: int
+    evicted_end: int
+    roll_src_start: int
+    roll_src_end: int
+    roll_dst_start: int
+    roll_dst_end: int
+    cache_local_end: int
+    local_write_start: int
+    local_write_end: int
+    kv_start: int
+    view_kind: str
+    view_local_end_index: int
+    local_suffix_len: int
+    local_start: int
+    sink_copy_len: int
+    sink_compress: bool
+
+    @property
+    def new_global_end(self) -> int:
+        return self.update.current_end
+
+    @property
+    def new_local_end_index(self) -> int:
+        return self.view_local_end_index
+
+
+class WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer:
+    """Stable-address scalar metadata for one layer's noisy KV update plan."""
+
+    VIEW_KIND_TO_INDEX = {
+        "prefix": 0,
+        "sink_only": 1,
+        "sink_suffix_cat": 2,
+        "suffix": 3,
+    }
+    SCALAR_KEYS = (
+        "input_global_end",
+        "input_local_end",
+        "effective_global_end",
+        "previous_local_end",
+        "cache_capacity",
+        "append_tokens",
+        "evict",
+        "num_evicted_tokens",
+        "num_rolled_tokens",
+        "evicted_start",
+        "evicted_end",
+        "roll_src_start",
+        "roll_src_end",
+        "roll_dst_start",
+        "roll_dst_end",
+        "cache_local_end",
+        "local_write_start",
+        "local_write_end",
+        "kv_start",
+        "view_kind",
+        "view_local_end_index",
+        "local_suffix_len",
+        "local_start",
+        "sink_copy_len",
+        "sink_compress",
+        "new_global_end",
+        "new_local_end_index",
+    )
+    SCALAR_INDEX = {key: index for index, key in enumerate(SCALAR_KEYS)}
+
+    def __init__(
+        self,
+        *,
+        scalar_values: torch.Tensor,
+        rolling_cache_indices: torch.Tensor | None = None,
+        rolling_cache_mask: torch.Tensor | None = None,
+        rolling_key_indices: torch.Tensor | None = None,
+        rolling_key_mask: torch.Tensor | None = None,
+        rolling_target_mask: torch.Tensor | None = None,
+        sink_evict_indices: torch.Tensor | None = None,
+        sink_copy_mask: torch.Tensor | None = None,
+        host_plan: WanS2VStreamR1NoisyKVCacheUpdatePlan | None = None,
+    ) -> None:
+        self.scalar_values = scalar_values
+        device = scalar_values.device
+        self.rolling_cache_indices = (
+            rolling_cache_indices
+            if rolling_cache_indices is not None
+            else torch.empty((0,), dtype=torch.long, device=device)
+        )
+        self.rolling_cache_mask = (
+            rolling_cache_mask
+            if rolling_cache_mask is not None
+            else torch.empty((0,), dtype=torch.bool, device=device)
+        )
+        self.rolling_key_indices = (
+            rolling_key_indices
+            if rolling_key_indices is not None
+            else torch.empty((0,), dtype=torch.long, device=device)
+        )
+        self.rolling_key_mask = (
+            rolling_key_mask
+            if rolling_key_mask is not None
+            else torch.empty((0,), dtype=torch.bool, device=device)
+        )
+        self.rolling_target_mask = (
+            rolling_target_mask
+            if rolling_target_mask is not None
+            else torch.empty((0,), dtype=torch.bool, device=device)
+        )
+        self.sink_evict_indices = (
+            sink_evict_indices
+            if sink_evict_indices is not None
+            else torch.empty((0,), dtype=torch.long, device=device)
+        )
+        self.sink_copy_mask = (
+            sink_copy_mask
+            if sink_copy_mask is not None
+            else torch.empty((0,), dtype=torch.bool, device=device)
+        )
+        self._host_plan = host_plan
+
+    @property
+    def host_plan(self) -> WanS2VStreamR1NoisyKVCacheUpdatePlan | None:
+        return self._host_plan
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        device: torch.device,
+        cache_capacity: int = 0,
+        sink_tokens: int = 0,
+    ) -> "WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer":
+        cache_capacity = int(cache_capacity)
+        sink_tokens = int(sink_tokens)
+        if cache_capacity < 0:
+            raise ValueError("cache_capacity must be non-negative")
+        if sink_tokens < 0:
+            raise ValueError("sink_tokens must be non-negative")
+        rolling_tokens = max(0, cache_capacity - sink_tokens)
+        return cls(
+            scalar_values=torch.zeros(
+                (len(cls.SCALAR_KEYS),),
+                dtype=torch.long,
+                device=device,
+            ),
+            rolling_cache_indices=torch.zeros(
+                (rolling_tokens,),
+                dtype=torch.long,
+                device=device,
+            ),
+            rolling_cache_mask=torch.zeros(
+                (rolling_tokens,),
+                dtype=torch.bool,
+                device=device,
+            ),
+            rolling_key_indices=torch.zeros(
+                (rolling_tokens,),
+                dtype=torch.long,
+                device=device,
+            ),
+            rolling_key_mask=torch.zeros(
+                (rolling_tokens,),
+                dtype=torch.bool,
+                device=device,
+            ),
+            rolling_target_mask=torch.zeros(
+                (rolling_tokens,),
+                dtype=torch.bool,
+                device=device,
+            ),
+            sink_evict_indices=torch.zeros(
+                (sink_tokens,),
+                dtype=torch.long,
+                device=device,
+            ),
+            sink_copy_mask=torch.zeros(
+                (sink_tokens,),
+                dtype=torch.bool,
+                device=device,
+            ),
+        )
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: WanS2VStreamR1NoisyKVCacheUpdatePlan,
+        *,
+        device: torch.device,
+    ) -> "WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer":
+        buffer = cls.allocate(
+            device=device,
+            cache_capacity=plan.cache_capacity,
+            sink_tokens=plan.update.sink_tokens,
+        )
+        buffer.copy_from_plan_(plan)
+        return buffer
+
+    @classmethod
+    def _scalar_values_from_plan(
+        cls, plan: WanS2VStreamR1NoisyKVCacheUpdatePlan
+    ) -> tuple[int, ...]:
+        try:
+            view_kind = cls.VIEW_KIND_TO_INDEX[plan.view_kind]
+        except KeyError as exc:
+            raise ValueError(f"unknown noisy KV cache view kind {plan.view_kind!r}") from exc
+        return (
+            int(plan.input_global_end),
+            int(plan.input_local_end),
+            int(plan.effective_global_end),
+            int(plan.previous_local_end),
+            int(plan.cache_capacity),
+            int(plan.append_tokens),
+            int(plan.evict),
+            int(plan.num_evicted_tokens),
+            int(plan.num_rolled_tokens),
+            int(plan.evicted_start),
+            int(plan.evicted_end),
+            int(plan.roll_src_start),
+            int(plan.roll_src_end),
+            int(plan.roll_dst_start),
+            int(plan.roll_dst_end),
+            int(plan.cache_local_end),
+            int(plan.local_write_start),
+            int(plan.local_write_end),
+            int(plan.kv_start),
+            int(view_kind),
+            int(plan.view_local_end_index),
+            int(plan.local_suffix_len),
+            int(plan.local_start),
+            int(plan.sink_copy_len),
+            int(plan.sink_compress),
+            int(plan.new_global_end),
+            int(plan.new_local_end_index),
+        )
+
+    def copy_from_plan_(self, plan: WanS2VStreamR1NoisyKVCacheUpdatePlan) -> None:
+        self.scalar_values.copy_(
+            self.scalar_values.new_tensor(self._scalar_values_from_plan(plan))
+        )
+        self._copy_index_metadata_from_plan_(plan)
+        self._host_plan = plan
+
+    def clear(self) -> None:
+        self.scalar_values.zero_()
+        self.rolling_cache_indices.zero_()
+        self.rolling_cache_mask.zero_()
+        self.rolling_key_indices.zero_()
+        self.rolling_key_mask.zero_()
+        self.rolling_target_mask.zero_()
+        self.sink_evict_indices.zero_()
+        self.sink_copy_mask.zero_()
+        self._host_plan = None
+
+    def _copy_index_metadata_from_plan_(
+        self, plan: WanS2VStreamR1NoisyKVCacheUpdatePlan
+    ) -> None:
+        rolling_tokens = max(0, plan.cache_capacity - plan.update.sink_tokens)
+        sink_tokens = plan.update.sink_tokens
+        if self.rolling_cache_indices.numel() != rolling_tokens:
+            if self.rolling_cache_indices.numel() != 0:
+                raise ValueError("rolling KV plan buffer length mismatch")
+            return
+        if self.sink_evict_indices.numel() != sink_tokens:
+            if self.sink_evict_indices.numel() != 0:
+                raise ValueError("sink KV plan buffer length mismatch")
+            return
+
+        device = self.scalar_values.device
+        rolling_cache_indices = torch.zeros(
+            (rolling_tokens,), dtype=torch.long, device=device
+        )
+        rolling_cache_mask = torch.zeros(
+            (rolling_tokens,), dtype=torch.bool, device=device
+        )
+        rolling_key_indices = torch.zeros(
+            (rolling_tokens,), dtype=torch.long, device=device
+        )
+        rolling_key_mask = torch.zeros(
+            (rolling_tokens,), dtype=torch.bool, device=device
+        )
+
+        if rolling_tokens > 0:
+            if plan.evict:
+                keep_src_start = plan.roll_src_start
+                keep_len = plan.num_rolled_tokens
+            else:
+                keep_src_start = plan.update.sink_tokens
+                keep_len = max(0, plan.local_write_start - plan.update.sink_tokens)
+            keep_len = max(0, min(int(keep_len), rolling_tokens))
+            if keep_len > 0:
+                rolling_cache_indices[:keep_len] = torch.arange(
+                    keep_src_start,
+                    keep_src_start + keep_len,
+                    dtype=torch.long,
+                    device=device,
+                )
+                rolling_cache_mask[:keep_len] = True
+
+            key_start = plan.local_write_start - plan.update.sink_tokens
+            key_len = min(
+                plan.update.noisy_seq_len,
+                max(0, rolling_tokens - max(0, key_start)),
+            )
+            if key_start >= 0 and key_len > 0:
+                rolling_key_indices[key_start : key_start + key_len] = torch.arange(
+                    key_len,
+                    dtype=torch.long,
+                    device=device,
+                )
+                rolling_key_mask[key_start : key_start + key_len] = True
+
+        self.rolling_cache_indices.copy_(rolling_cache_indices)
+        self.rolling_cache_mask.copy_(rolling_cache_mask)
+        self.rolling_key_indices.copy_(rolling_key_indices)
+        self.rolling_key_mask.copy_(rolling_key_mask)
+        self.rolling_target_mask.copy_(rolling_cache_mask | rolling_key_mask)
+
+        if sink_tokens > 0:
+            sink_indices = torch.arange(
+                plan.evicted_start,
+                plan.evicted_start + sink_tokens,
+                dtype=torch.long,
+                device=device,
+            ).clamp_(0, max(plan.cache_capacity - 1, 0))
+            sink_copy_len = max(0, min(plan.sink_copy_len, sink_tokens))
+            sink_copy_mask = torch.zeros(
+                (sink_tokens,), dtype=torch.bool, device=device
+            )
+            if sink_copy_len > 0:
+                sink_copy_mask[:sink_copy_len] = True
+            self.sink_evict_indices.copy_(sink_indices)
+            self.sink_copy_mask.copy_(sink_copy_mask)
+
+    def scalar_tensor(self, key: str) -> torch.Tensor:
+        try:
+            index = self.SCALAR_INDEX[key]
+        except KeyError as exc:
+            raise KeyError(f"unknown noisy KV update plan scalar {key!r}") from exc
+        return self.scalar_values[index]
+
+    def scalar_snapshot(self) -> dict[str, int]:
+        values = self.scalar_values.detach().cpu().tolist()
+        return dict(zip(self.SCALAR_KEYS, values))
+
+
+def _noisy_kv_update_plan_matches_state(
+    plan: WanS2VStreamR1NoisyKVCacheUpdatePlan,
+    update: WanS2VStreamR1NoisyKVCacheUpdate,
+    state: WanS2VStreamR1KVState,
+) -> bool:
+    return (
+        plan.update == update
+        and plan.input_global_end == state.global_end_index
+        and plan.input_local_end == state.local_end_index
+    )
+
+
+def build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
+    kv_cache: WanS2VKVCacheBlock,
+    update: WanS2VStreamR1NoisyKVCacheUpdate,
+    *,
+    state: WanS2VStreamR1KVState | None = None,
+) -> WanS2VStreamR1NoisyKVCacheUpdatePlan:
+    cache_k = kv_cache["k"]
+    if state is None:
+        state = get_wan_s2v_stream_r1_kv_cache_state(kv_cache)
+    global_end = int(state.global_end_index)
+    local_end = int(state.local_end_index)
+    input_global_end = global_end
+    input_local_end = local_end
+
+    if global_end == 0 and local_end == 0 and update.cache_start > 0:
+        global_end = update.cache_start
+    if global_end < update.cache_start:
+        raise ValueError("KV cache global_end_index is before cache_start")
+    if local_end < 0 or local_end > cache_k.shape[1]:
+        raise ValueError("KV cache local_end_index is outside cache capacity")
+    if local_end > update.required_cache_tokens:
+        raise ValueError("KV cache local_end_index exceeds the Stream-R1 local window")
+    if update.current_start > global_end:
+        raise ValueError("KV cache update cannot skip noisy-token ranges")
+    if update.current_end < global_end:
+        raise ValueError("KV cache update cannot move global_end_index backwards")
+
+    append_tokens = update.current_end - global_end
+    evict = append_tokens > 0 and update.noisy_seq_len + local_end > cache_k.shape[1]
+    num_evicted_tokens = (
+        update.noisy_seq_len + local_end - cache_k.shape[1] if evict else 0
+    )
+    num_rolled_tokens = (
+        max(0, local_end - num_evicted_tokens - update.sink_tokens) if evict else 0
+    )
+    evicted_start = update.sink_tokens
+    evicted_end = update.sink_tokens + num_evicted_tokens
+    roll_src_start = update.sink_tokens + num_evicted_tokens
+    roll_src_end = roll_src_start + num_rolled_tokens
+    roll_dst_start = update.sink_tokens
+    roll_dst_end = update.sink_tokens + num_rolled_tokens
+
+    if evict:
+        cache_local_end = local_end + append_tokens - num_evicted_tokens
+    else:
+        cache_local_end = local_end + append_tokens
+
+    local_write_start = cache_local_end - update.noisy_seq_len
+    local_write_end = cache_local_end
+    kv_start = max(
+        update.sink_tokens,
+        cache_local_end - update.local_tokens + update.sink_tokens,
+    )
+
+    if update.sink_tokens > 0:
+        if kv_start == update.sink_tokens:
+            view_kind = "prefix"
+            view_local_end_index = cache_local_end
+        elif kv_start >= cache_local_end:
+            view_kind = "sink_only"
+            view_local_end_index = update.sink_tokens
+        else:
+            view_kind = "sink_suffix_cat"
+            view_local_end_index = update.sink_tokens + cache_local_end - kv_start
+    else:
+        view_kind = "suffix"
+        view_local_end_index = cache_local_end - kv_start
+
+    local_suffix_len = max(0, cache_local_end - kv_start)
+    local_start = update.current_end - local_suffix_len
+    sink_copy_len = min(num_evicted_tokens, update.sink_tokens) if evict else 0
+    sink_compress = (
+        evict
+        and update.sink_tokens > 0
+        and num_evicted_tokens == update.sink_tokens
+    )
+
+    return WanS2VStreamR1NoisyKVCacheUpdatePlan(
+        update=update,
+        input_global_end=input_global_end,
+        input_local_end=input_local_end,
+        effective_global_end=global_end,
+        previous_local_end=local_end,
+        cache_capacity=cache_k.shape[1],
+        append_tokens=append_tokens,
+        evict=evict,
+        num_evicted_tokens=num_evicted_tokens,
+        num_rolled_tokens=num_rolled_tokens,
+        evicted_start=evicted_start,
+        evicted_end=evicted_end,
+        roll_src_start=roll_src_start,
+        roll_src_end=roll_src_end,
+        roll_dst_start=roll_dst_start,
+        roll_dst_end=roll_dst_end,
+        cache_local_end=cache_local_end,
+        local_write_start=local_write_start,
+        local_write_end=local_write_end,
+        kv_start=kv_start,
+        view_kind=view_kind,
+        view_local_end_index=view_local_end_index,
+        local_suffix_len=local_suffix_len,
+        local_start=local_start,
+        sink_copy_len=sink_copy_len,
+        sink_compress=sink_compress,
+    )
+
+
+@dataclass(frozen=True)
 class WanS2VStreamR1NoisyKVCacheView:
     key: torch.Tensor
     value: torch.Tensor
@@ -1838,6 +2658,9 @@ def update_wan_s2v_stream_r1_noisy_kv_cache(
     key: torch.Tensor,
     value: torch.Tensor,
     update: WanS2VStreamR1NoisyKVCacheUpdate,
+    plan: WanS2VStreamR1NoisyKVCacheUpdatePlan | None = None,
+    *,
+    commit_host_state: bool = True,
 ) -> WanS2VStreamR1NoisyKVCacheView:
     """Mutate one layer's noisy-token KV cache using Stream-R1 S2V windows."""
 
@@ -1845,55 +2668,32 @@ def update_wan_s2v_stream_r1_noisy_kv_cache(
 
     cache_k = kv_cache["k"]
     cache_v = kv_cache["v"]
-    global_end = int(kv_cache["global_end_index"].item())
-    local_end = int(kv_cache["local_end_index"].item())
-    if global_end == 0 and local_end == 0 and update.cache_start > 0:
-        global_end = update.cache_start
-    if global_end < update.cache_start:
-        raise ValueError("KV cache global_end_index is before cache_start")
-    if local_end < 0 or local_end > cache_k.shape[1]:
-        raise ValueError("KV cache local_end_index is outside cache capacity")
-    if local_end > update.required_cache_tokens:
-        raise ValueError("KV cache local_end_index exceeds the Stream-R1 local window")
-    if update.current_start > global_end:
-        raise ValueError("KV cache update cannot skip noisy-token ranges")
-    if update.current_end < global_end:
-        raise ValueError("KV cache update cannot move global_end_index backwards")
+    host_state = (
+        get_wan_s2v_stream_r1_kv_cache_state(kv_cache) if commit_host_state else None
+    )
+    if plan is None:
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
+            kv_cache,
+            update,
+            state=host_state,
+        )
+    elif plan.update != update:
+        raise ValueError("KV cache update plan does not match update")
 
-    if (
-        update.current_end > global_end
-        and update.noisy_seq_len + local_end > cache_k.shape[1]
-    ):
-        num_evicted_tokens = update.noisy_seq_len + local_end - cache_k.shape[1]
-        num_rolled_tokens = max(0, local_end - num_evicted_tokens - update.sink_tokens)
-        evicted_start = update.sink_tokens
-        evicted_end = update.sink_tokens + num_evicted_tokens
-        evicted_k = cache_k[:, evicted_start:evicted_end].clone()
-        evicted_v = cache_v[:, evicted_start:evicted_end].clone()
+    if plan.evict:
+        evicted_k = cache_k[:, plan.evicted_start : plan.evicted_end].clone()
+        evicted_v = cache_v[:, plan.evicted_start : plan.evicted_end].clone()
 
-        if num_rolled_tokens > 0:
-            cache_k[:, update.sink_tokens : update.sink_tokens + num_rolled_tokens] = (
-                cache_k[
-                    :,
-                    update.sink_tokens
-                    + num_evicted_tokens : update.sink_tokens
-                    + num_evicted_tokens
-                    + num_rolled_tokens,
-                ].clone()
-            )
-            cache_v[:, update.sink_tokens : update.sink_tokens + num_rolled_tokens] = (
-                cache_v[
-                    :,
-                    update.sink_tokens
-                    + num_evicted_tokens : update.sink_tokens
-                    + num_evicted_tokens
-                    + num_rolled_tokens,
-                ].clone()
-            )
+        if plan.num_rolled_tokens > 0:
+            cache_k[:, plan.roll_dst_start : plan.roll_dst_end] = cache_k[
+                :, plan.roll_src_start : plan.roll_src_end
+            ].clone()
+            cache_v[:, plan.roll_dst_start : plan.roll_dst_end] = cache_v[
+                :, plan.roll_src_start : plan.roll_src_end
+            ].clone()
 
-        local_end = local_end + update.current_end - global_end - num_evicted_tokens
         if update.sink_tokens > 0 and evicted_k.numel() > 0:
-            if evicted_k.shape[1] == update.sink_tokens:
+            if plan.sink_compress:
                 cache_k[:, : update.sink_tokens] = (
                     _STREAM_R1_SINK_COMPRESSION_ALPHA * cache_k[:, : update.sink_tokens]
                     + (1 - _STREAM_R1_SINK_COMPRESSION_ALPHA) * evicted_k
@@ -1902,56 +2702,210 @@ def update_wan_s2v_stream_r1_noisy_kv_cache(
                     _STREAM_R1_SINK_COMPRESSION_ALPHA * cache_v[:, : update.sink_tokens]
                     + (1 - _STREAM_R1_SINK_COMPRESSION_ALPHA) * evicted_v
                 )
-            else:
-                copy_len = min(evicted_k.shape[1], update.sink_tokens)
-                cache_k[:, :copy_len] = evicted_k[:, :copy_len]
-                cache_v[:, :copy_len] = evicted_v[:, :copy_len]
-    else:
-        local_end = local_end + update.current_end - global_end
+            elif plan.sink_copy_len > 0:
+                cache_k[:, : plan.sink_copy_len] = evicted_k[:, : plan.sink_copy_len]
+                cache_v[:, : plan.sink_copy_len] = evicted_v[:, : plan.sink_copy_len]
 
-    local_write_start = local_end - update.noisy_seq_len
-    cache_k[:, local_write_start:local_end] = key[:, : update.noisy_seq_len]
-    cache_v[:, local_write_start:local_end] = value[:, : update.noisy_seq_len]
+    cache_k[:, plan.local_write_start : plan.local_write_end] = key[
+        :, : update.noisy_seq_len
+    ]
+    cache_v[:, plan.local_write_start : plan.local_write_end] = value[
+        :, : update.noisy_seq_len
+    ]
 
-    kv_start = max(
-        update.sink_tokens,
-        local_end - update.local_tokens + update.sink_tokens,
-    )
     if update.sink_tokens > 0:
-        if kv_start == update.sink_tokens:
-            view_key = cache_k[:, :local_end]
-            view_value = cache_v[:, :local_end]
-        elif kv_start >= local_end:
+        if plan.view_kind == "prefix":
+            view_key = cache_k[:, : plan.cache_local_end]
+            view_value = cache_v[:, : plan.cache_local_end]
+        elif plan.view_kind == "sink_only":
             view_key = cache_k[:, : update.sink_tokens]
             view_value = cache_v[:, : update.sink_tokens]
         else:
             with _stream_r1_comm_nvtx_range(
                 "stream_r1_noisy_kv_view.sink_cat "
-                f"sink_tokens={update.sink_tokens} kv_start={kv_start} local_end={local_end}"
+                f"sink_tokens={update.sink_tokens} "
+                f"kv_start={plan.kv_start} local_end={plan.cache_local_end}"
             ):
                 view_key = torch.cat(
-                    [cache_k[:, : update.sink_tokens], cache_k[:, kv_start:local_end]],
+                    [
+                        cache_k[:, : update.sink_tokens],
+                        cache_k[:, plan.kv_start : plan.cache_local_end],
+                    ],
                     dim=1,
                 )
                 view_value = torch.cat(
-                    [cache_v[:, : update.sink_tokens], cache_v[:, kv_start:local_end]],
+                    [
+                        cache_v[:, : update.sink_tokens],
+                        cache_v[:, plan.kv_start : plan.cache_local_end],
+                    ],
                     dim=1,
                 )
     else:
-        view_key = cache_k[:, kv_start:local_end]
-        view_value = cache_v[:, kv_start:local_end]
+        view_key = cache_k[:, plan.kv_start : plan.cache_local_end]
+        view_value = cache_v[:, plan.kv_start : plan.cache_local_end]
 
-    local_suffix_len = max(0, local_end - kv_start)
-    local_start = update.current_end - local_suffix_len
-    local_end_index = int(view_key.shape[1])
+    local_end_index = plan.view_local_end_index
     kv_cache["global_end_index"].fill_(update.current_end)
     kv_cache["local_end_index"].fill_(local_end_index)
+    if commit_host_state:
+        host_state.apply_noisy_kv_cache_update_plan(plan)
+        sync_wan_s2v_stream_r1_kv_cache_host_shadow(kv_cache, host_state)
     return WanS2VStreamR1NoisyKVCacheView(
         key=view_key,
         value=view_value,
         global_end_index=update.current_end,
         local_end_index=local_end_index,
-        local_start=local_start,
+        local_start=plan.local_start,
+        local_end=update.current_end,
+    )
+
+
+def _expand_kv_gather_index(index: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return index.view(1, -1, 1, 1).expand(
+        target.shape[0],
+        -1,
+        target.shape[2],
+        target.shape[3],
+    )
+
+
+def _mask4(mask: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return mask.view(1, -1, 1, 1).expand(
+        target.shape[0],
+        -1,
+        target.shape[2],
+        target.shape[3],
+    )
+
+
+def update_wan_s2v_stream_r1_noisy_kv_cache_with_plan_buffer(
+    kv_cache: WanS2VKVCacheBlock,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    update: WanS2VStreamR1NoisyKVCacheUpdate,
+    plan_buffer: WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer,
+) -> WanS2VStreamR1NoisyKVCacheView:
+    """Graph-friendly fixed-shape noisy KV update using prepared plan buffers."""
+
+    _validate_noisy_kv_update_inputs(kv_cache, key, value, update)
+    plan = plan_buffer.host_plan
+    if plan is None:
+        raise ValueError("graph KV update requires a prepared host plan")
+    if plan.update != update:
+        raise ValueError("KV cache update plan does not match update")
+
+    cache_k = kv_cache["k"]
+    cache_v = kv_cache["v"]
+    cache_capacity = cache_k.shape[1]
+    sink_tokens = update.sink_tokens
+    rolling_tokens = cache_capacity - sink_tokens
+
+    if plan_buffer.rolling_cache_indices.numel() != rolling_tokens:
+        raise ValueError("graph KV update rolling index buffer length mismatch")
+    if plan_buffer.sink_evict_indices.numel() != sink_tokens:
+        raise ValueError("graph KV update sink index buffer length mismatch")
+
+    rolling_k_old = cache_k[:, sink_tokens:].clone() if rolling_tokens > 0 else None
+    rolling_v_old = cache_v[:, sink_tokens:].clone() if rolling_tokens > 0 else None
+    if rolling_tokens > 0:
+        cache_index = _expand_kv_gather_index(
+            plan_buffer.rolling_cache_indices,
+            rolling_k_old,
+        )
+        key_index = _expand_kv_gather_index(
+            plan_buffer.rolling_key_indices,
+            rolling_k_old,
+        )
+        rolling_k_from_cache = torch.gather(cache_k, dim=1, index=cache_index)
+        rolling_v_from_cache = torch.gather(cache_v, dim=1, index=cache_index)
+        noisy_key = key[:, : update.noisy_seq_len]
+        noisy_value = value[:, : update.noisy_seq_len]
+        rolling_k_from_key = torch.gather(noisy_key, dim=1, index=key_index)
+        rolling_v_from_key = torch.gather(noisy_value, dim=1, index=key_index)
+        cache_mask = _mask4(plan_buffer.rolling_cache_mask, rolling_k_old)
+        key_mask = _mask4(plan_buffer.rolling_key_mask, rolling_k_old)
+        target_mask = _mask4(plan_buffer.rolling_target_mask, rolling_k_old)
+        rolling_k_new = torch.where(cache_mask, rolling_k_from_cache, rolling_k_old)
+        rolling_v_new = torch.where(cache_mask, rolling_v_from_cache, rolling_v_old)
+        rolling_k_new = torch.where(key_mask, rolling_k_from_key, rolling_k_new)
+        rolling_v_new = torch.where(key_mask, rolling_v_from_key, rolling_v_new)
+        rolling_k_new = torch.where(target_mask, rolling_k_new, rolling_k_old)
+        rolling_v_new = torch.where(target_mask, rolling_v_new, rolling_v_old)
+    else:
+        rolling_k_new = None
+        rolling_v_new = None
+
+    if sink_tokens > 0:
+        old_sink_k = cache_k[:, :sink_tokens].clone()
+        old_sink_v = cache_v[:, :sink_tokens].clone()
+        sink_index = _expand_kv_gather_index(plan_buffer.sink_evict_indices, old_sink_k)
+        evicted_k = torch.gather(cache_k, dim=1, index=sink_index)
+        evicted_v = torch.gather(cache_v, dim=1, index=sink_index)
+        sink_compress = plan_buffer.scalar_tensor("sink_compress").to(
+            dtype=torch.bool
+        ).view(1, 1, 1, 1)
+        evict = plan_buffer.scalar_tensor("evict").to(dtype=torch.bool).view(
+            1, 1, 1, 1
+        )
+        copy_mask = _mask4(plan_buffer.sink_copy_mask, old_sink_k)
+        compressed_k = (
+            _STREAM_R1_SINK_COMPRESSION_ALPHA * old_sink_k
+            + (1 - _STREAM_R1_SINK_COMPRESSION_ALPHA) * evicted_k
+        )
+        compressed_v = (
+            _STREAM_R1_SINK_COMPRESSION_ALPHA * old_sink_v
+            + (1 - _STREAM_R1_SINK_COMPRESSION_ALPHA) * evicted_v
+        )
+        copied_k = torch.where(copy_mask, evicted_k, old_sink_k)
+        copied_v = torch.where(copy_mask, evicted_v, old_sink_v)
+        sink_k_new = torch.where(sink_compress, compressed_k, copied_k)
+        sink_v_new = torch.where(sink_compress, compressed_v, copied_v)
+        cache_k[:, :sink_tokens] = torch.where(evict, sink_k_new, old_sink_k)
+        cache_v[:, :sink_tokens] = torch.where(evict, sink_v_new, old_sink_v)
+
+    if rolling_tokens > 0:
+        cache_k[:, sink_tokens:] = rolling_k_new
+        cache_v[:, sink_tokens:] = rolling_v_new
+
+    kv_cache["global_end_index"].copy_(
+        plan_buffer.scalar_tensor("new_global_end").view(1)
+    )
+    kv_cache["local_end_index"].copy_(
+        plan_buffer.scalar_tensor("new_local_end_index").view(1)
+    )
+
+    if update.sink_tokens > 0:
+        if plan.view_kind == "prefix":
+            view_key = cache_k[:, : plan.cache_local_end]
+            view_value = cache_v[:, : plan.cache_local_end]
+        elif plan.view_kind == "sink_only":
+            view_key = cache_k[:, : update.sink_tokens]
+            view_value = cache_v[:, : update.sink_tokens]
+        else:
+            view_key = torch.cat(
+                [
+                    cache_k[:, : update.sink_tokens],
+                    cache_k[:, plan.kv_start : plan.cache_local_end],
+                ],
+                dim=1,
+            )
+            view_value = torch.cat(
+                [
+                    cache_v[:, : update.sink_tokens],
+                    cache_v[:, plan.kv_start : plan.cache_local_end],
+                ],
+                dim=1,
+            )
+    else:
+        view_key = cache_k[:, plan.kv_start : plan.cache_local_end]
+        view_value = cache_v[:, plan.kv_start : plan.cache_local_end]
+
+    return WanS2VStreamR1NoisyKVCacheView(
+        key=view_key,
+        value=view_value,
+        global_end_index=plan.new_global_end,
+        local_end_index=plan.new_local_end_index,
+        local_start=plan.local_start,
         local_end=update.current_end,
     )
 
@@ -2240,6 +3194,7 @@ def _prepare_wan_s2v_stream_r1_cached_attention_inputs(
     sequence_shard_enabled: bool,
     sp_pad_tokens: int,
     profile: _StreamR1Profile,
+    graph_kv_update: bool = False,
 ) -> _WanS2VCachedAttentionInputs:
     if kv_cache is None:
         raise ValueError("Stream-R1 S2V cached attention requires kv_cache")
@@ -2319,12 +3274,48 @@ def _prepare_wan_s2v_stream_r1_cached_attention_inputs(
             noisy_seq_len=layout.noisy_seq_len,
         )
     with profile.span("cache_update"):
-        noisy_view = update_wan_s2v_stream_r1_noisy_kv_cache(
-            kv_cache,
-            current_kv.noisy_key,
-            current_kv.noisy_value,
-            update,
+        kv_state = get_wan_s2v_stream_r1_kv_cache_state(kv_cache)
+        update_plan_buffer = kv_cache.get("update_plan_buffer")
+        update_plan = (
+            update_plan_buffer.host_plan
+            if update_plan_buffer is not None
+            else None
         )
+        if update_plan is None or not _noisy_kv_update_plan_matches_state(
+            update_plan,
+            update,
+            kv_state,
+        ):
+            update_plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
+                kv_cache,
+                update,
+                state=kv_state,
+            )
+            if update_plan_buffer is not None:
+                update_plan_buffer.copy_from_plan_(update_plan)
+        if graph_kv_update:
+            if not isinstance(
+                update_plan_buffer, WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer
+            ):
+                raise ValueError("graph KV update requires a plan buffer")
+            noisy_view = update_wan_s2v_stream_r1_noisy_kv_cache_with_plan_buffer(
+                kv_cache,
+                current_kv.noisy_key,
+                current_kv.noisy_value,
+                update,
+                update_plan_buffer,
+            )
+        else:
+            noisy_view = update_wan_s2v_stream_r1_noisy_kv_cache(
+                kv_cache,
+                current_kv.noisy_key,
+                current_kv.noisy_value,
+                update,
+                plan=update_plan,
+                commit_host_state=False,
+            )
+            kv_state.apply_noisy_kv_cache_update_plan(update_plan)
+            sync_wan_s2v_stream_r1_kv_cache_host_shadow(kv_cache, kv_state)
     return _WanS2VCachedAttentionInputs(
         query_for_attention=query_for_attention,
         current_kv=current_kv,
@@ -2346,6 +3337,7 @@ def update_wan_s2v_stream_r1_cached_self_attention_kv_cache(
     cache_start: int | None,
     sequence_shard_enabled: bool = False,
     sp_pad_tokens: int = 0,
+    graph_kv_update: bool = False,
 ) -> None:
     """Update cached Stream-R1 noisy K/V without computing attention output."""
 
@@ -2363,6 +3355,7 @@ def update_wan_s2v_stream_r1_cached_self_attention_kv_cache(
         sequence_shard_enabled=sequence_shard_enabled,
         sp_pad_tokens=sp_pad_tokens,
         profile=profile,
+        graph_kv_update=graph_kv_update,
     )
     profile.log(
         attention_backend=prepared.selected_backend,
@@ -2385,6 +3378,7 @@ def run_wan_s2v_stream_r1_cached_self_attention(
     cache_start: int | None,
     sequence_shard_enabled: bool = False,
     sp_pad_tokens: int = 0,
+    graph_kv_update: bool = False,
 ) -> torch.Tensor:
     """Run one guarded Stream-R1 S2V cached self-attention step."""
 
@@ -2402,6 +3396,7 @@ def run_wan_s2v_stream_r1_cached_self_attention(
         sequence_shard_enabled=sequence_shard_enabled,
         sp_pad_tokens=sp_pad_tokens,
         profile=profile,
+        graph_kv_update=graph_kv_update,
     )
     query_for_attention = prepared.query_for_attention
     current_kv = prepared.current_kv

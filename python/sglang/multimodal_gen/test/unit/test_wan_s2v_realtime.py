@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.wan_s2v_scheduler import (
 from sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime import (
     AudioRingBuffer,
     WanS2VRealtimeSessionRunner,
+    _WanS2VStreamingVAECudaGraphRunner,
     _WanS2VStreamingVAEState,
     _audio_window_after_extend,
     _wait_for_session_audio_chunk,
@@ -452,10 +453,64 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
         self.assertEqual(first.shape, (1, 1, 5, 1, 1))
         self.assertEqual(second.shape, (1, 1, 8, 1, 1))
 
+    def test_vae_graph_replay_refreshes_static_cache_from_live_cache(self):
+        runner = _WanS2VStreamingVAECudaGraphRunner()
+        runner.static_input = torch.zeros(1)
+        runner.static_output = torch.zeros(1)
+        runner.cache_input_map = [torch.zeros(2)]
+        runner.cache_output_map = [torch.zeros(2)]
+
+        def _replay():
+            runner.cache_output_map[0].copy_(runner.cache_input_map[0] + 3)
+            runner.static_output.copy_(runner.static_input + 5)
+
+        runner.graph = SimpleNamespace(replay=_replay)
+        live_cache = [torch.tensor([7.0, 11.0])]
+
+        output = runner.replay(torch.tensor([2.0]), live_cache)
+
+        torch.testing.assert_close(output, torch.tensor([7.0]))
+        torch.testing.assert_close(runner.cache_input_map[0], torch.tensor([10.0, 14.0]))
+        torch.testing.assert_close(live_cache[0], torch.tensor([10.0, 14.0]))
+        self.assertIsNot(live_cache[0], runner.cache_input_map[0])
+
+    def test_wav2vec_graph_prewarm_video_frames_include_realtime_defaults(self):
+        runner = _FakeRealtimeRunner({})
+        batch = SimpleNamespace(fps=25)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps=[16, 24]
+            )
+        )
+
+        self.assertEqual(
+            runner._wav2vec_cuda_graph_warmup_video_frames(
+                batch,
+                server_args,
+                audio_window_seconds=8.0,
+            ),
+            (128, 192, 200),
+        )
+
     def test_vae_cuda_graph_config_flag_is_available(self):
         cfg = WanS2VPipelineConfig(wan_s2v_vae_cuda_graph=True)
 
         self.assertTrue(cfg.wan_s2v_vae_cuda_graph)
+
+    def test_wav2vec_graph_warmup_fps_config_is_normalized(self):
+        cfg = WanS2VPipelineConfig(
+            wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps=[16, 24]
+        )
+
+        self.assertEqual(
+            cfg.wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps,
+            (16, 24),
+        )
+
+        with self.assertRaisesRegex(ValueError, "warmup_fps"):
+            WanS2VPipelineConfig(
+                wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps=[0]
+            )
 
     def test_adaptive_steps_config_is_available(self):
         cfg = WanS2VPipelineConfig(
@@ -487,6 +542,77 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
         self.assertEqual(extra["adaptive_steps_threshold"], 0.11)
         self.assertEqual(extra["adaptive_steps_reduced_step_count"], 2)
         self.assertTrue(extra["adaptive_steps_log_only"])
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.torch.cuda.is_available",
+        return_value=True,
+    )
+    def test_timestep_graph_preoutput_requirement(self, _cuda_available):
+        runner = _FakeRealtimeRunner({})
+        denoising_stage = SimpleNamespace(
+            _resolve_timestep_cuda_graph_config=lambda batch, server_args: SimpleNamespace(
+                enabled=True,
+                step_indices=(0,),
+            )
+        )
+
+        self.assertTrue(
+            runner._requires_preoutput_timestep_cuda_graph(
+                denoising_stage=denoising_stage,
+                batch=SimpleNamespace(),
+                server_args=SimpleNamespace(),
+                step_count=4,
+            )
+        )
+        self.assertFalse(
+            runner._requires_preoutput_timestep_cuda_graph(
+                denoising_stage=denoising_stage,
+                batch=SimpleNamespace(),
+                server_args=SimpleNamespace(),
+                step_count=0,
+            )
+        )
+
+    def test_timestep_graph_capture_remains_allowed_after_output_starts(self):
+        runner = _FakeRealtimeRunner({})
+
+        self.assertTrue(
+            runner._should_allow_timestep_cuda_graph_capture(
+                timestep_graph_output_started=False
+            )
+        )
+        self.assertTrue(
+            runner._should_allow_timestep_cuda_graph_capture(
+                timestep_graph_output_started=True
+            )
+        )
+
+    def test_timestep_graph_ready_for_output_requires_graph_hit(self):
+        runner = _FakeRealtimeRunner({})
+        denoising_stage = SimpleNamespace(
+            _last_timestep_cuda_graph_statuses=[
+                {"status": "warmup"},
+                {"status": "step_filtered"},
+            ]
+        )
+
+        self.assertFalse(runner._timestep_cuda_graph_ready_for_output(denoising_stage))
+
+        denoising_stage._last_timestep_cuda_graph_statuses = [
+            {"status": "capture"},
+            {"status": "step_filtered"},
+        ]
+        self.assertTrue(runner._timestep_cuda_graph_ready_for_output(denoising_stage))
+        self.assertIsNone(runner._timestep_cuda_graph_preoutput_error(denoising_stage))
+
+        denoising_stage._last_timestep_cuda_graph_statuses = [
+            {"status": "eager_kv_plan_mismatch"}
+        ]
+        self.assertFalse(runner._timestep_cuda_graph_ready_for_output(denoising_stage))
+        self.assertEqual(
+            runner._timestep_cuda_graph_preoutput_error(denoising_stage),
+            "eager_kv_plan_mismatch",
+        )
 
     def test_stream_r1_config_defaults_to_baseline_flow_shift(self):
         self.assertEqual(WanS2VPipelineConfig().flow_shift, 3.0)

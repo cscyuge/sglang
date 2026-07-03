@@ -50,6 +50,11 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_audio_overlap: bool = False
     wan_s2v_latent_condition_overlap: bool = False
     wan_s2v_wav2vec_cuda_graph: bool = False
+    wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps: tuple[int, ...] | list[int] | None = (
+        16,
+        24,
+        25,
+    )
     wan_s2v_streaming_vae_cache: bool = True
     wan_s2v_vae_cuda_graph: bool = False
     wan_s2v_adaptive_steps: bool = False
@@ -84,6 +89,11 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_timestep_ablation_value_tolerance: float = 1e-3
     wan_s2v_timestep_ablation_scale: float = 1.0
     wan_s2v_timestep_ablation_log: bool = False
+    wan_s2v_timestep_cuda_graph: bool = False
+    wan_s2v_timestep_cuda_graph_indices: list[int] | None = None
+    wan_s2v_timestep_cuda_graph_warmup_blocks: int = 2
+    wan_s2v_timestep_cuda_graph_max_graphs: int = 16
+    wan_s2v_timestep_cuda_graph_log: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -116,6 +126,21 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
             raise ValueError("wan_s2v_idle_policy must be either 'hold' or 'silence'")
         if self.wan_s2v_max_silence_blocks < 0:
             raise ValueError("wan_s2v_max_silence_blocks must be non-negative")
+        if self.wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps is None:
+            self.wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps = ()
+        else:
+            self.wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps = tuple(
+                int(fps)
+                for fps in self.wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps
+            )
+            if any(
+                fps <= 0
+                for fps in self.wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps
+            ):
+                raise ValueError(
+                    "wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps must contain "
+                    "positive FPS values"
+                )
         if self.wan_s2v_adaptive_steps_threshold < 0:
             raise ValueError("wan_s2v_adaptive_steps_threshold must be non-negative")
         if self.wan_s2v_adaptive_steps_aggressive_threshold < 0:
@@ -198,9 +223,16 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
             raise ValueError(
                 "wan_s2v_timestep_ablation_value_tolerance must be non-negative"
             )
+        if self.wan_s2v_timestep_cuda_graph_warmup_blocks < 0:
+            raise ValueError(
+                "wan_s2v_timestep_cuda_graph_warmup_blocks must be non-negative"
+            )
+        if self.wan_s2v_timestep_cuda_graph_max_graphs <= 0:
+            raise ValueError("wan_s2v_timestep_cuda_graph_max_graphs must be positive")
         for field_name in (
             "wan_s2v_timestep_ablation_indices",
             "wan_s2v_timestep_ablation_blocks",
+            "wan_s2v_timestep_cuda_graph_indices",
         ):
             values = getattr(self, field_name)
             if values is not None and any(int(value) < 0 for value in values):

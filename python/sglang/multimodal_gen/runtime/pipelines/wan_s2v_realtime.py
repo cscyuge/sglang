@@ -7,6 +7,7 @@ import gc
 import json
 import os
 import time
+from collections import OrderedDict
 from copy import copy
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -209,6 +210,38 @@ class _WanS2VWav2VecCudaGraphRunner:
         return self.static_output
 
 
+class _WanS2VWav2VecCudaGraphCache:
+    def __init__(self, max_graphs: int = 16):
+        self.max_graphs = max(1, int(max_graphs))
+        self.runners: OrderedDict[tuple[Any, ...], _WanS2VWav2VecCudaGraphRunner] = (
+            OrderedDict()
+        )
+
+    @staticmethod
+    def key_from_sample(
+        sample_feature: torch.Tensor,
+        audio_window_video_frames: int,
+    ) -> tuple[Any, ...]:
+        return (
+            tuple(sample_feature.shape),
+            str(sample_feature.dtype),
+            str(sample_feature.device),
+            int(audio_window_video_frames),
+        )
+
+    def get(self, key: tuple[Any, ...]) -> _WanS2VWav2VecCudaGraphRunner | None:
+        runner = self.runners.get(key)
+        if runner is not None:
+            self.runners.move_to_end(key)
+        return runner
+
+    def put(self, key: tuple[Any, ...], runner: _WanS2VWav2VecCudaGraphRunner) -> None:
+        self.runners[key] = runner
+        self.runners.move_to_end(key)
+        while len(self.runners) > self.max_graphs:
+            self.runners.popitem(last=False)
+
+
 class _WanS2VStreamingVAECudaGraphRunner:
     """CUDA graph runner for steady-state Wan VAE streaming decode.
 
@@ -322,14 +355,55 @@ class _WanS2VStreamingVAECudaGraphRunner:
         # has valid frames and the steady-state cache advances exactly once.
         self.graph.replay()
         self._copy_cache_map_(self.cache_input_map, self.cache_output_map)
+        self._copy_cache_map_(live_cache_map, self.cache_output_map)
         self._captured_shape = tuple(sample_input.shape)
         return self.static_output
 
-    def replay(self, latents: torch.Tensor):
+    def replay(self, latents: torch.Tensor, live_cache_map: list[Any] | None = None):
         self.static_input.copy_(latents)
+        if live_cache_map is not None:
+            self._copy_cache_map_(self.cache_input_map, live_cache_map)
         self.graph.replay()
+        if live_cache_map is not None:
+            self._copy_cache_map_(live_cache_map, self.cache_output_map)
         self._copy_cache_map_(self.cache_input_map, self.cache_output_map)
         return self.static_output
+
+
+class _WanS2VStreamingVAECudaGraphCache:
+    def __init__(self, max_graphs: int = 16):
+        self.max_graphs = max(1, int(max_graphs))
+        self.runners: OrderedDict[
+            tuple[Any, ...], _WanS2VStreamingVAECudaGraphRunner
+        ] = OrderedDict()
+
+    @staticmethod
+    def key_from_latents(latents: torch.Tensor) -> tuple[Any, ...]:
+        return (tuple(latents.shape), str(latents.dtype), str(latents.device))
+
+    def get(
+        self, latents: torch.Tensor
+    ) -> _WanS2VStreamingVAECudaGraphRunner | None:
+        key = self.key_from_latents(latents)
+        runner = self.runners.get(key)
+        if runner is not None:
+            self.runners.move_to_end(key)
+        return runner
+
+    def put(
+        self,
+        latents: torch.Tensor,
+        runner: _WanS2VStreamingVAECudaGraphRunner,
+    ) -> None:
+        key = self.key_from_latents(latents)
+        self.runners[key] = runner
+        self.runners.move_to_end(key)
+        while len(self.runners) > self.max_graphs:
+            self.runners.popitem(last=False)
+
+    @property
+    def cached_graph_count(self) -> int:
+        return len(self.runners)
 
 
 @dataclass
@@ -361,6 +435,18 @@ class _PreparedWanS2VBlock:
 
 
 @dataclass
+class _BufferedWanS2VFrameBlock:
+    block_idx: int
+    frames: torch.Tensor
+    frame_count: int
+    frame_start_idx: int
+    audio_chunk: np.ndarray
+    audio_chunk_idx: int
+    audio_meta: dict[str, Any]
+    audio_prefetched: bool
+
+
+@dataclass
 class _WanS2VStreamingVAEState:
     enabled: bool
     initialized: bool = False
@@ -379,6 +465,20 @@ class WanS2VRealtimeSessionRunner:
     def __init__(self, pipeline) -> None:
         self.pipeline = pipeline
         self.stages = pipeline.stages
+
+    def _wav2vec_cuda_graph_cache(self) -> _WanS2VWav2VecCudaGraphCache:
+        cache = getattr(self.pipeline, "_wan_s2v_wav2vec_cuda_graph_cache", None)
+        if cache is None:
+            cache = _WanS2VWav2VecCudaGraphCache()
+            setattr(self.pipeline, "_wan_s2v_wav2vec_cuda_graph_cache", cache)
+        return cache
+
+    def _vae_cuda_graph_cache(self) -> _WanS2VStreamingVAECudaGraphCache:
+        cache = getattr(self.pipeline, "_wan_s2v_vae_cuda_graph_cache", None)
+        if cache is None:
+            cache = _WanS2VStreamingVAECudaGraphCache()
+            setattr(self.pipeline, "_wan_s2v_vae_cuda_graph_cache", cache)
+        return cache
 
     def _get_stage(self, stage_type: type) -> Any:
         for stage in self.stages:
@@ -610,13 +710,145 @@ class WanS2VRealtimeSessionRunner:
             condition_s=condition_s,
         )
 
+    def _should_gate_prefetch_for_timestep_cuda_graph(
+        self,
+        *,
+        denoising_stage: Any,
+        batch: Req,
+        server_args: ServerArgs,
+        block_idx: int,
+        step_count: int,
+    ) -> bool:
+        timestep_graph_config = denoising_stage._resolve_timestep_cuda_graph_config(
+            batch,
+            server_args,
+        )
+        if (
+            not timestep_graph_config.enabled
+            or block_idx < timestep_graph_config.warmup_blocks
+            or step_count <= 0
+        ):
+            return False
+        if timestep_graph_config.step_indices:
+            return any(
+                0 <= int(step_index) < step_count
+                for step_index in timestep_graph_config.step_indices
+            )
+        return True
+
+    def _requires_preoutput_timestep_cuda_graph(
+        self,
+        *,
+        denoising_stage: Any,
+        batch: Req,
+        server_args: ServerArgs,
+        step_count: int,
+    ) -> bool:
+        timestep_graph_config = denoising_stage._resolve_timestep_cuda_graph_config(
+            batch,
+            server_args,
+        )
+        if (
+            not timestep_graph_config.enabled
+            or step_count <= 0
+            or not torch.cuda.is_available()
+        ):
+            return False
+        if timestep_graph_config.step_indices:
+            return any(
+                0 <= int(step_index) < step_count
+                for step_index in timestep_graph_config.step_indices
+            )
+        return True
+
+    @staticmethod
+    def _should_allow_timestep_cuda_graph_capture(
+        *,
+        timestep_graph_output_started: bool,
+    ) -> bool:
+        # Startup/session prewarm should cover the common graph keys, but an
+        # online request may still introduce a new supported shape. Let the
+        # runner backfill that graph on miss instead of permanently falling
+        # back or failing after streaming output has started.
+        return True
+
+    @staticmethod
+    def _timestep_cuda_graph_ready_for_output(denoising_stage: Any) -> bool:
+        statuses = getattr(denoising_stage, "_last_timestep_cuda_graph_statuses", [])
+        relevant = [
+            str(item.get("status"))
+            for item in statuses
+            if str(item.get("status"))
+            not in {"disabled", "non_cuda", "warmup", "step_filtered"}
+        ]
+        return bool(relevant) and all(
+            status in {"capture", "replay"} for status in relevant
+        )
+
+    @staticmethod
+    def _timestep_cuda_graph_preoutput_error(denoising_stage: Any) -> str | None:
+        statuses = getattr(denoising_stage, "_last_timestep_cuda_graph_statuses", [])
+        relevant = [
+            str(item.get("status"))
+            for item in statuses
+            if str(item.get("status"))
+            not in {"disabled", "non_cuda", "warmup", "step_filtered"}
+        ]
+        bad_statuses = [
+            status for status in relevant if status not in {"capture", "replay"}
+        ]
+        if not bad_statuses:
+            return None
+        return ", ".join(bad_statuses)
+
+    @staticmethod
+    def _write_progress(progress_file: str, block_idx: int) -> None:
+        if _safe_world_rank() != 0:
+            return
+        try:
+            with open(progress_file, "w", encoding="utf-8") as fp:
+                fp.write(f"{block_idx + 1} -1")
+        except Exception:
+            pass
+
+    def _save_streaming_frame_block(
+        self,
+        *,
+        frame_block: _BufferedWanS2VFrameBlock,
+        frame_dir: str,
+        frame_executor: Any,
+        frame_futures: list[Any],
+        timeline_path: str | None,
+        output_stream: torch.cuda.Stream | None,
+    ) -> None:
+        audio_meta = frame_block.audio_meta
+        self.pipeline._save_streaming_frames(
+            frame_block.frames,
+            frame_block.block_idx,
+            frame_dir,
+            frame_executor,
+            frame_futures,
+            frame_block.frame_count,
+            chunk_audio_data=frame_block.audio_chunk,
+            timeline_path=timeline_path,
+            audio_chunk_idx=frame_block.audio_chunk_idx,
+            used_silence=False,
+            audio_loaded=True,
+            audio_prefetched=frame_block.audio_prefetched,
+            chunk_source=audio_meta.get("chunk_source") or "audio",
+            is_filler=is_flashtalk_filler_audio_meta(audio_meta),
+            turn_id=audio_meta.get("turn_id"),
+            frame_start_idx=frame_block.frame_start_idx,
+            output_stream=output_stream,
+        )
+
     def _decode_block_frames(
         self,
         decoding_stage: DecodingStage,
         latents: torch.Tensor,
         server_args: ServerArgs,
         stream_vae_state: _WanS2VStreamingVAEState,
-        vae_graph_runner: _WanS2VStreamingVAECudaGraphRunner | None = None,
+        vae_graph_cache: _WanS2VStreamingVAECudaGraphCache | None = None,
     ) -> torch.Tensor:
         if not stream_vae_state.enabled:
             stream_vae_state.last_decode_mode = "eager"
@@ -696,38 +928,45 @@ class WanS2VRealtimeSessionRunner:
                     vae.clear_cache()
 
                 if (
-                    vae_graph_runner is not None
+                    vae_graph_cache is not None
                     and stream_vae_state.initialized
                     and torch.cuda.is_available()
                     and latents.is_cuda
-                    and not vae_graph_runner.disabled
                 ):
-                    if vae_graph_runner.can_replay(latents):
-                        image = vae_graph_runner.replay(latents)
-                        vae._feat_map = vae_graph_runner.cache_input_map
+                    vae_graph_runner = vae_graph_cache.get(latents)
+                    if (
+                        vae_graph_runner is not None
+                        and not vae_graph_runner.disabled
+                        and vae_graph_runner.can_replay(latents)
+                    ):
+                        image = vae_graph_runner.replay(latents, vae._feat_map)
                         stream_vae_state.last_decode_mode = "graph_replay"
-                    elif not vae_graph_runner.cache_ready(vae._feat_map):
+                    elif not _WanS2VStreamingVAECudaGraphRunner.cache_ready(
+                        vae._feat_map
+                    ):
                         image = decode_with_cache(
                             latents,
                             vae._feat_map,
                             not stream_vae_state.initialized,
                         )
                         stream_vae_state.last_decode_mode = "eager_cache_warmup"
-                    elif not vae_graph_runner.is_captured:
+                    else:
+                        vae_graph_runner = _WanS2VStreamingVAECudaGraphRunner()
                         try:
                             image = vae_graph_runner.capture(
                                 decode_with_cache,
                                 latents,
                                 vae._feat_map,
                             )
-                            vae._feat_map = vae_graph_runner.cache_input_map
+                            vae_graph_cache.put(latents, vae_graph_runner)
                             stream_vae_state.last_decode_mode = "graph_capture"
                             logger.info(
                                 "Wan S2V VAE decode CUDA graph captured: "
-                                "input_shape=%s output_shape=%s cache_entries=%d",
+                                "input_shape=%s output_shape=%s cache_entries=%d cached_graphs=%d",
                                 tuple(latents.shape),
                                 tuple(image.shape),
                                 len(vae_graph_runner.cache_input_map or []),
+                                vae_graph_cache.cached_graph_count,
                             )
                         except Exception as graph_exc:
                             vae_graph_runner.disable()
@@ -741,13 +980,6 @@ class WanS2VRealtimeSessionRunner:
                                 not stream_vae_state.initialized,
                             )
                             stream_vae_state.last_decode_mode = "eager"
-                    else:
-                        image = decode_with_cache(
-                            latents,
-                            vae._feat_map,
-                            not stream_vae_state.initialized,
-                        )
-                        stream_vae_state.last_decode_mode = "eager"
                 else:
                     image = decode_with_cache(
                         latents,
@@ -906,14 +1138,184 @@ class WanS2VRealtimeSessionRunner:
                     num_video_frames=audio_window_video_frames,
                 )
 
+        cache = self._wav2vec_cuda_graph_cache()
+        key = cache.key_from_sample(sample_feature, audio_window_video_frames)
+        runner = cache.get(key)
+        if runner is not None:
+            logger.info(
+                "Wan S2V Wav2Vec CUDA graph reused: input_shape=%s video_frames=%d",
+                tuple(sample_feature.shape),
+                audio_window_video_frames,
+            )
+            return runner
+
         runner = _WanS2VWav2VecCudaGraphRunner()
         runner.capture(forward_fn, sample_feature, audio_window_video_frames)
+        cache.put(key, runner)
         logger.info(
             "Wan S2V Wav2Vec CUDA graph captured: input_shape=%s video_frames=%d",
             tuple(sample_feature.shape),
             audio_window_video_frames,
         )
         return runner
+
+    @staticmethod
+    def _wav2vec_cuda_graph_warmup_video_frames(
+        batch: Req,
+        server_args: ServerArgs,
+        audio_window_seconds: float,
+    ) -> tuple[int, ...]:
+        fps_values: set[int] = set()
+
+        def add_fps(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, str):
+                for part in value.replace(";", ",").split(","):
+                    add_fps(part.strip())
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add_fps(item)
+                return
+            try:
+                fps = int(round(float(value)))
+            except (TypeError, ValueError):
+                return
+            if fps > 0:
+                fps_values.add(fps)
+
+        add_fps(getattr(batch, "fps", None))
+        add_fps(_pipeline_config_value(server_args, "fps", None))
+        add_fps(
+            _pipeline_config_value(
+                server_args,
+                "wan_s2v_realtime_wav2vec_cuda_graph_warmup_fps",
+                (16, 24, 25),
+            )
+        )
+        if not fps_values:
+            fps_values.add(16)
+        return tuple(
+            sorted(
+                {
+                    max(1, int(round(float(audio_window_seconds) * fps)))
+                    for fps in fps_values
+                }
+            )
+        )
+
+    def prewarm_realtime_cuda_graphs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        if not torch.cuda.is_available():
+            return
+        if not bool(_pipeline_config_value(server_args, "stream_r1_mode", False)):
+            return
+
+        use_wav2vec_cuda_graph = bool(
+            _pipeline_config_value(server_args, "wan_s2v_wav2vec_cuda_graph", False)
+        )
+        use_streaming_vae_cache = bool(
+            _pipeline_config_value(server_args, "wan_s2v_streaming_vae_cache", True)
+        )
+        use_vae_cuda_graph = bool(
+            _pipeline_config_value(server_args, "wan_s2v_vae_cuda_graph", False)
+        ) and use_streaming_vae_cache
+        if not use_wav2vec_cuda_graph and not use_vae_cuda_graph:
+            return
+
+        num_frame_per_block = int(
+            batch.extra.get("num_frame_per_block")
+            or _pipeline_config_value(server_args, "num_frame_per_block", 7)
+        )
+        block_public_frames = self._block_public_frames(
+            server_args, num_frame_per_block
+        )
+        audio_window_seconds = float(
+            _pipeline_config_value(
+                server_args, "wan_s2v_realtime_audio_window_seconds", 8
+            )
+        )
+        audio_window_samples = max(1, int(16000 * audio_window_seconds))
+        wav2vec_video_frame_values = self._wav2vec_cuda_graph_warmup_video_frames(
+            batch,
+            server_args,
+            audio_window_seconds,
+        )
+
+        if use_wav2vec_cuda_graph:
+            try:
+                audio_stage = self._get_stage(WanS2VAudioEncodingStage)
+                for audio_window_video_frames in wav2vec_video_frame_values:
+                    self._prepare_wav2vec_cuda_graph(
+                        audio_stage,
+                        audio_window_samples=audio_window_samples,
+                        audio_window_video_frames=audio_window_video_frames,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Wan S2V Wav2Vec CUDA graph startup prewarm failed: %s", exc
+                )
+
+        if not use_vae_cuda_graph:
+            return
+        try:
+            latent_stage = self._get_stage(LatentPreparationStage)
+            decoding_stage = self._get_stage(DecodingStage)
+            decoding_stage.load_model()
+            device = get_local_torch_device()
+            dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
+            sample_batch = self._copy_batch_for_block_prepare(batch)
+            sample_latents = self._prepare_block_latents(
+                sample_batch,
+                server_args,
+                latent_stage,
+                block_public_frames,
+            ).to(device=device, dtype=dit_dtype)
+            vae_graph_cache = self._vae_cuda_graph_cache()
+            if vae_graph_cache.get(sample_latents) is not None:
+                logger.info(
+                    "Wan S2V VAE decode CUDA graph reused during startup prewarm: "
+                    "input_shape=%s cached_graphs=%d",
+                    tuple(sample_latents.shape),
+                    vae_graph_cache.cached_graph_count,
+                )
+                return
+
+            stream_vae_state = _WanS2VStreamingVAEState(enabled=True)
+            self._decode_block_frames(
+                decoding_stage,
+                sample_latents,
+                server_args,
+                stream_vae_state,
+                vae_graph_cache=None,
+            )
+            self._decode_block_frames(
+                decoding_stage,
+                sample_latents,
+                server_args,
+                stream_vae_state,
+                vae_graph_cache=vae_graph_cache,
+            )
+            logger.info(
+                "Wan S2V VAE decode CUDA graph startup prewarm done: "
+                "input_shape=%s cached_graphs=%d",
+                tuple(sample_latents.shape),
+                vae_graph_cache.cached_graph_count,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Wan S2V VAE decode CUDA graph startup prewarm failed: %s", exc
+            )
+        finally:
+            try:
+                torch.cuda.synchronize(get_local_torch_device())
+                self._get_stage(DecodingStage).vae.clear_cache()
+            except Exception:
+                pass
 
     def _prefetch_next_audio_chunk(
         self,
@@ -1346,15 +1748,16 @@ class WanS2VRealtimeSessionRunner:
         prompt_embeds = None
         reference_latents_ready = False
         stream_vae_state = _WanS2VStreamingVAEState(enabled=use_streaming_vae_cache)
-        vae_graph_runner = (
-            _WanS2VStreamingVAECudaGraphRunner() if use_vae_cuda_graph else None
-        )
+        vae_graph_cache = self._vae_cuda_graph_cache() if use_vae_cuda_graph else None
 
         audio_chunk_idx = 0
         block_idx = 0
         frame_start_idx = 0
         end_requested = False
         previous_clean_latents: torch.Tensor | None = None
+        timestep_graph_preoutput_required: bool | None = None
+        timestep_graph_output_started = False
+        buffered_frame_blocks: list[_BufferedWanS2VFrameBlock] = []
 
         decoding_stage.load_model()
         denoising_stage.load_model()
@@ -1546,9 +1949,9 @@ class WanS2VRealtimeSessionRunner:
                         device=device,
                     )
                     denoising_stage._guard_cache_runtime(cache_state)
-                    crossattn_cache = [
-                        {} for _ in range(len(denoising_stage.transformer.blocks))
-                    ]
+                    crossattn_cache = denoising_stage._prepare_request_crossattn_cache(
+                        True
+                    )
 
                 if bundle is None:
                     condition_started = time.perf_counter()
@@ -1604,9 +2007,37 @@ class WanS2VRealtimeSessionRunner:
                     )
                     step_noise_s = time.perf_counter() - step_noise_started
                 latent_s = time.perf_counter() - latent_started
+                if timestep_graph_preoutput_required is None:
+                    timestep_graph_preoutput_required = (
+                        self._requires_preoutput_timestep_cuda_graph(
+                            denoising_stage=denoising_stage,
+                            batch=batch,
+                            server_args=server_args,
+                            step_count=int(block_timesteps.numel()),
+                        )
+                    )
+                    timestep_graph_output_started = (
+                        not timestep_graph_preoutput_required
+                    )
+
+                # Timestep graph replay may include USP/NCCL work and KV cache
+                # writes. Gate side-stream GPU prefetch until denoise finishes
+                # so it cannot interleave with capture/replay.
+                gate_prefetch_for_timestep_graph = (
+                    self._should_gate_prefetch_for_timestep_cuda_graph(
+                        denoising_stage=denoising_stage,
+                        batch=batch,
+                        server_args=server_args,
+                        block_idx=block_idx,
+                        step_count=int(block_timesteps.numel()),
+                    )
+                )
 
                 if audio_prefetch_pool is not None and prefetched_audio_future is None:
-                    if use_latent_condition_overlap:
+                    if (
+                        use_latent_condition_overlap
+                        and not gate_prefetch_for_timestep_graph
+                    ):
                         prefetch_after_denoise_event = None
                         prefetch_gpu_start_event = None
                     else:
@@ -1661,6 +2092,11 @@ class WanS2VRealtimeSessionRunner:
                     audio_start_frame=0,
                     step_noises_btchw=block_step_noises,
                     block_index=block_idx,
+                    allow_timestep_cuda_graph_capture=(
+                        self._should_allow_timestep_cuda_graph_capture(
+                            timestep_graph_output_started=timestep_graph_output_started
+                        )
+                    ),
                 )
                 timestep_profile_rows = list(
                     getattr(denoising_stage, "_last_timestep_profile_rows", [])
@@ -1709,41 +2145,82 @@ class WanS2VRealtimeSessionRunner:
                     batch.latents,
                     server_args,
                     stream_vae_state,
-                    vae_graph_runner=vae_graph_runner,
+                    vae_graph_cache=vae_graph_cache,
                 )
                 frames = server_args.pipeline_config.post_decoding(frames, server_args)
                 decode_s = time.perf_counter() - decode_started
                 frame_count = int(frames.shape[2])
-
-                stream_started = time.perf_counter()
-                self.pipeline._save_streaming_frames(
-                    frames,
-                    block_idx,
-                    frame_dir,
-                    frame_executor,
-                    frame_futures,
-                    frame_count,
-                    chunk_audio_data=audio_chunk,
-                    timeline_path=timeline_path,
-                    audio_chunk_idx=current_audio_idx,
-                    used_silence=False,
-                    audio_loaded=True,
-                    audio_prefetched=audio_prefetched,
-                    chunk_source=audio_meta.get("chunk_source") or "audio",
-                    is_filler=is_flashtalk_filler_audio_meta(audio_meta),
-                    turn_id=audio_meta.get("turn_id"),
+                if not timestep_graph_output_started or (
+                    stream_vae_state.last_decode_mode
+                    in {"graph_capture", "graph_replay"}
+                ):
+                    # VAE graph replay returns a reusable static output tensor.
+                    # Any frame block that can outlive the current replay must
+                    # own its contents before another replay overwrites it.
+                    frames = frames.detach().clone()
+                frame_block = _BufferedWanS2VFrameBlock(
+                    block_idx=block_idx,
+                    frames=frames,
+                    frame_count=frame_count,
                     frame_start_idx=frame_start_idx,
-                    output_stream=output_stream,
+                    audio_chunk=audio_chunk,
+                    audio_chunk_idx=current_audio_idx,
+                    audio_meta=audio_meta,
+                    audio_prefetched=audio_prefetched,
                 )
-                stream_s = time.perf_counter() - stream_started
                 frame_start_idx += frame_count
 
-                if _safe_world_rank() == 0:
-                    try:
-                        with open(progress_file, "w", encoding="utf-8") as fp:
-                            fp.write(f"{block_idx + 1} -1")
-                    except Exception:
-                        pass
+                stream_started = time.perf_counter()
+                if timestep_graph_output_started:
+                    self._save_streaming_frame_block(
+                        frame_block=frame_block,
+                        frame_dir=frame_dir,
+                        frame_executor=frame_executor,
+                        frame_futures=frame_futures,
+                        timeline_path=timeline_path,
+                        output_stream=output_stream,
+                    )
+                    self._write_progress(progress_file, block_idx)
+                else:
+                    buffered_frame_blocks.append(frame_block)
+                    preoutput_error = self._timestep_cuda_graph_preoutput_error(
+                        denoising_stage
+                    )
+                    if preoutput_error is not None:
+                        raise RuntimeError(
+                            "Wan S2V timestep CUDA graph pre-output capture failed "
+                            f"with status: {preoutput_error}"
+                        )
+                    if self._timestep_cuda_graph_ready_for_output(denoising_stage):
+                        timestep_graph_output_started = True
+                        emit_chunk_timeline(
+                            timeline_path,
+                            "wan_s2v_timestep_cuda_graph_prewarm_done",
+                            block_idx=block_idx,
+                            buffered_blocks=len(buffered_frame_blocks),
+                            cached_graphs=(
+                                denoising_stage._timestep_cuda_graph_runner.cached_graph_count
+                            ),
+                        )
+                        logger.info(
+                            "Wan S2V timestep CUDA graph prewarm done: "
+                            "block=%d buffered_blocks=%d cached_graphs=%d",
+                            block_idx,
+                            len(buffered_frame_blocks),
+                            denoising_stage._timestep_cuda_graph_runner.cached_graph_count,
+                        )
+                        for buffered_block in buffered_frame_blocks:
+                            self._save_streaming_frame_block(
+                                frame_block=buffered_block,
+                                frame_dir=frame_dir,
+                                frame_executor=frame_executor,
+                                frame_futures=frame_futures,
+                                timeline_path=timeline_path,
+                                output_stream=output_stream,
+                            )
+                        self._write_progress(progress_file, block_idx)
+                        buffered_frame_blocks.clear()
+                stream_s = time.perf_counter() - stream_started
 
                 total_s = time.perf_counter() - loop_started
                 logger.info(

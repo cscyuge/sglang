@@ -46,6 +46,9 @@ from sglang.multimodal_gen.runtime.server_warmup import should_return_warmup_res
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
+    resolve_stream_r1_warmup_num_frames,
+)
 
 logger = init_logger(__name__)
 
@@ -367,7 +370,10 @@ class Scheduler(SchedulerDisaggMixin):
                 if audio_encoder_path is not None:
                     import numpy as np
 
-                    chunk_frame_num = getattr(pipeline_config, "chunk_frame_num", 33)
+                    chunk_frame_num = resolve_stream_r1_warmup_num_frames(
+                        self.server_args,
+                        int(getattr(pipeline_config, "chunk_frame_num", 33)),
+                    )
                     motion_frames_num = getattr(pipeline_config, "motion_frames_num", 5)
                     fps = 25
                     req.num_frames = chunk_frame_num

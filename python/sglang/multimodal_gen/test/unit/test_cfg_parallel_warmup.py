@@ -729,6 +729,46 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             int(9 / 16 * 16000),
         )
 
+    def test_server_based_warmup_extends_stream_r1_s2v_for_timestep_graph(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.component_paths = {}
+        server_args.pipeline_config = SimpleNamespace(
+            task_type=ModelTaskType.I2V,
+            audio_encoder_path="/tmp/audio_encoder",
+            stream_r1_mode=True,
+            num_frame_per_block=3,
+            wan_s2v_timestep_cuda_graph=True,
+            wan_s2v_timestep_cuda_graph_warmup_blocks=2,
+        )
+        sampling_defaults = SamplingParams(
+            width=480,
+            height=832,
+            num_frames=17,
+            fps=16,
+            negative_prompt=None,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual(req.num_frames, 33)
+        self.assertIn("audio_tensor", req.extra)
+        self.assertGreaterEqual(
+            req.extra["audio_tensor"].shape[-1],
+            int(33 / 16 * 16000),
+        )
+
 
 class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
     def test_single_frame_custom_vae_encode_input_is_4d(self):

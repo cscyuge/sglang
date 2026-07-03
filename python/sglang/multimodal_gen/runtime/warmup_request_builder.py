@@ -263,7 +263,29 @@ def _get_temporal_scale_factor(server_args: ServerArgs) -> int:
     return 4
 
 
-def _align_stream_r1_warmup_num_frames(
+def _stream_r1_timestep_graph_enabled(server_args: ServerArgs) -> bool:
+    return bool(
+        getattr(
+            getattr(server_args, "pipeline_config", None),
+            "wan_s2v_timestep_cuda_graph",
+            False,
+        )
+    )
+
+
+def _stream_r1_timestep_graph_warmup_blocks(server_args: ServerArgs) -> int:
+    value = getattr(
+        getattr(server_args, "pipeline_config", None),
+        "wan_s2v_timestep_cuda_graph_warmup_blocks",
+        2,
+    )
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 2
+
+
+def resolve_stream_r1_warmup_num_frames(
     server_args: ServerArgs,
     num_frames: int,
 ) -> int:
@@ -278,7 +300,20 @@ def _align_stream_r1_warmup_num_frames(
     temporal_scale = _get_temporal_scale_factor(server_args)
     latent_frames = max(1, (num_frames - 1) // temporal_scale + 1)
     aligned_latent_frames = max(block_size, (latent_frames // block_size) * block_size)
+    if _stream_r1_timestep_graph_enabled(server_args):
+        required_blocks = _stream_r1_timestep_graph_warmup_blocks(server_args) + 1
+        aligned_latent_frames = max(
+            aligned_latent_frames,
+            required_blocks * block_size,
+        )
     return (aligned_latent_frames - 1) * temporal_scale + 1
+
+
+def _align_stream_r1_warmup_num_frames(
+    server_args: ServerArgs,
+    num_frames: int,
+) -> int:
+    return resolve_stream_r1_warmup_num_frames(server_args, num_frames)
 
 
 def _should_include_warmup_audio(

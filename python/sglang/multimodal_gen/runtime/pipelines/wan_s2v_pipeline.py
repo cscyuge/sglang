@@ -231,7 +231,12 @@ class WanS2VPipeline(FlashTalkPipeline):
                     "audio_path/audio_url or set wan_s2v_realtime=true."
                 )
             return WanS2VRealtimeSessionRunner(self).run(batch, server_args)
-        return ComposedPipelineBase.forward(self, batch, server_args)
+        output = ComposedPipelineBase.forward(self, batch, server_args)
+        if getattr(batch, "is_warmup", False):
+            WanS2VRealtimeSessionRunner(self).prewarm_realtime_cuda_graphs(
+                batch, server_args
+            )
+        return output
 
     def _load_transformer(
         self, model_path: str, server_args: ServerArgs, device: torch.device

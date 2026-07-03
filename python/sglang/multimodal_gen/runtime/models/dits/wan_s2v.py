@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_c
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VKVCacheBlock,
     WanS2VStreamR1AttentionLayout,
+    WanS2VTimestepStaticMetadataBuffers,
     run_wan_s2v_stream_r1_cached_self_attention,
     update_wan_s2v_stream_r1_cached_self_attention_kv_cache,
     validate_wan_s2v_stream_r1_forward_cache,
@@ -118,6 +119,43 @@ def _sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
     return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
 
 
+def _cuda_graph_capture_active() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _linspace_index(
+    start: int,
+    end: int,
+    steps: int,
+    device: torch.device,
+) -> np.ndarray | torch.Tensor:
+    if (
+        torch.device(device).type == "cuda"
+        and _cuda_graph_capture_active()
+    ):
+        if steps == 1:
+            return torch.full((1,), int(start), dtype=torch.long, device=device)
+        return torch.linspace(
+            float(start), float(end), int(steps), device=device
+        ).to(torch.long)
+    return np.linspace(start, end, steps).astype(int)
+
+
+def _clone_as_mutable_cache_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    with torch.inference_mode(False):
+        return tensor.detach().clone()
+
+
+def _is_inference_tensor(tensor: torch.Tensor) -> bool:
+    is_inference = getattr(tensor, "is_inference", None)
+    return bool(is_inference()) if callable(is_inference) else False
+
+
 def _rope_precompute(
     x: torch.Tensor,
     grid_sizes,
@@ -147,24 +185,27 @@ def _rope_precompute(
 
             f, h, w = g[1][i]
             t_f, t_h, t_w = g[2][i]
+            f_o, h_o, w_o = int(f_o), int(h_o), int(w_o)
+            f, h, w = int(f), int(h), int(w)
+            t_f, t_h, t_w = int(t_f), int(t_h), int(t_w)
             seq_f, seq_h, seq_w = f - f_o, h - h_o, w - w_o
             seq_len = int(seq_f * seq_h * seq_w)
             if seq_len <= 0:
                 continue
             if t_f > 0:
                 if f_o >= 0:
-                    f_sam = np.linspace(
-                        f_o.item(), (t_f + f_o).item() - 1, seq_f
-                    ).astype(int)
+                    f_sam = _linspace_index(
+                        f_o, t_f + f_o - 1, seq_f, freqs[0].device
+                    )
                 else:
-                    f_sam = np.linspace(
-                        -f_o.item(), (-t_f - f_o).item() + 1, seq_f
-                    ).astype(int)
-                h_sam = np.linspace(h_o.item(), (t_h + h_o).item() - 1, seq_h).astype(
-                    int
+                    f_sam = _linspace_index(
+                        -f_o, -t_f - f_o + 1, seq_f, freqs[0].device
+                    )
+                h_sam = _linspace_index(
+                    h_o, t_h + h_o - 1, seq_h, freqs[1].device
                 )
-                w_sam = np.linspace(w_o.item(), (t_w + w_o).item() - 1, seq_w).astype(
-                    int
+                w_sam = _linspace_index(
+                    w_o, t_w + w_o - 1, seq_w, freqs[2].device
                 )
                 assert f_o * f >= 0 and h_o * h >= 0 and w_o * w >= 0
                 freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
@@ -187,6 +228,120 @@ def _rope_precompute(
             output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = freqs_i
         seq_bucket.append(seq_bucket[-1] + seq_len)
     return output
+
+
+def _rope_precompute_s2v_stream_r1_tensor_current_start(
+    x: torch.Tensor,
+    noisy_grid_sizes: torch.Tensor,
+    ref_grid_sizes,
+    freqs: torch.Tensor | list[torch.Tensor],
+    *,
+    current_start: torch.Tensor,
+    frame_seq_length: int,
+) -> torch.Tensor:
+    """Precompute S2V noisy/ref RoPE with tensor-driven noisy frame offset."""
+
+    frame_seq_length = int(frame_seq_length)
+    if frame_seq_length <= 0:
+        raise ValueError("frame_seq_length must be positive")
+    if noisy_grid_sizes.dim() != 2 or noisy_grid_sizes.shape[1] != 3:
+        raise ValueError("noisy_grid_sizes must have shape [B, 3]")
+
+    b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
+    base_freqs = freqs[0] if isinstance(freqs, list) else freqs
+    freq_f, freq_h, freq_w = base_freqs.split(
+        [c - 2 * (c // 3), c // 3, c // 3],
+        dim=1,
+    )
+    output = torch.view_as_complex(x.detach().reshape(b, s, n, -1, 2).to(torch.float64))
+    current_start = current_start.to(device=freq_f.device, dtype=torch.long).reshape(())
+    frame_offset = torch.div(
+        current_start,
+        frame_seq_length,
+        rounding_mode="floor",
+    )
+
+    if noisy_grid_sizes.device.type != "cpu":
+        if _cuda_graph_capture_active():
+            raise RuntimeError(
+                "Stream-R1 tensor-current-start RoPE requires host noisy grid sizes "
+                "during CUDA graph capture"
+            )
+        noisy_grid_sizes = noisy_grid_sizes.cpu()
+
+    noisy_seq_len = 0
+    for i in range(noisy_grid_sizes.shape[0]):
+        seq_f = int(noisy_grid_sizes[i, 0])
+        seq_h = int(noisy_grid_sizes[i, 1])
+        seq_w = int(noisy_grid_sizes[i, 2])
+        seq_len = int(seq_f * seq_h * seq_w)
+        if seq_len <= 0:
+            continue
+        noisy_seq_len = max(noisy_seq_len, seq_len)
+        f_sam = frame_offset + torch.arange(
+            seq_f,
+            dtype=torch.long,
+            device=freq_f.device,
+        )
+        h_sam = torch.arange(seq_h, dtype=torch.long, device=freq_h.device)
+        w_sam = torch.arange(seq_w, dtype=torch.long, device=freq_w.device)
+        freqs_i = torch.cat(
+            [
+                freq_f[f_sam]
+                .view(seq_f, 1, 1, -1)
+                .expand(seq_f, seq_h, seq_w, -1),
+                freq_h[h_sam]
+                .view(1, seq_h, 1, -1)
+                .expand(seq_f, seq_h, seq_w, -1),
+                freq_w[w_sam]
+                .view(1, 1, seq_w, -1)
+                .expand(seq_f, seq_h, seq_w, -1),
+            ],
+            dim=-1,
+        ).reshape(seq_len, 1, -1)
+        output[i, :seq_len] = freqs_i
+
+    if ref_grid_sizes:
+        ref_freqs = _rope_precompute(x[:, noisy_seq_len:], ref_grid_sizes, freqs)
+        ref_seq_len = ref_freqs.shape[1]
+        output[:, noisy_seq_len : noisy_seq_len + ref_seq_len] = ref_freqs
+    return output
+
+
+def _slice_s2v_audio_embeddings_with_tensor_start(
+    audio_emb: torch.Tensor,
+    *,
+    audio_start_frame: torch.Tensor,
+    motion_prefix_frames: torch.Tensor | int,
+    latent_frames: int,
+) -> torch.Tensor:
+    """Slice S2V audio embeddings with tensor-provided chunk start metadata."""
+
+    latent_frames = int(latent_frames)
+    if latent_frames <= 0:
+        raise ValueError("latent_frames must be positive")
+    if audio_emb.dim() < 2:
+        raise ValueError("audio embeddings must have at least batch/time dimensions")
+    audio_start = audio_start_frame.to(device=audio_emb.device, dtype=torch.long).reshape(
+        ()
+    )
+    if isinstance(motion_prefix_frames, torch.Tensor):
+        motion_prefix = motion_prefix_frames.to(
+            device=audio_emb.device,
+            dtype=torch.long,
+        ).reshape(())
+    else:
+        motion_prefix = torch.tensor(
+            int(motion_prefix_frames),
+            dtype=torch.long,
+            device=audio_emb.device,
+        )
+    indices = (
+        audio_start
+        + motion_prefix
+        + torch.arange(latent_frames, dtype=torch.long, device=audio_emb.device)
+    )
+    return torch.index_select(audio_emb, dim=1, index=indices)
 
 
 def _rope_apply_precomputed(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -354,28 +509,37 @@ class FramePackMotioner(nn.Module):
         self.proj = nn.Conv3d(16, inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
         self.proj_2x = nn.Conv3d(16, inner_dim, kernel_size=(2, 4, 4), stride=(2, 4, 4))
         self.proj_4x = nn.Conv3d(16, inner_dim, kernel_size=(4, 8, 8), stride=(4, 8, 8))
-        self.zip_frame_buckets = torch.tensor(zip_frame_buckets, dtype=torch.long)
+        self.zip_frame_bucket_values = tuple(int(item) for item in zip_frame_buckets)
+        self.register_buffer(
+            "zip_frame_buckets",
+            torch.tensor(self.zip_frame_bucket_values, dtype=torch.long),
+            persistent=False,
+        )
         self.inner_dim = inner_dim
         self.num_heads = num_heads
         d = inner_dim // num_heads
-        self.freqs = torch.cat(
-            [
-                rope_params(1024, d - 4 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-            ],
-            dim=1,
+        self.register_buffer(
+            "freqs",
+            torch.cat(
+                [
+                    rope_params(1024, d - 4 * (d // 6)),
+                    rope_params(1024, 2 * (d // 6)),
+                    rope_params(1024, 2 * (d // 6)),
+                ],
+                dim=1,
+            ),
+            persistent=False,
         )
         self.drop_mode = drop_mode
 
     def forward(self, motion_latents: list[torch.Tensor], add_last_motion: int = 2):
         mot, mot_remb = [], []
-        buckets = self.zip_frame_buckets.to(device=motion_latents[0].device)
+        buckets = self.zip_frame_bucket_values
         for m in motion_latents:
             lat_height, lat_width = m.shape[2], m.shape[3]
             padd_lat = torch.zeros(
                 16,
-                int(buckets.sum().item()),
+                sum(buckets),
                 lat_height,
                 lat_width,
                 device=m.device,
@@ -385,15 +549,13 @@ class FramePackMotioner(nn.Module):
             if overlap_frame > 0:
                 padd_lat[:, -overlap_frame:] = m[:, -overlap_frame:]
             if add_last_motion < 2 and self.drop_mode != "drop":
-                zero_end_frame = int(
-                    buckets[: len(buckets) - add_last_motion - 1].sum()
-                )
+                zero_end_frame = sum(buckets[: len(buckets) - add_last_motion - 1])
                 if zero_end_frame > 0:
                     padd_lat[:, -zero_end_frame:] = 0
 
             padd_lat = padd_lat.unsqueeze(0)
             clean_4x, clean_2x, clean_post = padd_lat.split(
-                list(buckets.cpu())[::-1], dim=2
+                list(buckets)[::-1], dim=2
             )
             clean_post = self.proj(clean_post).flatten(2).transpose(1, 2)
             clean_2x = self.proj_2x(clean_2x).flatten(2).transpose(1, 2)
@@ -409,58 +571,47 @@ class FramePackMotioner(nn.Module):
             if not (add_last_motion < 2 and self.drop_mode == "drop"):
                 grid_sizes.append(
                     [
-                        torch.tensor([-buckets[:1].sum(), 0, 0], device=m.device).view(
-                            1, 3
-                        ),
+                        torch.tensor([-sum(buckets[:1]), 0, 0]).view(1, 3),
                         torch.tensor(
                             [
-                                -buckets[:1].sum() + buckets[0],
+                                -sum(buckets[:1]) + buckets[0],
                                 lat_height // 2,
                                 lat_width // 2,
-                            ],
-                            device=m.device,
+                            ]
                         ).view(1, 3),
                         torch.tensor(
-                            [buckets[0], lat_height // 2, lat_width // 2],
-                            device=m.device,
+                            [buckets[0], lat_height // 2, lat_width // 2]
                         ).view(1, 3),
                     ]
                 )
             if not (add_last_motion < 1 and self.drop_mode == "drop"):
                 grid_sizes.append(
                     [
-                        torch.tensor([-buckets[:2].sum(), 0, 0], device=m.device).view(
-                            1, 3
-                        ),
+                        torch.tensor([-sum(buckets[:2]), 0, 0]).view(1, 3),
                         torch.tensor(
                             [
-                                -buckets[:2].sum() + buckets[1] // 2,
+                                -sum(buckets[:2]) + buckets[1] // 2,
                                 lat_height // 4,
                                 lat_width // 4,
-                            ],
-                            device=m.device,
+                            ]
                         ).view(1, 3),
                         torch.tensor(
-                            [buckets[1], lat_height // 2, lat_width // 2],
-                            device=m.device,
+                            [buckets[1], lat_height // 2, lat_width // 2]
                         ).view(1, 3),
                     ]
                 )
             grid_sizes.append(
                 [
-                    torch.tensor([-buckets[:3].sum(), 0, 0], device=m.device).view(
-                        1, 3
-                    ),
+                    torch.tensor([-sum(buckets[:3]), 0, 0]).view(1, 3),
                     torch.tensor(
                         [
-                            -buckets[:3].sum() + buckets[2] // 4,
+                            -sum(buckets[:3]) + buckets[2] // 4,
                             lat_height // 8,
                             lat_width // 8,
-                        ],
-                        device=m.device,
+                        ]
                     ).view(1, 3),
                     torch.tensor(
-                        [buckets[2], lat_height // 2, lat_width // 2], device=m.device
+                        [buckets[2], lat_height // 2, lat_width // 2]
                     ).view(1, 3),
                 ]
             )
@@ -498,6 +649,7 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         stream_r1_sequence_shard_enabled: bool = False,
         stream_r1_sp_pad_tokens: int = 0,
         stream_r1_cache_update_only: bool = False,
+        stream_r1_graph_kv_update: bool = False,
         crossattn_kv_cache: dict | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
@@ -544,6 +696,7 @@ class WanS2VTransformerBlock(WanTransformerBlock):
                 cache_start=cache_start,
                 sequence_shard_enabled=stream_r1_sequence_shard_enabled,
                 sp_pad_tokens=stream_r1_sp_pad_tokens,
+                graph_kv_update=stream_r1_graph_kv_update,
             )
             return hidden_states.to(orig_dtype)
         if stream_r1_kv_cache is not None or stream_r1_attention_layout is not None:
@@ -557,6 +710,7 @@ class WanS2VTransformerBlock(WanTransformerBlock):
                 cache_start=cache_start,
                 sequence_shard_enabled=stream_r1_sequence_shard_enabled,
                 sp_pad_tokens=stream_r1_sp_pad_tokens,
+                graph_kv_update=stream_r1_graph_kv_update,
             ).flatten(2)
         else:
             attn_output = self.attn1(query, key, value, attn_mask=attn_mask).flatten(2)
@@ -566,10 +720,14 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         )
         hidden_states = hidden_states.to(orig_dtype)
 
-        # Populate cross-attn K/V cache on first call so subsequent
-        # forward passes (additional timesteps / clean-context refreshes)
-        # skip the redundant to_k/to_v text projections.
-        if crossattn_kv_cache is not None and "k" not in crossattn_kv_cache:
+        # Populate or refresh cross-attn K/V cache. Server startup graph
+        # pre-capture reuses these tensor addresses across real sessions, so a
+        # new request refreshes contents in place instead of replacing tensors.
+        if crossattn_kv_cache is not None and (
+            bool(crossattn_kv_cache.get("needs_update", False))
+            or not isinstance(crossattn_kv_cache.get("k"), torch.Tensor)
+            or not isinstance(crossattn_kv_cache.get("v"), torch.Tensor)
+        ):
             ctx_k, _ = self.attn2.to_k(encoder_hidden_states)
             if self.attn2.tp_rmsnorm:
                 ctx_k = tensor_parallel_rms_norm(ctx_k, self.attn2.norm_k)
@@ -582,8 +740,33 @@ class WanS2VTransformerBlock(WanTransformerBlock):
             ctx_v = ctx_v.unflatten(
                 2, (self.attn2.local_num_heads, self.attn2.head_dim)
             )
+            cached_k = crossattn_kv_cache.get("k")
+            cached_v = crossattn_kv_cache.get("v")
+            if (
+                isinstance(cached_k, torch.Tensor)
+                and cached_k.shape == ctx_k.shape
+                and cached_k.dtype == ctx_k.dtype
+                and cached_k.device == ctx_k.device
+                and not _is_inference_tensor(cached_k)
+            ):
+                cached_k.copy_(ctx_k)
+                ctx_k = cached_k
+            else:
+                ctx_k = _clone_as_mutable_cache_tensor(ctx_k)
+            if (
+                isinstance(cached_v, torch.Tensor)
+                and cached_v.shape == ctx_v.shape
+                and cached_v.dtype == ctx_v.dtype
+                and cached_v.device == ctx_v.device
+                and not _is_inference_tensor(cached_v)
+            ):
+                cached_v.copy_(ctx_v)
+                ctx_v = cached_v
+            else:
+                ctx_v = _clone_as_mutable_cache_tensor(ctx_v)
             crossattn_kv_cache["k"] = ctx_k
             crossattn_kv_cache["v"] = ctx_v
+            crossattn_kv_cache["needs_update"] = False
 
         attn_output = self.attn2(
             self.self_attn_residual_norm.norm(hidden_states),
@@ -763,16 +946,20 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                 inner_dim=inner_dim,
                 num_heads=arch.num_attention_heads,
                 drop_mode=arch.framepack_drop_mode,
-            )
+        )
 
         d = inner_dim // arch.num_attention_heads
-        self.freqs = torch.cat(
-            [
-                rope_params(1024, d - 4 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-            ],
-            dim=1,
+        self.register_buffer(
+            "freqs",
+            torch.cat(
+                [
+                    rope_params(1024, d - 4 * (d // 6)),
+                    rope_params(1024, 2 * (d // 6)),
+                    rope_params(1024, 2 * (d // 6)),
+                ],
+                dim=1,
+            ),
+            persistent=False,
         )
         self.layer_names = ["blocks"]
         self.cnt = 0
@@ -816,7 +1003,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         if len(mot) > 0:
             x = [torch.cat([u, m], dim=1) for u, m in zip(x, mot)]
             seq_lens = seq_lens + torch.tensor(
-                [r.size(1) for r in mot], dtype=torch.long, device=seq_lens.device
+                [r.size(1) for r in mot], dtype=torch.long
             )
             rope_embs = [torch.cat([u, m], dim=1) for u, m in zip(rope_embs, mot_remb)]
             mask_input = [
@@ -969,6 +1156,25 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         )
         self.stream_r1_kv_cache_requested = bool(kv_cache)
 
+    def forward_with_plan_buffers(
+        self,
+        *,
+        timestep_metadata_buffers: WanS2VTimestepStaticMetadataBuffers,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Forward adapter driven by stable timestep metadata buffers.
+
+        This is the Phase-4 bridge into a graph-friendly forward path. The
+        current implementation materializes metadata as Python scalars and
+        delegates to ``forward``; later patches should move the corresponding
+        audio/RoPE/attention/KV code to consume tensor metadata directly.
+        """
+
+        return self.forward(
+            timestep_metadata_buffers=timestep_metadata_buffers,
+            **kwargs,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor | list[torch.Tensor],
@@ -991,11 +1197,23 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         drop_motion_frames: bool = False,
         stream_r1_mode: bool = False,
         stream_r1_refresh_only: bool = False,
+        stream_r1_audio_emb_pre_sliced: bool = False,
+        stream_r1_graph_kv_update: bool = False,
+        timestep_metadata_buffers: WanS2VTimestepStaticMetadataBuffers | None = None,
         **kwargs,
     ) -> torch.Tensor:
         timestep = timestep if timestep is not None else t
         if timestep is None:
             raise ValueError("WanS2VTransformer3DModel.forward requires timestep/t")
+        if timestep_metadata_buffers is not None:
+            timestep_metadata = timestep_metadata_buffers.to_forward_kwargs()
+            current_start = timestep_metadata["current_start"]
+            cache_start = timestep_metadata["cache_start"]
+            audio_start_frame = timestep_metadata["audio_start_frame"]
+            motion_frames = timestep_metadata["motion_frames"]
+            add_last_motion = timestep_metadata["add_last_motion"]
+            drop_motion_frames = timestep_metadata["drop_motion_frames"]
+            stream_r1_mode = timestep_metadata["stream_r1_mode"]
         validate_wan_s2v_stream_r1_forward_cache(
             kv_cache=kv_cache,
             crossattn_cache=crossattn_cache,
@@ -1056,6 +1274,12 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             audio_emb_res = self.casual_audio_encoder(audio_input)
         else:
             audio_emb_res = audio_emb
+        use_tensor_audio_slice = (
+            stream_r1_mode and timestep_metadata_buffers is not None
+        )
+        audio_emb_pre_sliced = bool(stream_r1_audio_emb_pre_sliced)
+        audio_slice_start = motion_frames[1] + audio_start_frame
+        audio_slice_end = audio_slice_start + latent_frames
         if self.enable_adain:
             if isinstance(audio_emb_res, tuple):
                 audio_emb_global, audio_emb = audio_emb_res
@@ -1066,46 +1290,84 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                 )
             else:
                 audio_emb = audio_emb_res
-            self.audio_emb_global = audio_emb_global[
-                :,
-                motion_frames[1]
-                + audio_start_frame : motion_frames[1]
-                + audio_start_frame
-                + latent_frames,
-            ].clone()
+            if audio_emb_pre_sliced:
+                if audio_emb_global.shape[1] != latent_frames:
+                    raise ValueError(
+                        "pre-sliced Wan S2V global audio embeddings must match "
+                        f"latent_frames={latent_frames}, "
+                        f"got={audio_emb_global.shape[1]}"
+                    )
+                self.audio_emb_global = audio_emb_global
+            elif audio_slice_end > audio_emb_global.shape[1]:
+                raise ValueError(
+                    "Wan S2V global audio embeddings do not cover the requested "
+                    "latent chunk: "
+                    f"chunk_start={audio_start_frame}, "
+                    f"chunk_frames={latent_frames}, "
+                    f"available_audio_frames={audio_emb_global.shape[1] - motion_frames[1]}"
+                )
+            elif use_tensor_audio_slice:
+                self.audio_emb_global = _slice_s2v_audio_embeddings_with_tensor_start(
+                    audio_emb_global,
+                    audio_start_frame=timestep_metadata_buffers.scalar_tensor(
+                        "audio_start_frame"
+                    ),
+                    motion_prefix_frames=timestep_metadata_buffers.motion_frames[1],
+                    latent_frames=latent_frames,
+                )
+            else:
+                self.audio_emb_global = audio_emb_global[
+                    :,
+                    audio_slice_start:audio_slice_end,
+                ].clone()
         else:
             audio_emb = audio_emb_res
-        self.merged_audio_emb = audio_emb[
-            :,
-            motion_frames[1]
-            + audio_start_frame : motion_frames[1]
-            + audio_start_frame
-            + latent_frames,
-            :,
-        ]
-        if self.merged_audio_emb.shape[1] != latent_frames:
+        if audio_emb_pre_sliced:
+            if audio_emb.shape[1] != latent_frames:
+                raise ValueError(
+                    "pre-sliced Wan S2V audio embeddings must match "
+                    f"latent_frames={latent_frames}, got={audio_emb.shape[1]}"
+                )
+            self.merged_audio_emb = audio_emb
+        elif audio_slice_end > audio_emb.shape[1]:
             raise ValueError(
                 "Wan S2V audio embeddings do not cover the requested latent chunk: "
                 f"chunk_start={audio_start_frame}, chunk_frames={latent_frames}, "
                 f"available_audio_frames={audio_emb.shape[1] - motion_frames[1]}"
             )
+        elif use_tensor_audio_slice:
+            self.merged_audio_emb = _slice_s2v_audio_embeddings_with_tensor_start(
+                audio_emb,
+                audio_start_frame=timestep_metadata_buffers.scalar_tensor(
+                    "audio_start_frame"
+                ),
+                motion_prefix_frames=timestep_metadata_buffers.motion_frames[1],
+                latent_frames=latent_frames,
+            )
+        else:
+            self.merged_audio_emb = audio_emb[
+                :,
+                audio_slice_start:audio_slice_end,
+                :,
+            ]
 
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x_list]
         cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_list]
         x = [x_ + pose for x_, pose in zip(x, cond)]
         grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long, device=u.device) for u in x]
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]
         )
         original_grid_sizes = deepcopy(grid_sizes)
         x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor(
-            [u.size(1) for u in x], dtype=torch.long, device=x[0].device
-        )
-        grid_sizes_rope = _build_s2v_noisy_rope_grid_sizes(
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        noisy_grid_sizes_rope = _build_s2v_noisy_rope_grid_sizes(
             grid_sizes,
             stream_r1_mode=stream_r1_mode,
             current_start=current_start,
             frame_seq_length=frame_seq_length,
+        )
+        use_tensor_current_start_rope = (
+            stream_r1_mode and timestep_metadata_buffers is not None
         )
 
         ref = [self.patch_embedding(r.unsqueeze(0)) for r in ref_list]
@@ -1113,23 +1375,16 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
         height, width = ref[0].shape[3], ref[0].shape[4]
         ref_grid_sizes = [
             [
-                torch.tensor([30, 0, 0], device=ref[0].device)
-                .view(1, 3)
-                .repeat(batch_size, 1),
-                torch.tensor([31, height, width], device=ref[0].device)
-                .view(1, 3)
-                .repeat(batch_size, 1),
-                torch.tensor([1, height, width], device=ref[0].device)
-                .view(1, 3)
-                .repeat(batch_size, 1),
+                torch.tensor([30, 0, 0]).view(1, 3).repeat(batch_size, 1),
+                torch.tensor([31, height, width]).view(1, 3).repeat(batch_size, 1),
+                torch.tensor([1, height, width]).view(1, 3).repeat(batch_size, 1),
             ]
         ]
         ref = [r.flatten(2).transpose(1, 2) for r in ref]
         self.original_seq_len = seq_lens[0].item()
         seq_lens = seq_lens + torch.tensor(
-            [r.size(1) for r in ref], dtype=torch.long, device=seq_lens.device
+            [r.size(1) for r in ref], dtype=torch.long
         )
-        grid_sizes_rope = grid_sizes_rope + ref_grid_sizes
         x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)]
 
         mask_input = [
@@ -1146,9 +1401,24 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
             self.hidden_size // self.num_attention_heads,
         )
         freqs = self.freqs.to(device=x_cat.device)
-        pre_compute_freqs = _rope_precompute(
-            x_cat.detach().view(b, s, n, d), grid_sizes_rope, freqs
-        )
+        x_for_rope = x_cat.detach().view(b, s, n, d)
+        if use_tensor_current_start_rope:
+            pre_compute_freqs = _rope_precompute_s2v_stream_r1_tensor_current_start(
+                x_for_rope,
+                grid_sizes,
+                ref_grid_sizes,
+                freqs,
+                current_start=timestep_metadata_buffers.scalar_tensor(
+                    "current_start"
+                ),
+                frame_seq_length=frame_seq_length,
+            )
+        else:
+            pre_compute_freqs = _rope_precompute(
+                x_for_rope,
+                noisy_grid_sizes_rope + ref_grid_sizes,
+                freqs,
+            )
         x = [u.unsqueeze(0) for u in x_cat]
         pre_compute_freqs = [u.unsqueeze(0) for u in pre_compute_freqs]
         x, seq_lens, pre_compute_freqs, mask_input = self._inject_motion(
@@ -1320,6 +1590,7 @@ class WanS2VTransformer3DModel(WanTransformer3DModel):
                 ),
                 stream_r1_sp_pad_tokens=seq_shard_pad,
                 stream_r1_cache_update_only=refresh_last_block,
+                stream_r1_graph_kv_update=stream_r1_graph_kv_update,
                 crossattn_kv_cache=(
                     crossattn_cache[idx]
                     if stream_r1_mode and crossattn_cache is not None

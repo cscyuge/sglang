@@ -2,7 +2,9 @@
 """Wan2.2-S2V specific pipeline stages."""
 
 import inspect
+import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -14,9 +16,18 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VKVCacheBlock,
+    WanS2VStreamR1NoisyKVCacheUpdate,
+    WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer,
+    WanS2VStreamR1KVState,
+    WanS2VTimestepMetadataPlan,
+    WanS2VTimestepStaticMetadataBuffers,
+    build_wan_s2v_stream_r1_noisy_kv_cache_update_plan,
     wan_s2v_stream_r1_uses_head_sharded_sp_kv_cache,
 )
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
@@ -109,6 +120,7 @@ class WanS2VStreamR1CacheMetadata:
 class WanS2VStreamR1CacheState:
     metadata: WanS2VStreamR1CacheMetadata | None = None
     kv_cache: list[WanS2VKVCacheBlock] | None = None
+    kv_states: list[WanS2VStreamR1KVState] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -133,8 +145,11 @@ class WanS2VStreamR1CacheState:
         cls, metadata: WanS2VStreamR1CacheMetadata
     ) -> "WanS2VStreamR1CacheState":
         kv_cache: list[WanS2VKVCacheBlock] = []
+        kv_states: list[WanS2VStreamR1KVState] = []
         with torch.inference_mode(False):
             for _ in range(metadata.num_layers):
+                state = WanS2VStreamR1KVState()
+                kv_states.append(state)
                 kv_cache.append(
                     {
                         "k": torch.zeros(
@@ -163,16 +178,76 @@ class WanS2VStreamR1CacheState:
                         "local_end_index": torch.zeros(
                             (1,), dtype=torch.long, device=metadata.device
                         ),
+                        "global_end_index_host": 0,
+                        "local_end_index_host": 0,
+                        "state": state,
+                        "update_plan_buffer": (
+                            WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer.allocate(
+                                device=metadata.device,
+                                cache_capacity=metadata.cache_tokens,
+                                sink_tokens=metadata.sink_tokens,
+                            )
+                        ),
                     }
                 )
-        return cls(metadata=metadata, kv_cache=kv_cache)
+        return cls(metadata=metadata, kv_cache=kv_cache, kv_states=kv_states)
 
     def reset(self) -> None:
         if self.kv_cache is None:
             return
+        if self.kv_states is not None:
+            for state in self.kv_states:
+                state.reset()
         for block_cache in self.kv_cache:
             block_cache["global_end_index"].zero_()
             block_cache["local_end_index"].zero_()
+            block_state = block_cache.get("state")
+            if isinstance(block_state, WanS2VStreamR1KVState):
+                block_state.reset()
+                block_cache["global_end_index_host"] = block_state.global_end_index
+                block_cache["local_end_index_host"] = block_state.local_end_index
+            else:
+                block_cache["global_end_index_host"] = 0
+                block_cache["local_end_index_host"] = 0
+            update_plan_buffer = block_cache.get("update_plan_buffer")
+            if isinstance(
+                update_plan_buffer, WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer
+            ):
+                update_plan_buffer.clear()
+
+    def prepare_kv_update_plans(
+        self,
+        *,
+        noisy_seq_len: int,
+        current_start: int,
+        cache_start: int = 0,
+    ) -> None:
+        if self.metadata is None or self.kv_cache is None or self.kv_states is None:
+            return
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=int(noisy_seq_len),
+            frame_seq_length=self.metadata.frame_seq_length,
+            local_attn_size=self.metadata.local_attn_size,
+            sink_size=self.metadata.sink_size,
+            current_start=int(current_start),
+            cache_start=int(cache_start),
+        )
+        for block_cache, state in zip(self.kv_cache, self.kv_states):
+            update_plan_buffer = block_cache.get("update_plan_buffer")
+            if not isinstance(
+                update_plan_buffer, WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer
+            ):
+                continue
+            try:
+                plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
+                    block_cache,
+                    update,
+                    state=state,
+                )
+            except ValueError:
+                update_plan_buffer.clear()
+                continue
+            update_plan_buffer.copy_from_plan_(plan)
 
 
 @dataclass(frozen=True)
@@ -227,6 +302,658 @@ class WanS2VTimestepAblationConfig:
     @property
     def enabled(self) -> bool:
         return self.mode != "off" and bool(self.step_indices or self.timestep_values)
+
+
+@dataclass(frozen=True)
+class WanS2VTimestepCudaGraphConfig:
+    enabled: bool
+    step_indices: tuple[int, ...]
+    warmup_blocks: int
+    max_graphs: int
+    log: bool
+
+
+class _WanS2VTimestepTensorTree:
+    """Small tensor-tree helpers used by the timestep graph path."""
+
+    _NON_TENSOR_ADDRESS_SIGNATURE = ("__non_tensor__",)
+
+    @staticmethod
+    def tensor_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
+        return (
+            tuple(tensor.shape),
+            str(tensor.dtype),
+            str(tensor.device),
+        )
+
+    @classmethod
+    def nested_signature(cls, value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return cls.tensor_signature(value)
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return tuple(cls.nested_signature(item) for item in value)
+        if isinstance(value, dict):
+            return tuple(
+                (key, cls.nested_signature(value[key])) for key in sorted(value)
+            )
+        return (type(value).__name__, value)
+
+    @staticmethod
+    def tensor_address_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
+        return (
+            int(tensor.data_ptr()),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            str(tensor.dtype),
+            str(tensor.device),
+        )
+
+    @classmethod
+    def nested_address_signature(cls, value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return cls.tensor_address_signature(value)
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return tuple(cls.nested_address_signature(item) for item in value)
+        if isinstance(value, dict):
+            return tuple(
+                (key, signature)
+                for key in sorted(value)
+                for signature in (cls.nested_address_signature(value[key]),)
+                if signature != cls._NON_TENSOR_ADDRESS_SIGNATURE
+            )
+        return cls._NON_TENSOR_ADDRESS_SIGNATURE
+
+    @classmethod
+    def clone_static(cls, value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            with torch.inference_mode(False):
+                static = torch.empty_strided(
+                    tuple(value.shape),
+                    tuple(value.stride()),
+                    dtype=value.dtype,
+                    device=value.device,
+                )
+                static.copy_(value)
+            return static
+        if value is None:
+            return None
+        if isinstance(value, tuple):
+            return tuple(cls.clone_static(item) for item in value)
+        if isinstance(value, list):
+            return [cls.clone_static(item) for item in value]
+        if isinstance(value, dict):
+            return {key: cls.clone_static(item) for key, item in value.items()}
+        return value
+
+    @classmethod
+    def copy_static_(cls, static: Any, live: Any) -> None:
+        if isinstance(static, torch.Tensor):
+            if not isinstance(live, torch.Tensor):
+                raise TypeError("CUDA graph static tensor input received non-tensor")
+            if static.shape != live.shape or static.dtype != live.dtype:
+                raise ValueError(
+                    "CUDA graph static input shape/dtype mismatch: "
+                    f"static={tuple(static.shape)}/{static.dtype}, "
+                    f"live={tuple(live.shape)}/{live.dtype}"
+                )
+            static.copy_(live)
+            return
+        if static is None:
+            if live is not None:
+                raise ValueError("CUDA graph static None input received a value")
+            return
+        if isinstance(static, tuple):
+            if not isinstance(live, tuple) or len(static) != len(live):
+                raise ValueError("CUDA graph tuple input structure mismatch")
+            for static_item, live_item in zip(static, live):
+                cls.copy_static_(static_item, live_item)
+            return
+        if isinstance(static, list):
+            if not isinstance(live, list) or len(static) != len(live):
+                raise ValueError("CUDA graph list input structure mismatch")
+            for static_item, live_item in zip(static, live):
+                cls.copy_static_(static_item, live_item)
+            return
+        if isinstance(static, dict):
+            if not isinstance(live, dict) or set(static) != set(live):
+                raise ValueError("CUDA graph dict input structure mismatch")
+            for key in static:
+                cls.copy_static_(static[key], live[key])
+
+
+class _WanS2VTimestepStaticInputBuffers:
+    """Static-address transformer inputs for one captured timestep shape."""
+
+    _STATIC_INPUT_KEYS = (
+        "hidden_states",
+        "timestep",
+        "encoder_hidden_states",
+        "ref_latents",
+        "motion_latents",
+        "cond_states",
+        "audio_input",
+        "audio_emb",
+        "audio_emb_global",
+    )
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        self.values = values
+
+    @classmethod
+    def from_live_kwargs(
+        cls, kwargs: dict[str, Any]
+    ) -> "_WanS2VTimestepStaticInputBuffers":
+        return cls(
+            {
+                key: _WanS2VTimestepTensorTree.clone_static(kwargs.get(key))
+                for key in cls._STATIC_INPUT_KEYS
+            }
+        )
+
+    @classmethod
+    def signature_from_kwargs(cls, kwargs: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(
+            (key, _WanS2VTimestepTensorTree.nested_signature(kwargs.get(key)))
+            for key in cls._STATIC_INPUT_KEYS
+        )
+
+    def copy_from_live_kwargs_(self, kwargs: dict[str, Any]) -> None:
+        for key in self._STATIC_INPUT_KEYS:
+            _WanS2VTimestepTensorTree.copy_static_(self.values[key], kwargs.get(key))
+
+    def bind_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        static_kwargs = dict(kwargs)
+        static_kwargs.update(self.values)
+        return static_kwargs
+
+
+@dataclass
+class _WanS2VTimestepCudaGraphEntry:
+    graph: torch.cuda.CUDAGraph
+    static_inputs: _WanS2VTimestepStaticInputBuffers
+    static_metadata: WanS2VTimestepStaticMetadataBuffers
+    static_kwargs: dict[str, Any]
+    output: Any
+    kv_update_plan_signature: tuple[Any, ...] | None = None
+
+
+class _WanS2VTimestepFullCudaGraphBackend:
+    """Full-graph capture/replay for one Wan transformer timestep shape."""
+
+    def capture_one(
+        self,
+        *,
+        forward_fn: Any,
+        static_kwargs: dict[str, Any],
+    ) -> tuple[torch.cuda.CUDAGraph, Any]:
+        graph = torch.cuda.CUDAGraph()
+        try:
+            # Do not run backend-local warmups here: the Wan timestep forward
+            # mutates KV cache state. The public warmup_blocks gate keeps early
+            # one-time setup out of capture without replaying this step eagerly.
+            with torch.cuda.graph(graph):
+                output = forward_fn(**static_kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                "Wan S2V timestep CUDA graph capture failed. Disable "
+                "wan_s2v_timestep_cuda_graph to fall back to eager execution."
+            ) from exc
+        return graph, output
+
+    @staticmethod
+    def replay(entry: _WanS2VTimestepCudaGraphEntry) -> Any:
+        entry.graph.replay()
+        return entry.output
+
+
+class _WanS2VTransformerTimestepCudaGraphRunner:
+    """CUDA graph runner for one Stream-R1 Wan S2V transformer timestep.
+
+    This mirrors the LLM decode full-graph split at a smaller scope: the
+    runner owns graph keys, LRU state, and fallbacks; static input buffers own
+    stable tensor addresses; the backend only captures and replays the full
+    transformer forward.
+    """
+
+    def __init__(self) -> None:
+        self.max_graphs = 16
+        self.graphs: OrderedDict[tuple[Any, ...], _WanS2VTimestepCudaGraphEntry] = (
+            OrderedDict()
+        )
+        self.backend = _WanS2VTimestepFullCudaGraphBackend()
+
+    @property
+    def cached_graph_count(self) -> int:
+        return len(self.graphs)
+
+    def configure(self, *, max_graphs: int) -> None:
+        self.max_graphs = max(1, int(max_graphs))
+        while len(self.graphs) > self.max_graphs:
+            self.graphs.popitem(last=False)
+
+    def clear(self) -> None:
+        self.graphs.clear()
+
+    @staticmethod
+    def crossattn_cache_ready(crossattn_cache: list[dict] | None) -> bool:
+        if crossattn_cache is None:
+            return True
+        return all(
+            isinstance(item.get("k"), torch.Tensor)
+            and isinstance(item.get("v"), torch.Tensor)
+            and not bool(item.get("needs_update", False))
+            for item in crossattn_cache
+        )
+
+    @classmethod
+    def _cache_signature(
+        cls,
+        kv_cache: list[WanS2VKVCacheBlock] | None,
+        crossattn_cache: list[dict] | None,
+    ) -> tuple[Any, ...]:
+        return (
+            _WanS2VTimestepTensorTree.nested_address_signature(kv_cache),
+            _WanS2VTimestepTensorTree.nested_address_signature(crossattn_cache),
+        )
+
+    @staticmethod
+    def kv_update_plan_signature(
+        kv_cache: list[WanS2VKVCacheBlock] | None,
+    ) -> tuple[Any, ...] | None:
+        if kv_cache is None:
+            return None
+        signature = []
+        for block_cache in kv_cache:
+            update_plan_buffer = block_cache.get("update_plan_buffer")
+            if not isinstance(
+                update_plan_buffer, WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer
+            ):
+                return None
+            host_plan = update_plan_buffer.host_plan
+            if host_plan is None:
+                return None
+            signature.append(
+                (
+                    int(host_plan.cache_capacity),
+                    int(host_plan.update.noisy_seq_len),
+                    int(host_plan.update.sink_tokens),
+                    int(host_plan.update.local_tokens),
+                    int(host_plan.cache_local_end),
+                    int(host_plan.local_write_start),
+                    int(host_plan.local_write_end),
+                    int(host_plan.kv_start),
+                    int(
+                        WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer.VIEW_KIND_TO_INDEX[
+                            host_plan.view_kind
+                        ]
+                    ),
+                    int(host_plan.view_local_end_index),
+                    int(host_plan.local_suffix_len),
+                )
+            )
+        return tuple(signature)
+
+    @staticmethod
+    def commit_kv_update_plans(
+        kv_cache: list[WanS2VKVCacheBlock] | None,
+    ) -> None:
+        if kv_cache is None:
+            return
+        for block_cache in kv_cache:
+            update_plan_buffer = block_cache.get("update_plan_buffer")
+            if not isinstance(
+                update_plan_buffer, WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer
+            ):
+                raise ValueError("Wan timestep graph KV replay requires plan buffers")
+            host_plan = update_plan_buffer.host_plan
+            if host_plan is None:
+                raise ValueError("Wan timestep graph KV replay requires prepared plans")
+            kv_state = block_cache.get("state")
+            if not isinstance(kv_state, WanS2VStreamR1KVState):
+                raise ValueError("Wan timestep graph KV replay requires KV state owner")
+            kv_state.apply_noisy_kv_cache_update_plan(host_plan)
+            block_cache["global_end_index_host"] = int(kv_state.global_end_index)
+            block_cache["local_end_index_host"] = int(kv_state.local_end_index)
+
+    @classmethod
+    def make_key(
+        cls,
+        *,
+        kwargs: dict[str, Any],
+        metadata_plan: WanS2VTimestepMetadataPlan,
+        metadata_device: torch.device,
+    ) -> tuple[Any, ...]:
+        return (
+            "wan_s2v_transformer_timestep_v4",
+            metadata_plan.structure_key_signature,
+            bool(kwargs.get("stream_r1_audio_emb_pre_sliced", False)),
+            bool(kwargs.get("stream_r1_graph_kv_update", False)),
+            WanS2VTimestepStaticMetadataBuffers.signature_from_plan(
+                metadata_plan,
+                device=metadata_device,
+            ),
+            _WanS2VTimestepStaticInputBuffers.signature_from_kwargs(kwargs),
+            cls._cache_signature(
+                kwargs.get("kv_cache"), kwargs.get("crossattn_cache")
+            ),
+        )
+
+    @staticmethod
+    def _static_input_key_diff(existing: Any, current: Any) -> list[str]:
+        if not isinstance(existing, tuple) or not isinstance(current, tuple):
+            return ["<non_tuple>"]
+        changed: list[str] = []
+        for existing_item, current_item in zip(existing, current):
+            if (
+                not isinstance(existing_item, tuple)
+                or not isinstance(current_item, tuple)
+                or len(existing_item) != 2
+                or len(current_item) != 2
+            ):
+                if existing_item != current_item:
+                    changed.append("<unknown>")
+                continue
+            existing_name, existing_sig = existing_item
+            current_name, current_sig = current_item
+            name = str(existing_name)
+            if existing_name != current_name:
+                changed.append(f"{name}->{current_name}")
+            elif existing_sig != current_sig:
+                changed.append(name)
+        if len(existing) != len(current):
+            changed.append("<length>")
+        return changed
+
+    @classmethod
+    def _key_diff_summary(
+        cls,
+        existing_key: tuple[Any, ...],
+        current_key: tuple[Any, ...],
+    ) -> dict[str, Any]:
+        component_names = (
+            "version",
+            "metadata_structure",
+            "audio_pre_sliced",
+            "graph_kv_update",
+            "metadata_buffers",
+            "static_inputs",
+            "cache_addresses",
+        )
+        changed = []
+        for idx, (existing_item, current_item) in enumerate(
+            zip(existing_key, current_key)
+        ):
+            if existing_item == current_item:
+                continue
+            name = component_names[idx] if idx < len(component_names) else str(idx)
+            if name == "static_inputs":
+                changed.append(
+                    {
+                        "component": name,
+                        "inputs": cls._static_input_key_diff(
+                            existing_item, current_item
+                        ),
+                    }
+                )
+            elif name == "cache_addresses":
+                cache_changed = []
+                if (
+                    isinstance(existing_item, tuple)
+                    and isinstance(current_item, tuple)
+                    and len(existing_item) == 2
+                    and len(current_item) == 2
+                ):
+                    if existing_item[0] != current_item[0]:
+                        cache_changed.append("kv_cache")
+                    if existing_item[1] != current_item[1]:
+                        cache_changed.append("crossattn_cache")
+                else:
+                    cache_changed.append("<unknown>")
+                changed.append({"component": name, "caches": cache_changed})
+            else:
+                changed.append({"component": name})
+        if len(existing_key) != len(current_key):
+            changed.append({"component": "<length>"})
+        return {"changed": changed}
+
+    def _log_key_miss_debug(self, key: tuple[Any, ...]) -> None:
+        if not os.getenv("WAN_S2V_TIMESTEP_CUDA_GRAPH_KEY_DEBUG"):
+            return
+        summaries = [
+            self._key_diff_summary(existing_key, key)
+            for existing_key in reversed(self.graphs.keys())
+        ]
+        logger.info(
+            "Wan S2V timestep CUDA graph key miss: cached_graphs=%d diffs=%s",
+            len(self.graphs),
+            summaries,
+        )
+
+    @staticmethod
+    def _latent_frames_from_hidden_states(hidden_states: Any) -> int | None:
+        if isinstance(hidden_states, torch.Tensor):
+            if hidden_states.dim() >= 5:
+                return int(hidden_states.shape[2])
+            if hidden_states.dim() >= 4:
+                return int(hidden_states.shape[1])
+            return None
+        if isinstance(hidden_states, (list, tuple)) and hidden_states:
+            first = hidden_states[0]
+            if isinstance(first, torch.Tensor) and first.dim() >= 4:
+                return int(first.shape[1])
+        return None
+
+    @staticmethod
+    def _slice_audio_embedding_for_graph(
+        audio_embedding: torch.Tensor,
+        *,
+        audio_slice_start: int,
+        audio_slice_end: int,
+    ) -> torch.Tensor:
+        if audio_embedding.dim() < 2:
+            raise ValueError(
+                "Wan timestep graph audio embedding must have batch/time dimensions"
+            )
+        if audio_slice_end > int(audio_embedding.shape[1]):
+            raise ValueError(
+                "Wan timestep graph audio embeddings do not cover the requested "
+                f"slice: end={audio_slice_end}, available={audio_embedding.shape[1]}"
+            )
+        return audio_embedding[:, audio_slice_start:audio_slice_end].contiguous()
+
+    @classmethod
+    def prepare_graph_kwargs(
+        cls,
+        kwargs: dict[str, Any],
+        metadata_plan: WanS2VTimestepMetadataPlan,
+    ) -> dict[str, Any]:
+        graph_kwargs = dict(kwargs)
+        audio_emb = graph_kwargs.get("audio_emb")
+        if audio_emb is None:
+            return graph_kwargs
+        latent_frames = cls._latent_frames_from_hidden_states(
+            graph_kwargs.get("hidden_states")
+        )
+        if latent_frames is None:
+            return graph_kwargs
+        if len(metadata_plan.motion_frames) < 2:
+            return graph_kwargs
+
+        audio_start_frame = (
+            0
+            if metadata_plan.audio_start_frame is None
+            else int(metadata_plan.audio_start_frame)
+        )
+        audio_slice_start = int(metadata_plan.motion_frames[1]) + audio_start_frame
+        audio_slice_end = audio_slice_start + int(latent_frames)
+
+        if isinstance(audio_emb, tuple):
+            if len(audio_emb) != 2:
+                return graph_kwargs
+            audio_emb_global, local_audio_emb = audio_emb
+            if not isinstance(audio_emb_global, torch.Tensor) or not isinstance(
+                local_audio_emb, torch.Tensor
+            ):
+                return graph_kwargs
+            graph_kwargs["audio_emb"] = (
+                cls._slice_audio_embedding_for_graph(
+                    audio_emb_global,
+                    audio_slice_start=audio_slice_start,
+                    audio_slice_end=audio_slice_end,
+                ),
+                cls._slice_audio_embedding_for_graph(
+                    local_audio_emb,
+                    audio_slice_start=audio_slice_start,
+                    audio_slice_end=audio_slice_end,
+                ),
+            )
+        elif isinstance(audio_emb, torch.Tensor):
+            graph_kwargs["audio_emb"] = cls._slice_audio_embedding_for_graph(
+                audio_emb,
+                audio_slice_start=audio_slice_start,
+                audio_slice_end=audio_slice_end,
+            )
+            audio_emb_global = graph_kwargs.get("audio_emb_global")
+            if isinstance(audio_emb_global, torch.Tensor):
+                graph_kwargs["audio_emb_global"] = cls._slice_audio_embedding_for_graph(
+                    audio_emb_global,
+                    audio_slice_start=audio_slice_start,
+                    audio_slice_end=audio_slice_end,
+                )
+        else:
+            return graph_kwargs
+
+        graph_kwargs["stream_r1_audio_emb_pre_sliced"] = True
+        graph_kwargs["audio_input"] = None
+        return graph_kwargs
+
+    @staticmethod
+    def _disable_graph_kv_update(kwargs: dict[str, Any]) -> dict[str, Any]:
+        if not kwargs.get("stream_r1_graph_kv_update", False):
+            return kwargs
+        eager_kwargs = dict(kwargs)
+        eager_kwargs["stream_r1_graph_kv_update"] = False
+        return eager_kwargs
+
+    @staticmethod
+    def bind_forward_with_metadata(
+        forward_fn: Any,
+        metadata_buffers: WanS2VTimestepStaticMetadataBuffers,
+    ) -> Any:
+        forward_with_plan_buffers = getattr(
+            forward_fn, "forward_with_plan_buffers", None
+        )
+        if not callable(forward_with_plan_buffers):
+            return forward_fn
+
+        def _forward_with_plan_buffers(**call_kwargs: Any) -> Any:
+            return forward_with_plan_buffers(
+                timestep_metadata_buffers=metadata_buffers,
+                **call_kwargs,
+            )
+
+        return _forward_with_plan_buffers
+
+    def run(
+        self,
+        *,
+        kwargs: dict[str, Any],
+        forward_fn: Any,
+        step_index: int,
+        current_start: int,
+        audio_start_frame: int | None,
+        sequence_shard_enabled: bool,
+        allow_capture: bool = True,
+    ) -> tuple[Any, str]:
+        metadata_plan = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs=kwargs,
+            step_index=step_index,
+            current_start=current_start,
+            audio_start_frame=audio_start_frame,
+            sequence_shard_enabled=sequence_shard_enabled,
+        )
+        graph_kwargs = self.prepare_graph_kwargs(kwargs, metadata_plan)
+        if graph_kwargs.get("kv_cache") is not None:
+            graph_kwargs = {
+                **graph_kwargs,
+                "stream_r1_graph_kv_update": True,
+            }
+        metadata_device = WanS2VTimestepStaticMetadataBuffers.device_from_kwargs(
+            graph_kwargs
+        )
+        key = self.make_key(
+            kwargs=graph_kwargs,
+            metadata_plan=metadata_plan,
+            metadata_device=metadata_device,
+        )
+        entry = self.graphs.get(key)
+        kv_plan_signature = self.kv_update_plan_signature(graph_kwargs.get("kv_cache"))
+        if entry is not None:
+            entry.static_metadata.copy_from_plan_(metadata_plan)
+            if graph_kwargs.get("kv_cache") is not None:
+                if (
+                    kv_plan_signature is None
+                    or entry.kv_update_plan_signature != kv_plan_signature
+                ):
+                    bound_forward = self.bind_forward_with_metadata(
+                        forward_fn,
+                        entry.static_metadata,
+                    )
+                    return (
+                        bound_forward(**self._disable_graph_kv_update(graph_kwargs)),
+                        "eager_kv_plan_mismatch",
+                    )
+            entry.static_inputs.copy_from_live_kwargs_(graph_kwargs)
+            output = self.backend.replay(entry)
+            self.commit_kv_update_plans(graph_kwargs.get("kv_cache"))
+            self.graphs.move_to_end(key)
+            return output, "replay"
+
+        if len(self.graphs) >= self.max_graphs:
+            return (
+                forward_fn(**self._disable_graph_kv_update(graph_kwargs)),
+                "eager_graph_limit",
+            )
+
+        if not allow_capture:
+            raise RuntimeError(
+                "Wan S2V timestep CUDA graph attempted capture while capture is disabled."
+            )
+
+        self._log_key_miss_debug(key)
+
+        static_inputs = _WanS2VTimestepStaticInputBuffers.from_live_kwargs(
+            graph_kwargs
+        )
+        static_metadata = WanS2VTimestepStaticMetadataBuffers.from_plan(
+            metadata_plan,
+            device=metadata_device,
+        )
+        static_kwargs = static_inputs.bind_kwargs(graph_kwargs)
+        bound_forward = self.bind_forward_with_metadata(
+            forward_fn,
+            static_metadata,
+        )
+        graph, output = self.backend.capture_one(
+            forward_fn=bound_forward,
+            static_kwargs=static_kwargs,
+        )
+        entry = _WanS2VTimestepCudaGraphEntry(
+            graph=graph,
+            static_inputs=static_inputs,
+            static_metadata=static_metadata,
+            static_kwargs=static_kwargs,
+            output=output,
+            kv_update_plan_signature=kv_plan_signature,
+        )
+        output = self.backend.replay(entry)
+        self.commit_kv_update_plans(graph_kwargs.get("kv_cache"))
+        self.graphs[key] = entry
+        return output, "capture"
 
 
 @dataclass(frozen=True)
@@ -791,6 +1518,41 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         self._adaptive_reduced_blocks: int = 0
         self._last_adaptive_step_decision: WanS2VAdaptiveStepDecision | None = None
         self._last_timestep_profile_rows: list[dict[str, Any]] = []
+        self._timestep_cuda_graph_runner = (
+            _WanS2VTransformerTimestepCudaGraphRunner()
+        )
+        self.crossattn_cache: list[dict[str, Any]] | None = None
+
+    def _prepare_crossattn_cache(self, enabled: bool) -> list[dict[str, Any]] | None:
+        if not enabled:
+            self.crossattn_cache = None
+            return None
+
+        num_blocks = len(self.transformer.blocks)
+        if (
+            self.crossattn_cache is None
+            or len(self.crossattn_cache) != num_blocks
+            or any(not isinstance(item, dict) for item in self.crossattn_cache)
+        ):
+            self.crossattn_cache = [{} for _ in range(num_blocks)]
+        return self.crossattn_cache
+
+    @staticmethod
+    def _mark_crossattn_cache_needs_update(
+        crossattn_cache: list[dict[str, Any]] | None,
+    ) -> None:
+        if crossattn_cache is None:
+            return
+        for item in crossattn_cache:
+            item["needs_update"] = True
+
+    def _prepare_request_crossattn_cache(
+        self,
+        enabled: bool,
+    ) -> list[dict[str, Any]] | None:
+        crossattn_cache = self._prepare_crossattn_cache(enabled)
+        self._mark_crossattn_cache_needs_update(crossattn_cache)
+        return crossattn_cache
 
     def _prepare_timesteps(
         self,
@@ -1089,6 +1851,91 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 )
             ),
         )
+
+    def _resolve_timestep_cuda_graph_config(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> WanS2VTimestepCudaGraphConfig:
+        max_graphs = int(
+            _resolve_request_value(
+                batch,
+                server_args,
+                "timestep_cuda_graph_max_graphs",
+                "wan_s2v_timestep_cuda_graph_max_graphs",
+                16,
+            )
+        )
+        if max_graphs <= 0:
+            raise ValueError("wan_s2v_timestep_cuda_graph_max_graphs must be positive")
+        warmup_blocks = int(
+            _resolve_request_value(
+                batch,
+                server_args,
+                "timestep_cuda_graph_warmup_blocks",
+                "wan_s2v_timestep_cuda_graph_warmup_blocks",
+                2,
+            )
+        )
+        if warmup_blocks < 0:
+            raise ValueError(
+                "wan_s2v_timestep_cuda_graph_warmup_blocks must be non-negative"
+            )
+        return WanS2VTimestepCudaGraphConfig(
+            enabled=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_cuda_graph",
+                    "wan_s2v_timestep_cuda_graph",
+                    False,
+                )
+            ),
+            step_indices=_coerce_optional_int_tuple(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_cuda_graph_indices",
+                    "wan_s2v_timestep_cuda_graph_indices",
+                    (),
+                ),
+                "wan_s2v_timestep_cuda_graph_indices",
+            ),
+            warmup_blocks=warmup_blocks,
+            max_graphs=max_graphs,
+            log=bool(
+                _resolve_request_value(
+                    batch,
+                    server_args,
+                    "timestep_cuda_graph_log",
+                    "wan_s2v_timestep_cuda_graph_log",
+                    False,
+                )
+            ),
+        )
+
+    def _can_use_timestep_cuda_graph(
+        self,
+        config: WanS2VTimestepCudaGraphConfig,
+        *,
+        block_index: int,
+        step_index: int,
+        device: torch.device,
+        crossattn_cache: list[dict] | None,
+    ) -> tuple[bool, str]:
+        if not config.enabled:
+            return False, "disabled"
+        if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+            return False, "non_cuda"
+        if block_index < config.warmup_blocks:
+            return False, "warmup"
+        if config.step_indices and step_index not in config.step_indices:
+            return False, "step_filtered"
+        if not _WanS2VTransformerTimestepCudaGraphRunner.crossattn_cache_ready(
+            crossattn_cache
+        ):
+            return False, "crossattn_cache_not_ready"
+        return True, "enabled"
 
     def _select_timestep_ablation_action(
         self,
@@ -1953,6 +2800,15 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             dtype=torch.long,
             device=block_latents.device,
         )
+        if cache_state.metadata is not None:
+            cache_state.prepare_kv_update_plans(
+                noisy_seq_len=(
+                    int(block_latents.shape[2])
+                    * cache_state.metadata.frame_seq_length
+                ),
+                current_start=current_start,
+                cache_start=0,
+            )
 
         with set_forward_context(
             current_timestep=0,
@@ -2028,6 +2884,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         audio_start_frame: int | None = None,
         step_noises_btchw: Sequence[torch.Tensor] | None = None,
         block_index: int | None = None,
+        allow_timestep_cuda_graph_capture: bool = True,
     ) -> torch.Tensor:
         """Denoise one Stream-R1 S2V latent block.
 
@@ -2046,6 +2903,15 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             block_index = int(block_start) // int(chunk_frames)
         profile_config = self._resolve_timestep_profile_config(batch, server_args)
         ablation_config = self._resolve_timestep_ablation_config(batch, server_args)
+        cuda_graph_config = self._resolve_timestep_cuda_graph_config(
+            batch, server_args
+        )
+        if cuda_graph_config.enabled:
+            self._timestep_cuda_graph_runner.configure(
+                max_graphs=cuda_graph_config.max_graphs
+            )
+        else:
+            self._timestep_cuda_graph_runner.clear()
         use_nvtx = bool(
             profile_config.nvtx and (profile_config.enabled or ablation_config.enabled)
         )
@@ -2053,7 +2919,9 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             float(item) for item in timesteps.detach().cpu().reshape(-1).tolist()
         ]
         timestep_profile_rows: list[dict[str, Any]] = []
+        timestep_cuda_graph_statuses: list[dict[str, Any]] = []
         self._last_timestep_profile_rows = timestep_profile_rows
+        self._last_timestep_cuda_graph_statuses = timestep_cuda_graph_statuses
         if step_noises_btchw is not None and len(step_noises_btchw) != max(
             int(timesteps.numel()) - 1, 0
         ):
@@ -2081,6 +2949,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             )
             transformer_ms = None
             scheduler_ms = None
+            cuda_graph_status = None
             step_started = self._timestep_profile_timestamp(
                 profile_config, current_latents.device
             )
@@ -2113,34 +2982,98 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                                 forward_batch=batch,
                             ),
                         ):
-                            noise_pred_bcthw = self.transformer(
-                                hidden_states=current_latents,
-                                timestep=t_expand,
-                                encoder_hidden_states=prompt_embeds,
-                                ref_latents=block_bundle.ref_latents,
-                                motion_latents=block_bundle.motion_latents,
-                                cond_states=block_bundle.cond_states,
-                                audio_input=block_bundle.audio_input,
-                                audio_emb=block_bundle.audio_emb,
-                                motion_frames=block_bundle.motion_frames,
-                                add_last_motion=block_bundle.add_last_motion,
-                                drop_motion_frames=block_bundle.drop_motion_frames,
-                                kv_cache=cache_state.kv_cache,
-                                crossattn_cache=crossattn_cache,
-                                current_start=current_start,
-                                cache_start=None,
-                                audio_start_frame=audio_start_frame,
-                                stream_r1_mode=True,
+                            if cache_state.metadata is not None:
+                                cache_state.prepare_kv_update_plans(
+                                    noisy_seq_len=(
+                                        int(current_latents.shape[2])
+                                        * cache_state.metadata.frame_seq_length
+                                    ),
+                                    current_start=current_start,
+                                    cache_start=0,
+                                )
+                            transformer_kwargs = {
+                                "hidden_states": current_latents,
+                                "timestep": t_expand,
+                                "encoder_hidden_states": prompt_embeds,
+                                "ref_latents": block_bundle.ref_latents,
+                                "motion_latents": block_bundle.motion_latents,
+                                "cond_states": block_bundle.cond_states,
+                                "audio_input": block_bundle.audio_input,
+                                "audio_emb": block_bundle.audio_emb,
+                                "motion_frames": block_bundle.motion_frames,
+                                "add_last_motion": block_bundle.add_last_motion,
+                                "drop_motion_frames": block_bundle.drop_motion_frames,
+                                "kv_cache": cache_state.kv_cache,
+                                "crossattn_cache": crossattn_cache,
+                                "current_start": current_start,
+                                "cache_start": None,
+                                "audio_start_frame": audio_start_frame,
+                                "stream_r1_mode": True,
+                            }
+                            use_cuda_graph, cuda_graph_status = (
+                                self._can_use_timestep_cuda_graph(
+                                    cuda_graph_config,
+                                    block_index=block_index,
+                                    step_index=i,
+                                    device=current_latents.device,
+                                    crossattn_cache=crossattn_cache,
+                                )
                             )
+                            if use_cuda_graph:
+                                forward_batch = getattr(
+                                    get_forward_context(), "forward_batch", None
+                                )
+                                sequence_shard_enabled = bool(
+                                    forward_batch is not None
+                                    and getattr(
+                                        forward_batch,
+                                        "enable_sequence_shard",
+                                        False,
+                                    )
+                                    and _safe_sp_world_size() > 1
+                                )
+                                noise_pred_bcthw, cuda_graph_status = (
+                                    self._timestep_cuda_graph_runner.run(
+                                        kwargs=transformer_kwargs,
+                                        forward_fn=self.transformer,
+                                        step_index=i,
+                                        current_start=current_start,
+                                        audio_start_frame=audio_start_frame,
+                                        sequence_shard_enabled=sequence_shard_enabled,
+                                        allow_capture=allow_timestep_cuda_graph_capture,
+                                    )
+                                )
+                            else:
+                                noise_pred_bcthw = self.transformer(
+                                    **transformer_kwargs
+                                )
                     transformer_ms = (
                         self._timestep_profile_timestamp(
                             profile_config, current_latents.device
                         )
                         - transformer_started
                     ) * 1000.0
+                    if cuda_graph_config.log and cuda_graph_status is not None:
+                        self.log_info(
+                            "Wan S2V timestep CUDA graph block=%d step=%d "
+                            "status=%s cached_graphs=%d",
+                            block_index,
+                            i,
+                            cuda_graph_status,
+                            self._timestep_cuda_graph_runner.cached_graph_count,
+                        )
                     if action == "scale_pred":
                         noise_pred_bcthw = noise_pred_bcthw * ablation_config.scale
                     noise_pred_btchw = noise_pred_bcthw.permute(0, 2, 1, 3, 4)
+
+                if cuda_graph_config.enabled and cuda_graph_status is not None:
+                    timestep_cuda_graph_statuses.append(
+                        {
+                            "block_idx": int(block_index),
+                            "step_idx": int(i),
+                            "status": cuda_graph_status,
+                        }
+                    )
 
                 if noise_pred_btchw is not None:
                     previous_noise_pred_btchw = noise_pred_btchw
@@ -2216,6 +3149,8 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     ),
                     "total_ms": round(step_ms, 3),
                 }
+                if cuda_graph_config.enabled:
+                    row["cuda_graph"] = cuda_graph_status or "not_run"
                 timestep_profile_rows.append(row)
                 if profile_config.log or (
                     ablation_config.log and effective_action != "full"
@@ -2322,12 +3257,11 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     False,
                 )
             )
-            # Text context is constant across Stream-R1 chunks and refreshes, so
-            # cache cross-attention K/V unless explicitly disabled.
-            crossattn_cache: list[dict] | None = (
-                [{} for _ in range(len(self.transformer.blocks))]
-                if use_crossattn_cache
-                else None
+            # Text context is constant across Stream-R1 chunks and refreshes.
+            # The cache object is stage-owned so startup pre-captured graphs
+            # can keep using the same external K/V tensor addresses.
+            crossattn_cache = self._prepare_request_crossattn_cache(
+                use_crossattn_cache
             )
             latent_warm_start_config = self._resolve_latent_warm_start_config(
                 batch,

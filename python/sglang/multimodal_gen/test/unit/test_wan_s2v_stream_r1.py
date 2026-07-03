@@ -12,13 +12,22 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v import (
     WanS2VTransformer3DModel,
     _build_s2v_noisy_rope_grid_sizes,
     _pad_stream_r1_attention_mask_for_sp,
+    _rope_precompute,
+    _rope_precompute_s2v_stream_r1_tensor_current_start,
+    _slice_s2v_audio_embeddings_with_tensor_start,
+    rope_params,
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     WanS2VStreamR1AttentionLayout,
     WanS2VStreamR1AttentionPlan,
+    WanS2VStreamR1KVState,
     WanS2VStreamR1MixedKVView,
     WanS2VStreamR1NoisyKVCacheUpdate,
+    WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer,
     WanS2VStreamR1NoisyKVCacheView,
+    WanS2VTimestepMetadataPlan,
+    WanS2VTimestepStaticMetadataBuffers,
+    build_wan_s2v_stream_r1_noisy_kv_cache_update_plan,
     build_wan_s2v_stream_r1_segmented_mixed_kv_attention_plan,
     build_wan_s2v_stream_r1_cached_noisy_kv_index,
     build_wan_s2v_stream_r1_mixed_kv_attention_mask,
@@ -33,8 +42,10 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     stream_r1_segmented_packed_varlen_attention,
     stream_r1_packed_varlen_attention,
     _pad_stream_r1_sp_packed_attention_output,
+    _StreamR1ProfileSpan,
     update_wan_s2v_stream_r1_cached_self_attention_kv_cache,
     update_wan_s2v_stream_r1_noisy_kv_cache,
+    update_wan_s2v_stream_r1_noisy_kv_cache_with_plan_buffer,
     validate_wan_s2v_stream_r1_forward_cache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_s2v import (
@@ -44,9 +55,33 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     WanS2VStreamR1CacheState,
     WanS2VStreamR1DenoisingStage,
     WanS2VTimestepAblationConfig,
+    _WanS2VTransformerTimestepCudaGraphRunner,
     _has_negative_prompt_embeds,
     _select_wan_s2v_adaptive_timesteps,
 )
+
+
+class TestWanS2VStreamR1Profile(unittest.TestCase):
+    def test_profile_span_uses_cpu_timing_during_cuda_graph_capture(self):
+        profile = SimpleNamespace(use_cuda_events=True, timings=[])
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits."
+                "wan_s2v_stream_r1._cuda_graph_capture_active",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits."
+                "wan_s2v_stream_r1.torch.cuda.Event",
+                side_effect=AssertionError("CUDA event should not be created"),
+            ),
+        ):
+            with _StreamR1ProfileSpan(profile, "capture"):
+                pass
+
+        self.assertEqual(len(profile.timings), 1)
+        self.assertEqual(profile.timings[0][0], "capture")
 
 
 class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
@@ -86,6 +121,43 @@ class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
         torch.testing.assert_close(span, grid_sizes)
         torch.testing.assert_close(end - start, span)
 
+    def test_stream_r1_tensor_current_start_rope_matches_legacy_grid(self):
+        noisy_grid_sizes = torch.tensor([[3, 2, 2]], dtype=torch.long)
+        ref_grid_sizes = [
+            [
+                torch.tensor([30, 0, 0]).view(1, 3),
+                torch.tensor([31, 2, 2]).view(1, 3),
+                torch.tensor([1, 2, 2]).view(1, 3),
+            ]
+        ]
+        current_start = 8
+        frame_seq_length = 4
+        noisy_seq_len = int(noisy_grid_sizes.prod().item())
+        ref_seq_len = 4
+        x = torch.zeros(1, noisy_seq_len + ref_seq_len, 1, 12)
+        freqs = rope_params(max_seq_len=64, dim=12)
+        legacy_grid = (
+            _build_s2v_noisy_rope_grid_sizes(
+                noisy_grid_sizes,
+                stream_r1_mode=True,
+                current_start=current_start,
+                frame_seq_length=frame_seq_length,
+            )
+            + ref_grid_sizes
+        )
+
+        legacy = _rope_precompute(x, legacy_grid, freqs)
+        tensor_current = _rope_precompute_s2v_stream_r1_tensor_current_start(
+            x,
+            noisy_grid_sizes,
+            ref_grid_sizes,
+            freqs,
+            current_start=torch.tensor(current_start, dtype=torch.long),
+            frame_seq_length=frame_seq_length,
+        )
+
+        torch.testing.assert_close(tensor_current, legacy)
+
     def test_stream_r1_grid_rejects_invalid_current_start(self):
         grid_sizes = torch.tensor([[3, 4, 5]], dtype=torch.long)
 
@@ -104,6 +176,37 @@ class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
                 current_start=5,
                 frame_seq_length=12,
             )
+
+
+class TestWanS2VAudioTensorSlice(unittest.TestCase):
+    def test_tensor_audio_slice_matches_legacy_slice(self):
+        audio_emb = torch.arange(2 * 12 * 3, dtype=torch.float32).reshape(2, 12, 3)
+        audio_start_frame = torch.tensor(3, dtype=torch.long)
+        motion_prefix_frames = torch.tensor(2, dtype=torch.long)
+        latent_frames = 4
+
+        tensor_slice = _slice_s2v_audio_embeddings_with_tensor_start(
+            audio_emb,
+            audio_start_frame=audio_start_frame,
+            motion_prefix_frames=motion_prefix_frames,
+            latent_frames=latent_frames,
+        )
+
+        legacy = audio_emb[:, 5:9, :]
+        torch.testing.assert_close(tensor_slice, legacy)
+
+    def test_tensor_audio_slice_supports_global_audio_shape(self):
+        audio_emb = torch.arange(2 * 12 * 4 * 5, dtype=torch.float32).reshape(
+            2, 12, 4, 5
+        )
+        tensor_slice = _slice_s2v_audio_embeddings_with_tensor_start(
+            audio_emb,
+            audio_start_frame=torch.tensor(1, dtype=torch.long),
+            motion_prefix_frames=torch.tensor(3, dtype=torch.long),
+            latent_frames=6,
+        )
+
+        torch.testing.assert_close(tensor_slice, audio_emb[:, 4:10])
 
 
 class TestWanS2VSamplingParams(unittest.TestCase):
@@ -1608,6 +1711,282 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
         value = key + 100
         return key, value
 
+    def test_update_plan_describes_append_and_cache_start(self):
+        cache = self._cache(tokens=6)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=2,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=0,
+        )
+
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(cache, update)
+
+        self.assertEqual(plan.input_global_end, 0)
+        self.assertEqual(plan.effective_global_end, 0)
+        self.assertEqual(plan.append_tokens, 4)
+        self.assertFalse(plan.evict)
+        self.assertEqual(plan.cache_local_end, 4)
+        self.assertEqual(plan.local_write_start, 0)
+        self.assertEqual(plan.local_write_end, 4)
+        self.assertEqual(plan.view_kind, "prefix")
+        self.assertEqual(plan.view_local_end_index, 4)
+        self.assertEqual(plan.local_start, 2)
+
+        cache = self._cache(tokens=4)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=2,
+            frame_seq_length=1,
+            local_attn_size=4,
+            sink_size=1,
+            current_start=4,
+            cache_start=4,
+        )
+
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(cache, update)
+
+        self.assertEqual(plan.input_global_end, 0)
+        self.assertEqual(plan.effective_global_end, 4)
+        self.assertEqual(plan.append_tokens, 2)
+        self.assertEqual(plan.cache_local_end, 2)
+        self.assertEqual(plan.local_write_start, 0)
+        self.assertEqual(plan.local_write_end, 2)
+
+    def test_update_plan_describes_eviction_roll_and_sink_compression(self):
+        cache = self._cache(tokens=3)
+        for current_start in (0, 1, 2):
+            key, value = self._kv(current_start, 1)
+            update = WanS2VStreamR1NoisyKVCacheUpdate(
+                noisy_seq_len=1,
+                frame_seq_length=1,
+                local_attn_size=3,
+                sink_size=1,
+                current_start=current_start,
+            )
+            update_wan_s2v_stream_r1_noisy_kv_cache(cache, key, value, update)
+
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=1,
+            frame_seq_length=1,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=3,
+        )
+
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(cache, update)
+
+        self.assertTrue(plan.evict)
+        self.assertEqual(plan.num_evicted_tokens, 1)
+        self.assertEqual(plan.num_rolled_tokens, 1)
+        self.assertEqual(plan.evicted_start, 1)
+        self.assertEqual(plan.evicted_end, 2)
+        self.assertEqual(plan.roll_src_start, 2)
+        self.assertEqual(plan.roll_src_end, 3)
+        self.assertEqual(plan.roll_dst_start, 1)
+        self.assertEqual(plan.roll_dst_end, 2)
+        self.assertEqual(plan.cache_local_end, 3)
+        self.assertEqual(plan.local_write_start, 2)
+        self.assertEqual(plan.local_write_end, 3)
+        self.assertEqual(plan.view_kind, "prefix")
+        self.assertEqual(plan.view_local_end_index, 3)
+        self.assertTrue(plan.sink_compress)
+
+    def test_update_accepts_explicit_plan(self):
+        cache = self._cache(tokens=3)
+        key, value = self._kv(0, 1)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=1,
+            frame_seq_length=1,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=0,
+        )
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(cache, update)
+
+        view = update_wan_s2v_stream_r1_noisy_kv_cache(
+            cache, key, value, update, plan=plan
+        )
+
+        self.assertEqual(view.global_end_index, plan.new_global_end)
+        self.assertEqual(view.local_end_index, plan.new_local_end_index)
+        torch.testing.assert_close(view.key[:, :, 0, 0], torch.tensor([[0.0]]))
+
+    def test_update_plan_buffer_copies_host_plan_and_scalar_metadata(self):
+        cache = self._cache(tokens=3)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=1,
+            frame_seq_length=1,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=0,
+        )
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(cache, update)
+
+        buffer = WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer.from_plan(
+            plan,
+            device=torch.device("cpu"),
+        )
+
+        self.assertIs(buffer.host_plan, plan)
+        snapshot = buffer.scalar_snapshot()
+        self.assertEqual(snapshot["input_global_end"], 0)
+        self.assertEqual(snapshot["input_local_end"], 0)
+        self.assertEqual(snapshot["local_write_start"], plan.local_write_start)
+        self.assertEqual(snapshot["local_write_end"], plan.local_write_end)
+        self.assertEqual(snapshot["new_global_end"], plan.new_global_end)
+        self.assertEqual(snapshot["new_local_end_index"], plan.new_local_end_index)
+        self.assertEqual(buffer.scalar_tensor("kv_start").item(), plan.kv_start)
+
+    def test_graph_plan_buffer_update_matches_eager_append_window(self):
+        eager_cache = self._cache(tokens=3)
+        for current_start in (0, 1):
+            key, value = self._kv(current_start, 1)
+            update = WanS2VStreamR1NoisyKVCacheUpdate(
+                noisy_seq_len=1,
+                frame_seq_length=1,
+                local_attn_size=3,
+                sink_size=1,
+                current_start=current_start,
+            )
+            update_wan_s2v_stream_r1_noisy_kv_cache(
+                eager_cache, key, value, update
+            )
+        graph_cache = {
+            name: tensor.clone() if isinstance(tensor, torch.Tensor) else tensor
+            for name, tensor in eager_cache.items()
+        }
+        key, value = self._kv(2, 1)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=1,
+            frame_seq_length=1,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=2,
+        )
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
+            graph_cache, update
+        )
+        plan_buffer = WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer.from_plan(
+            plan,
+            device=torch.device("cpu"),
+        )
+
+        eager_view = update_wan_s2v_stream_r1_noisy_kv_cache(
+            eager_cache,
+            key,
+            value,
+            update,
+        )
+        graph_view = update_wan_s2v_stream_r1_noisy_kv_cache_with_plan_buffer(
+            graph_cache,
+            key,
+            value,
+            update,
+            plan_buffer,
+        )
+
+        torch.testing.assert_close(graph_cache["k"], eager_cache["k"])
+        torch.testing.assert_close(graph_cache["v"], eager_cache["v"])
+        torch.testing.assert_close(graph_view.key, eager_view.key)
+        torch.testing.assert_close(graph_view.value, eager_view.value)
+        self.assertEqual(graph_cache["global_end_index"].item(), 3)
+        self.assertEqual(graph_cache["local_end_index"].item(), 3)
+
+    def test_graph_plan_buffer_update_matches_eager_eviction_window(self):
+        eager_cache = self._cache(tokens=3)
+        for current_start in (0, 1, 2):
+            key, value = self._kv(current_start, 1)
+            update = WanS2VStreamR1NoisyKVCacheUpdate(
+                noisy_seq_len=1,
+                frame_seq_length=1,
+                local_attn_size=3,
+                sink_size=1,
+                current_start=current_start,
+            )
+            update_wan_s2v_stream_r1_noisy_kv_cache(
+                eager_cache, key, value, update
+            )
+        graph_cache = {
+            name: tensor.clone() if isinstance(tensor, torch.Tensor) else tensor
+            for name, tensor in eager_cache.items()
+        }
+        key, value = self._kv(3, 1)
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=1,
+            frame_seq_length=1,
+            local_attn_size=3,
+            sink_size=1,
+            current_start=3,
+        )
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
+            graph_cache, update
+        )
+        plan_buffer = WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer.from_plan(
+            plan,
+            device=torch.device("cpu"),
+        )
+
+        eager_view = update_wan_s2v_stream_r1_noisy_kv_cache(
+            eager_cache,
+            key,
+            value,
+            update,
+        )
+        graph_view = update_wan_s2v_stream_r1_noisy_kv_cache_with_plan_buffer(
+            graph_cache,
+            key,
+            value,
+            update,
+            plan_buffer,
+        )
+
+        torch.testing.assert_close(graph_cache["k"], eager_cache["k"])
+        torch.testing.assert_close(graph_cache["v"], eager_cache["v"])
+        torch.testing.assert_close(graph_view.key, eager_view.key)
+        torch.testing.assert_close(graph_view.value, eager_view.value)
+        self.assertEqual(graph_cache["global_end_index"].item(), 4)
+        self.assertEqual(graph_cache["local_end_index"].item(), 3)
+
+    def test_update_plan_uses_external_state_owner(self):
+        cache = self._cache(tokens=3)
+        state = WanS2VStreamR1KVState()
+
+        for current_start in (0, 1):
+            key, value = self._kv(current_start, 1)
+            update = WanS2VStreamR1NoisyKVCacheUpdate(
+                noisy_seq_len=1,
+                frame_seq_length=1,
+                local_attn_size=3,
+                sink_size=1,
+                current_start=current_start,
+            )
+            plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
+                cache,
+                update,
+                state=state,
+            )
+
+            view = update_wan_s2v_stream_r1_noisy_kv_cache(
+                cache,
+                key,
+                value,
+                update,
+                plan=plan,
+                commit_host_state=False,
+            )
+
+            self.assertEqual(state.global_end_index, current_start)
+            self.assertNotIn("global_end_index_host", cache)
+            state.apply_noisy_kv_cache_update_plan(plan)
+            self.assertEqual(view.global_end_index, state.global_end_index)
+            self.assertEqual(view.local_end_index, state.local_end_index)
+
+        self.assertEqual(state.global_end_index, 2)
+        self.assertEqual(state.local_end_index, 2)
+        self.assertEqual(cache["global_end_index"].item(), 2)
+        self.assertEqual(cache["local_end_index"].item(), 2)
+
     def test_update_appends_then_replaces_same_noisy_block(self):
         cache = self._cache(tokens=6)
         update = WanS2VStreamR1NoisyKVCacheUpdate(
@@ -1881,6 +2260,8 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         stage._adaptive_reduced_blocks = 0
         stage._last_adaptive_step_decision = None
         stage._last_timestep_profile_rows = []
+        stage._timestep_cuda_graph_runner = _WanS2VTransformerTimestepCudaGraphRunner()
+        stage.crossattn_cache = None
         return stage
 
     def _metadata(self) -> WanS2VStreamR1CacheMetadata:
@@ -1942,6 +2323,450 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             audio_metadata={"cache_audio_embeddings": cache_audio_embeddings},
         )
 
+    def _graph_kwargs(self):
+        return {
+            "hidden_states": torch.zeros(1, 3, 1, 2, 2),
+            "timestep": torch.zeros(1),
+            "encoder_hidden_states": torch.zeros(1, 2, 4),
+            "ref_latents": torch.zeros(1, 3, 1, 2, 2),
+            "motion_latents": torch.zeros(1, 3, 2, 2, 2),
+            "cond_states": torch.zeros(1, 3, 4, 2, 2),
+            "audio_input": torch.zeros(1, 4, 5, 16),
+            "audio_emb": None,
+            "motion_frames": (73, 19),
+            "add_last_motion": 2,
+            "drop_motion_frames": False,
+            "kv_cache": None,
+            "crossattn_cache": None,
+            "current_start": 0,
+            "cache_start": None,
+            "audio_start_frame": 0,
+            "stream_r1_mode": True,
+        }
+
+    def test_timestep_metadata_buffers_update_without_reallocation(self):
+        kwargs = self._graph_kwargs()
+        plan = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs=kwargs,
+            step_index=0,
+            current_start=0,
+            audio_start_frame=0,
+            sequence_shard_enabled=False,
+        )
+        buffers = WanS2VTimestepStaticMetadataBuffers.from_plan(
+            plan,
+            device=torch.device("cpu"),
+        )
+        scalar_ptr = buffers.scalar_values.data_ptr()
+        motion_ptr = buffers.motion_frames.data_ptr()
+
+        next_plan = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs={**kwargs, "cache_start": 4, "drop_motion_frames": True},
+            step_index=3,
+            current_start=12,
+            audio_start_frame=1,
+            sequence_shard_enabled=True,
+        )
+        buffers.copy_from_plan_(next_plan)
+
+        self.assertEqual(buffers.scalar_values.data_ptr(), scalar_ptr)
+        self.assertEqual(buffers.motion_frames.data_ptr(), motion_ptr)
+        snapshot = buffers.scalar_snapshot()
+        self.assertEqual(snapshot["step_index"], 3)
+        self.assertEqual(snapshot["current_start"], 12)
+        self.assertEqual(snapshot["cache_start"], 4)
+        self.assertEqual(snapshot["audio_start_frame"], 1)
+        self.assertEqual(snapshot["sequence_shard_enabled"], 1)
+        self.assertEqual(snapshot["drop_motion_frames"], 1)
+        torch.testing.assert_close(
+            buffers.motion_frames.cpu(),
+            torch.tensor([73, 19], dtype=torch.long),
+        )
+
+    def test_timestep_metadata_forward_kwargs_use_host_plan_mirror(self):
+        kwargs = self._graph_kwargs()
+        plan = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs={**kwargs, "cache_start": 4},
+            step_index=0,
+            current_start=12,
+            audio_start_frame=3,
+            sequence_shard_enabled=False,
+        )
+        buffers = WanS2VTimestepStaticMetadataBuffers.from_plan(
+            plan,
+            device=torch.device("cpu"),
+        )
+        buffers.scalar_values.fill_(-999)
+        buffers.motion_frames.fill_(-999)
+
+        forward_kwargs = buffers.to_forward_kwargs()
+
+        self.assertEqual(forward_kwargs["current_start"], 12)
+        self.assertEqual(forward_kwargs["cache_start"], 4)
+        self.assertEqual(forward_kwargs["audio_start_frame"], 3)
+        self.assertEqual(forward_kwargs["motion_frames"], (73, 19))
+
+    def test_timestep_graph_key_uses_structure_not_dynamic_offsets(self):
+        kwargs = self._graph_kwargs()
+        device = torch.device("cpu")
+        plan_step0 = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs=kwargs,
+            step_index=0,
+            current_start=0,
+            audio_start_frame=0,
+            sequence_shard_enabled=False,
+        )
+        plan_step1 = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs=kwargs,
+            step_index=1,
+            current_start=0,
+            audio_start_frame=0,
+            sequence_shard_enabled=False,
+        )
+        plan_next_block = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs=kwargs,
+            step_index=0,
+            current_start=12,
+            audio_start_frame=1,
+            sequence_shard_enabled=False,
+        )
+        plan_drop_motion = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs={**kwargs, "drop_motion_frames": True},
+            step_index=0,
+            current_start=12,
+            audio_start_frame=1,
+            sequence_shard_enabled=False,
+        )
+
+        key_step0 = _WanS2VTransformerTimestepCudaGraphRunner.make_key(
+            kwargs=kwargs,
+            metadata_plan=plan_step0,
+            metadata_device=device,
+        )
+        key_step1 = _WanS2VTransformerTimestepCudaGraphRunner.make_key(
+            kwargs=kwargs,
+            metadata_plan=plan_step1,
+            metadata_device=device,
+        )
+        key_next_block = _WanS2VTransformerTimestepCudaGraphRunner.make_key(
+            kwargs=kwargs,
+            metadata_plan=plan_next_block,
+            metadata_device=device,
+        )
+        key_drop_motion = _WanS2VTransformerTimestepCudaGraphRunner.make_key(
+            kwargs=kwargs,
+            metadata_plan=plan_drop_motion,
+            metadata_device=device,
+        )
+
+        self.assertEqual(key_step0, key_step1)
+        self.assertEqual(key_step0, key_next_block)
+        self.assertNotEqual(key_step0, key_drop_motion)
+
+    def test_timestep_graph_runner_preslices_audio_embeddings(self):
+        kwargs = {
+            **self._graph_kwargs(),
+            "hidden_states": torch.zeros(1, 3, 2, 2, 2),
+            "audio_input": None,
+            "audio_emb": (
+                torch.arange(1 * 8 * 2, dtype=torch.float32).reshape(1, 8, 2),
+                torch.arange(100, 100 + 1 * 8 * 3, dtype=torch.float32).reshape(
+                    1, 8, 3
+                ),
+            ),
+            "motion_frames": (3, 2),
+            "audio_start_frame": 1,
+        }
+        plan = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs=kwargs,
+            step_index=0,
+            current_start=0,
+            audio_start_frame=1,
+            sequence_shard_enabled=False,
+        )
+
+        graph_kwargs = _WanS2VTransformerTimestepCudaGraphRunner.prepare_graph_kwargs(
+            kwargs,
+            plan,
+        )
+
+        self.assertTrue(graph_kwargs["stream_r1_audio_emb_pre_sliced"])
+        audio_global, audio_local = graph_kwargs["audio_emb"]
+        torch.testing.assert_close(audio_global, kwargs["audio_emb"][0][:, 3:5])
+        torch.testing.assert_close(audio_local, kwargs["audio_emb"][1][:, 3:5])
+
+    def test_timestep_graph_runner_binds_plan_buffer_forward(self):
+        kwargs = self._graph_kwargs()
+        plan = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs={**kwargs, "cache_start": 4},
+            step_index=0,
+            current_start=12,
+            audio_start_frame=3,
+            sequence_shard_enabled=False,
+        )
+        buffers = WanS2VTimestepStaticMetadataBuffers.from_plan(
+            plan,
+            device=torch.device("cpu"),
+        )
+        calls = []
+
+        class _Forward:
+            def __call__(self, **call_kwargs):
+                calls.append(("direct", call_kwargs))
+                return call_kwargs["hidden_states"]
+
+            def forward_with_plan_buffers(
+                self,
+                *,
+                timestep_metadata_buffers,
+                **call_kwargs,
+            ):
+                call_kwargs.update(timestep_metadata_buffers.to_forward_kwargs())
+                calls.append(("plan", call_kwargs))
+                return call_kwargs["hidden_states"] + 1
+
+        bound_forward = (
+            _WanS2VTransformerTimestepCudaGraphRunner.bind_forward_with_metadata(
+                _Forward(),
+                buffers,
+            )
+        )
+        out = bound_forward(**kwargs)
+
+        torch.testing.assert_close(out, kwargs["hidden_states"] + 1)
+        self.assertEqual(calls[0][0], "plan")
+        self.assertEqual(calls[0][1]["current_start"], 12)
+        self.assertEqual(calls[0][1]["cache_start"], 4)
+
+    def test_timestep_graph_runner_captures_on_key_miss_when_allowed(self):
+        kwargs = self._graph_kwargs()
+        runner = _WanS2VTransformerTimestepCudaGraphRunner()
+        captured = []
+        replayed = []
+
+        def _capture_one(
+            *,
+            forward_fn,
+            static_kwargs,
+        ):
+            captured.append(static_kwargs)
+            return object(), forward_fn(**static_kwargs)
+
+        def _replay(entry):
+            replayed.append(entry)
+            return entry.output + 1
+
+        runner.backend = SimpleNamespace(
+            capture_one=_capture_one,
+            replay=_replay,
+        )
+
+        class _Forward:
+            def __call__(self, **call_kwargs):
+                return call_kwargs["hidden_states"] + 2
+
+        output, status = runner.run(
+            kwargs=kwargs,
+            forward_fn=_Forward(),
+            step_index=0,
+            current_start=0,
+            audio_start_frame=0,
+            sequence_shard_enabled=False,
+            allow_capture=True,
+        )
+
+        self.assertEqual(status, "capture")
+        self.assertEqual(runner.cached_graph_count, 1)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(replayed), 1)
+        torch.testing.assert_close(
+            output,
+            kwargs["hidden_states"] + 3,
+        )
+
+    def test_timestep_graph_runner_rejects_key_miss_when_capture_disabled(self):
+        kwargs = self._graph_kwargs()
+        runner = _WanS2VTransformerTimestepCudaGraphRunner()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "capture is disabled",
+        ):
+            runner.run(
+                kwargs=kwargs,
+                forward_fn=lambda **call_kwargs: call_kwargs["hidden_states"],
+                step_index=0,
+                current_start=0,
+                audio_start_frame=0,
+                sequence_shard_enabled=False,
+                allow_capture=False,
+            )
+
+    def test_timestep_graph_runner_falls_back_on_kv_plan_mismatch(self):
+        metadata = WanS2VStreamR1CacheMetadata(
+            batch_size=1,
+            num_layers=1,
+            frame_seq_length=1,
+            local_num_attention_heads=1,
+            attention_head_dim=1,
+            local_attn_size=4,
+            sink_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        cache_state = WanS2VStreamR1CacheState.allocate(metadata)
+        cache_state.prepare_kv_update_plans(noisy_seq_len=1, current_start=0)
+        kwargs = {**self._graph_kwargs(), "kv_cache": cache_state.kv_cache}
+        runner = _WanS2VTransformerTimestepCudaGraphRunner()
+        runner.backend = SimpleNamespace(replay=lambda entry: entry.output)
+        runner.graphs[("key",)] = SimpleNamespace(
+            static_metadata=WanS2VTimestepStaticMetadataBuffers.from_plan(
+                WanS2VTimestepMetadataPlan.from_kwargs(
+                    kwargs=kwargs,
+                    step_index=0,
+                    current_start=0,
+                    audio_start_frame=0,
+                    sequence_shard_enabled=False,
+                ),
+                device=torch.device("cpu"),
+            ),
+            static_inputs=SimpleNamespace(copy_from_live_kwargs_=lambda kwargs: None),
+            output=kwargs["hidden_states"] + 1,
+            kv_update_plan_signature=(("stale",),),
+        )
+        runner.make_key = lambda **_: ("key",)
+        calls = []
+
+        class _Forward:
+            def forward_with_plan_buffers(self, **call_kwargs):
+                calls.append(call_kwargs)
+                return call_kwargs["hidden_states"] + 2
+
+        output, status = runner.run(
+            kwargs=kwargs,
+            forward_fn=_Forward(),
+            step_index=0,
+            current_start=0,
+            audio_start_frame=0,
+            sequence_shard_enabled=False,
+        )
+
+        self.assertEqual(status, "eager_kv_plan_mismatch")
+        self.assertEqual(len(calls), 1)
+        torch.testing.assert_close(output, kwargs["hidden_states"] + 2)
+
+    def test_timestep_graph_runner_replay_commits_matching_kv_plan(self):
+        metadata = WanS2VStreamR1CacheMetadata(
+            batch_size=1,
+            num_layers=1,
+            frame_seq_length=1,
+            local_num_attention_heads=1,
+            attention_head_dim=1,
+            local_attn_size=4,
+            sink_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        cache_state = WanS2VStreamR1CacheState.allocate(metadata)
+        cache_state.prepare_kv_update_plans(noisy_seq_len=1, current_start=0)
+        kwargs = {**self._graph_kwargs(), "kv_cache": cache_state.kv_cache}
+        runner = _WanS2VTransformerTimestepCudaGraphRunner()
+        metadata_plan = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs=kwargs,
+            step_index=0,
+            current_start=0,
+            audio_start_frame=0,
+            sequence_shard_enabled=False,
+        )
+        kv_signature = runner.kv_update_plan_signature(cache_state.kv_cache)
+        replayed = []
+
+        def _replay(entry):
+            replayed.append(entry)
+            return entry.output
+
+        runner.backend = SimpleNamespace(replay=_replay)
+        runner.graphs[("key",)] = SimpleNamespace(
+            static_metadata=WanS2VTimestepStaticMetadataBuffers.from_plan(
+                metadata_plan,
+                device=torch.device("cpu"),
+            ),
+            static_inputs=SimpleNamespace(copy_from_live_kwargs_=lambda kwargs: None),
+            output=kwargs["hidden_states"] + 1,
+            kv_update_plan_signature=kv_signature,
+        )
+        runner.make_key = lambda **_: ("key",)
+
+        output, status = runner.run(
+            kwargs=kwargs,
+            forward_fn=object(),
+            step_index=0,
+            current_start=0,
+            audio_start_frame=0,
+            sequence_shard_enabled=False,
+        )
+
+        self.assertEqual(status, "replay")
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(cache_state.kv_states[0].global_end_index, 1)
+        self.assertEqual(cache_state.kv_states[0].local_end_index, 1)
+        self.assertEqual(cache_state.kv_cache[0]["global_end_index_host"], 1)
+        self.assertEqual(cache_state.kv_cache[0]["local_end_index_host"], 1)
+        torch.testing.assert_close(output, kwargs["hidden_states"] + 1)
+
+    def test_transformer_forward_with_plan_buffers_passes_metadata_to_forward(self):
+        kwargs = self._graph_kwargs()
+        plan = WanS2VTimestepMetadataPlan.from_kwargs(
+            kwargs={
+                **kwargs,
+                "cache_start": 4,
+                "motion_frames": (3, 1),
+                "add_last_motion": 5,
+                "drop_motion_frames": True,
+                "stream_r1_mode": False,
+            },
+            step_index=2,
+            current_start=12,
+            audio_start_frame=7,
+            sequence_shard_enabled=False,
+        )
+        buffers = WanS2VTimestepStaticMetadataBuffers.from_plan(
+            plan,
+            device=torch.device("cpu"),
+        )
+        model = WanS2VTransformer3DModel.__new__(WanS2VTransformer3DModel)
+        calls = []
+
+        def fake_forward(**forward_kwargs):
+            calls.append(forward_kwargs)
+            return forward_kwargs["hidden_states"] + 1
+
+        model.forward = fake_forward
+        out = WanS2VTransformer3DModel.forward_with_plan_buffers(
+            model,
+            timestep_metadata_buffers=buffers,
+            **{
+                **kwargs,
+                "current_start": 0,
+                "cache_start": None,
+                "audio_start_frame": 0,
+                "motion_frames": (73, 19),
+                "add_last_motion": 2,
+                "drop_motion_frames": False,
+                "stream_r1_mode": True,
+            },
+        )
+
+        torch.testing.assert_close(out, kwargs["hidden_states"] + 1)
+        self.assertIs(calls[0]["timestep_metadata_buffers"], buffers)
+        self.assertEqual(calls[0]["current_start"], 0)
+        self.assertIsNone(calls[0]["cache_start"])
+        self.assertEqual(calls[0]["audio_start_frame"], 0)
+        self.assertEqual(calls[0]["motion_frames"], (73, 19))
+        self.assertEqual(calls[0]["add_last_motion"], 2)
+        self.assertFalse(calls[0]["drop_motion_frames"])
+        self.assertTrue(calls[0]["stream_r1_mode"])
+
     def test_negative_prompt_embeds_presence_avoids_tensor_truthiness(self):
         self.assertTrue(
             _has_negative_prompt_embeds(
@@ -1996,8 +2821,22 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         )
 
         state = WanS2VStreamR1CacheState.allocate(metadata)
+        self.assertEqual(len(state.kv_states), 2)
+        self.assertIs(state.kv_cache[0]["state"], state.kv_states[0])
+        self.assertIs(state.kv_cache[1]["state"], state.kv_states[1])
+        self.assertIsInstance(
+            state.kv_cache[0]["update_plan_buffer"],
+            WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer,
+        )
+        state.prepare_kv_update_plans(noisy_seq_len=5, current_start=0)
+        plan_buffer = state.kv_cache[0]["update_plan_buffer"]
+        self.assertIsNotNone(plan_buffer.host_plan)
+        self.assertEqual(plan_buffer.host_plan.update.noisy_seq_len, 5)
+        self.assertEqual(plan_buffer.scalar_snapshot()["new_global_end"], 5)
         state.kv_cache[0]["global_end_index"].fill_(7)
         state.kv_cache[1]["local_end_index"].fill_(9)
+        state.kv_states[0].global_end_index = 7
+        state.kv_states[1].local_end_index = 9
         state.reset()
 
         self.assertTrue(state.enabled)
@@ -2006,6 +2845,68 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(state.kv_cache[0]["v"].shape, (2, 20, 3, 8))
         self.assertEqual(state.kv_cache[0]["global_end_index"].item(), 0)
         self.assertEqual(state.kv_cache[1]["local_end_index"].item(), 0)
+        self.assertEqual(state.kv_states[0].global_end_index, 0)
+        self.assertEqual(state.kv_states[1].local_end_index, 0)
+        self.assertIsNone(state.kv_cache[0]["update_plan_buffer"].host_plan)
+
+    def test_crossattn_cache_is_stage_owned_and_marked_for_refresh(self):
+        stage = self._stage()
+
+        first_cache = stage._prepare_request_crossattn_cache(True)
+        self.assertIs(first_cache, stage.crossattn_cache)
+        self.assertEqual(len(first_cache), 2)
+        self.assertTrue(all(item["needs_update"] for item in first_cache))
+
+        cached_k = torch.zeros(1, 4, 2, 3)
+        cached_v = torch.ones(1, 4, 2, 3)
+        first_cache[0]["k"] = cached_k
+        first_cache[0]["v"] = cached_v
+        first_cache[0]["needs_update"] = False
+
+        second_cache = stage._prepare_request_crossattn_cache(True)
+        self.assertIs(second_cache, first_cache)
+        self.assertIs(second_cache[0]["k"], cached_k)
+        self.assertIs(second_cache[0]["v"], cached_v)
+        self.assertTrue(second_cache[0]["needs_update"])
+        self.assertFalse(
+            _WanS2VTransformerTimestepCudaGraphRunner.crossattn_cache_ready(
+                second_cache
+            )
+        )
+
+        second_cache[0]["needs_update"] = False
+        second_cache[1]["k"] = torch.zeros(1, 4, 2, 3)
+        second_cache[1]["v"] = torch.ones(1, 4, 2, 3)
+        second_cache[1]["needs_update"] = False
+        self.assertTrue(
+            _WanS2VTransformerTimestepCudaGraphRunner.crossattn_cache_ready(
+                second_cache
+            )
+        )
+
+        self.assertIsNone(stage._prepare_crossattn_cache(False))
+        self.assertIsNone(stage.crossattn_cache)
+
+    def test_kv_cache_state_prebuild_clears_discontinuous_update_plan(self):
+        metadata = WanS2VStreamR1CacheMetadata(
+            batch_size=1,
+            num_layers=1,
+            frame_seq_length=5,
+            local_num_attention_heads=1,
+            attention_head_dim=4,
+            local_attn_size=4,
+            sink_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        state = WanS2VStreamR1CacheState.allocate(metadata)
+        state.prepare_kv_update_plans(noisy_seq_len=5, current_start=0)
+        self.assertIsNotNone(state.kv_cache[0]["update_plan_buffer"].host_plan)
+
+        state.reset()
+        state.prepare_kv_update_plans(noisy_seq_len=5, current_start=10)
+
+        self.assertIsNone(state.kv_cache[0]["update_plan_buffer"].host_plan)
 
     def test_kv_cache_state_allocates_normal_tensors_in_inference_mode(self):
         metadata = WanS2VStreamR1CacheMetadata(
