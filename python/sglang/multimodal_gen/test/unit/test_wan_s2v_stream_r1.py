@@ -12,8 +12,11 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v import (
     WanS2VTransformer3DModel,
     _build_s2v_noisy_rope_grid_sizes,
     _pad_stream_r1_attention_mask_for_sp,
+    _rope_apply_precomputed,
     _rope_precompute,
     _rope_precompute_s2v_stream_r1_tensor_current_start,
+    _segment_gate_add,
+    _segment_modulate,
     _slice_s2v_audio_embeddings_with_tensor_start,
     rope_params,
 )
@@ -85,6 +88,101 @@ class TestWanS2VStreamR1Profile(unittest.TestCase):
 
 
 class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
+    def test_rope_params_uses_complex64(self):
+        self.assertEqual(rope_params(8, 4).dtype, torch.complex64)
+
+    def test_rope_apply_matches_double_reference(self):
+        torch.manual_seed(0)
+        x = torch.randn(2, 5, 3, 8, dtype=torch.float32)
+        phases = torch.randn(2, 5, 3, 4, dtype=torch.float64)
+        freqs = torch.polar(torch.ones_like(phases), phases)
+
+        expected = torch.view_as_complex(
+            x.to(torch.float64).reshape(*x.shape[:-1], -1, 2)
+        )
+        expected = torch.view_as_real(expected * freqs).flatten(3).float()
+
+        actual = _rope_apply_precomputed(x, freqs.to(torch.complex64))
+
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+    def test_rope_apply_preserves_input_dtype(self):
+        x = torch.randn(1, 3, 2, 8, dtype=torch.float32).to(torch.bfloat16)
+        phases = torch.randn(1, 3, 2, 4, dtype=torch.float32)
+        freqs = torch.polar(torch.ones_like(phases), phases).to(torch.complex64)
+
+        actual = _rope_apply_precomputed(x, freqs)
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertEqual(actual.shape, x.shape)
+
+    def test_segment_gate_add_matches_reference(self):
+        torch.manual_seed(1)
+        residual = torch.randn(2, 5, 4, dtype=torch.float32)
+        update = torch.randn(2, 5, 4, dtype=torch.float32)
+        gate = torch.randn(2, 2, 4, dtype=torch.float32)
+        seg_idx = 3
+
+        expected = residual + torch.cat(
+            [
+                update[:, :seg_idx] * gate[:, 0:1],
+                update[:, seg_idx:] * gate[:, 1:2],
+            ],
+            dim=1,
+        )
+        actual = _segment_gate_add(residual, update, gate, seg_idx)
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_segment_gate_add_preserves_residual_dtype(self):
+        residual = torch.randn(1, 4, 3, dtype=torch.float32).to(torch.bfloat16)
+        update = torch.randn(1, 4, 3, dtype=torch.float32).to(torch.bfloat16)
+        gate = torch.randn(1, 2, 3, dtype=torch.float32)
+
+        actual = _segment_gate_add(residual, update, gate, 2)
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertEqual(actual.shape, residual.shape)
+
+    def test_segment_modulate_matches_reference(self):
+        torch.manual_seed(2)
+        x = torch.randn(2, 5, 4, dtype=torch.float32)
+        shift = torch.randn(2, 2, 4, dtype=torch.float32)
+        scale = torch.randn(2, 2, 4, dtype=torch.float32)
+        seg_idx = 3
+
+        expected = torch.cat(
+            [
+                x[:, :seg_idx] * (1 + scale[:, 0:1]) + shift[:, 0:1],
+                x[:, seg_idx:] * (1 + scale[:, 1:2]) + shift[:, 1:2],
+            ],
+            dim=1,
+        )
+        actual = _segment_modulate(x, shift, scale, seg_idx)
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_segment_modulate_uses_requested_output_dtype(self):
+        x = torch.randn(1, 4, 3, dtype=torch.float32).to(torch.bfloat16)
+        shift = torch.randn(1, 2, 3, dtype=torch.float32)
+        scale = torch.randn(1, 2, 3, dtype=torch.float32)
+        seg_idx = 2
+
+        expected = torch.cat(
+            [
+                x[:, :seg_idx] * (1 + scale[:, 0:1]) + shift[:, 0:1],
+                x[:, seg_idx:] * (1 + scale[:, 1:2]) + shift[:, 1:2],
+            ],
+            dim=1,
+        ).to(torch.bfloat16)
+        actual = _segment_modulate(
+            x, shift, scale, seg_idx, out_dtype=torch.bfloat16
+        )
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertEqual(actual.shape, x.shape)
+        torch.testing.assert_close(actual, expected)
+
     def test_legacy_grid_has_zero_start_and_current_values(self):
         grid_sizes = torch.tensor([[2, 3, 4], [5, 6, 7]], dtype=torch.long)
 

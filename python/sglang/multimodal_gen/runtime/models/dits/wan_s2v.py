@@ -65,10 +65,10 @@ logger = init_logger(__name__)
 def rope_params(max_seq_len: int, dim: int, theta: int = 10000) -> torch.Tensor:
     assert dim % 2 == 0
     freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
+        torch.arange(max_seq_len, dtype=torch.float32),
+        1.0 / torch.pow(theta, torch.arange(0, dim, 2, dtype=torch.float32).div(dim)),
     )
-    return torch.polar(torch.ones_like(freqs), freqs)
+    return torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
 
 
 def _as_list_4d(x: torch.Tensor | list[torch.Tensor]) -> list[torch.Tensor]:
@@ -169,7 +169,7 @@ def _rope_precompute(
         freqs = freqs[0]
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    output = torch.view_as_complex(x.detach().reshape(b, s, n, -1, 2).to(torch.float64))
+    output = torch.empty((b, s, n, c), dtype=torch.complex64, device=x.device)
     seq_bucket = [0]
     if not isinstance(grid_sizes, list):
         grid_sizes = [grid_sizes]
@@ -253,7 +253,7 @@ def _rope_precompute_s2v_stream_r1_tensor_current_start(
         [c - 2 * (c // 3), c // 3, c // 3],
         dim=1,
     )
-    output = torch.view_as_complex(x.detach().reshape(b, s, n, -1, 2).to(torch.float64))
+    output = torch.empty((b, s, n, c), dtype=torch.complex64, device=x.device)
     current_start = current_start.to(device=freq_f.device, dtype=torch.long).reshape(())
     frame_offset = torch.div(
         current_start,
@@ -345,9 +345,22 @@ def _slice_s2v_audio_embeddings_with_tensor_start(
 
 
 def _rope_apply_precomputed(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    out = torch.view_as_complex(x.to(torch.float64).reshape(*x.shape[:-1], -1, 2))
-    out = torch.view_as_real(out * freqs[:, : x.shape[1]]).flatten(3)
-    return out.float()
+    freqs = freqs[:, : x.shape[1]]
+    if x.device.type == "cuda":
+        try:
+            from sglang.jit_kernel.diffusion.triton.wan_s2v_rope import (
+                apply_wan_s2v_rope,
+            )
+
+            return apply_wan_s2v_rope(x, freqs)
+        except Exception:
+            pass
+
+    out = torch.view_as_complex(x.to(torch.float32).reshape(*x.shape[:-1], -1, 2))
+    if freqs.dtype != torch.complex64:
+        freqs = freqs.to(torch.complex64)
+    out = torch.view_as_real(out * freqs).flatten(3)
+    return out.to(x.dtype)
 
 
 def _segment_modulate(
@@ -355,13 +368,29 @@ def _segment_modulate(
     shift: torch.Tensor,
     scale: torch.Tensor,
     seg_idx: int,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    if x.device.type == "cuda":
+        try:
+            from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
+                segment_modulate,
+            )
+
+            return segment_modulate(
+                x, shift, scale, seg_idx, out_dtype=out_dtype
+            )
+        except Exception:
+            pass
+
     seg_idx = min(max(0, seg_idx), x.size(1))
     parts = [
         x[:, :seg_idx] * (1 + scale[:, 0:1]) + shift[:, 0:1],
         x[:, seg_idx:] * (1 + scale[:, 1:2]) + shift[:, 1:2],
     ]
-    return torch.cat(parts, dim=1)
+    out = torch.cat(parts, dim=1)
+    if out_dtype is not None:
+        out = out.to(out_dtype)
+    return out
 
 
 def _segment_gate(x: torch.Tensor, gate: torch.Tensor, seg_idx: int) -> torch.Tensor:
@@ -369,6 +398,25 @@ def _segment_gate(x: torch.Tensor, gate: torch.Tensor, seg_idx: int) -> torch.Te
     return torch.cat(
         [x[:, :seg_idx] * gate[:, 0:1], x[:, seg_idx:] * gate[:, 1:2]], dim=1
     )
+
+
+def _segment_gate_add(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    seg_idx: int,
+) -> torch.Tensor:
+    if residual.device.type == "cuda":
+        try:
+            from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
+                segment_gate_add,
+            )
+
+            return segment_gate_add(residual, update, gate, seg_idx)
+        except Exception:
+            pass
+
+    return (residual + _segment_gate(update, gate, seg_idx)).to(residual.dtype)
 
 
 def _pad_stream_r1_attention_mask_for_sp(
@@ -662,8 +710,12 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         )
 
         norm_hidden_states = _segment_modulate(
-            self.norm1.norm(hidden_states), shift_msa, scale_msa, seg_idx
-        ).to(orig_dtype)
+            self.norm1.norm(hidden_states),
+            shift_msa,
+            scale_msa,
+            seg_idx,
+            out_dtype=orig_dtype,
+        )
         query, key, value = self._project_self_attn_qkv(norm_hidden_states)
         if self.norm_q is not None:
             query = (
@@ -715,8 +767,8 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         else:
             attn_output = self.attn1(query, key, value, attn_mask=attn_mask).flatten(2)
         attn_output, _ = self.to_out(attn_output)
-        hidden_states = hidden_states + _segment_gate(
-            attn_output.squeeze(1), gate_msa, seg_idx
+        hidden_states = _segment_gate_add(
+            hidden_states, attn_output.squeeze(1), gate_msa, seg_idx
         )
         hidden_states = hidden_states.to(orig_dtype)
 
@@ -780,9 +832,10 @@ class WanS2VTransformerBlock(WanTransformerBlock):
             c_shift_msa,
             c_scale_msa,
             seg_idx,
-        ).to(orig_dtype)
+            out_dtype=orig_dtype,
+        )
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = hidden_states + _segment_gate(ff_output, c_gate_msa, seg_idx)
+        hidden_states = _segment_gate_add(hidden_states, ff_output, c_gate_msa, seg_idx)
         return hidden_states.to(orig_dtype)
 
 
