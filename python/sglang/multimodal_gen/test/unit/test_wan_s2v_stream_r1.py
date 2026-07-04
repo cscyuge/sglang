@@ -116,6 +116,117 @@ class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
         self.assertEqual(actual.dtype, torch.bfloat16)
         self.assertEqual(actual.shape, x.shape)
 
+
+class TestWanS2VStreamR1Fp8CommKernels(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_fused_fp8_qkv_dequant_unpack_matches_reference(self):
+        from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+            blockwise_dequant_fp8,
+            blockwise_quant_fp8,
+            fused_dequant_unpack_qkv_fp8,
+        )
+        from sglang.jit_kernel.diffusion.triton.usp_permute import (
+            fused_unpack_qkv_from_all_to_all,
+        )
+
+        torch.manual_seed(3)
+        B = 1
+        S_local = 3
+        H_local = 2
+        world_size = 2
+        D = 128
+        group_size = 128
+        packed = torch.randn(
+            3 * H_local * world_size,
+            B,
+            S_local,
+            D,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        packed_q, scale = blockwise_quant_fp8(packed, group_size=group_size)
+        dequant = blockwise_dequant_fp8(
+            packed_q,
+            scale,
+            group_size=group_size,
+            dtype=packed.dtype,
+        )
+        expected = fused_unpack_qkv_from_all_to_all(
+            dequant,
+            B,
+            S_local,
+            H_local,
+            D,
+            world_size,
+        )
+
+        actual = fused_dequant_unpack_qkv_fp8(
+            packed_q,
+            scale,
+            B,
+            S_local,
+            H_local,
+            D,
+            world_size,
+            group_size=group_size,
+            dtype=packed.dtype,
+        )
+
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_fused_fp8_output_dequant_postunpack_matches_reference(self):
+        from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+            blockwise_dequant_fp8,
+            blockwise_quant_fp8,
+            fused_dequant_unpack_output_fp8,
+        )
+
+        torch.manual_seed(4)
+        batch_size = 1
+        s_local = 3
+        world_size = 2
+        seq_len = s_local * world_size
+        h_local = 2
+        D = 128
+        group_size = 128
+        packed = torch.randn(
+            seq_len,
+            batch_size,
+            h_local,
+            D,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        packed_q, scale = blockwise_quant_fp8(packed, group_size=group_size)
+        dequant = blockwise_dequant_fp8(
+            packed_q,
+            scale,
+            group_size=group_size,
+            dtype=packed.dtype,
+        )
+        expected = (
+            dequant.reshape(world_size, s_local, batch_size, h_local, D)
+            .permute(2, 1, 0, 3, 4)
+            .contiguous()
+            .reshape(batch_size, s_local, h_local * world_size, D)
+        )
+
+        actual = fused_dequant_unpack_output_fp8(
+            packed_q,
+            scale,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            world_size=world_size,
+            group_size=group_size,
+            dtype=packed.dtype,
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class TestWanS2VStreamR1SegmentKernels(unittest.TestCase):
     def test_segment_gate_add_matches_reference(self):
         torch.manual_seed(1)
         residual = torch.randn(2, 5, 4, dtype=torch.float32)
@@ -175,9 +286,7 @@ class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
             ],
             dim=1,
         ).to(torch.bfloat16)
-        actual = _segment_modulate(
-            x, shift, scale, seg_idx, out_dtype=torch.bfloat16
-        )
+        actual = _segment_modulate(x, shift, scale, seg_idx, out_dtype=torch.bfloat16)
 
         self.assertEqual(actual.dtype, torch.bfloat16)
         self.assertEqual(actual.shape, x.shape)
@@ -1947,9 +2056,7 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
                 sink_size=1,
                 current_start=current_start,
             )
-            update_wan_s2v_stream_r1_noisy_kv_cache(
-                eager_cache, key, value, update
-            )
+            update_wan_s2v_stream_r1_noisy_kv_cache(eager_cache, key, value, update)
         graph_cache = {
             name: tensor.clone() if isinstance(tensor, torch.Tensor) else tensor
             for name, tensor in eager_cache.items()
@@ -1962,9 +2069,7 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
             sink_size=1,
             current_start=2,
         )
-        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
-            graph_cache, update
-        )
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(graph_cache, update)
         plan_buffer = WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer.from_plan(
             plan,
             device=torch.device("cpu"),
@@ -2002,9 +2107,7 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
                 sink_size=1,
                 current_start=current_start,
             )
-            update_wan_s2v_stream_r1_noisy_kv_cache(
-                eager_cache, key, value, update
-            )
+            update_wan_s2v_stream_r1_noisy_kv_cache(eager_cache, key, value, update)
         graph_cache = {
             name: tensor.clone() if isinstance(tensor, torch.Tensor) else tensor
             for name, tensor in eager_cache.items()
@@ -2017,9 +2120,7 @@ class TestWanS2VStreamR1NoisyKVCacheUpdate(unittest.TestCase):
             sink_size=1,
             current_start=3,
         )
-        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
-            graph_cache, update
-        )
+        plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(graph_cache, update)
         plan_buffer = WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer.from_plan(
             plan,
             device=torch.device("cpu"),

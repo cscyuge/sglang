@@ -212,14 +212,47 @@ def _usp_blockwise_fp8_all_to_all_single(
     *,
     cache_name: str,
 ) -> torch.Tensor:
-    if x.dtype not in (torch.bfloat16, torch.float16) or not x.is_contiguous():
-        return _usp_all_to_all_single(x, cache_name=cache_name)
-    group_size = _usp_fp8_comm_block_size()
-    if x.shape[-1] % group_size != 0:
+    fp8_result = _usp_blockwise_fp8_all_to_all_payload_scale(
+        x,
+        cache_name=cache_name,
+    )
+    if fp8_result is None:
         return _usp_all_to_all_single(x, cache_name=cache_name)
 
+    x_q, x_scale, group_size = fp8_result
+    from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import blockwise_dequant_fp8
+
+    with _comm_nvtx_range(
+        "sgl_mm_usp_fp8_comm_dequant "
+        f"group_size={group_size} shape={tuple(x.shape)} {_comm_nvtx_caller()}"
+    ):
+        out = _usp_get_buffer(
+            f"{cache_name}.fp8_dequant",
+            x,
+            tuple(x.shape),
+            dtype=x.dtype,
+        )
+        return blockwise_dequant_fp8(
+            x_q,
+            x_scale,
+            group_size=group_size,
+            dtype=x.dtype,
+            out=out,
+        )
+
+
+def _usp_blockwise_fp8_all_to_all_payload_scale(
+    x: torch.Tensor,
+    *,
+    cache_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+    if x.dtype not in (torch.bfloat16, torch.float16) or not x.is_contiguous():
+        return None
+    group_size = _usp_fp8_comm_block_size()
+    if x.shape[-1] % group_size != 0:
+        return None
+
     from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
-        blockwise_dequant_fp8,
         blockwise_quant_fp8,
     )
 
@@ -261,23 +294,7 @@ def _usp_blockwise_fp8_all_to_all_single(
         )
         x_q = x_q_bytes.view(torch.float8_e4m3fn)
 
-    with _comm_nvtx_range(
-        "sgl_mm_usp_fp8_comm_dequant "
-        f"group_size={group_size} shape={tuple(x.shape)} {_comm_nvtx_caller()}"
-    ):
-        out = _usp_get_buffer(
-            f"{cache_name}.fp8_dequant",
-            x,
-            tuple(x.shape),
-            dtype=x.dtype,
-        )
-        return blockwise_dequant_fp8(
-            x_q,
-            x_scale,
-            group_size=group_size,
-            dtype=x.dtype,
-            out=out,
-        )
+    return x_q, x_scale, group_size
 
 
 def _usp_input_all_to_all(
@@ -369,7 +386,9 @@ def _usp_input_all_to_all(
 
 
 def _usp_input_all_to_all_qkv(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched Ulysses input all-to-all for QKV (head_dim=2 layout).
 
@@ -398,9 +417,9 @@ def _usp_input_all_to_all_qkv(
         return q, k, v
 
     B, S_local, H_global, D = q.shape
-    assert H_global % world_size == 0, (
-        f"H_global ({H_global}) must be divisible by world_size ({world_size})"
-    )
+    assert (
+        H_global % world_size == 0
+    ), f"H_global ({H_global}) must be divisible by world_size ({world_size})"
     H_local = H_global // world_size
 
     from sglang.jit_kernel.diffusion.triton.usp_permute import (
@@ -421,12 +440,48 @@ def _usp_input_all_to_all_qkv(
         packed = fused_pack_qkv_for_all_to_all(q, k, v, out=packed_out)
 
     # 2. Single NCCL all-to-all. When enabled, send blockwise FP8 payload
-    # plus FP32 scales, then dequantize before the existing unpack path.
+    # plus FP32 scales and fuse dequantization with the QKV unpack.
     if _usp_fp8_comm_enabled("qkv"):
-        packed = _usp_blockwise_fp8_all_to_all_single(
+        fp8_result = _usp_blockwise_fp8_all_to_all_payload_scale(
             packed,
             cache_name="usp_qkv_fp8",
         )
+        if fp8_result is not None:
+            packed_q, packed_scale, group_size = fp8_result
+            from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+                fused_dequant_unpack_qkv_fp8,
+            )
+
+            with _comm_nvtx_range(
+                "sgl_mm_usp_qkv_fused_dequant_unpack "
+                f"world_size={world_size} group_size={group_size} "
+                f"packed={tuple(packed_q.shape)}"
+            ):
+                qkv_out_buffer = _usp_get_buffer(
+                    "usp_qkv_unpack",
+                    q,
+                    (3, B, S_local * world_size, H_local, D),
+                )
+                qkv_out = None
+                if qkv_out_buffer is not None:
+                    qkv_out = (
+                        qkv_out_buffer[0],
+                        qkv_out_buffer[1],
+                        qkv_out_buffer[2],
+                    )
+                return fused_dequant_unpack_qkv_fp8(
+                    packed_q,
+                    packed_scale,
+                    B,
+                    S_local,
+                    H_local,
+                    D,
+                    world_size,
+                    group_size=group_size,
+                    dtype=q.dtype,
+                    out=qkv_out,
+                )
+        packed = _usp_all_to_all_single(packed, cache_name="usp_qkv")
     else:
         packed = _usp_all_to_all_single(packed, cache_name="usp_qkv")
 
@@ -582,10 +637,38 @@ def _usp_output_all_to_all_packed_bshd(
         x = packed.reshape(seq_len, batch_size, h_local, d)
 
     if _usp_fp8_comm_enabled("output"):
-        x = _usp_blockwise_fp8_all_to_all_single(
+        fp8_result = _usp_blockwise_fp8_all_to_all_payload_scale(
             x,
             cache_name="usp_output_packed_fp8",
         )
+        if fp8_result is not None:
+            packed_q, packed_scale, group_size = fp8_result
+            from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+                fused_dequant_unpack_output_fp8,
+            )
+
+            with _comm_nvtx_range(
+                "sgl_mm_usp_output_fused_dequant_postunpack "
+                f"world_size={world_size} group_size={group_size} "
+                f"shape={tuple(packed_q.shape)}"
+            ):
+                out = _usp_get_buffer(
+                    "usp_output_postunpack.packed_bshd",
+                    x,
+                    (batch_size, s_local, h_global, d),
+                    dtype=packed.dtype,
+                )
+                return fused_dequant_unpack_output_fp8(
+                    packed_q,
+                    packed_scale,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    world_size=world_size,
+                    group_size=group_size,
+                    dtype=packed.dtype,
+                    out=out,
+                )
+        x = _usp_all_to_all_single(x, cache_name="usp_output_packed")
     else:
         x = _usp_all_to_all_single(x, cache_name="usp_output_packed")
     x = x.reshape(world_size, s_local, batch_size, h_local, d)
