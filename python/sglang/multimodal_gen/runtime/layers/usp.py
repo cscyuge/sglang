@@ -78,6 +78,10 @@ def _usp_fp8_comm_block_size() -> int:
     return block_size if block_size in (16, 32, 64, 128) else 128
 
 
+def _usp_fp8_comm_rowpack_enabled() -> bool:
+    return _env_enabled("SGLANG_STREAM_R1_SP_COMM_FP8_ROWPACK", "1")
+
+
 def _usp_device_cache_key(device: torch.device) -> tuple[str, int]:
     index = device.index
     if device.type == "cuda" and index is None and torch.cuda.is_available():
@@ -297,6 +301,86 @@ def _usp_blockwise_fp8_all_to_all_payload_scale(
     return x_q, x_scale, group_size
 
 
+def _usp_blockwise_fp8_all_to_all_rowpack_payload_scale(
+    x: torch.Tensor,
+    *,
+    cache_name: str,
+) -> tuple[torch.Tensor, int] | None:
+    if not _usp_fp8_comm_rowpack_enabled():
+        return None
+    if x.dtype not in (torch.bfloat16, torch.float16) or not x.is_contiguous():
+        return None
+    group_size = _usp_fp8_comm_block_size()
+    if x.shape[-1] % group_size != 0 or x.shape[-1] % 4 != 0:
+        return None
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1 or x.shape[0] % world_size != 0:
+        return None
+
+    from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+        aligned_rowpack_shape,
+        blockwise_quant_fp8,
+        pack_fp8_payload_scale_aligned,
+    )
+
+    scale_shape = tuple(x.shape[:-1]) + (x.shape[-1] // group_size,)
+    with _comm_nvtx_range(
+        "sgl_mm_usp_fp8_comm_quant "
+        f"group_size={group_size} {_tensor_desc('x', x)} {_comm_nvtx_caller()}"
+    ):
+        q_out = _usp_get_buffer(
+            f"{cache_name}.fp8_quant",
+            x,
+            tuple(x.shape),
+            dtype=torch.float8_e4m3fn,
+        )
+        scale_out = _usp_get_buffer(
+            f"{cache_name}.fp8_scale_quant",
+            x,
+            scale_shape,
+            dtype=torch.float32,
+        )
+        x_q, x_scale = blockwise_quant_fp8(
+            x,
+            group_size=group_size,
+            out_q=q_out,
+            out_scale=scale_out,
+        )
+
+    rowpack_shape = aligned_rowpack_shape(
+        tuple(x_q.shape),
+        scale_cols=x_scale.shape[-1],
+        world_size=world_size,
+    )
+    with _comm_nvtx_range(
+        "sgl_mm_usp_fp8_comm_pack_payload_scale_rowpack "
+        f"group_size={group_size} payload_shape={tuple(x_q.shape)} "
+        f"rowpack_shape={rowpack_shape}"
+    ):
+        rowpack = _usp_get_buffer(
+            f"{cache_name}.fp8_rowpack_pack",
+            x,
+            rowpack_shape,
+            dtype=torch.uint8,
+        )
+        rowpack = pack_fp8_payload_scale_aligned(
+            x_q,
+            x_scale,
+            world_size=world_size,
+            out=rowpack,
+        )
+
+    with _comm_nvtx_range(
+        "sgl_mm_usp_fp8_comm_all_to_all_rowpack "
+        f"group_size={group_size} shape={tuple(rowpack.shape)} {_comm_nvtx_caller()}"
+    ):
+        rowpack = _usp_all_to_all_single(
+            rowpack,
+            cache_name=f"{cache_name}.fp8_rowpack",
+        )
+    return rowpack, group_size
+
+
 def _usp_input_all_to_all(
     x: torch.Tensor,
     head_dim: int = 1,
@@ -442,6 +526,45 @@ def _usp_input_all_to_all_qkv(
     # 2. Single NCCL all-to-all. When enabled, send blockwise FP8 payload
     # plus FP32 scales and fuse dequantization with the QKV unpack.
     if _usp_fp8_comm_enabled("qkv"):
+        rowpack_result = _usp_blockwise_fp8_all_to_all_rowpack_payload_scale(
+            packed,
+            cache_name="usp_qkv_fp8_rowpack",
+        )
+        if rowpack_result is not None:
+            packed_rowpack, group_size = rowpack_result
+            from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+                fused_dequant_unpack_qkv_fp8_rowpack,
+            )
+
+            with _comm_nvtx_range(
+                "sgl_mm_usp_qkv_rowpack_fused_dequant_unpack "
+                f"world_size={world_size} group_size={group_size} "
+                f"packed={tuple(packed_rowpack.shape)}"
+            ):
+                qkv_out_buffer = _usp_get_buffer(
+                    "usp_qkv_unpack",
+                    q,
+                    (3, B, S_local * world_size, H_local, D),
+                )
+                qkv_out = None
+                if qkv_out_buffer is not None:
+                    qkv_out = (
+                        qkv_out_buffer[0],
+                        qkv_out_buffer[1],
+                        qkv_out_buffer[2],
+                    )
+                return fused_dequant_unpack_qkv_fp8_rowpack(
+                    packed_rowpack,
+                    B,
+                    S_local,
+                    H_local,
+                    D,
+                    world_size,
+                    group_size=group_size,
+                    dtype=q.dtype,
+                    out=qkv_out,
+                )
+
         fp8_result = _usp_blockwise_fp8_all_to_all_payload_scale(
             packed,
             cache_name="usp_qkv_fp8",
@@ -637,6 +760,37 @@ def _usp_output_all_to_all_packed_bshd(
         x = packed.reshape(seq_len, batch_size, h_local, d)
 
     if _usp_fp8_comm_enabled("output"):
+        rowpack_result = _usp_blockwise_fp8_all_to_all_rowpack_payload_scale(
+            x,
+            cache_name="usp_output_packed_fp8_rowpack",
+        )
+        if rowpack_result is not None:
+            packed_rowpack, group_size = rowpack_result
+            from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+                fused_dequant_unpack_output_fp8_rowpack,
+            )
+
+            with _comm_nvtx_range(
+                "sgl_mm_usp_output_rowpack_fused_dequant_postunpack "
+                f"world_size={world_size} group_size={group_size} "
+                f"shape={tuple(packed_rowpack.shape)}"
+            ):
+                out = _usp_get_buffer(
+                    "usp_output_postunpack.packed_bshd",
+                    x,
+                    (batch_size, s_local, h_global, d),
+                    dtype=packed.dtype,
+                )
+                return fused_dequant_unpack_output_fp8_rowpack(
+                    packed_rowpack,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    world_size=world_size,
+                    group_size=group_size,
+                    dtype=packed.dtype,
+                    out=out,
+                )
+
         fp8_result = _usp_blockwise_fp8_all_to_all_payload_scale(
             x,
             cache_name="usp_output_packed_fp8",

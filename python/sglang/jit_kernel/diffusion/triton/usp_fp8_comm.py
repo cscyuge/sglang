@@ -175,6 +175,148 @@ def blockwise_dequant_fp8(
 
 
 @triton.jit
+def _pack_fp8_payload_scale_aligned_kernel(
+    payload_ptr,
+    scale_u8_ptr,
+    combined_ptr,
+    TOTAL: tl.constexpr,
+    REST: tl.constexpr,
+    D: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    CHUNK_ROWS: tl.constexpr,
+    SCALE_BYTE_COLS: tl.constexpr,
+    MERGED_ROWS_PER_PEER: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < TOTAL
+
+    col = offsets % D
+    tmp = offsets // D
+    rest_idx = tmp % REST
+    out_row = tmp // REST
+
+    peer = out_row // MERGED_ROWS_PER_PEER
+    inner = out_row - peer * MERGED_ROWS_PER_PEER
+    is_payload = inner < CHUNK_ROWS
+
+    src_row = peer * CHUNK_ROWS + inner
+    payload_offsets = src_row * REST * D + rest_idx * D + col
+
+    scale_linear = (inner - CHUNK_ROWS) * D + col
+    scale_row = peer * CHUNK_ROWS + scale_linear // SCALE_BYTE_COLS
+    scale_byte = scale_linear % SCALE_BYTE_COLS
+    scale_offsets = scale_row * REST * SCALE_BYTE_COLS + rest_idx * SCALE_BYTE_COLS + scale_byte
+    valid_scale = (inner >= CHUNK_ROWS) & (scale_linear < CHUNK_ROWS * SCALE_BYTE_COLS)
+
+    payload_val = tl.load(payload_ptr + payload_offsets, mask=mask & is_payload, other=0)
+    scale_val = tl.load(scale_u8_ptr + scale_offsets, mask=mask & valid_scale, other=0)
+    out = tl.where(is_payload, payload_val, scale_val)
+    tl.store(combined_ptr + offsets, out, mask=mask)
+
+
+def _rowpack_scale_rows(
+    *,
+    chunk_rows: int,
+    d: int,
+    scale_cols: int,
+) -> int:
+    scale_byte_cols = scale_cols * 4
+    return triton.cdiv(chunk_rows * scale_byte_cols, d)
+
+
+def _flatten_rowpack_shape(payload: torch.Tensor) -> tuple[int, int, int]:
+    if payload.ndim < 2:
+        raise ValueError("payload must have at least row and feature dimensions")
+    rows = payload.shape[0]
+    d = payload.shape[-1]
+    rest = payload.numel() // (rows * d)
+    return rows, rest, d
+
+
+def aligned_rowpack_shape(
+    payload_shape: tuple[int, ...],
+    *,
+    scale_cols: int,
+    world_size: int,
+) -> tuple[int, ...]:
+    rows = payload_shape[0]
+    d = payload_shape[-1]
+    if rows % world_size != 0:
+        raise ValueError(f"rows={rows} must be divisible by world_size={world_size}")
+    chunk_rows = rows // world_size
+    scale_rows = _rowpack_scale_rows(
+        chunk_rows=chunk_rows,
+        d=d,
+        scale_cols=scale_cols,
+    )
+    return (world_size * (chunk_rows + scale_rows),) + payload_shape[1:]
+
+
+def pack_fp8_payload_scale_aligned(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    world_size: int,
+    out: torch.Tensor | None = None,
+    block: int = 1024,
+) -> torch.Tensor:
+    if payload.dtype != _FP8_DTYPE:
+        raise ValueError(f"payload must use float8_e4m3fn, got {payload.dtype}")
+    if scale.dtype != torch.float32:
+        raise ValueError(f"scale must use float32, got {scale.dtype}")
+    if not payload.is_contiguous() or not scale.is_contiguous():
+        raise ValueError("payload and scale must be contiguous")
+    rows, rest, d = _flatten_rowpack_shape(payload)
+    if scale.ndim != payload.ndim or scale.shape[:-1] != payload.shape[:-1]:
+        raise ValueError(
+            "scale leading dimensions must match payload: "
+            f"payload={tuple(payload.shape)} scale={tuple(scale.shape)}"
+        )
+    if d % 4 != 0:
+        raise ValueError(f"payload last dimension d={d} must be divisible by 4")
+    if rows % world_size != 0:
+        raise ValueError(f"rows={rows} must be divisible by world_size={world_size}")
+
+    combined_shape = aligned_rowpack_shape(
+        tuple(payload.shape),
+        scale_cols=scale.shape[-1],
+        world_size=world_size,
+    )
+    if out is None:
+        out = torch.empty(combined_shape, dtype=torch.uint8, device=payload.device)
+    elif out.shape != combined_shape or out.dtype != torch.uint8 or out.device != payload.device:
+        raise ValueError("out must match aligned row-pack shape/device and use uint8")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+
+    chunk_rows = rows // world_size
+    scale_byte_cols = scale.shape[-1] * 4
+    scale_rows = _rowpack_scale_rows(
+        chunk_rows=chunk_rows,
+        d=d,
+        scale_cols=scale.shape[-1],
+    )
+    merged_rows_per_peer = chunk_rows + scale_rows
+    total = out.numel()
+    _pack_fp8_payload_scale_aligned_kernel[(triton.cdiv(total, block),)](
+        payload.view(torch.uint8),
+        scale.view(torch.uint8),
+        out,
+        total,
+        rest,
+        d,
+        world_size,
+        chunk_rows,
+        scale_byte_cols,
+        merged_rows_per_peer,
+        block,
+        num_warps=8,
+    )
+    return out
+
+
+@triton.jit
 def _fp8_dequant_unpack_qkv_kernel(
     packed_q_ptr,
     scale_ptr,
@@ -346,6 +488,194 @@ def _fp8_dequant_unpack_output_kernel(
     tl.store(out_ptr + out_offsets, value, mask=m_mask[:, None])
 
 
+@triton.jit
+def _fp8_dequant_unpack_qkv_rowpack_kernel(
+    packed_q_ptr,
+    scale_f32_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    N: tl.constexpr,
+    S_LOCAL: tl.constexpr,
+    H_LOCAL: tl.constexpr,
+    D: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    SCALE_FLOATS_PER_ROW: tl.constexpr,
+    MERGED_ROWS_PER_PEER: tl.constexpr,
+    stride_p_row,
+    stride_p_b,
+    stride_p_s,
+    stride_scale_row,
+    stride_scale_b,
+    stride_scale_s,
+    stride_o_b,
+    stride_o_s,
+    stride_o_h,
+    BLOCK_M: tl.constexpr,
+):
+    m_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_offsets < N
+
+    h = m_offsets % H_LOCAL
+    tmp = m_offsets // H_LOCAL
+    s = tmp % S_LOCAL
+    tmp = tmp // S_LOCAL
+    ws = tmp % WORLD_SIZE
+    b = tmp // WORLD_SIZE
+
+    d_offsets = tl.arange(0, D)
+    group_offsets = d_offsets // GROUP_SIZE
+    scale_cols = D // GROUP_SIZE
+    chunk_base = ws * MERGED_ROWS_PER_PEER
+
+    q_inner = 3 * h
+    k_inner = q_inner + 1
+    v_inner = q_inner + 2
+
+    q_row = chunk_base + q_inner
+    k_row = chunk_base + k_inner
+    v_row = chunk_base + v_inner
+
+    q_scale_linear = q_inner[:, None] * scale_cols + group_offsets[None, :]
+    k_scale_linear = k_inner[:, None] * scale_cols + group_offsets[None, :]
+    v_scale_linear = v_inner[:, None] * scale_cols + group_offsets[None, :]
+
+    q_scale_row = chunk_base[:, None] + 3 * H_LOCAL + q_scale_linear // SCALE_FLOATS_PER_ROW
+    k_scale_row = chunk_base[:, None] + 3 * H_LOCAL + k_scale_linear // SCALE_FLOATS_PER_ROW
+    v_scale_row = chunk_base[:, None] + 3 * H_LOCAL + v_scale_linear // SCALE_FLOATS_PER_ROW
+    q_scale_col = q_scale_linear % SCALE_FLOATS_PER_ROW
+    k_scale_col = k_scale_linear % SCALE_FLOATS_PER_ROW
+    v_scale_col = v_scale_linear % SCALE_FLOATS_PER_ROW
+
+    scale_base = b[:, None] * stride_scale_b + s[:, None] * stride_scale_s
+    q_scale = tl.load(
+        scale_f32_ptr + q_scale_row * stride_scale_row + scale_base + q_scale_col,
+        mask=m_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    k_scale = tl.load(
+        scale_f32_ptr + k_scale_row * stride_scale_row + scale_base + k_scale_col,
+        mask=m_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    v_scale = tl.load(
+        scale_f32_ptr + v_scale_row * stride_scale_row + scale_base + v_scale_col,
+        mask=m_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    payload_base = b[:, None] * stride_p_b + s[:, None] * stride_p_s + d_offsets[None, :]
+    q_val = (
+        tl.load(
+            packed_q_ptr + q_row[:, None] * stride_p_row + payload_base,
+            mask=m_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        * q_scale
+    )
+    k_val = (
+        tl.load(
+            packed_q_ptr + k_row[:, None] * stride_p_row + payload_base,
+            mask=m_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        * k_scale
+    )
+    v_val = (
+        tl.load(
+            packed_q_ptr + v_row[:, None] * stride_p_row + payload_base,
+            mask=m_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        * v_scale
+    )
+
+    s_global = ws * S_LOCAL + s
+    out_base = (
+        b[:, None] * stride_o_b
+        + s_global[:, None] * stride_o_s
+        + h[:, None] * stride_o_h
+        + d_offsets[None, :]
+    )
+    tl.store(q_ptr + out_base, q_val, mask=m_mask[:, None])
+    tl.store(k_ptr + out_base, k_val, mask=m_mask[:, None])
+    tl.store(v_ptr + out_base, v_val, mask=m_mask[:, None])
+
+
+@triton.jit
+def _fp8_dequant_unpack_output_rowpack_kernel(
+    packed_q_ptr,
+    scale_f32_ptr,
+    out_ptr,
+    N: tl.constexpr,
+    S_LOCAL: tl.constexpr,
+    H_LOCAL: tl.constexpr,
+    D: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    SCALE_FLOATS_PER_ROW: tl.constexpr,
+    MERGED_ROWS_PER_PEER: tl.constexpr,
+    stride_p_row,
+    stride_p_b,
+    stride_p_h,
+    stride_scale_row,
+    stride_scale_b,
+    stride_scale_h,
+    stride_o_b,
+    stride_o_s,
+    stride_o_h,
+    BLOCK_M: tl.constexpr,
+):
+    m_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_offsets < N
+
+    h = m_offsets % H_LOCAL
+    tmp = m_offsets // H_LOCAL
+    ws = tmp % WORLD_SIZE
+    tmp = tmp // WORLD_SIZE
+    s_local = tmp % S_LOCAL
+    b = tmp // S_LOCAL
+
+    d_offsets = tl.arange(0, D)
+    group_offsets = d_offsets // GROUP_SIZE
+    scale_cols = D // GROUP_SIZE
+    chunk_base = ws * MERGED_ROWS_PER_PEER
+    payload_row = chunk_base + s_local
+
+    scale_linear = s_local[:, None] * scale_cols + group_offsets[None, :]
+    scale_row = chunk_base[:, None] + S_LOCAL + scale_linear // SCALE_FLOATS_PER_ROW
+    scale_col = scale_linear % SCALE_FLOATS_PER_ROW
+    scale_base = b[:, None] * stride_scale_b + h[:, None] * stride_scale_h
+    scale = tl.load(
+        scale_f32_ptr + scale_row * stride_scale_row + scale_base + scale_col,
+        mask=m_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    payload_offsets = (
+        payload_row[:, None] * stride_p_row
+        + b[:, None] * stride_p_b
+        + h[:, None] * stride_p_h
+        + d_offsets[None, :]
+    )
+    value = (
+        tl.load(packed_q_ptr + payload_offsets, mask=m_mask[:, None], other=0.0).to(
+            tl.float32
+        )
+        * scale
+    )
+
+    h_global = ws * H_LOCAL + h
+    out_offsets = (
+        b[:, None] * stride_o_b
+        + s_local[:, None] * stride_o_s
+        + h_global[:, None] * stride_o_h
+        + d_offsets[None, :]
+    )
+    tl.store(out_ptr + out_offsets, value, mask=m_mask[:, None])
+
+
 def fused_dequant_unpack_qkv_fp8(
     packed_q: torch.Tensor,
     scale: torch.Tensor,
@@ -366,8 +696,8 @@ def fused_dequant_unpack_qkv_fp8(
         )
     if packed_q.dtype != _FP8_DTYPE:
         raise ValueError(f"packed_q must use float8_e4m3fn, got {packed_q.dtype}")
-    if not packed_q.is_contiguous():
-        raise ValueError("packed_q must be contiguous")
+    if packed_q.stride(-1) != 1:
+        raise ValueError("packed_q last dimension must be contiguous")
     scale_shape = packed_shape[:-1] + (D // group_size,)
     if scale.shape != scale_shape or scale.dtype != torch.float32:
         raise ValueError(
@@ -445,8 +775,8 @@ def fused_dequant_unpack_output_fp8(
         )
     if packed_q.dtype != _FP8_DTYPE:
         raise ValueError(f"packed_q must use float8_e4m3fn, got {packed_q.dtype}")
-    if not packed_q.is_contiguous():
-        raise ValueError("packed_q must be contiguous")
+    if packed_q.stride(-1) != 1:
+        raise ValueError("packed_q last dimension must be contiguous")
     if packed_q.shape[0] != seq_len or packed_q.shape[1] != batch_size:
         raise ValueError(
             "packed_q leading dimensions must match seq_len/batch_size: "
@@ -498,6 +828,184 @@ def fused_dequant_unpack_output_fp8(
         scale.stride(1),
         scale.stride(2),
         scale.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        block_m,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+def fused_dequant_unpack_qkv_fp8_rowpack(
+    packed: torch.Tensor,
+    B: int,
+    S_local: int,
+    H_local: int,
+    D: int,
+    world_size: int,
+    *,
+    group_size: int,
+    dtype: torch.dtype,
+    out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if packed.dtype != torch.uint8:
+        raise ValueError(f"row-packed tensor must use uint8, got {packed.dtype}")
+    if D % group_size != 0:
+        raise ValueError(f"D={D} must be divisible by group_size={group_size}")
+    if D % 4 != 0:
+        raise ValueError(f"D={D} must be divisible by 4")
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"output dtype must be bf16/fp16, got {dtype}")
+
+    chunk_rows = 3 * H_local
+    scale_cols = D // group_size
+    scale_rows = _rowpack_scale_rows(
+        chunk_rows=chunk_rows,
+        d=D,
+        scale_cols=scale_cols,
+    )
+    merged_rows_per_peer = chunk_rows + scale_rows
+    packed_shape = (world_size * merged_rows_per_peer, B, S_local, D)
+    if packed.shape != packed_shape:
+        raise ValueError(
+            f"packed rowpack must have shape {packed_shape}, got {tuple(packed.shape)}"
+        )
+    if not packed.is_contiguous():
+        raise ValueError("packed rowpack tensor must be contiguous")
+
+    out_shape = (B, S_local * world_size, H_local, D)
+    if out is None:
+        q = torch.empty(out_shape, dtype=dtype, device=packed.device)
+        k = torch.empty(out_shape, dtype=dtype, device=packed.device)
+        v = torch.empty(out_shape, dtype=dtype, device=packed.device)
+    else:
+        q, k, v = out
+        for name, tensor in (("q", q), ("k", k), ("v", v)):
+            if tensor.shape != out_shape:
+                raise ValueError(
+                    f"{name} output must have shape {out_shape}, got {tuple(tensor.shape)}"
+                )
+            if tensor.dtype != dtype or tensor.device != packed.device:
+                raise ValueError(f"{name} output dtype/device must match request")
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} output must be contiguous")
+
+    packed_q = packed.view(torch.float8_e4m3fn)
+    scale_f32 = packed.view(torch.float32)
+    rows = B * world_size * S_local * H_local
+    block_m = _block_m_for_rows(rows)
+    grid = (triton.cdiv(rows, block_m),)
+    _fp8_dequant_unpack_qkv_rowpack_kernel[grid](
+        packed_q,
+        scale_f32,
+        q,
+        k,
+        v,
+        rows,
+        S_local,
+        H_local,
+        D,
+        world_size,
+        group_size,
+        D // 4,
+        merged_rows_per_peer,
+        packed_q.stride(0),
+        packed_q.stride(1),
+        packed_q.stride(2),
+        scale_f32.stride(0),
+        scale_f32.stride(1),
+        scale_f32.stride(2),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        block_m,
+        num_warps=4,
+        num_stages=2,
+    )
+    return q, k, v
+
+
+def fused_dequant_unpack_output_fp8_rowpack(
+    packed: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    world_size: int,
+    group_size: int,
+    dtype: torch.dtype,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if packed.ndim != 4:
+        raise ValueError(
+            f"packed rowpack must have shape [S_merged, B, H, D], got {tuple(packed.shape)}"
+        )
+    if packed.dtype != torch.uint8:
+        raise ValueError(f"packed rowpack must use uint8, got {packed.dtype}")
+    if not packed.is_contiguous():
+        raise ValueError("packed rowpack tensor must be contiguous")
+    if packed.shape[1] != batch_size:
+        raise ValueError(
+            f"packed batch dimension must match batch_size={batch_size}, got {packed.shape[1]}"
+        )
+    if seq_len % world_size != 0:
+        raise ValueError(f"seq_len ({seq_len}) must be divisible by world_size")
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"output dtype must be bf16/fp16, got {dtype}")
+
+    h_local = packed.shape[2]
+    D = packed.shape[3]
+    if D % group_size != 0:
+        raise ValueError(f"D={D} must be divisible by group_size={group_size}")
+    if D % 4 != 0:
+        raise ValueError(f"D={D} must be divisible by 4")
+    s_local = seq_len // world_size
+    scale_cols = D // group_size
+    scale_rows = _rowpack_scale_rows(
+        chunk_rows=s_local,
+        d=D,
+        scale_cols=scale_cols,
+    )
+    merged_rows_per_peer = s_local + scale_rows
+    expected_rows = world_size * merged_rows_per_peer
+    if packed.shape[0] != expected_rows:
+        raise ValueError(
+            f"packed row count must be {expected_rows}, got {packed.shape[0]}"
+        )
+
+    h_global = h_local * world_size
+    out_shape = (batch_size, s_local, h_global, D)
+    if out is None:
+        out = torch.empty(out_shape, dtype=dtype, device=packed.device)
+    elif out.shape != out_shape or out.dtype != dtype or out.device != packed.device:
+        raise ValueError("out must match fused output shape/device/dtype")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+
+    packed_q = packed.view(torch.float8_e4m3fn)
+    scale_f32 = packed.view(torch.float32)
+    rows = batch_size * s_local * world_size * h_local
+    block_m = _block_m_for_rows(rows)
+    grid = (triton.cdiv(rows, block_m),)
+    _fp8_dequant_unpack_output_rowpack_kernel[grid](
+        packed_q,
+        scale_f32,
+        out,
+        rows,
+        s_local,
+        h_local,
+        D,
+        world_size,
+        group_size,
+        D // 4,
+        merged_rows_per_peer,
+        packed_q.stride(0),
+        packed_q.stride(1),
+        packed_q.stride(2),
+        scale_f32.stride(0),
+        scale_f32.stride(1),
+        scale_f32.stride(2),
         out.stride(0),
         out.stride(1),
         out.stride(2),
