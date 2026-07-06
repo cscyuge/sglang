@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
+import shutil
+import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
@@ -14,6 +17,7 @@ from PIL import Image
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
     RealtimeStageTimer,
 )
+from sglang.multimodal_gen.runtime.realtime.errors import RealtimeProtocolError
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     JPEG_FRAME_CONTENT_TYPE,
     RAW_RGB_CHANNELS,
@@ -131,6 +135,12 @@ JPEG_DEFAULT_QUALITY = 95
 JPEG_SUBSAMPLING = 0
 RAW_LOSSLESS_OUTPUT_FORMAT = "raw"
 ENCODED_PREVIEW_FORMATS = {"webp", "jpeg"}
+H264_OUTPUT_FORMATS = {"h264", "h264_annexb"}
+H264_ANNEXB_OUTPUT_FORMAT = "h264_annexb"
+H264_FRAME_CONTENT_TYPE = "video/h264"
+H264_DEFAULT_CRF = 23
+REALTIME_WS_WRITE_TIMEOUT_ENV = "SGLANG_REALTIME_WS_WRITE_TIMEOUT_MS"
+REALTIME_WS_WRITE_TIMEOUT_DEFAULT_MS = 10000.0
 
 
 @dataclass(frozen=True)
@@ -138,6 +148,50 @@ class _TransportPayload:
     content_type: str
     payload: bytes
     metadata: dict[str, int | str | bool | list[int]]
+
+
+def _format_ms(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:.3f}"
+
+
+def get_realtime_ws_write_timeout_ms() -> float:
+    raw_env = os.environ.get(REALTIME_WS_WRITE_TIMEOUT_ENV)
+    if raw_env is not None and raw_env != "":
+        return max(0.0, float(raw_env))
+    try:
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        raw_value = getattr(
+            getattr(server_args, "pipeline_config", None),
+            "realtime_ws_write_timeout_ms",
+            REALTIME_WS_WRITE_TIMEOUT_DEFAULT_MS,
+        )
+    except Exception:
+        raw_value = REALTIME_WS_WRITE_TIMEOUT_DEFAULT_MS
+    return max(0.0, float(raw_value))
+
+
+async def send_realtime_ws_bytes(
+    ws: WebSocket,
+    payload: bytes,
+    *,
+    timeout_ms: float | None = None,
+) -> None:
+    if timeout_ms is None:
+        timeout_ms = get_realtime_ws_write_timeout_ms()
+    if timeout_ms <= 0:
+        await ws.send_bytes(payload)
+        return
+    try:
+        await asyncio.wait_for(ws.send_bytes(payload), timeout=timeout_ms / 1000.0)
+    except asyncio.TimeoutError as exc:
+        raise RealtimeProtocolError(
+            "output_write_timeout",
+            f"WebSocket write timed out after {_format_ms(timeout_ms)}ms",
+            timeout_ms=round(timeout_ms, 3),
+            payload_bytes=len(payload),
+        ) from exc
 
 
 def _split_frame_batch(
@@ -245,6 +299,84 @@ def _pack_frame_batch_header(header: RealtimeFrameBatchHeader) -> bytes:
     return msgspec.msgpack.encode(header)
 
 
+def _encode_raw_rgb_frames_to_h264_annexb(
+    transport_frames: list[bytes],
+    *,
+    width: int,
+    height: int,
+    fps: int,
+    crf: int,
+) -> bytes:
+    if not transport_frames:
+        return b""
+
+    frame_size = width * height * RAW_RGB_CHANNELS
+    for frame in transport_frames:
+        if len(frame) != frame_size:
+            raise ValueError(
+                "h264 transport requires fixed-size rgb24 frames: "
+                f"expected={frame_size}, got={len(frame)}"
+            )
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for realtime h264 transport")
+
+    frame_count = len(transport_frames)
+    keyint = max(1, frame_count)
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(max(1, fps)),
+        "-i",
+        "pipe:0",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "zerolatency",
+        "-bf",
+        "0",
+        "-g",
+        str(keyint),
+        "-keyint_min",
+        str(keyint),
+        "-sc_threshold",
+        "0",
+        "-x264-params",
+        "repeat-headers=1:scenecut=0",
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "h264",
+        "pipe:1",
+    ]
+    proc = subprocess.run(
+        cmd,
+        input=b"".join(transport_frames),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        error = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg h264 encode failed: {error}")
+    return proc.stdout
+
+
 def _build_transport_payload(
     transport_frames: list[bytes],
     *,
@@ -259,6 +391,36 @@ def _build_transport_payload(
     raw_payload = b""
 
     if (
+        output_format in H264_OUTPUT_FORMATS
+        and content_type == RAW_RGB_CONTENT_TYPE
+        and transport_frames
+    ):
+        width = int(metadata["width"])
+        height = int(metadata["height"])
+        fps = int(metadata.get("fps") or 16)
+        crf = int(transport_quality or H264_DEFAULT_CRF)
+        raw_size = sum(len(frame) for frame in transport_frames)
+        raw_payload = _encode_raw_rgb_frames_to_h264_annexb(
+            transport_frames,
+            width=width,
+            height=height,
+            fps=fps,
+            crf=crf,
+        )
+        payload_content_type = H264_FRAME_CONTENT_TYPE
+        payload_metadata = {
+            "format": H264_ANNEXB_OUTPUT_FORMAT,
+            "encoding": H264_ANNEXB_OUTPUT_FORMAT,
+            "codec": "h264",
+            "source_format": "rgb24",
+            "pixel_format": "yuv420p",
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "raw_size": raw_size,
+            "keyframe": True,
+        }
+    elif (
         output_format in ENCODED_PREVIEW_FORMATS
         and content_type == RAW_RGB_CONTENT_TYPE
         and transport_frames
@@ -328,7 +490,11 @@ def _should_build_payload_off_loop(
 ) -> bool:
     if content_type != RAW_RGB_CONTENT_TYPE or not transport_frames:
         return False
-    return output_format in ENCODED_PREVIEW_FORMATS or output_format is None
+    return (
+        output_format in ENCODED_PREVIEW_FORMATS
+        or output_format in H264_OUTPUT_FORMATS
+        or output_format is None
+    )
 
 
 def _is_encoded_preview_transport(
@@ -340,6 +506,24 @@ def _is_encoded_preview_transport(
         output_format in ENCODED_PREVIEW_FORMATS
         and content_type == RAW_RGB_CONTENT_TYPE
     )
+
+
+def _split_transport_frame_batches(
+    frames: list[bytes],
+    *,
+    content_type: str,
+    output_format: str | None,
+) -> list[list[bytes]]:
+    if output_format in H264_OUTPUT_FORMATS:
+        return [frames]
+    if _is_encoded_preview_transport(
+        content_type=content_type,
+        output_format=output_format,
+    ):
+        return _split_frame_batch(frames, ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE)
+    if content_type == RAW_RGB_CONTENT_TYPE:
+        return _split_frame_batch(frames)
+    return [frames]
 
 
 async def _build_encoded_preview_payloads(
@@ -463,6 +647,9 @@ class RawRGBRealtimeOutputAdapter:
             if content_type == RAW_RGB_CONTENT_TYPE
             else {}
         )
+        if content_type == RAW_RGB_CONTENT_TYPE and frame_metadata:
+            frame_metadata = dict(frame_metadata)
+            frame_metadata.setdefault("fps", int(getattr(batch, "fps", None) or 16))
         output_format = getattr(batch, "realtime_output_format", None)
         preview_max_width = getattr(batch, "realtime_preview_max_width", None)
         stats = await self._send_frame_batches(
@@ -498,17 +685,10 @@ class RawRGBRealtimeOutputAdapter:
         metadata = frame_metadata or {}
         stats = empty_frame_send_stats(content_type)
         for frames in frame_batches:
-            split_batches = (
-                _split_frame_batch(frames, ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE)
-                if _is_encoded_preview_transport(
-                    content_type=content_type,
-                    output_format=output_format,
-                )
-                else (
-                    _split_frame_batch(frames)
-                    if content_type == RAW_RGB_CONTENT_TYPE
-                    else [frames]
-                )
+            split_batches = _split_transport_frame_batches(
+                frames,
+                content_type=content_type,
+                output_format=output_format,
             )
             num_frame_batches = len(split_batches)
             encoded_preview_payloads: list[_TransportPayload] | None = None
@@ -578,10 +758,10 @@ class RawRGBRealtimeOutputAdapter:
                     header_payload = _pack_frame_batch_header(header)
                     stats["header_pack_ms"] += timer.mark_ms()
 
-                    await ws.send_bytes(header_payload)
+                    await send_realtime_ws_bytes(ws, header_payload)
                     stats["header_write_ms"] += timer.mark_ms()
 
-                    await ws.send_bytes(transport_payload.payload)
+                    await send_realtime_ws_bytes(ws, transport_payload.payload)
                     stats["raw_write_ms"] += timer.mark_ms()
 
                     stats["ws_payload_bytes"] += len(header_payload) + len(
@@ -595,7 +775,7 @@ class RawRGBRealtimeOutputAdapter:
                     stats["header_pack_ms"] += timer.mark_ms()
 
                     stats["header_write_ms"] += timer.mark_ms()
-                    await ws.send_bytes(message_payload)
+                    await send_realtime_ws_bytes(ws, message_payload)
                     stats["raw_write_ms"] += timer.mark_ms()
 
                     stats["ws_payload_bytes"] += len(message_payload)

@@ -204,6 +204,11 @@ def build_raw_rgb_frame_batches(
             "height": frame_height,
             "channels": channels,
             "bytes_per_frame": frame_width * frame_height * channels,
+            "timings": {
+                "raw_frame_sample_to_frames_ms": round(sample_to_frames_ms, 3),
+                "raw_frame_frames_to_bytes_ms": round(frames_to_bytes_ms, 3),
+                "raw_frame_materialize_ms": round(total_ms, 3),
+            },
         }
     return frame_batches, frame_metadata
 

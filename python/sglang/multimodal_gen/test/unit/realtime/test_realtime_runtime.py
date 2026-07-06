@@ -452,6 +452,10 @@ def test_send_output_emits_chunk_stats_message():
                 "content_type": "image/webp",
             }
 
+        def build_chunk_stats_extra(self, session, batch, result):
+            del session, batch, result
+            return None
+
     session = GenerateSession()
     session.adapter = _Adapter()
     chunk = session.new_chunk()
@@ -467,7 +471,14 @@ def test_send_output_emits_chunk_stats_message():
             session,
             chunk,
             batch,
-            SimpleNamespace(),
+            SimpleNamespace(
+                realtime_timings={
+                    "denoise_ms": 12.3456,
+                    "decode_ms": 3.2,
+                    "raw_frame_materialize_ms": 4.0,
+                    "total_ms": 18.0,
+                }
+            ),
             request_prepare_ms=1.0,
             scheduler_forward_ms=2.0,
             chunk_started=time.perf_counter(),
@@ -483,6 +494,9 @@ def test_send_output_emits_chunk_stats_message():
     assert message["ws_write_ms"] == 42
     assert message["ws_payload_bytes"] == 450
     assert message["content_type"] == "image/webp"
+    assert message["worker_timings"]["denoise_ms"] == 12
+    assert message["worker_timings"]["raw_frame_materialize_ms"] == 4
+    assert message["scheduler_overhead_ms"] == 0
     assert bytes([0xCB]) not in sent_messages[-1]
 
 

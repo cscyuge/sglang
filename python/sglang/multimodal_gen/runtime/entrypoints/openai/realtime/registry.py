@@ -34,11 +34,17 @@ def _register_builtin_realtime_model_adapters() -> None:
     from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
         SanaWMRealtimeConfig,
     )
+    from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import (
+        WanS2VPipelineConfig,
+    )
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.lingbot_world_realtime_adapter import (
         LingBotWorldRealtimeAdapter,
     )
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.sana_wm_realtime_adapter import (
         SanaWMRealtimeAdapter,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.wan_s2v_realtime_adapter import (
+        WanS2VRealtimeAdapter,
     )
 
     register_realtime_model_adapter(
@@ -48,6 +54,10 @@ def _register_builtin_realtime_model_adapters() -> None:
     register_realtime_model_adapter(
         SanaWMRealtimeConfig,
         SanaWMRealtimeAdapter,
+    )
+    register_realtime_model_adapter(
+        WanS2VPipelineConfig,
+        WanS2VRealtimeAdapter,
     )
     _BUILTIN_ADAPTERS_REGISTERED = True
 

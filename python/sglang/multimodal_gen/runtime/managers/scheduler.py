@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     ProfileReqOutput,
+    ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
     StartProfileReq,
@@ -37,6 +38,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -105,6 +107,7 @@ class Scheduler(SchedulerDisaggMixin):
         self.result_pipes_from_slaves = result_pipes_from_slaves
         self.gpu_id = gpu_id
         self._running = True
+        self.realtime_session_cache = RealtimeSessionCache()
 
         self.request_handlers = {
             SetLoraReq: self._handle_set_lora,
@@ -115,6 +118,7 @@ class Scheduler(SchedulerDisaggMixin):
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
+            ReleaseRealtimeSessionReq: self._handle_release_realtime_session,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
             StartProfileReq: self._handle_start_profile,
@@ -178,6 +182,16 @@ class Scheduler(SchedulerDisaggMixin):
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
+
+    def _handle_release_realtime_session(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        released = self.realtime_session_cache.release(req.session_id)
+        return OutputBatch(
+            output={
+                "session_id": req.session_id,
+                "released": released,
+            }
+        )
 
     def _handle_start_profile(self, reqs: List[Any]) -> OutputBatch:
         import time
@@ -281,6 +295,9 @@ class Scheduler(SchedulerDisaggMixin):
         return OutputBatch(output=checksums)
 
     def _handle_generation(self, reqs: List[Req]):
+        for req in reqs:
+            self.realtime_session_cache.attach(req)
+
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._warmup_processed += len(warmup_reqs)

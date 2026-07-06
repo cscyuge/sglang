@@ -10,10 +10,22 @@ from sglang.multimodal_gen.runtime.realtime.states.causal import (
     RealtimeCausalDiTState,
     get_realtime_causal_dit_state,
 )
+from sglang.multimodal_gen.runtime.realtime.states.wan_s2v_audio import (
+    WAN_S2V_REALTIME_DEFAULT_FPS,
+    WAN_S2V_REALTIME_SAMPLE_RATE,
+    WAN_S2V_REALTIME_VAE_TEMPORAL_SCALE,
+    WanS2VAudioTimelineState,
+    WanS2VAudioWindow,
+)
 
 __all__ = [
     "RealtimeCameraControlState",
     "RealtimeCausalDecodeState",
     "RealtimeCausalDiTState",
+    "WAN_S2V_REALTIME_DEFAULT_FPS",
+    "WAN_S2V_REALTIME_SAMPLE_RATE",
+    "WAN_S2V_REALTIME_VAE_TEMPORAL_SCALE",
+    "WanS2VAudioTimelineState",
+    "WanS2VAudioWindow",
     "get_realtime_causal_dit_state",
 ]

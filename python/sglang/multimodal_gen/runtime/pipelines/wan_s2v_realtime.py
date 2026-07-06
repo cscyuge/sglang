@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     DecodingStage,
     ImageVAEEncodingStage,
@@ -40,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     build_wan_s2v_condition_bundle,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
     emit_chunk_timeline,
@@ -48,6 +50,10 @@ from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
     read_flashtalk_audio_chunk_meta,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.realtime_video import (
+    RAW_RGB_CONTENT_TYPE,
+    build_raw_rgb_frame_batches,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -136,6 +142,171 @@ def _pipeline_config_value(
     default: Any,
 ) -> Any:
     return getattr(server_args.pipeline_config, key, default)
+
+
+def _parity_debug_enabled() -> bool:
+    return (
+        os.environ.get("WAN_S2V_PARITY_DEBUG", "").lower()
+        in {"1", "true", "yes", "on"}
+        and _safe_world_rank() == 0
+    )
+
+
+def _parity_float(value: Any) -> float | str | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(result):
+        return str(result)
+    return round(result, 6)
+
+
+def _parity_tensor_stats(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_parity_tensor_stats(item) for item in value[:4]]
+    if not isinstance(value, torch.Tensor):
+        return _parity_value_stats(value)
+
+    tensor = value.detach()
+    stats: dict[str, Any] = {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "numel": int(tensor.numel()),
+    }
+    if tensor.numel() == 0:
+        return stats
+
+    if torch.is_complex(tensor):
+        work = tensor.real.float()
+    else:
+        work = tensor.float()
+    flat = work.reshape(-1)
+    stats.update(
+        {
+            "mean": _parity_float(flat.mean().item()),
+            "std": _parity_float(
+                flat.std(unbiased=False).item() if flat.numel() > 1 else 0.0
+            ),
+            "min": _parity_float(flat.min().item()),
+            "max": _parity_float(flat.max().item()),
+            "sum": _parity_float(flat.sum().item()),
+            "l2": _parity_float(torch.sqrt((flat * flat).sum()).item()),
+            "first": [_parity_float(item) for item in flat[:4].cpu().tolist()],
+        }
+    )
+    return stats
+
+
+def _parity_array_stats(value: np.ndarray) -> dict[str, Any]:
+    array = np.asarray(value)
+    stats: dict[str, Any] = {
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "numel": int(array.size),
+    }
+    if array.size == 0:
+        return stats
+
+    work = array.astype(np.float64, copy=False).reshape(-1)
+    stats.update(
+        {
+            "mean": _parity_float(work.mean()),
+            "std": _parity_float(work.std()),
+            "min": _parity_float(work.min()),
+            "max": _parity_float(work.max()),
+            "sum": _parity_float(work.sum()),
+            "l2": _parity_float(np.sqrt(np.sum(work * work))),
+            "first": [_parity_float(item) for item in work[:4].tolist()],
+        }
+    )
+    return stats
+
+
+def _parity_generator_stats(generator: Any) -> dict[str, Any] | None:
+    if isinstance(generator, (list, tuple)):
+        generator = generator[0] if generator else None
+    if generator is None:
+        return None
+
+    stats: dict[str, Any] = {"type": type(generator).__name__}
+    try:
+        stats["device"] = str(generator.device)
+    except Exception:
+        pass
+    try:
+        stats["initial_seed"] = int(generator.initial_seed())
+    except Exception:
+        pass
+    try:
+        stats["state"] = _parity_tensor_stats(generator.get_state())
+    except Exception as exc:
+        stats["state_error"] = str(exc)
+    return stats
+
+
+def _parity_bundle_stats(bundle: WanS2VConditionBundle | None) -> dict[str, Any] | None:
+    if bundle is None:
+        return None
+
+    stats: dict[str, Any] = {}
+    for name in (
+        "prompt_embeds",
+        "ref_latents",
+        "motion_latents",
+        "cond_states",
+        "audio_input",
+        "audio_emb",
+    ):
+        stats[name] = _parity_value_stats(getattr(bundle, name, None))
+    stats["motion_frames"] = list(getattr(bundle, "motion_frames", ()))
+    stats["add_last_motion"] = getattr(bundle, "add_last_motion", None)
+    stats["drop_motion_frames"] = getattr(bundle, "drop_motion_frames", None)
+    stats["control_policy"] = getattr(bundle, "control_policy", None)
+    stats["chunk_start"] = getattr(bundle, "chunk_start", None)
+    stats["chunk_frames"] = getattr(bundle, "chunk_frames", None)
+    stats["audio_lookahead_frames"] = getattr(bundle, "audio_lookahead_frames", None)
+    stats["audio_metadata"] = _parity_value_stats(
+        getattr(bundle, "audio_metadata", None)
+    )
+    return stats
+
+
+def _parity_value_stats(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _parity_tensor_stats(value)
+    if isinstance(value, np.ndarray):
+        return _parity_array_stats(value)
+    if isinstance(value, torch.Generator):
+        return _parity_generator_stats(value)
+    if isinstance(value, WanS2VConditionBundle):
+        return _parity_bundle_stats(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _parity_value_stats(item)
+            for key, item in value.items()
+            if isinstance(item, (str, int, float, bool, type(None), list, tuple, dict))
+            or isinstance(item, (torch.Tensor, np.ndarray, torch.Generator))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_parity_value_stats(item) for item in value[:8]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _parity_log(label: str, **items: Any) -> None:
+    if not _parity_debug_enabled():
+        return
+    payload = {"label": label}
+    payload.update({key: _parity_value_stats(value) for key, value in items.items()})
+    try:
+        logger.info("WAN_S2V_PARITY %s", json.dumps(payload, sort_keys=True))
+    except Exception as exc:
+        logger.info("WAN_S2V_PARITY label=%s log_error=%s", label, exc)
 
 
 def _audio_window_after_extend(
@@ -452,6 +623,49 @@ class _WanS2VStreamingVAEState:
     initialized: bool = False
     decoded_latent_frames: int = 0
     last_decode_mode: str = "eager"
+
+
+class _WanS2VPerChunkRealtimeState(BaseRealtimeState):
+    """Worker-side state for WebSocket-driven Wan S2V realtime chunks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reset()
+
+    def reset(self) -> None:
+        self.initialized = False
+        self.session_id: str | None = None
+        self.base_batch: Req | None = None
+        self.audio_ring: AudioRingBuffer | None = None
+        self.num_frame_per_block = 0
+        self.block_public_frames = 0
+        self.fps = 0
+        self.audio_window_samples = 0
+        self.audio_window_video_frames = 0
+        self.target_audio_frames = 0
+        self.use_wav2vec_cuda_graph = False
+        self.use_streaming_vae_cache = True
+        self.use_vae_cuda_graph = False
+        self.wav2vec_graph_runner: _WanS2VWav2VecCudaGraphRunner | None = None
+        self.stream_vae_state: _WanS2VStreamingVAEState | None = None
+        self.vae_graph_cache: _WanS2VStreamingVAECudaGraphCache | None = None
+        self.attention_request = None
+        self.crossattn_cache: list[dict] | None = None
+        self.cache_state = None
+        self.frame_seq_length = None
+        self.timesteps: torch.Tensor | None = None
+        self.reference_latents_ready = False
+        self.previous_clean_latents: torch.Tensor | None = None
+        self.frame_start_idx = 0
+        self.latent_warm_start_config = None
+        self.clean_refresh_config = None
+        self.dit_dtype: torch.dtype | None = None
+        self.device = None
+        self.generator: torch.Generator | None = None
+        self.autocast_enabled = False
+
+    def dispose(self) -> None:
+        self.reset()
 
 
 class WanS2VRealtimeSessionRunner:
@@ -1451,6 +1665,552 @@ class WanS2VRealtimeSessionRunner:
             json.dump(meta, fp)
         return frame_dir, ThreadPoolExecutor(max_workers=1)
 
+    @staticmethod
+    def _clear_block_local_batch_fields(batch: Req) -> None:
+        batch.latents = None
+        batch.latent_ids = None
+        batch.raw_latent_shape = None
+        batch.trajectory_timesteps = None
+        batch.trajectory_latents = None
+        batch.rollout_trajectory_data = None
+        batch.trajectory_audio_latents = None
+        batch.output = None
+        batch.audio = None
+        batch.noise_pred = None
+        if batch.extra is not None:
+            for key in (
+                "audio_input",
+                "wan_s2v_audio_window",
+                "wan_s2v_audio_window_meta",
+                "wan_s2v_audio_is_final",
+            ):
+                batch.extra.pop(key, None)
+
+    def _store_per_chunk_base_batch(
+        self,
+        state: _WanS2VPerChunkRealtimeState,
+        batch: Req,
+    ) -> None:
+        cached = copy(batch)
+        cached.extra = dict(batch.extra)
+        self._clear_block_local_batch_fields(cached)
+        state.base_batch = cached
+
+    def _work_batch_for_realtime_chunk(
+        self,
+        state: _WanS2VPerChunkRealtimeState,
+        batch: Req,
+    ) -> Req:
+        if state.base_batch is None:
+            return batch
+
+        work_batch = copy(state.base_batch)
+        work_batch.sampling_params = batch.sampling_params
+        work_batch.extra = dict(state.base_batch.extra)
+        work_batch.extra.update(batch.extra)
+        work_batch.condition_inputs = dict(batch.condition_inputs)
+        work_batch.metrics = batch.metrics
+        work_batch.trace_ctx = batch.trace_ctx
+        work_batch.session = batch.session
+        work_batch.realtime_session_id = batch.realtime_session_id
+        work_batch.block_idx = batch.block_idx
+        work_batch.realtime_chunk_size = batch.realtime_chunk_size
+        work_batch.realtime_event_id = batch.realtime_event_id
+        work_batch.realtime_output_format = batch.realtime_output_format
+        work_batch.realtime_preview_max_width = batch.realtime_preview_max_width
+        work_batch.realtime_output_pacing = batch.realtime_output_pacing
+        work_batch.realtime_causal_sink_size = batch.realtime_causal_sink_size
+        work_batch.realtime_causal_kv_cache_num_frames = (
+            batch.realtime_causal_kv_cache_num_frames
+        )
+        work_batch.return_raw_frames = batch.return_raw_frames
+        work_batch.is_warmup = batch.is_warmup
+        return work_batch
+
+    def _initialize_per_chunk_state(
+        self,
+        state: _WanS2VPerChunkRealtimeState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        stream_r1_mode = batch.extra.get("stream_r1_mode")
+        if stream_r1_mode is None:
+            stream_r1_mode = _pipeline_config_value(
+                server_args, "stream_r1_mode", False
+            )
+        if not bool(stream_r1_mode):
+            raise RuntimeError("Wan S2V realtime chunks require stream_r1_mode=true.")
+
+        state.session_id = (
+            batch.realtime_session_id
+            or getattr(batch, "request_id", None)
+            or getattr(batch, "output_file_name", None)
+        )
+        state.num_frame_per_block = int(
+            batch.extra.get("num_frame_per_block")
+            or _pipeline_config_value(server_args, "num_frame_per_block", 7)
+        )
+        state.block_public_frames = self._block_public_frames(
+            server_args, state.num_frame_per_block
+        )
+        state.fps = int(batch.fps or 24)
+        audio_window_seconds = float(
+            _pipeline_config_value(
+                server_args, "wan_s2v_realtime_audio_window_seconds", 8
+            )
+        )
+        state.audio_window_samples = max(1, int(16000 * audio_window_seconds))
+        state.audio_window_video_frames = max(
+            1, int(round(audio_window_seconds * state.fps))
+        )
+        state.target_audio_frames = state.num_frame_per_block * 4
+        state.audio_ring = AudioRingBuffer(state.audio_window_samples)
+
+        state.use_wav2vec_cuda_graph = bool(
+            _pipeline_config_value(server_args, "wan_s2v_wav2vec_cuda_graph", False)
+        )
+        state.use_streaming_vae_cache = bool(
+            _pipeline_config_value(server_args, "wan_s2v_streaming_vae_cache", True)
+        )
+        state.use_vae_cuda_graph = bool(
+            _pipeline_config_value(server_args, "wan_s2v_vae_cuda_graph", False)
+        )
+        if state.use_vae_cuda_graph and not (
+            torch.cuda.is_available() and state.use_streaming_vae_cache
+        ):
+            state.use_vae_cuda_graph = False
+
+        audio_stage = self._get_stage(WanS2VAudioEncodingStage)
+        decoding_stage = self._get_stage(DecodingStage)
+        denoising_dispatch = self._get_stage(WanS2VDenoisingDispatchStage)
+        denoising_stage = denoising_dispatch.stream_r1_stage
+        audio_stage.load_model()
+        decoding_stage.load_model()
+        denoising_stage.load_model()
+
+        if state.use_wav2vec_cuda_graph:
+            try:
+                state.wav2vec_graph_runner = self._prepare_wav2vec_cuda_graph(
+                    audio_stage,
+                    audio_window_samples=state.audio_window_samples,
+                    audio_window_video_frames=state.audio_window_video_frames,
+                )
+            except Exception as exc:
+                logger.warning("Wan S2V Wav2Vec CUDA graph disabled: %s", exc)
+                state.wav2vec_graph_runner = None
+
+        state.stream_vae_state = _WanS2VStreamingVAEState(
+            enabled=state.use_streaming_vae_cache
+        )
+        state.vae_graph_cache = (
+            _WanS2VStreamingVAECudaGraphCache()
+            if state.use_vae_cuda_graph
+            else None
+        )
+        state.device = get_local_torch_device()
+        state.dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
+        state.autocast_enabled = (
+            state.dit_dtype != torch.float32 and not server_args.disable_autocast
+        )
+        state.latent_warm_start_config = (
+            denoising_stage._resolve_latent_warm_start_config(batch, server_args)
+        )
+        state.clean_refresh_config = denoising_stage._resolve_clean_context_refresh_config(
+            batch,
+            server_args,
+        )
+
+        batch = self._prepare_reference_and_prompt(
+            batch, server_args, state.block_public_frames
+        )
+        state.generator = (
+            batch.generator[0] if isinstance(batch.generator, list) else batch.generator
+        )
+        self._store_per_chunk_base_batch(state, batch)
+        state.initialized = True
+        logger.info(
+            "Wan S2V per-chunk realtime session initialized: session=%s "
+            "block_latent_frames=%d block_public_frames=%d fps=%d "
+            "audio_window_samples=%d wav2vec_cuda_graph=%s "
+            "streaming_vae_cache=%s vae_cuda_graph=%s",
+            state.session_id,
+            state.num_frame_per_block,
+            state.block_public_frames,
+            state.fps,
+            state.audio_window_samples,
+            state.wav2vec_graph_runner is not None,
+            state.use_streaming_vae_cache,
+            state.use_vae_cuda_graph,
+        )
+        return batch
+
+    @torch.no_grad()
+    def run_chunk(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        if batch.session is None:
+            raise RuntimeError("Wan S2V realtime chunk requires batch.session")
+
+        state = batch.session.get_or_create_state(_WanS2VPerChunkRealtimeState)
+        if not isinstance(state, _WanS2VPerChunkRealtimeState):
+            raise TypeError("Invalid Wan S2V realtime chunk state")
+        if batch.block_idx == 0:
+            state.reset()
+
+        if not state.initialized:
+            work_batch = self._initialize_per_chunk_state(state, batch, server_args)
+        else:
+            work_batch = self._work_batch_for_realtime_chunk(state, batch)
+
+        if state.audio_ring is None or state.stream_vae_state is None:
+            raise RuntimeError("Wan S2V realtime chunk state is not initialized")
+        if state.dit_dtype is None or state.device is None:
+            raise RuntimeError("Wan S2V realtime device state is not initialized")
+
+        audio_window = work_batch.extra.get("wan_s2v_audio_window")
+        if audio_window is None:
+            raise RuntimeError("Wan S2V realtime chunk requires audio window samples")
+        audio_chunk = np.asarray(audio_window, dtype=np.float32)
+        audio_meta = dict(work_batch.extra.get("wan_s2v_audio_window_meta") or {})
+
+        loop_started = time.perf_counter()
+        audio_started = time.perf_counter()
+        state.audio_ring.extend(audio_chunk)
+        audio_window_snapshot = state.audio_ring.snapshot()
+        _parity_log(
+            "ws.audio_window",
+            session_id=state.session_id,
+            request_id=getattr(work_batch, "request_id", None),
+            block_idx=work_batch.block_idx,
+            audio_meta=audio_meta,
+            audio_chunk=audio_chunk,
+            audio_window=audio_window_snapshot,
+            batch_generator=work_batch.generator,
+            state_generator=state.generator,
+            condition_keys=sorted(work_batch.condition_inputs or {}),
+            image_path=getattr(work_batch, "image_path", None),
+            seed=getattr(work_batch, "seed", None),
+        )
+
+        denoising_dispatch = self._get_stage(WanS2VDenoisingDispatchStage)
+        denoising_stage = denoising_dispatch.stream_r1_stage
+        audio_stage = self._get_stage(WanS2VAudioEncodingStage)
+        latent_stage = self._get_stage(LatentPreparationStage)
+        image_stage = self._get_stage(ImageVAEEncodingStage)
+        decoding_stage = self._get_stage(DecodingStage)
+
+        work_batch.extra["audio_input"] = self._encode_audio_window(
+            work_batch,
+            server_args,
+            audio_stage,
+            audio_window_snapshot,
+            target_audio_frames=state.target_audio_frames,
+            audio_window_video_frames=state.audio_window_video_frames,
+            wav2vec_graph_runner=state.wav2vec_graph_runner,
+            ensure_loaded=False,
+        )
+        audio_s = time.perf_counter() - audio_started
+        _parity_log(
+            "ws.audio_input",
+            session_id=state.session_id,
+            block_idx=work_batch.block_idx,
+            audio_input=work_batch.extra.get("audio_input"),
+            state_generator=state.generator,
+        )
+
+        latent_started = time.perf_counter()
+        block_latents = self._prepare_block_latents(
+            work_batch,
+            server_args,
+            latent_stage,
+            state.block_public_frames,
+        ).to(device=state.device, dtype=state.dit_dtype)
+        work_batch.latents = block_latents
+        latent_prepare_s = time.perf_counter() - latent_started
+        _parity_log(
+            "ws.block_latents",
+            session_id=state.session_id,
+            block_idx=work_batch.block_idx,
+            block_latents=block_latents,
+            state_generator=state.generator,
+        )
+
+        if not state.reference_latents_ready:
+            work_batch = self._prepare_reference_latents_once(
+                work_batch,
+                server_args,
+                image_stage,
+            )
+            state.reference_latents_ready = True
+            self._store_per_chunk_base_batch(state, work_batch)
+            _parity_log(
+                "ws.reference",
+                session_id=state.session_id,
+                block_idx=work_batch.block_idx,
+                image_latent=getattr(work_batch, "image_latent", None),
+                prompt_embeds=getattr(work_batch, "prompt_embeds", None),
+                state_generator=state.generator,
+            )
+
+        if state.attention_request is None:
+            state.attention_request = denoising_stage._resolve_attention_request(
+                work_batch,
+                server_args,
+                block_latents.shape[2],
+            )
+            state.timesteps = denoising_stage._prepare_timesteps(
+                work_batch, server_args, state.device
+            )
+            if state.timesteps.numel() == 0:
+                raise ValueError(
+                    "Wan S2V realtime chunk requires at least one timestep"
+                )
+            patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+            _, _, _, latent_h, latent_w = block_latents.shape
+            state.frame_seq_length = (latent_h // patch_size[1]) * (
+                latent_w // patch_size[2]
+            )
+            denoising_stage._configure_transformer_attention(state.attention_request)
+            state.cache_state = denoising_stage._prepare_cache_state(
+                request=state.attention_request,
+                batch_size=block_latents.shape[0],
+                frame_seq_length=state.frame_seq_length,
+                dtype=state.dit_dtype,
+                device=state.device,
+            )
+            denoising_stage._guard_cache_runtime(state.cache_state)
+            state.crossattn_cache = denoising_stage._prepare_request_crossattn_cache(
+                True
+            )
+
+        condition_started = time.perf_counter()
+        bundle = build_wan_s2v_condition_bundle(
+            work_batch,
+            server_args,
+            latents=block_latents,
+            dtype=state.dit_dtype,
+            device=state.device,
+        )
+        prompt_embeds = bundle.prompt_embeds
+        if isinstance(prompt_embeds, list):
+            prompt_embeds = prompt_embeds[0]
+        condition_s = time.perf_counter() - condition_started
+        _parity_log(
+            "ws.bundle",
+            session_id=state.session_id,
+            block_idx=work_batch.block_idx,
+            bundle=bundle,
+        )
+
+        denoising_stage._maybe_cache_audio_embeddings(
+            bundle,
+            dtype=state.dit_dtype,
+            autocast_enabled=state.autocast_enabled,
+        )
+        step_decision = denoising_stage._select_adaptive_timesteps(
+            batch=work_batch,
+            server_args=server_args,
+            block_bundle=bundle,
+            timesteps=state.timesteps,
+            block_index=work_batch.block_idx,
+        )
+        block_timesteps = step_decision.timesteps
+
+        latent_warm_start_started = time.perf_counter()
+        block_latents, latent_warm_start_applied = (
+            denoising_stage.apply_stream_r1_latent_warm_start(
+                batch=work_batch,
+                server_args=server_args,
+                block_latents=block_latents,
+                previous_clean_latents=state.previous_clean_latents,
+                timesteps=block_timesteps,
+                block_index=work_batch.block_idx,
+                config=state.latent_warm_start_config,
+            )
+        )
+        latent_warm_start_s = time.perf_counter() - latent_warm_start_started
+        work_batch.latents = block_latents
+
+        step_noise_started = time.perf_counter()
+        block_step_noises = self._prepare_step_noises(
+            block_latents,
+            block_timesteps,
+            state.generator,
+        )
+        step_noise_s = time.perf_counter() - step_noise_started
+        latent_s = time.perf_counter() - latent_started
+        _parity_log(
+            "ws.denoise_inputs",
+            session_id=state.session_id,
+            block_idx=work_batch.block_idx,
+            block_timesteps=block_timesteps,
+            block_latents=block_latents,
+            step_noises=block_step_noises,
+            state_generator=state.generator,
+        )
+
+        denoise_started = time.perf_counter()
+        current_latents = denoising_stage.denoise_stream_r1_block(
+            batch=work_batch,
+            server_args=server_args,
+            block_latents=block_latents,
+            block_bundle=bundle,
+            block_start=work_batch.block_idx * state.num_frame_per_block,
+            frame_seq_length=state.frame_seq_length,
+            timesteps=block_timesteps,
+            prompt_embeds=prompt_embeds,
+            cache_state=state.cache_state,
+            crossattn_cache=state.crossattn_cache,
+            generator=state.generator,
+            dit_dtype=state.dit_dtype,
+            autocast_enabled=state.autocast_enabled,
+            audio_start_frame=0,
+            step_noises_btchw=block_step_noises,
+            block_index=work_batch.block_idx,
+            allow_timestep_cuda_graph_capture=True,
+        )
+        timestep_profile_rows = list(
+            getattr(denoising_stage, "_last_timestep_profile_rows", [])
+        )
+        denoise_loop_s = time.perf_counter() - denoise_started
+        _parity_log(
+            "ws.denoise_output",
+            session_id=state.session_id,
+            block_idx=work_batch.block_idx,
+            current_latents=current_latents,
+            timestep_profile=timestep_profile_rows,
+            timestep_graph_statuses=getattr(
+                denoising_stage, "_last_timestep_cuda_graph_statuses", []
+            ),
+        )
+
+        clean_refresh_started = time.perf_counter()
+        clean_refresh_decision = denoising_stage.select_clean_context_refresh(
+            batch=work_batch,
+            server_args=server_args,
+            block_index=work_batch.block_idx,
+            config=state.clean_refresh_config,
+        )
+        if clean_refresh_decision.refresh:
+            denoising_stage._clean_context_refresh(
+                block_latents=current_latents,
+                prompt_embeds=prompt_embeds,
+                block_bundle=bundle,
+                current_start=(
+                    work_batch.block_idx
+                    * state.num_frame_per_block
+                    * state.frame_seq_length
+                ),
+                attention_request=state.attention_request,
+                cache_state=state.cache_state,
+                dtype=state.dit_dtype,
+                autocast_enabled=state.autocast_enabled,
+                forward_batch=work_batch,
+                crossattn_cache=state.crossattn_cache,
+                audio_start_frame=0,
+            )
+        clean_refresh_s = time.perf_counter() - clean_refresh_started
+        work_batch.latents = current_latents
+        state.previous_clean_latents = current_latents.detach()
+        denoise_s = denoise_loop_s + clean_refresh_s
+
+        decode_started = time.perf_counter()
+        frames = self._decode_block_frames(
+            decoding_stage,
+            work_batch.latents,
+            server_args,
+            state.stream_vae_state,
+            vae_graph_cache=state.vae_graph_cache,
+        )
+        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        decode_s = time.perf_counter() - decode_started
+        frame_count = int(frames.shape[2])
+        _parity_log(
+            "ws.frames",
+            session_id=state.session_id,
+            block_idx=work_batch.block_idx,
+            frames=frames,
+            vae_decode_mode=state.stream_vae_state.last_decode_mode,
+        )
+        frame_start_idx = state.frame_start_idx
+        state.frame_start_idx += frame_count
+
+        output_batch = OutputBatch(
+            output=None,
+            output_file_paths=[],
+            metrics=work_batch.metrics,
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+        )
+        raw_frame_batches, raw_frame_metadata = build_raw_rgb_frame_batches(
+            frames,
+            work_batch,
+            output_batch,
+            post_process_sample,
+        )
+        output_batch.raw_frame_batches = raw_frame_batches
+        output_batch.raw_frame_metadata = raw_frame_metadata
+
+        total_s = time.perf_counter() - loop_started
+        model_compute_total_s = total_s
+        raw_frame_timings: dict[str, Any] = {}
+        if isinstance(raw_frame_metadata, dict):
+            raw_frame_timings = dict(raw_frame_metadata.get("timings") or {})
+        worker_timings = {
+            "audio_ms": round(audio_s * 1000, 3),
+            "latent_ms": round(latent_s * 1000, 3),
+            "latent_prepare_ms": round(latent_prepare_s * 1000, 3),
+            "condition_ms": round(condition_s * 1000, 3),
+            "latent_warm_start_ms": round(latent_warm_start_s * 1000, 3),
+            "step_noise_ms": round(step_noise_s * 1000, 3),
+            "denoise_ms": round(denoise_s * 1000, 3),
+            "denoise_loop_ms": round(denoise_loop_s * 1000, 3),
+            "clean_refresh_ms": round(clean_refresh_s * 1000, 3),
+            "decode_ms": round(decode_s * 1000, 3),
+            "model_compute_total_ms": round(model_compute_total_s * 1000, 3),
+            "total_ms": round(total_s * 1000, 3),
+        }
+        worker_timings.update(raw_frame_timings)
+        output_batch.realtime_timings = worker_timings
+        logger.info(
+            "Wan S2V realtime chunk %d: audio=%.3fs latent=%.3fs "
+            "latent_prepare=%.3fs condition=%.3fs warm_start=%s/%.3fs "
+            "steps=%d/%d denoise_loop=%.3fs refresh=%s/%s/%.3fs "
+            "decode=%.3fs active=%.3fs total=%.3fs frames=%d pts=%s-%s",
+            work_batch.block_idx,
+            audio_s,
+            latent_s,
+            latent_prepare_s,
+            condition_s,
+            latent_warm_start_applied,
+            latent_warm_start_s,
+            step_decision.step_count,
+            step_decision.base_step_count,
+            denoise_loop_s,
+            clean_refresh_decision.refresh,
+            clean_refresh_decision.reason,
+            clean_refresh_s,
+            decode_s,
+            model_compute_total_s,
+            total_s,
+            frame_count,
+            audio_meta.get("pts_start_ms"),
+            audio_meta.get("pts_end_ms"),
+        )
+        emit_chunk_timeline(
+            work_batch.extra.get("chunk_timeline_path"),
+            "wan_s2v_realtime_chunk_done",
+            session_id=state.session_id,
+            block_idx=work_batch.block_idx,
+            audio_samples=int(len(audio_chunk)),
+            audio_pts_start_ms=audio_meta.get("pts_start_ms"),
+            audio_pts_end_ms=audio_meta.get("pts_end_ms"),
+            audio_is_final=audio_meta.get("is_final"),
+            frame_count=frame_count,
+            frame_start_idx=frame_start_idx,
+            vae_decode_mode=state.stream_vae_state.last_decode_mode,
+            timestep_profile=timestep_profile_rows,
+            timings=worker_timings,
+        )
+        return output_batch
+
     @torch.no_grad()
     def run(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         session_dir = batch.extra.get("session_dir")
@@ -1716,6 +2476,8 @@ class WanS2VRealtimeSessionRunner:
             while True:
                 loop_started = time.perf_counter()
                 audio_prefetched = False
+                audio_s = 0.0
+                audio_compute_s = 0.0
                 audio_cpu_s = 0.0
                 audio_gpu_enqueue_s = 0.0
                 audio_prefetch_wall_s = 0.0
@@ -1769,7 +2531,8 @@ class WanS2VRealtimeSessionRunner:
                         - prefetched.audio_cpu_s
                         - prefetched.audio_gpu_enqueue_s,
                     )
-                    audio_s = audio_wait_s
+                    audio_compute_s = audio_cpu_s + audio_gpu_enqueue_s
+                    audio_s = audio_compute_s
                     audio_prefetched = True
                     if prepared_block is not None:
                         latent_prefetched = True
@@ -1778,6 +2541,7 @@ class WanS2VRealtimeSessionRunner:
                         step_noise_s = prepared_block.step_noise_s
                         condition_s = prepared_block.condition_s
                 else:
+                    audio_wait_started = time.perf_counter()
                     current_audio_idx, audio_chunk, audio_meta, end_requested = (
                         self._next_audio_chunk(
                             session_dir=session_dir,
@@ -1787,6 +2551,7 @@ class WanS2VRealtimeSessionRunner:
                             timeline_path=timeline_path,
                         )
                     )
+                    audio_wait_s = time.perf_counter() - audio_wait_started
                     audio_chunk_idx = current_audio_idx + (0 if end_requested else 1)
                     if end_requested:
                         break
@@ -1802,7 +2567,25 @@ class WanS2VRealtimeSessionRunner:
                         wav2vec_graph_runner=wav2vec_graph_runner,
                         ensure_loaded=False,
                     )
-                    audio_s = time.perf_counter() - audio_started
+                    audio_compute_s = time.perf_counter() - audio_started
+                    audio_s = audio_compute_s
+
+                _parity_log(
+                    "legacy.audio_window",
+                    session_id=session_id,
+                    request_id=getattr(batch, "request_id", None),
+                    block_idx=block_idx,
+                    audio_chunk_idx=current_audio_idx,
+                    audio_meta=audio_meta,
+                    audio_chunk=audio_chunk,
+                    audio_window=audio_ring.snapshot(),
+                    audio_input=batch.extra.get("audio_input"),
+                    generator=generator,
+                    condition_keys=sorted(batch.condition_inputs or {}),
+                    image_path=getattr(batch, "image_path", None),
+                    seed=getattr(batch, "seed", None),
+                    audio_prefetched=audio_prefetched,
+                )
 
                 emit_chunk_timeline(
                     timeline_path,
@@ -1853,6 +2636,14 @@ class WanS2VRealtimeSessionRunner:
                     ).to(device=device, dtype=dit_dtype)
                     latent_prepare_gpu_s = time.perf_counter() - latent_started
                 batch.latents = block_latents
+                _parity_log(
+                    "legacy.block_latents",
+                    session_id=session_id,
+                    block_idx=block_idx,
+                    block_latents=block_latents,
+                    generator=generator,
+                    latent_prefetched=latent_prefetched,
+                )
                 if not reference_latents_ready:
                     ref_started = time.perf_counter()
                     batch = self._prepare_reference_latents_once(
@@ -1869,6 +2660,14 @@ class WanS2VRealtimeSessionRunner:
                             (time.perf_counter() - ref_started) * 1000,
                             3,
                         ),
+                    )
+                    _parity_log(
+                        "legacy.reference",
+                        session_id=session_id,
+                        block_idx=block_idx,
+                        image_latent=getattr(batch, "image_latent", None),
+                        prompt_embeds=getattr(batch, "prompt_embeds", None),
+                        generator=generator,
                     )
 
                 if attention_request is None:
@@ -1917,6 +2716,12 @@ class WanS2VRealtimeSessionRunner:
                     if isinstance(prompt_embeds, list):
                         prompt_embeds = prompt_embeds[0]
                     condition_s = time.perf_counter() - condition_started
+                _parity_log(
+                    "legacy.bundle",
+                    session_id=session_id,
+                    block_idx=block_idx,
+                    bundle=bundle,
+                )
                 denoising_stage._maybe_cache_audio_embeddings(
                     bundle,
                     dtype=dit_dtype,
@@ -1958,6 +2763,15 @@ class WanS2VRealtimeSessionRunner:
                     )
                     step_noise_s = time.perf_counter() - step_noise_started
                 latent_s = time.perf_counter() - latent_started
+                _parity_log(
+                    "legacy.denoise_inputs",
+                    session_id=session_id,
+                    block_idx=block_idx,
+                    block_timesteps=block_timesteps,
+                    block_latents=block_latents,
+                    step_noises=block_step_noises,
+                    generator=generator,
+                )
                 if timestep_graph_preoutput_required is None:
                     timestep_graph_preoutput_required = (
                         self._requires_preoutput_timestep_cuda_graph(
@@ -2053,6 +2867,16 @@ class WanS2VRealtimeSessionRunner:
                     getattr(denoising_stage, "_last_timestep_profile_rows", [])
                 )
                 denoise_loop_s = time.perf_counter() - denoise_started
+                _parity_log(
+                    "legacy.denoise_output",
+                    session_id=session_id,
+                    block_idx=block_idx,
+                    current_latents=current_latents,
+                    timestep_profile=timestep_profile_rows,
+                    timestep_graph_statuses=getattr(
+                        denoising_stage, "_last_timestep_cuda_graph_statuses", []
+                    ),
+                )
                 clean_refresh_started = time.perf_counter()
                 clean_refresh_decision = denoising_stage.select_clean_context_refresh(
                     batch=batch,
@@ -2101,6 +2925,13 @@ class WanS2VRealtimeSessionRunner:
                 frames = server_args.pipeline_config.post_decoding(frames, server_args)
                 decode_s = time.perf_counter() - decode_started
                 frame_count = int(frames.shape[2])
+                _parity_log(
+                    "legacy.frames",
+                    session_id=session_id,
+                    block_idx=block_idx,
+                    frames=frames,
+                    vae_decode_mode=stream_vae_state.last_decode_mode,
+                )
                 if not timestep_graph_output_started or (
                     stream_vae_state.last_decode_mode
                     in {"graph_capture", "graph_replay"}
@@ -2174,11 +3005,13 @@ class WanS2VRealtimeSessionRunner:
                 stream_s = time.perf_counter() - stream_started
 
                 total_s = time.perf_counter() - loop_started
+                model_compute_total_s = max(0.0, total_s - audio_wait_s)
                 logger.info(
-                    "Wan S2V realtime block %d: audio=%.3fs latent=%.3fs "
+                    "Wan S2V realtime block %d: audio_wait=%.3fs audio=%.3fs latent=%.3fs "
                     "warm_start=%s/%.3fs steps=%d/%d denoise_loop=%.3fs "
-                    "refresh=%s/%s/%.3fs decode=%.3fs stream=%.3fs total=%.3fs",
+                    "refresh=%s/%s/%.3fs decode=%.3fs stream=%.3fs active=%.3fs total=%.3fs",
                     block_idx,
+                    audio_wait_s,
                     audio_s,
                     latent_s,
                     latent_warm_start_applied,
@@ -2191,6 +3024,7 @@ class WanS2VRealtimeSessionRunner:
                     clean_refresh_s,
                     decode_s,
                     stream_s,
+                    model_compute_total_s,
                     total_s,
                 )
                 emit_chunk_timeline(
@@ -2233,6 +3067,8 @@ class WanS2VRealtimeSessionRunner:
                     timestep_profile=timestep_profile_rows,
                     timings={
                         "audio_ms": round(audio_s * 1000, 3),
+                        "audio_compute_ms": round(audio_compute_s * 1000, 3),
+                        "audio_wait_ms": round(audio_wait_s * 1000, 3),
                         "audio_cpu_ms": round(audio_cpu_s * 1000, 3),
                         "audio_gpu_enqueue_ms": round(
                             audio_gpu_enqueue_s * 1000,
@@ -2270,6 +3106,11 @@ class WanS2VRealtimeSessionRunner:
                         "clean_refresh_ms": round(clean_refresh_s * 1000, 3),
                         "decode_ms": round(decode_s * 1000, 3),
                         "stream_ms": round(stream_s * 1000, 3),
+                        "model_compute_total_ms": round(
+                            model_compute_total_s * 1000,
+                            3,
+                        ),
+                        "block_wall_ms": round(total_s * 1000, 3),
                         "total_ms": round(total_s * 1000, 3),
                     },
                     audio_prefetched=audio_prefetched,

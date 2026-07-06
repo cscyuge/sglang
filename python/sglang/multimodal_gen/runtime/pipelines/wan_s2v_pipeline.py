@@ -224,6 +224,13 @@ class WanS2VPipeline(FlashTalkPipeline):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        if batch.extra.get("wan_s2v_realtime_per_chunk", False):
+            if not bool(getattr(server_args.pipeline_config, "wan_s2v_realtime", True)):
+                raise RuntimeError(
+                    "Wan S2V realtime chunks are disabled. Set "
+                    "wan_s2v_realtime=true."
+                )
+            return WanS2VRealtimeSessionRunner(self).run_chunk(batch, server_args)
         if batch.extra.get("session_mode", False):
             if not bool(getattr(server_args.pipeline_config, "wan_s2v_realtime", True)):
                 raise RuntimeError(

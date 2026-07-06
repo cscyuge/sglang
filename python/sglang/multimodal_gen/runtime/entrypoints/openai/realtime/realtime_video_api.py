@@ -3,7 +3,7 @@
 import asyncio
 import shutil
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import msgspec.msgpack
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RealtimeFrameSendStats,
+    send_realtime_ws_bytes,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
@@ -45,8 +46,65 @@ _ACTIVE_SESSION_WAIT_SECONDS = 1.0
 _ACTIVE_SESSION_WAIT_INTERVAL_SECONDS = 0.1
 
 
+def _realtime_error_code(error: Exception, default: str) -> str:
+    return str(getattr(error, "code", None) or default)
+
+
+def _realtime_error_message(error: Exception, fallback: str) -> str:
+    return str(error).splitlines()[0] or fallback
+
+
+def _realtime_error_details(
+    error: Exception,
+    **extra: Any,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    source = getattr(error, "details", None)
+    if isinstance(source, dict):
+        details.update(source)
+    details.update({key: value for key, value in extra.items() if value is not None})
+    return details
+
+
 def _transport_ms(value: float) -> int:
     return max(0, int(value + 0.5))
+
+
+def _session_elapsed_ms(
+    session: GenerateSession,
+    *,
+    at_perf: float | None = None,
+) -> float:
+    started = getattr(session, "created_at_perf", None)
+    if started is None:
+        return 0.0
+    now = time.perf_counter() if at_perf is None else at_perf
+    return max(0.0, (now - started) * 1000.0)
+
+
+def _merge_realtime_debug_payload(
+    payload: dict,
+    extra: dict | None,
+) -> None:
+    if not extra:
+        return
+    for key, value in extra.items():
+        if key not in payload:
+            payload[key] = value
+
+
+def _realtime_worker_timings(result) -> dict[str, int] | None:
+    timings = getattr(result, "realtime_timings", None)
+    if not isinstance(timings, dict):
+        return None
+
+    clean_timings: dict[str, int] = {}
+    for key, value in timings.items():
+        try:
+            clean_timings[str(key)] = _transport_ms(float(value))
+        except (TypeError, ValueError):
+            continue
+    return clean_timings or None
 
 
 async def _wait_for_active_session_slot(
@@ -106,37 +164,53 @@ async def _send_realtime_chunk_stats(
     session: GenerateSession,
     chunk: RealtimeChunkContext,
     batch: "Req",
+    result,
     request_prepare_ms: float,
     scheduler_forward_ms: float,
     chunk_total_ms: float,
     send_stats: RealtimeFrameSendStats,
+    chunk_started: float,
 ) -> None:
-    await ws.send_bytes(
-        msgspec.msgpack.encode(
-            {
-                "type": "chunk_stats",
-                "session_id": session.id,
-                "request_id": chunk.request_id,
-                "chunk_index": batch.block_idx,
-                "event_id": getattr(batch, "realtime_event_id", None),
-                "request_prepare_ms": _transport_ms(request_prepare_ms),
-                "scheduler_forward_ms": _transport_ms(scheduler_forward_ms),
-                "pace_wait_ms": _transport_ms(send_stats["pace_wait_ms"]),
-                "header_write_ms": _transport_ms(send_stats["header_write_ms"]),
-                "raw_payload_build_ms": _transport_ms(
-                    send_stats["raw_payload_build_ms"]
-                ),
-                "raw_write_ms": _transport_ms(send_stats["raw_write_ms"]),
-                "ws_write_ms": _transport_ms(send_stats["ws_write_ms"]),
-                "chunk_total_ms": _transport_ms(chunk_total_ms),
-                "num_batches": send_stats["num_batches"],
-                "num_frames": send_stats["num_frames"],
-                "raw_bytes": send_stats["raw_bytes"],
-                "ws_payload_bytes": send_stats["ws_payload_bytes"],
-                "content_type": send_stats["content_type"],
-            }
+    payload = {
+        "type": "chunk_stats",
+        "session_id": session.id,
+        "request_id": chunk.request_id,
+        "chunk_index": batch.block_idx,
+        "event_id": getattr(batch, "realtime_event_id", None),
+        "server_chunk_start_ms": _transport_ms(
+            _session_elapsed_ms(session, at_perf=chunk_started)
+        ),
+        "server_chunk_end_ms": _transport_ms(_session_elapsed_ms(session)),
+        "request_prepare_ms": _transport_ms(request_prepare_ms),
+        "scheduler_forward_ms": _transport_ms(scheduler_forward_ms),
+        "pace_wait_ms": _transport_ms(send_stats["pace_wait_ms"]),
+        "header_write_ms": _transport_ms(send_stats["header_write_ms"]),
+        "raw_payload_build_ms": _transport_ms(send_stats["raw_payload_build_ms"]),
+        "raw_write_ms": _transport_ms(send_stats["raw_write_ms"]),
+        "ws_write_ms": _transport_ms(send_stats["ws_write_ms"]),
+        "chunk_total_ms": _transport_ms(chunk_total_ms),
+        "num_batches": send_stats["num_batches"],
+        "num_frames": send_stats["num_frames"],
+        "raw_bytes": send_stats["raw_bytes"],
+        "ws_payload_bytes": send_stats["ws_payload_bytes"],
+        "content_type": send_stats["content_type"],
+    }
+    worker_timings = _realtime_worker_timings(result)
+    if worker_timings is not None:
+        payload["worker_timings"] = worker_timings
+        worker_total_ms = worker_timings.get("total_ms")
+        if worker_total_ms is not None:
+            payload["scheduler_overhead_ms"] = _transport_ms(
+                max(0.0, scheduler_forward_ms - worker_total_ms)
+            )
+    if session.adapter is not None and hasattr(
+        session.adapter, "build_chunk_stats_extra"
+    ):
+        _merge_realtime_debug_payload(
+            payload,
+            session.adapter.build_chunk_stats_extra(session, batch, result),
         )
-    )
+    await send_realtime_ws_bytes(ws, msgspec.msgpack.encode(payload))
 
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
@@ -154,7 +228,14 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             # send to scheduler and generate video chunk
             server_args = get_global_server_args()
 
-            await adapter.wait_for_next_chunk(session)
+            try:
+                await adapter.wait_for_next_chunk(session)
+            except StopAsyncIteration:
+                logger.info(
+                    "generation ended by realtime adapter, session_id=%s",
+                    session.id,
+                )
+                break
 
             timer = RealtimeStageTimer()
             chunk_started = time.perf_counter()
@@ -226,9 +307,24 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 pending_send_task.cancel()
                 await _await_realtime_task(pending_send_task)
             err_msg = str(e).splitlines()[0]
-            logger.error("error during generate loop: %s", err_msg)
+            error_code = _realtime_error_code(e, "generation_error")
+            logger.error(
+                "error during generate loop, code=%s: %s",
+                error_code,
+                err_msg,
+            )
             try:
-                await write_error_msg(f"error during generate loop: {err_msg}", ws)
+                content = (
+                    err_msg
+                    if error_code == "output_write_timeout"
+                    else f"error during generate loop: {err_msg}"
+                )
+                await write_error_msg(
+                    content,
+                    ws,
+                    code=error_code,
+                    details=_realtime_error_details(e, session_id=session.id),
+                )
             except Exception as send_error:
                 logger.error(
                     "error during sending complete msg: %s",
@@ -280,10 +376,12 @@ async def _send_output_and_log(
         session,
         chunk,
         batch,
+        result,
         request_prepare_ms,
         scheduler_forward_ms,
         chunk_total_ms,
         send_stats,
+        chunk_started,
     )
     return send_stats
 
@@ -347,9 +445,69 @@ async def _await_realtime_task(task: asyncio.Task | None) -> None:
         logger.debug("realtime task exited with error: %s", e)
 
 
+async def _send_realtime_init_ack(
+    ws: WebSocket,
+    session: GenerateSession,
+    request: RealtimeVideoGenerationsRequest,
+) -> None:
+    payload = {
+        "type": "init_ack",
+        "session_id": session.id,
+        "server_ack_ms": _transport_ms(_session_elapsed_ms(session)),
+        "server_session_start_wall_ms": _transport_ms(
+            getattr(session, "created_at_wall_ms", 0.0)
+        ),
+        "server_ack_wall_ms": _transport_ms(time.time() * 1000.0),
+        "request": {
+            "fps": request.fps,
+            "max_chunks": request.max_chunks,
+            "size": request.size,
+            "realtime_output_format": request.realtime_output_format,
+            "realtime_output_pacing": bool(request.realtime_output_pacing),
+        },
+    }
+    if session.adapter is not None:
+        _merge_realtime_debug_payload(
+            payload,
+            session.adapter.build_init_ack(session, request),
+        )
+    await send_realtime_ws_bytes(ws, msgspec.msgpack.encode(payload))
+
+
+async def _send_realtime_event_ack(
+    ws: WebSocket,
+    session: GenerateSession,
+    event: RealtimeEvent,
+    event_log: str,
+    *,
+    message_bytes: int,
+    recv_perf: float,
+    ack_perf: float,
+) -> None:
+    payload = {
+        "type": "event_ack",
+        "session_id": session.id,
+        "event_id": event.event_id,
+        "kind": event.kind,
+        "server_recv_ms": _transport_ms(
+            _session_elapsed_ms(session, at_perf=recv_perf)
+        ),
+        "server_ack_ms": _transport_ms(_session_elapsed_ms(session, at_perf=ack_perf)),
+        "ingest_ms": _transport_ms((ack_perf - recv_perf) * 1000.0),
+        "message_bytes": message_bytes,
+    }
+    if session.adapter is not None:
+        _merge_realtime_debug_payload(
+            payload,
+            session.adapter.build_event_ack(session, event, event_log),
+        )
+    await send_realtime_ws_bytes(ws, msgspec.msgpack.encode(payload))
+
+
 async def _listen_events(ws: WebSocket, session: GenerateSession):
     """listen for user events: usually condition inputs"""
     async for message in ws.iter_bytes():
+        recv_perf = time.perf_counter()
         data = None
         try:
             data = msgspec.msgpack.decode(message)
@@ -365,10 +523,44 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
                 realtime_event.event_id,
                 event_log,
             )
+            ack_perf = time.perf_counter()
+            await _send_realtime_event_ack(
+                ws,
+                session,
+                realtime_event,
+                event_log,
+                message_bytes=len(message),
+                recv_perf=recv_perf,
+                ack_perf=ack_perf,
+            )
         except Exception as e:
+            if _realtime_error_code(e, "") == "output_write_timeout":
+                logger.warning(
+                    "event ack write timeout, session_id=%s, error=%s",
+                    session.id,
+                    e,
+                )
+                raise
             event_kind = data.get("kind") if isinstance(data, dict) else None
-            logger.warning("invalid event, kind=%s, error=%s", event_kind, e)
-            await write_error_msg("invalid event", ws)
+            event_id = data.get("event_id") if isinstance(data, dict) else None
+            error_code = _realtime_error_code(e, "invalid_event")
+            err_msg = _realtime_error_message(e, "invalid event")
+            logger.warning(
+                "invalid event, kind=%s, code=%s, error=%s",
+                event_kind,
+                error_code,
+                err_msg,
+            )
+            await write_error_msg(
+                err_msg,
+                ws,
+                code=error_code,
+                details=_realtime_error_details(
+                    e,
+                    kind=event_kind,
+                    event_id=event_id,
+                ),
+            )
             continue
 
 
@@ -386,16 +578,32 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
 
             # Keep session state update atomic with validated request.
             session.set_request(realtime_req)
+            await _send_realtime_init_ack(ws, session, realtime_req)
             break
         except WebSocketDisconnect:
             raise
         except Exception as e:
+            if _realtime_error_code(e, "") == "output_write_timeout":
+                logger.warning(
+                    "init ack write timeout, session_id=%s, error=%s",
+                    session.id,
+                    e,
+                )
+                raise
+            error_code = _realtime_error_code(e, "invalid_generate_request")
+            err_msg = _realtime_error_message(e, "invalid generate request")
             logger.warning(
-                "invalid generate request, session_id=%s, error=%s",
+                "invalid generate request, session_id=%s, code=%s, error=%s",
                 session.id,
-                e,
+                error_code,
+                err_msg,
             )
-            await write_error_msg("invalid generate request", ws)
+            await write_error_msg(
+                err_msg,
+                ws,
+                code=error_code,
+                details=_realtime_error_details(e, session_id=session.id),
+            )
             continue
 
 
@@ -457,7 +665,10 @@ async def generate(websocket: WebSocket):
         )
         try:
             await write_error_msg(
-                "another realtime session is already active", websocket
+                "another realtime session is already active",
+                websocket,
+                code="session_busy",
+                details={"active_session_ids": sorted(_ACTIVE_SESSION_IDS)},
             )
         finally:
             await websocket.close(code=1008)
@@ -494,7 +705,18 @@ async def generate(websocket: WebSocket):
             _ACTIVE_SESSION_IDS.discard(session.id)
 
 
-async def write_error_msg(error_msg: str, websocket: WebSocket):
-    await websocket.send_bytes(
-        msgspec.msgpack.encode({"type": "error", "content": error_msg})
-    )
+async def write_error_msg(
+    error_msg: str,
+    websocket: WebSocket,
+    *,
+    code: str = "server_error",
+    details: dict[str, Any] | None = None,
+):
+    payload: dict[str, Any] = {
+        "type": "error",
+        "code": code,
+        "content": error_msg,
+    }
+    if details:
+        payload["details"] = details
+    await send_realtime_ws_bytes(websocket, msgspec.msgpack.encode(payload))

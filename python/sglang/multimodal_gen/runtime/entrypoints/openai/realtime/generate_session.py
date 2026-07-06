@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -31,6 +32,8 @@ class GenerateSession:
 
     def __init__(self):
         self.id = uuid4().hex
+        self.created_at_perf = time.perf_counter()
+        self.created_at_wall_ms = time.time() * 1000.0
         self.request: RealtimeVideoGenerationsRequest | None = None
         self.input_temp_dir: str | None = None
         self.generate_chunk_cnt = 0

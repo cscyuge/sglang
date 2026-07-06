@@ -74,6 +74,7 @@ def test_raw_rgb_frame_batches_preserve_frame_bytes_and_metadata():
         post_process_sample,
     )
 
+    timings = metadata.pop("timings", None)
     assert metadata == {
         "format": "rgb24",
         "width": 2,
@@ -81,6 +82,7 @@ def test_raw_rgb_frame_batches_preserve_frame_bytes_and_metadata():
         "channels": 3,
         "bytes_per_frame": 12,
     }
+    assert timings["raw_frame_materialize_ms"] >= 0
     assert len(frame_batches) == 1
     assert frame_batches[0][0] == bytes([1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4])
     assert frame_batches[0][1] == bytes([5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19])
@@ -117,6 +119,7 @@ def test_raw_rgb_frame_batches_use_tensor_fast_path_without_postprocess():
         post_process_sample,
     )
 
+    timings = metadata.pop("timings", None)
     assert metadata == {
         "format": "rgb24",
         "width": 1,
@@ -124,6 +127,7 @@ def test_raw_rgb_frame_batches_use_tensor_fast_path_without_postprocess():
         "channels": 3,
         "bytes_per_frame": 3,
     }
+    assert timings["raw_frame_materialize_ms"] >= 0
     assert frame_batches == [[bytes([0, 127, 255]), bytes([63, 191, 255])]]
 
 
@@ -325,6 +329,79 @@ def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
     assert stats["raw_bytes"] == 6000
     assert stats["num_batches"] == 1
     assert stats["num_frames"] == 2
+    assert stats["ws_payload_bytes"] == sum(len(payload) for payload in payloads)
+
+
+def test_raw_rgb_realtime_output_adapter_can_send_h264_annexb_chunks(monkeypatch):
+    def fake_h264_encoder(transport_frames, *, width, height, fps, crf):
+        assert len(transport_frames) == 2
+        assert width == 2
+        assert height == 2
+        assert fps == 16
+        assert crf == 27
+        return b"\x00\x00\x00\x01fake-h264"
+
+    monkeypatch.setattr(
+        realtime_output_adapter,
+        "_encode_raw_rgb_frames_to_h264_annexb",
+        fake_h264_encoder,
+    )
+
+    class _WebSocket:
+        def __init__(self):
+            self.payloads = []
+
+        async def send_bytes(self, payload):
+            self.payloads.append(payload)
+
+    async def run():
+        ws = _WebSocket()
+        adapter = RawRGBRealtimeOutputAdapter()
+        frame0 = bytes([255, 0, 0]) * 4
+        frame1 = bytes([0, 255, 0]) * 4
+        batch = SimpleNamespace(
+            block_idx=0,
+            request_id="req-h264",
+            width=2,
+            height=2,
+            fps=16,
+            enable_upscaling=False,
+            realtime_event_id=3,
+            realtime_output_format="h264",
+            output_compression=27,
+        )
+        result = OutputBatch(
+            raw_frame_batches=[[frame0, frame1]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata={
+                "format": "rgb24",
+                "width": 2,
+                "height": 2,
+                "channels": 3,
+                "bytes_per_frame": 12,
+            },
+        )
+
+        stats = await adapter.send(ws, SimpleNamespace(), result, batch)
+        return ws.payloads, stats
+
+    payloads, stats = asyncio.run(run())
+
+    [(header, payload)] = _unpack_frame_batch_messages(payloads)
+    assert header["content_type"] == realtime_output_adapter.H264_FRAME_CONTENT_TYPE
+    assert header["format"] == "h264_annexb"
+    assert header["encoding"] == "h264_annexb"
+    assert header["codec"] == "h264"
+    assert header["source_format"] == "rgb24"
+    assert header["pixel_format"] == "yuv420p"
+    assert header["width"] == 2
+    assert header["height"] == 2
+    assert header["fps"] == 16
+    assert header["raw_size"] == 24
+    assert header["num_frames"] == 2
+    assert payload == b"\x00\x00\x00\x01fake-h264"
+    assert stats["content_type"] == realtime_output_adapter.H264_FRAME_CONTENT_TYPE
+    assert stats["raw_bytes"] == 24
     assert stats["ws_payload_bytes"] == sum(len(payload) for payload in payloads)
 
 

@@ -192,6 +192,32 @@ class BaseRealtimeModelAdapter:
         del session
         return None
 
+    def build_init_ack(
+        self,
+        session: GenerateSession,
+        request: RealtimeVideoGenerationsRequest,
+    ) -> dict[str, Any] | None:
+        del session, request
+        return None
+
+    def build_event_ack(
+        self,
+        session: GenerateSession,
+        event: RealtimeEvent,
+        event_log: str,
+    ) -> dict[str, Any] | None:
+        del session, event, event_log
+        return None
+
+    def build_chunk_stats_extra(
+        self,
+        session: GenerateSession,
+        batch: Req,
+        result: OutputBatch,
+    ) -> dict[str, Any] | None:
+        del session, batch, result
+        return None
+
     def prepare_next_request(
         self,
         session: GenerateSession,
