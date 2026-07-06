@@ -74,6 +74,9 @@ class RealtimeFrameSendStats(TypedDict):
     raw_payload_build_ms: float
     frame_store_wait_ms: float
     frame_store_read_ms: float
+    output_enqueue_wait_ms: float
+    output_queue_delay_ms: float
+    output_queue_size: int
     raw_write_ms: float
     ws_write_ms: float
     pace_wait_ms: float
@@ -92,6 +95,9 @@ def empty_frame_send_stats(content_type: str = "") -> RealtimeFrameSendStats:
         "raw_payload_build_ms": 0.0,
         "frame_store_wait_ms": 0.0,
         "frame_store_read_ms": 0.0,
+        "output_enqueue_wait_ms": 0.0,
+        "output_queue_delay_ms": 0.0,
+        "output_queue_size": 0,
         "raw_write_ms": 0.0,
         "ws_write_ms": 0.0,
         "pace_wait_ms": 0.0,

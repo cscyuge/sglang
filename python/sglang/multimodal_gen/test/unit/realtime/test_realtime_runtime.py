@@ -428,6 +428,74 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
     assert events[-1] == "send_end_1"
 
 
+def test_generate_loop_queues_multiple_outputs_before_backpressure(monkeypatch):
+    events = []
+
+    class _Adapter:
+        async def wait_for_next_chunk(self, session):
+            del session
+
+        def prepare_next_request(self, session, server_args, chunk):
+            del session, server_args
+            return SimpleNamespace(
+                block_idx=chunk.index,
+                request_id=chunk.request_id,
+                condition_inputs={},
+            )
+
+        async def send_output(self, ws, session, result, batch):
+            del ws, session, result
+            events.append(f"send_start_{batch.block_idx}")
+            await asyncio.sleep(0.05)
+            events.append(f"send_end_{batch.block_idx}")
+            return empty_frame_send_stats("test")
+
+        def on_chunk_complete(self, session, result):
+            del result
+            session.generate_chunk_completed()
+
+    async def fake_process_generation_batch(client, batch):
+        del client
+        events.append(f"generate_start_{batch.block_idx}")
+        await asyncio.sleep(0.01)
+        events.append(f"generate_end_{batch.block_idx}")
+        return None, SimpleNamespace()
+
+    monkeypatch.setattr(
+        realtime_video_api,
+        "get_global_server_args",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        realtime_video_api,
+        "process_generation_batch",
+        fake_process_generation_batch,
+    )
+    monkeypatch.setenv("SGLANG_REALTIME_OUTPUT_QUEUE_SIZE", "2")
+
+    session = GenerateSession()
+    session.adapter = _Adapter()
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+            max_chunks=3,
+        )
+    )
+
+    class _Ws:
+        async def send_bytes(self, _message):
+            pass
+
+    asyncio.run(realtime_video_api._generate_loop(_Ws(), session))
+
+    assert events.index("generate_start_1") < events.index("send_end_0")
+    assert events.index("generate_start_2") < events.index("send_end_0")
+    assert events.index("send_end_0") < events.index("send_start_1")
+    assert events.index("send_end_1") < events.index("send_start_2")
+    assert events[-1] == "send_end_2"
+
+
 def test_send_output_emits_chunk_stats_message():
     sent_messages = []
 
@@ -492,6 +560,9 @@ def test_send_output_emits_chunk_stats_message():
     assert message["event_id"] == 11
     assert message["raw_write_ms"] == 42
     assert message["ws_write_ms"] == 42
+    assert message["output_enqueue_wait_ms"] == 0
+    assert message["output_queue_delay_ms"] == 0
+    assert message["output_queue_size"] == 0
     assert message["ws_payload_bytes"] == 450
     assert message["content_type"] == "image/webp"
     assert message["worker_timings"]["denoise_ms"] == 12

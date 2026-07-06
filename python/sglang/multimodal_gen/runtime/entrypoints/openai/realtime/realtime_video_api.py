@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import os
 import shutil
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import msgspec.msgpack
@@ -32,6 +34,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ReleaseRealtimeSessionReq,
 )
+from sglang.multimodal_gen.runtime.realtime.errors import RealtimeProtocolError
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -44,6 +47,42 @@ router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 _ACTIVE_SESSION_IDS: set[str] = set()
 _ACTIVE_SESSION_WAIT_SECONDS = 1.0
 _ACTIVE_SESSION_WAIT_INTERVAL_SECONDS = 0.1
+REALTIME_OUTPUT_QUEUE_SIZE_ENV = "SGLANG_REALTIME_OUTPUT_QUEUE_SIZE"
+REALTIME_OUTPUT_QUEUE_SIZE_DEFAULT = 2
+REALTIME_OUTPUT_ENQUEUE_TIMEOUT_ENV = "SGLANG_REALTIME_OUTPUT_ENQUEUE_TIMEOUT_MS"
+REALTIME_OUTPUT_ENQUEUE_TIMEOUT_DEFAULT_MS = 10000.0
+
+
+def get_realtime_output_queue_size() -> int:
+    raw_env = os.environ.get(REALTIME_OUTPUT_QUEUE_SIZE_ENV)
+    if raw_env is not None and raw_env != "":
+        raw_value = raw_env
+    else:
+        try:
+            raw_value = getattr(
+                getattr(get_global_server_args(), "pipeline_config", None),
+                "realtime_output_queue_size",
+                REALTIME_OUTPUT_QUEUE_SIZE_DEFAULT,
+            )
+        except Exception:
+            raw_value = REALTIME_OUTPUT_QUEUE_SIZE_DEFAULT
+    return max(1, int(raw_value))
+
+
+def get_realtime_output_enqueue_timeout_ms() -> float:
+    raw_env = os.environ.get(REALTIME_OUTPUT_ENQUEUE_TIMEOUT_ENV)
+    if raw_env is not None and raw_env != "":
+        raw_value = raw_env
+    else:
+        try:
+            raw_value = getattr(
+                getattr(get_global_server_args(), "pipeline_config", None),
+                "realtime_output_enqueue_timeout_ms",
+                REALTIME_OUTPUT_ENQUEUE_TIMEOUT_DEFAULT_MS,
+            )
+        except Exception:
+            raw_value = REALTIME_OUTPUT_ENQUEUE_TIMEOUT_DEFAULT_MS
+    return max(0.0, float(raw_value))
 
 
 def _realtime_error_code(error: Exception, default: str) -> str:
@@ -131,6 +170,8 @@ def _log_realtime_chunk_timing(
         "realtime chunk timing: session_id=%s request_id=%s "
         "chunk_idx=%s event_id=%s condition_kinds=%s "
         "request_prepare=%.2fms scheduler_forward=%.2fms "
+        "output_enqueue_wait=%.2fms output_queue_delay=%.2fms "
+        "output_queue_size=%d "
         "output_pace=%.2fms "
         "header_pack=%.2fms "
         "header_write=%.2fms frame_store_wait=%.2fms frame_store_read=%.2fms "
@@ -144,6 +185,9 @@ def _log_realtime_chunk_timing(
         sorted(batch.condition_inputs) if batch.condition_inputs else [],
         request_prepare_ms,
         scheduler_forward_ms,
+        send_stats.get("output_enqueue_wait_ms", 0.0),
+        send_stats.get("output_queue_delay_ms", 0.0),
+        send_stats.get("output_queue_size", 0),
         send_stats["pace_wait_ms"],
         send_stats["header_pack_ms"],
         send_stats["header_write_ms"],
@@ -186,6 +230,13 @@ async def _send_realtime_chunk_stats(
         "server_chunk_end_ms": _transport_ms(_session_elapsed_ms(session)),
         "request_prepare_ms": _transport_ms(request_prepare_ms),
         "scheduler_forward_ms": _transport_ms(scheduler_forward_ms),
+        "output_enqueue_wait_ms": _transport_ms(
+            send_stats.get("output_enqueue_wait_ms", 0.0)
+        ),
+        "output_queue_delay_ms": _transport_ms(
+            send_stats.get("output_queue_delay_ms", 0.0)
+        ),
+        "output_queue_size": int(send_stats.get("output_queue_size", 0)),
         "pace_wait_ms": _transport_ms(send_stats["pace_wait_ms"]),
         "header_write_ms": _transport_ms(send_stats["header_write_ms"]),
         "frame_store_wait_ms": _transport_ms(
@@ -222,28 +273,222 @@ async def _send_realtime_chunk_stats(
     await send_realtime_ws_bytes(ws, msgspec.msgpack.encode(payload))
 
 
+@dataclass(slots=True)
+class RealtimeOutputItem:
+    chunk: RealtimeChunkContext
+    batch: Any
+    result: Any
+    request_prepare_ms: float
+    scheduler_forward_ms: float
+    chunk_started: float
+    enqueued_at: float
+    output_enqueue_wait_ms: float
+    output_queue_size: int
+
+
+class RealtimeOutputPipeline:
+    """Bounded per-session output pipeline for encode/build/send work."""
+
+    def __init__(
+        self,
+        ws: WebSocket,
+        session: GenerateSession,
+        *,
+        max_queue_size: int | None = None,
+        enqueue_timeout_ms: float | None = None,
+    ) -> None:
+        self.ws = ws
+        self.session = session
+        self.max_queue_size = max_queue_size or get_realtime_output_queue_size()
+        self.enqueue_timeout_ms = (
+            get_realtime_output_enqueue_timeout_ms()
+            if enqueue_timeout_ms is None
+            else max(0.0, float(enqueue_timeout_ms))
+        )
+        self._queue: asyncio.Queue[RealtimeOutputItem] = asyncio.Queue()
+        self._slots = asyncio.Semaphore(self.max_queue_size)
+        self._failed: BaseException | None = None
+        self._failure_event = asyncio.Event()
+        self._closed = False
+        self._worker_task = asyncio.create_task(
+            self._run(),
+            name=f"realtime-output-{session.id}",
+        )
+
+    def raise_if_failed(self) -> None:
+        if self._failed is not None:
+            raise self._failed
+
+    async def wait_failed(self) -> None:
+        await self._failure_event.wait()
+        self.raise_if_failed()
+
+    async def submit(
+        self,
+        *,
+        chunk: RealtimeChunkContext,
+        batch: "Req",
+        result,
+        request_prepare_ms: float,
+        scheduler_forward_ms: float,
+        chunk_started: float,
+    ) -> None:
+        if self._closed:
+            raise RealtimeProtocolError(
+                "output_pipeline_closed",
+                "Realtime output pipeline is already closed",
+                session_id=self.session.id,
+                chunk_index=getattr(batch, "block_idx", None),
+            )
+        self.raise_if_failed()
+
+        wait_started = time.perf_counter()
+        try:
+            if self.enqueue_timeout_ms <= 0:
+                await self._slots.acquire()
+            else:
+                await asyncio.wait_for(
+                    self._slots.acquire(),
+                    timeout=self.enqueue_timeout_ms / 1000.0,
+                )
+        except asyncio.TimeoutError as exc:
+            raise RealtimeProtocolError(
+                "output_backpressure_timeout",
+                "Timed out waiting for realtime output queue slot",
+                session_id=self.session.id,
+                chunk_index=getattr(batch, "block_idx", None),
+                queue_size=self._queue.qsize(),
+                max_queue_size=self.max_queue_size,
+                timeout_ms=round(self.enqueue_timeout_ms, 3),
+            ) from exc
+
+        try:
+            self.raise_if_failed()
+            enqueued_at = time.perf_counter()
+            item = RealtimeOutputItem(
+                chunk=chunk,
+                batch=batch,
+                result=result,
+                request_prepare_ms=request_prepare_ms,
+                scheduler_forward_ms=scheduler_forward_ms,
+                chunk_started=chunk_started,
+                enqueued_at=enqueued_at,
+                output_enqueue_wait_ms=(enqueued_at - wait_started) * 1000.0,
+                output_queue_size=self._queue.qsize() + 1,
+            )
+            self._queue.put_nowait(item)
+        except Exception:
+            self._slots.release()
+            raise
+
+    async def drain(self) -> None:
+        await self._queue.join()
+        self.raise_if_failed()
+
+    async def close(self) -> None:
+        self._closed = True
+        await self.drain()
+        await self.cancel()
+
+    async def cancel(self) -> None:
+        self._closed = True
+        if not self._worker_task.done():
+            self._worker_task.cancel()
+        await _await_realtime_task(self._worker_task)
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                item = await self._queue.get()
+                try:
+                    output_queue_delay_ms = (
+                        time.perf_counter() - item.enqueued_at
+                    ) * 1000.0
+                    await _send_output_and_log(
+                        self.ws,
+                        self.session,
+                        item.chunk,
+                        item.batch,
+                        item.result,
+                        item.request_prepare_ms,
+                        item.scheduler_forward_ms,
+                        item.chunk_started,
+                        output_enqueue_wait_ms=item.output_enqueue_wait_ms,
+                        output_queue_delay_ms=output_queue_delay_ms,
+                        output_queue_size=item.output_queue_size,
+                    )
+                finally:
+                    self._queue.task_done()
+                    self._slots.release()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._failed = exc
+            self._failure_event.set()
+            logger.error(
+                "realtime output pipeline failed, session_id=%s, error=%s",
+                self.session.id,
+                exc,
+            )
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._queue.task_done()
+                self._slots.release()
+
+
+async def _wait_for_next_chunk_or_output_failure(
+    adapter,
+    session: GenerateSession,
+    output_pipeline: RealtimeOutputPipeline,
+) -> None:
+    wait_task = asyncio.create_task(adapter.wait_for_next_chunk(session))
+    failure_task = asyncio.create_task(output_pipeline.wait_failed())
+    try:
+        done, pending = await asyncio.wait(
+            {wait_task, failure_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            await _await_realtime_task(task)
+        for task in done:
+            await task
+    finally:
+        for task in (wait_task, failure_task):
+            if not task.done():
+                task.cancel()
+                await _await_realtime_task(task)
+
+
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
     adapter = session.adapter
     if adapter is None:
         raise ValueError("realtime adapter is not initialized")
 
-    pending_send_task = None
+    output_pipeline = RealtimeOutputPipeline(ws, session)
+    ended_by_adapter = False
     while not session.reached_max_chunks():
         try:
-            if pending_send_task is not None and pending_send_task.done():
-                await pending_send_task
-                pending_send_task = None
-
+            output_pipeline.raise_if_failed()
             # send to scheduler and generate video chunk
             server_args = get_global_server_args()
 
             try:
-                await adapter.wait_for_next_chunk(session)
+                await _wait_for_next_chunk_or_output_failure(
+                    adapter,
+                    session,
+                    output_pipeline,
+                )
             except StopAsyncIteration:
                 logger.info(
                     "generation ended by realtime adapter, session_id=%s",
                     session.id,
                 )
+                ended_by_adapter = True
                 break
 
             timer = RealtimeStageTimer()
@@ -269,52 +514,27 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
             # finish
             adapter.on_chunk_complete(session, result)
-            if pending_send_task is not None:
-                await pending_send_task
-            if getattr(batch, "realtime_output_pacing", False):
-                await _send_output_and_log(
-                    ws,
-                    session,
-                    chunk,
-                    batch,
-                    result,
-                    request_prepare_ms,
-                    scheduler_forward_ms,
-                    chunk_started,
-                )
-                pending_send_task = None
-            else:
-                pending_send_task = asyncio.create_task(
-                    _send_output_and_log(
-                        ws,
-                        session,
-                        chunk,
-                        batch,
-                        result,
-                        request_prepare_ms,
-                        scheduler_forward_ms,
-                        chunk_started,
-                    )
-                )
+            await output_pipeline.submit(
+                chunk=chunk,
+                batch=batch,
+                result=result,
+                request_prepare_ms=request_prepare_ms,
+                scheduler_forward_ms=scheduler_forward_ms,
+                chunk_started=chunk_started,
+            )
 
         except asyncio.CancelledError:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
+            await output_pipeline.cancel()
             logger.info("generation completed, session_id=%s", session.id)
             break
         except WebSocketDisconnect:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
+            await output_pipeline.cancel()
             logger.info(
                 "client disconnected during generation, session_id=%s", session.id
             )
             break
         except Exception as e:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
+            await output_pipeline.cancel()
             err_msg = str(e).splitlines()[0]
             error_code = _realtime_error_code(e, "generation_error")
             logger.error(
@@ -341,13 +561,16 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 )
             break
     else:
-        if pending_send_task is not None:
-            await pending_send_task
+        await output_pipeline.close()
         logger.info(
             "generation reached max chunks, session_id=%s, max_chunks=%s",
             session.id,
             session.request.max_chunks if session.request is not None else None,
         )
+        return
+
+    if ended_by_adapter:
+        await output_pipeline.close()
 
 
 async def _send_output_and_log(
@@ -359,6 +582,10 @@ async def _send_output_and_log(
     request_prepare_ms: float,
     scheduler_forward_ms: float,
     chunk_started: float,
+    *,
+    output_enqueue_wait_ms: float = 0.0,
+    output_queue_delay_ms: float = 0.0,
+    output_queue_size: int = 0,
 ) -> RealtimeFrameSendStats:
     if session.adapter is None:
         raise ValueError("realtime adapter is not initialized")
@@ -370,6 +597,9 @@ async def _send_output_and_log(
         batch,
     )
     send_stats["pace_wait_ms"] = pace_wait_ms
+    send_stats["output_enqueue_wait_ms"] = output_enqueue_wait_ms
+    send_stats["output_queue_delay_ms"] = output_queue_delay_ms
+    send_stats["output_queue_size"] = output_queue_size
     chunk_total_ms = (time.perf_counter() - chunk_started) * 1000
     _log_realtime_chunk_timing(
         session,
