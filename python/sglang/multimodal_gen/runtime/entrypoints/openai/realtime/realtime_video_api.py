@@ -133,7 +133,8 @@ def _log_realtime_chunk_timing(
         "request_prepare=%.2fms scheduler_forward=%.2fms "
         "output_pace=%.2fms "
         "header_pack=%.2fms "
-        "header_write=%.2fms raw_payload_build=%.2fms raw_write=%.2fms "
+        "header_write=%.2fms frame_store_wait=%.2fms frame_store_read=%.2fms "
+        "raw_payload_build=%.2fms raw_write=%.2fms "
         "ws_write=%.2fms chunk_total=%.2fms batches=%d frames=%d "
         "frame_shape=%s raw_bytes=%d ws_payload_bytes=%d content_type=%s",
         session.id,
@@ -146,6 +147,8 @@ def _log_realtime_chunk_timing(
         send_stats["pace_wait_ms"],
         send_stats["header_pack_ms"],
         send_stats["header_write_ms"],
+        send_stats.get("frame_store_wait_ms", 0.0),
+        send_stats.get("frame_store_read_ms", 0.0),
         send_stats["raw_payload_build_ms"],
         send_stats["raw_write_ms"],
         send_stats["ws_write_ms"],
@@ -185,6 +188,12 @@ async def _send_realtime_chunk_stats(
         "scheduler_forward_ms": _transport_ms(scheduler_forward_ms),
         "pace_wait_ms": _transport_ms(send_stats["pace_wait_ms"]),
         "header_write_ms": _transport_ms(send_stats["header_write_ms"]),
+        "frame_store_wait_ms": _transport_ms(
+            send_stats.get("frame_store_wait_ms", 0.0)
+        ),
+        "frame_store_read_ms": _transport_ms(
+            send_stats.get("frame_store_read_ms", 0.0)
+        ),
         "raw_payload_build_ms": _transport_ms(send_stats["raw_payload_build_ms"]),
         "raw_write_ms": _transport_ms(send_stats["raw_write_ms"]),
         "ws_write_ms": _transport_ms(send_stats["ws_write_ms"]),
@@ -387,9 +396,12 @@ async def _send_output_and_log(
 
 
 def _result_num_frames(result) -> int:
-    if result.raw_frame_batches is None:
-        return 0
-    return sum(len(frames) for frames in result.raw_frame_batches)
+    if result.raw_frame_batches is not None:
+        return sum(len(frames) for frames in result.raw_frame_batches)
+    handles = getattr(result, "raw_frame_store_handles", None)
+    if handles is not None:
+        return sum(int(getattr(handle, "num_frames", 0)) for handle in handles)
+    return 0
 
 
 def _output_pacing_fps(batch: "Req") -> float:

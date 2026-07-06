@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import os
 from types import SimpleNamespace
 
 import msgspec.msgpack
@@ -14,6 +15,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
     RawRGBRealtimeOutputAdapter,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.utils.realtime_frame_store import (
+    create_raw_rgb_frame_store_handles,
+    start_raw_rgb_frame_store_writer,
+)
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     JPEG_FRAME_CONTENT_TYPE,
     RAW_RGB_CONTENT_TYPE,
@@ -129,6 +134,60 @@ def test_raw_rgb_frame_batches_use_tensor_fast_path_without_postprocess():
     }
     assert timings["raw_frame_materialize_ms"] >= 0
     assert frame_batches == [[bytes([0, 127, 255]), bytes([63, 191, 255])]]
+
+
+def test_raw_rgb_realtime_output_adapter_reads_frame_store_handles():
+    class _WebSocket:
+        def __init__(self):
+            self.payloads = []
+
+        async def send_bytes(self, payload):
+            self.payloads.append(payload)
+
+    async def run():
+        ws = _WebSocket()
+        adapter = RawRGBRealtimeOutputAdapter()
+        batch = SimpleNamespace(
+            block_idx=0,
+            request_id="req-frame-store",
+            width=1,
+            height=1,
+            fps=16,
+            enable_upscaling=False,
+            realtime_event_id=7,
+        )
+        output = torch.tensor(
+            [[[[[0.0]], [[0.25]]], [[[0.5]], [[0.75]]], [[[1.0]], [[1.0]]]]]
+        )
+        handles, metadata = create_raw_rgb_frame_store_handles(output, batch)
+        start_raw_rgb_frame_store_writer(
+            output=output,
+            handles=handles,
+            request_id=batch.request_id,
+            chunk_idx=batch.block_idx,
+        )
+        result = OutputBatch(
+            raw_frame_store_handles=handles,
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata=metadata,
+        )
+
+        stats = await adapter.send(ws, SimpleNamespace(), result, batch)
+        return ws.payloads, stats, handles
+
+    payloads, stats, handles = asyncio.run(run())
+
+    [(header, payload)] = _unpack_frame_batch_messages(payloads)
+    assert header["content_type"] == RAW_RGB_CONTENT_TYPE
+    assert header["encoding"] == "raw"
+    assert header["event_id"] == 7
+    assert header["num_frames"] == 2
+    assert payload == bytes([0, 127, 255, 63, 191, 255])
+    assert stats["raw_bytes"] == 6
+    assert stats["num_frames"] == 2
+    assert stats["frame_store_wait_ms"] >= 0
+    assert stats["frame_store_read_ms"] >= 0
+    assert all(not os.path.exists(handle.path) for handle in handles)
 
 
 def test_output_batch_uses_raw_frame_transport_names():

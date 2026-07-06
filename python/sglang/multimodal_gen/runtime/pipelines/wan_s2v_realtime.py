@@ -50,6 +50,11 @@ from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
     read_flashtalk_audio_chunk_meta,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.realtime_frame_store import (
+    can_use_raw_rgb_frame_store,
+    create_raw_rgb_frame_store_handles,
+    start_raw_rgb_frame_store_writer,
+)
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
     build_raw_rgb_frame_batches,
@@ -2139,13 +2144,34 @@ class WanS2VRealtimeSessionRunner:
             metrics=work_batch.metrics,
             raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
         )
-        raw_frame_batches, raw_frame_metadata = build_raw_rgb_frame_batches(
-            frames,
-            work_batch,
-            output_batch,
-            post_process_sample,
-        )
-        output_batch.raw_frame_batches = raw_frame_batches
+        raw_frame_metadata: dict[str, Any]
+        if can_use_raw_rgb_frame_store(frames, work_batch):
+            frame_store_started = time.perf_counter()
+            raw_frame_store_handles, raw_frame_metadata = (
+                create_raw_rgb_frame_store_handles(frames, work_batch)
+            )
+            start_raw_rgb_frame_store_writer(
+                output=frames,
+                handles=raw_frame_store_handles,
+                request_id=work_batch.request_id,
+                chunk_idx=work_batch.block_idx,
+            )
+            raw_frame_metadata = dict(raw_frame_metadata)
+            raw_frame_timings = dict(raw_frame_metadata.get("timings") or {})
+            raw_frame_timings["raw_frame_store_enqueue_ms"] = round(
+                (time.perf_counter() - frame_store_started) * 1000.0,
+                3,
+            )
+            raw_frame_metadata["timings"] = raw_frame_timings
+            output_batch.raw_frame_store_handles = raw_frame_store_handles
+        else:
+            raw_frame_batches, raw_frame_metadata = build_raw_rgb_frame_batches(
+                frames,
+                work_batch,
+                output_batch,
+                post_process_sample,
+            )
+            output_batch.raw_frame_batches = raw_frame_batches
         output_batch.raw_frame_metadata = raw_frame_metadata
 
         total_s = time.perf_counter() - loop_started

@@ -18,6 +18,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
     RealtimeStageTimer,
 )
 from sglang.multimodal_gen.runtime.realtime.errors import RealtimeProtocolError
+from sglang.multimodal_gen.runtime.utils.realtime_frame_store import (
+    RealtimeRawFrameBatch,
+    load_raw_rgb_frame_store_handles,
+)
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     JPEG_FRAME_CONTENT_TYPE,
     RAW_RGB_CHANNELS,
@@ -61,10 +65,15 @@ class RealtimeFrameBatchMessage(RealtimeFrameBatchHeader, total=False):
     payload: bytes
 
 
+TransportFrameBatch = list[bytes] | RealtimeRawFrameBatch
+
+
 class RealtimeFrameSendStats(TypedDict):
     header_pack_ms: float
     header_write_ms: float
     raw_payload_build_ms: float
+    frame_store_wait_ms: float
+    frame_store_read_ms: float
     raw_write_ms: float
     ws_write_ms: float
     pace_wait_ms: float
@@ -81,6 +90,8 @@ def empty_frame_send_stats(content_type: str = "") -> RealtimeFrameSendStats:
         "header_pack_ms": 0.0,
         "header_write_ms": 0.0,
         "raw_payload_build_ms": 0.0,
+        "frame_store_wait_ms": 0.0,
+        "frame_store_read_ms": 0.0,
         "raw_write_ms": 0.0,
         "ws_write_ms": 0.0,
         "pace_wait_ms": 0.0,
@@ -206,6 +217,30 @@ def _split_frame_batch(
     ]
 
 
+def _transport_frame_count(transport_frames: TransportFrameBatch) -> int:
+    if isinstance(transport_frames, RealtimeRawFrameBatch):
+        return transport_frames.num_frames
+    return len(transport_frames)
+
+
+def _transport_raw_size(transport_frames: TransportFrameBatch) -> int:
+    if isinstance(transport_frames, RealtimeRawFrameBatch):
+        return transport_frames.raw_size
+    return sum(len(frame) for frame in transport_frames)
+
+
+def _transport_payload_bytes(transport_frames: TransportFrameBatch) -> bytes:
+    if isinstance(transport_frames, RealtimeRawFrameBatch):
+        return transport_frames.payload
+    return b"".join(transport_frames)
+
+
+def _iter_transport_frame_bytes(transport_frames: TransportFrameBatch):
+    if isinstance(transport_frames, RealtimeRawFrameBatch):
+        return transport_frames.iter_frames()
+    return iter(transport_frames)
+
+
 def _encode_rgb_frame_to_webp(
     frame: bytes,
     *,
@@ -300,29 +335,30 @@ def _pack_frame_batch_header(header: RealtimeFrameBatchHeader) -> bytes:
 
 
 def _encode_raw_rgb_frames_to_h264_annexb(
-    transport_frames: list[bytes],
+    transport_frames: TransportFrameBatch,
     *,
     width: int,
     height: int,
     fps: int,
     crf: int,
 ) -> bytes:
-    if not transport_frames:
+    frame_count = _transport_frame_count(transport_frames)
+    if frame_count == 0:
         return b""
 
     frame_size = width * height * RAW_RGB_CHANNELS
-    for frame in transport_frames:
-        if len(frame) != frame_size:
-            raise ValueError(
-                "h264 transport requires fixed-size rgb24 frames: "
-                f"expected={frame_size}, got={len(frame)}"
-            )
+    raw_input = _transport_payload_bytes(transport_frames)
+    expected_size = frame_count * frame_size
+    if len(raw_input) != expected_size:
+        raise ValueError(
+            "h264 transport requires fixed-size rgb24 frames: "
+            f"expected={expected_size}, got={len(raw_input)}"
+        )
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is required for realtime h264 transport")
 
-    frame_count = len(transport_frames)
     keyint = max(1, frame_count)
     cmd = [
         ffmpeg,
@@ -366,7 +402,7 @@ def _encode_raw_rgb_frames_to_h264_annexb(
     ]
     proc = subprocess.run(
         cmd,
-        input=b"".join(transport_frames),
+        input=raw_input,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -378,7 +414,7 @@ def _encode_raw_rgb_frames_to_h264_annexb(
 
 
 def _build_transport_payload(
-    transport_frames: list[bytes],
+    transport_frames: TransportFrameBatch,
     *,
     content_type: str,
     metadata: dict[str, int | str],
@@ -399,7 +435,7 @@ def _build_transport_payload(
         height = int(metadata["height"])
         fps = int(metadata.get("fps") or 16)
         crf = int(transport_quality or H264_DEFAULT_CRF)
-        raw_size = sum(len(frame) for frame in transport_frames)
+        raw_size = _transport_raw_size(transport_frames)
         raw_payload = _encode_raw_rgb_frames_to_h264_annexb(
             transport_frames,
             width=width,
@@ -434,7 +470,7 @@ def _build_transport_payload(
                     quality=int(transport_quality or WEBP_DEFAULT_QUALITY),
                     preview_max_width=preview_max_width,
                 )
-                for frame in transport_frames
+                for frame in _iter_transport_frame_bytes(transport_frames)
             ]
             payload_content_type = WEBP_FRAME_CONTENT_TYPE
         else:
@@ -446,7 +482,7 @@ def _build_transport_payload(
                     quality=int(transport_quality or JPEG_DEFAULT_QUALITY),
                     preview_max_width=preview_max_width,
                 )
-                for frame in transport_frames
+                for frame in _iter_transport_frame_bytes(transport_frames)
             ]
             payload_content_type = JPEG_FRAME_CONTENT_TYPE
         raw_payload = b"".join(encoded_frames)
@@ -467,13 +503,13 @@ def _build_transport_payload(
             "payload_lengths": [len(frame) for frame in encoded_frames],
         }
     elif content_type == RAW_RGB_CONTENT_TYPE and transport_frames:
-        raw_payload = b"".join(transport_frames)
+        raw_payload = _transport_payload_bytes(transport_frames)
         payload_metadata = {
             "raw_size": len(raw_payload),
             "encoding": RAW_LOSSLESS_OUTPUT_FORMAT,
         }
     else:
-        raw_payload = b"".join(transport_frames)
+        raw_payload = _transport_payload_bytes(transport_frames)
 
     return _TransportPayload(
         content_type=payload_content_type,
@@ -486,14 +522,14 @@ def _should_build_payload_off_loop(
     *,
     content_type: str,
     output_format: str | None,
-    transport_frames: list[bytes],
+    transport_frames: TransportFrameBatch,
 ) -> bool:
     if content_type != RAW_RGB_CONTENT_TYPE or not transport_frames:
         return False
     return (
         output_format in ENCODED_PREVIEW_FORMATS
         or output_format in H264_OUTPUT_FORMATS
-        or output_format is None
+        or output_format in (RAW_LOSSLESS_OUTPUT_FORMAT, None)
     )
 
 
@@ -509,13 +545,29 @@ def _is_encoded_preview_transport(
 
 
 def _split_transport_frame_batches(
-    frames: list[bytes],
+    frames: TransportFrameBatch,
     *,
     content_type: str,
     output_format: str | None,
-) -> list[list[bytes]]:
+) -> list[TransportFrameBatch]:
     if output_format in H264_OUTPUT_FORMATS:
         return [frames]
+    if isinstance(frames, RealtimeRawFrameBatch):
+        if _is_encoded_preview_transport(
+            content_type=content_type,
+            output_format=output_format,
+        ):
+            frames_per_message = ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE
+        elif content_type == RAW_RGB_CONTENT_TYPE:
+            frames_per_message = RAW_RGB_FRAMES_PER_WS_MESSAGE
+        else:
+            return [frames]
+        if frames.num_frames == 0:
+            return [frames]
+        return [
+            frames.slice_frames(i, i + frames_per_message)
+            for i in range(0, frames.num_frames, frames_per_message)
+        ]
     if _is_encoded_preview_transport(
         content_type=content_type,
         output_format=output_format,
@@ -527,7 +579,7 @@ def _split_transport_frame_batches(
 
 
 async def _build_encoded_preview_payloads(
-    split_batches: list[list[bytes]],
+    split_batches: list[TransportFrameBatch],
     *,
     content_type: str,
     metadata: dict[str, int | str],
@@ -553,7 +605,7 @@ async def _build_encoded_preview_payloads(
 
 
 async def _build_encoded_preview_payload(
-    transport_frames: list[bytes],
+    transport_frames: TransportFrameBatch,
     *,
     metadata: dict[str, int | str],
     output_format: str,
@@ -574,7 +626,7 @@ async def _build_encoded_preview_payload(
                         quality=int(transport_quality or WEBP_DEFAULT_QUALITY),
                         preview_max_width=preview_max_width,
                     )
-                    for frame in transport_frames
+                    for frame in _iter_transport_frame_bytes(transport_frames)
                 )
             )
         )
@@ -591,7 +643,7 @@ async def _build_encoded_preview_payload(
                         quality=int(transport_quality or JPEG_DEFAULT_QUALITY),
                         preview_max_width=preview_max_width,
                     )
-                    for frame in transport_frames
+                    for frame in _iter_transport_frame_bytes(transport_frames)
                 )
             )
         )
@@ -637,7 +689,16 @@ class RawRGBRealtimeOutputAdapter:
     ) -> RealtimeFrameSendStats:
         """send frames through ws"""
         content_type = result.raw_frame_content_type
-        if result.raw_frame_batches is None:
+        frame_batches = result.raw_frame_batches
+        frame_store_load = None
+        frame_store_handles = getattr(result, "raw_frame_store_handles", None)
+        if frame_batches is None and frame_store_handles is not None:
+            frame_store_load = await asyncio.to_thread(
+                load_raw_rgb_frame_store_handles,
+                frame_store_handles,
+            )
+            frame_batches = frame_store_load.frame_batches
+        if frame_batches is None:
             return empty_frame_send_stats(content_type)
         if batch.block_idx == 0:
             self.reset()
@@ -654,7 +715,7 @@ class RawRGBRealtimeOutputAdapter:
         preview_max_width = getattr(batch, "realtime_preview_max_width", None)
         stats = await self._send_frame_batches(
             ws,
-            result.raw_frame_batches,
+            frame_batches,
             content_type=content_type,
             chunk_index_start=batch.block_idx,
             request_id=batch.request_id,
@@ -664,13 +725,16 @@ class RawRGBRealtimeOutputAdapter:
             transport_quality=getattr(batch, "output_compression", None),
             preview_max_width=preview_max_width,
         )
+        if frame_store_load is not None:
+            stats["frame_store_wait_ms"] += frame_store_load.wait_ms
+            stats["frame_store_read_ms"] += frame_store_load.read_ms
         stats["frame_shape"] = _frame_shape_from_metadata(frame_metadata)
         return stats
 
     async def _send_frame_batches(
         self,
         ws: WebSocket,
-        frame_batches: list[list[bytes]],
+        frame_batches: list[TransportFrameBatch],
         *,
         content_type: str,
         chunk_index_start: int,
@@ -743,7 +807,7 @@ class RawRGBRealtimeOutputAdapter:
                     "request_id": request_id,
                     "chunk_index": chunk_index,
                     "content_type": transport_payload.content_type,
-                    "num_frames": len(transport_frames),
+                    "num_frames": _transport_frame_count(transport_frames),
                     "total_size": len(transport_payload.payload),
                     "frame_batch_index": frame_batch_index,
                     "num_frame_batches": num_frame_batches,
@@ -780,8 +844,8 @@ class RawRGBRealtimeOutputAdapter:
 
                     stats["ws_payload_bytes"] += len(message_payload)
 
-                stats["raw_bytes"] += sum(len(frame) for frame in transport_frames)
-                stats["num_frames"] += len(transport_frames)
+                stats["raw_bytes"] += _transport_raw_size(transport_frames)
+                stats["num_frames"] += _transport_frame_count(transport_frames)
                 stats["num_batches"] += 1
                 stats["content_type"] = transport_payload.content_type
             chunk_index += 1

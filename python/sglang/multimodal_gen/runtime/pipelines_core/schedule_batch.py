@@ -410,6 +410,7 @@ class OutputBatch:
     # tensors or numpy frames
     output: Sequence[Any] | None = None
     raw_frame_batches: list[list[bytes]] | None = None
+    raw_frame_store_handles: list[Any] | None = None
     raw_frame_content_type: str = "application/x-raw-rgb"
     raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
@@ -443,5 +444,6 @@ class OutputBatch:
         self.trajectory_decoded = None
         self.output_file_paths = None
         self.raw_frame_batches = None
+        self.raw_frame_store_handles = None
         self.noise_pred = None
         self.realtime_timings = None
