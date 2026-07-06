@@ -31,6 +31,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 - [Compatibility Matrix](compatibility_matrix.md): check model, optimization, and component override support
 - [CLI](api/cli.md): run one-off generation jobs or launch a persistent server
 - [OpenAI-Compatible API](api/openai_api.md): send image and video requests to the HTTP server
+- [Wan S2V Realtime API](wan_s2v_realtime_api_integration.md): integrate the WebSocket realtime video generation API
 - [Attention Backends](performance/attention_backends.md): choose the best backend for your model and hardware
 - [Caching Acceleration](performance/cache/index.md): use Cache-DiT or TeaCache to reduce denoising cost
 - [Quantization](quantization.md): load quantized transformer checkpoints
