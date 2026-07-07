@@ -13,6 +13,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import (
     WanS2VPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.wan_s2v_realtime_adapter import (
+    WanS2VRealtimeAdapter,
+    WanS2VRealtimeAdapterState,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_self_forcing_flow_match import (
     SelfForcingFlowMatchScheduler,
 )
@@ -159,6 +163,71 @@ class _FakePipelineConfig:
 
 
 class WanS2VRealtimeHelpersTest(unittest.TestCase):
+    def test_ws_audio_prefetch_reservation_preserves_window_order(self):
+        state = WanS2VRealtimeAdapterState()
+        state.configure(fps=16, num_frame_per_block=3)
+        samples = np.linspace(-0.5, 0.5, 21000, dtype=np.float32)
+
+        state.receive_audio_delta(
+            {
+                "seq": 0,
+                "pts_ms": 0.0,
+                "sample_rate": 16000,
+                "channels": 1,
+                "format": "f32le",
+                "audio": samples.astype("<f4", copy=False).tobytes(),
+                "sample_count": int(samples.size),
+            },
+            event_id=1,
+        )
+
+        first = state.pop_window()
+        reserved = state.reserve_prefetch_window()
+
+        self.assertEqual(first.chunk_idx, 0)
+        self.assertEqual(len(first.samples), 9000)
+        self.assertIsNotNone(reserved)
+        assert reserved is not None
+        self.assertEqual(reserved.chunk_idx, 1)
+        self.assertEqual(len(reserved.samples), 12000)
+        self.assertTrue(state.has_ready_window())
+
+        second = state.pop_window()
+
+        self.assertEqual(second.chunk_idx, 1)
+        np.testing.assert_array_equal(second.samples, reserved.samples)
+        self.assertFalse(state.has_ready_window())
+
+    def test_ws_audio_prefetch_requires_explicit_experiment_flag(self):
+        adapter = WanS2VRealtimeAdapter()
+        session = SimpleNamespace(request=SimpleNamespace(max_chunks=None))
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(wan_s2v_audio_overlap=True)
+        )
+        chunk = SimpleNamespace(index=0)
+        window = SimpleNamespace(is_final=False)
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WAN_S2V_WS_AUDIO_CPU_PREFETCH", None)
+            self.assertFalse(
+                adapter._should_prefetch_next_audio_window(
+                    session,
+                    server_args,
+                    chunk,
+                    window,
+                )
+            )
+
+        with patch.dict(os.environ, {"WAN_S2V_WS_AUDIO_CPU_PREFETCH": "1"}):
+            self.assertTrue(
+                adapter._should_prefetch_next_audio_window(
+                    session,
+                    server_args,
+                    chunk,
+                    window,
+                )
+            )
+
     def test_audio_ring_buffer_wraps_in_chronological_order(self):
         ring = AudioRingBuffer(5)
 

@@ -157,6 +157,17 @@ def _parity_debug_enabled() -> bool:
     )
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _audio_cuda_event_profile_enabled() -> bool:
+    return _env_flag("WAN_S2V_AUDIO_PROFILE_CUDA_EVENTS")
+
+
 def _parity_float(value: Any) -> float | str | None:
     try:
         result = float(value)
@@ -350,6 +361,8 @@ class _WanS2VWav2VecCudaGraphRunner:
             self.is_captured
             and self._captured_shape == tuple(audio_feature.shape)
             and self._captured_video_frames == int(num_video_frames)
+            and self.static_input is not None
+            and audio_feature.dtype == self.static_input.dtype
         )
 
     def capture(
@@ -380,9 +393,45 @@ class _WanS2VWav2VecCudaGraphRunner:
         self._captured_shape = tuple(sample_input.shape)
         self._captured_video_frames = int(num_video_frames)
 
-    def replay(self, audio_feature: torch.Tensor) -> torch.Tensor:
-        self.static_input.copy_(audio_feature)
+    def replay(
+        self,
+        audio_feature: torch.Tensor,
+        timings: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        profile_cuda = (
+            timings is not None
+            and _audio_cuda_event_profile_enabled()
+            and torch.cuda.is_available()
+            and self.static_input is not None
+            and self.static_input.is_cuda
+        )
+        copy_start = copy_end = replay_start = replay_end = None
+        if profile_cuda:
+            stream = torch.cuda.current_stream(self.static_input.device)
+            copy_start = torch.cuda.Event(enable_timing=True)
+            copy_end = torch.cuda.Event(enable_timing=True)
+            replay_start = torch.cuda.Event(enable_timing=True)
+            replay_end = torch.cuda.Event(enable_timing=True)
+            copy_start.record(stream)
+        self.static_input.copy_(
+            audio_feature,
+            non_blocking=bool(
+                audio_feature.device.type == "cpu" and audio_feature.is_pinned()
+            ),
+        )
+        if profile_cuda:
+            copy_end.record(stream)
+            replay_start.record(stream)
         self.graph.replay()
+        if profile_cuda:
+            replay_end.record(stream)
+            replay_end.synchronize()
+            timings["audio_graph_input_copy_cuda_ms"] = round(
+                copy_start.elapsed_time(copy_end), 3
+            )
+            timings["audio_graph_replay_cuda_ms"] = round(
+                replay_start.elapsed_time(replay_end), 3
+            )
         return self.static_output
 
 
@@ -654,6 +703,14 @@ class _PrefetchedAudioChunk:
 
 
 @dataclass
+class _PendingWSAudioPrefetch:
+    chunk_idx: int
+    future: Future
+    timings: dict[str, Any]
+    submitted_at: float
+
+
+@dataclass
 class _PreparedWanS2VBlock:
     block_idx: int
     latents: torch.Tensor
@@ -700,6 +757,13 @@ class _WanS2VPerChunkRealtimeState(BaseRealtimeState):
         self.reset()
 
     def reset(self) -> None:
+        audio_prefetch = getattr(self, "audio_prefetch", None)
+        if audio_prefetch is not None:
+            audio_prefetch.future.cancel()
+        audio_prefetch_pool = getattr(self, "audio_prefetch_pool", None)
+        if audio_prefetch_pool is not None:
+            audio_prefetch_pool.shutdown(wait=False, cancel_futures=True)
+
         self.initialized = False
         self.session_id: str | None = None
         self.base_batch: Req | None = None
@@ -710,6 +774,9 @@ class _WanS2VPerChunkRealtimeState(BaseRealtimeState):
         self.audio_window_samples = 0
         self.audio_window_video_frames = 0
         self.target_audio_frames = 0
+        self.use_ws_audio_cpu_prefetch = False
+        self.audio_prefetch_pool: ThreadPoolExecutor | None = None
+        self.audio_prefetch: _PendingWSAudioPrefetch | None = None
         self.use_wav2vec_cuda_graph = False
         self.use_streaming_vae_cache = True
         self.use_vae_cuda_graph = False
@@ -1464,14 +1531,29 @@ class WanS2VRealtimeSessionRunner:
         audio_window: np.ndarray,
         *,
         ensure_loaded: bool = True,
+        timings: dict[str, Any] | None = None,
     ) -> torch.Tensor:
+        total_started = time.perf_counter()
         sample_rate = 16000
         if ensure_loaded:
+            stage_started = time.perf_counter()
             audio_stage.load_model()
+            if timings is not None:
+                timings["audio_load_model_ms"] = round(
+                    (time.perf_counter() - stage_started) * 1000.0,
+                    3,
+                )
 
+        stage_started = time.perf_counter()
         speech_array = audio_window.astype(np.float32, copy=False)
         speech_array = audio_stage._loudness_norm(speech_array, sample_rate)
+        if timings is not None:
+            timings["audio_loudness_norm_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0,
+                3,
+            )
 
+        stage_started = time.perf_counter()
         if audio_stage.wav2vec_feature_extractor is not None:
             audio_feature_np = np.squeeze(
                 audio_stage.wav2vec_feature_extractor(
@@ -1481,13 +1563,42 @@ class WanS2VRealtimeSessionRunner:
             audio_feature_np = np.asarray(audio_feature_np, dtype=np.float32)
         else:
             audio_feature_np = np.asarray(speech_array, dtype=np.float32)
+        if timings is not None:
+            timings["audio_feature_extractor_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0,
+                3,
+            )
 
+        stage_started = time.perf_counter()
         audio_feature = torch.from_numpy(audio_feature_np).float().unsqueeze(0)
+        if timings is not None:
+            timings["audio_feature_tensor_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0,
+                3,
+            )
         if torch.cuda.is_available():
+            stage_started = time.perf_counter()
+            pinned = False
+            pin_mode = "none"
             try:
                 audio_feature = audio_feature.pin_memory()
+                pinned = bool(audio_feature.is_pinned())
+                pin_mode = "pin_memory" if pinned else "pin_memory_unpinned"
             except RuntimeError:
-                pass
+                pin_mode = "pin_memory_failed"
+            if timings is not None:
+                timings["audio_pin_memory_ms"] = round(
+                    (time.perf_counter() - stage_started) * 1000.0,
+                    3,
+                )
+                timings["audio_pinned_staging"] = pinned
+                timings["audio_pin_memory_mode"] = pin_mode
+        if timings is not None:
+            timings["audio_feature_cpu_ms"] = round(
+                (time.perf_counter() - total_started) * 1000.0,
+                3,
+            )
+            timings["audio_feature_samples"] = int(audio_feature.shape[-1])
         return audio_feature
 
     def _encode_audio_feature(
@@ -1498,27 +1609,84 @@ class WanS2VRealtimeSessionRunner:
         target_audio_frames: int,
         audio_window_video_frames: int,
         wav2vec_graph_runner: _WanS2VWav2VecCudaGraphRunner | None = None,
+        timings: dict[str, Any] | None = None,
     ) -> torch.Tensor:
+        total_started = time.perf_counter()
         device = get_local_torch_device()
+        graph_can_replay = (
+            wav2vec_graph_runner is not None
+            and wav2vec_graph_runner.can_replay(
+                audio_feature,
+                audio_window_video_frames,
+            )
+        )
+        profile_cuda = (
+            timings is not None
+            and _audio_cuda_event_profile_enabled()
+            and torch.cuda.is_available()
+        )
+        stage_started = time.perf_counter()
+        to_device_start = to_device_end = None
         if audio_feature.device != torch.device(device):
+            if profile_cuda:
+                stream = torch.cuda.current_stream(device)
+                to_device_start = torch.cuda.Event(enable_timing=True)
+                to_device_end = torch.cuda.Event(enable_timing=True)
+                to_device_start.record(stream)
             audio_feature = audio_feature.to(
                 device,
                 non_blocking=bool(
                     audio_feature.device.type == "cpu" and audio_feature.is_pinned()
                 ),
             )
+            if profile_cuda:
+                to_device_end.record(torch.cuda.current_stream(device))
+                to_device_end.synchronize()
+        if timings is not None:
+            timings["audio_to_device_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0,
+                3,
+            )
+            if to_device_start is not None and to_device_end is not None:
+                timings["audio_to_device_cuda_ms"] = round(
+                    to_device_start.elapsed_time(to_device_end), 3
+                )
 
+        graph_mode = "eager"
+        stage_started = time.perf_counter()
         with set_forward_context(current_timestep=0, attn_metadata=None):
-            if wav2vec_graph_runner is not None and wav2vec_graph_runner.can_replay(
-                audio_feature, audio_window_video_frames
-            ):
-                audio_features = wav2vec_graph_runner.replay(audio_feature)
+            if graph_can_replay:
+                graph_mode = "graph_replay"
+                audio_features = wav2vec_graph_runner.replay(
+                    audio_feature,
+                    timings=timings,
+                )
             else:
+                encoder_start = encoder_end = None
+                if profile_cuda and audio_feature.is_cuda:
+                    stream = torch.cuda.current_stream(audio_feature.device)
+                    encoder_start = torch.cuda.Event(enable_timing=True)
+                    encoder_end = torch.cuda.Event(enable_timing=True)
+                    encoder_start.record(stream)
                 audio_features = audio_stage.audio_encoder(
                     audio_feature,
                     num_video_frames=audio_window_video_frames,
                 )
+                if encoder_start is not None and encoder_end is not None:
+                    encoder_end.record(torch.cuda.current_stream(audio_feature.device))
+                    encoder_end.synchronize()
+                    if timings is not None:
+                        timings["audio_encoder_cuda_ms"] = round(
+                            encoder_start.elapsed_time(encoder_end), 3
+                        )
+        if timings is not None:
+            timings["audio_encoder_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0,
+                3,
+            )
+            timings["audio_encoder_mode"] = graph_mode
 
+        stage_started = time.perf_counter()
         if audio_features.shape[1] < target_audio_frames:
             pad = target_audio_frames - audio_features.shape[1]
             audio_features = torch.nn.functional.pad(
@@ -1527,7 +1695,17 @@ class WanS2VRealtimeSessionRunner:
         else:
             audio_features = audio_features[:, -target_audio_frames:]
 
-        return audio_features.permute(0, 2, 3, 1).contiguous()
+        audio_features = audio_features.permute(0, 2, 3, 1).contiguous()
+        if timings is not None:
+            timings["audio_postprocess_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0,
+                3,
+            )
+            timings["audio_encode_feature_ms"] = round(
+                (time.perf_counter() - total_started) * 1000.0,
+                3,
+            )
+        return audio_features
 
     def _encode_audio_window(
         self,
@@ -1540,18 +1718,179 @@ class WanS2VRealtimeSessionRunner:
         audio_window_video_frames: int,
         wav2vec_graph_runner: _WanS2VWav2VecCudaGraphRunner | None = None,
         ensure_loaded: bool = True,
+        timings: dict[str, Any] | None = None,
     ) -> torch.Tensor:
+        total_started = time.perf_counter()
         audio_feature = self._prepare_audio_feature_cpu(
             audio_stage,
             audio_window,
             ensure_loaded=ensure_loaded,
+            timings=timings,
         )
-        return self._encode_audio_feature(
+        audio_input = self._encode_audio_feature(
             audio_stage,
             audio_feature,
             target_audio_frames=target_audio_frames,
             audio_window_video_frames=audio_window_video_frames,
             wav2vec_graph_runner=wav2vec_graph_runner,
+            timings=timings,
+        )
+        if timings is not None:
+            timings["audio_encode_window_ms"] = round(
+                (time.perf_counter() - total_started) * 1000.0,
+                3,
+            )
+        return audio_input
+
+    @staticmethod
+    def _timing_ms_value(timings: dict[str, Any], key: str) -> float:
+        value = timings.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return 0.0
+
+    def _record_audio_active_compute_ms(self, timings: dict[str, Any]) -> None:
+        timings["audio_active_compute_ms"] = round(
+            self._timing_ms_value(timings, "audio_ring_extend_ms")
+            + self._timing_ms_value(timings, "audio_ring_snapshot_ms")
+            + self._timing_ms_value(timings, "audio_feature_cpu_ms")
+            + self._timing_ms_value(timings, "audio_encode_feature_ms"),
+            3,
+        )
+
+    @staticmethod
+    def _ws_audio_prefetch_timing_key(key: str) -> str:
+        if key.startswith("audio_"):
+            return f"audio_prefetch_{key[len('audio_'):]}"
+        return f"audio_prefetch_{key}"
+
+    def _copy_ws_audio_prefetch_timings(
+        self,
+        timings: dict[str, Any],
+        prefetch_timings: dict[str, Any],
+    ) -> None:
+        for key, value in prefetch_timings.items():
+            timings[self._ws_audio_prefetch_timing_key(key)] = value
+
+    def _consume_ws_audio_prefetch(
+        self,
+        *,
+        state: _WanS2VPerChunkRealtimeState,
+        chunk_idx: int,
+        timings: dict[str, Any],
+    ) -> torch.Tensor | None:
+        pending = state.audio_prefetch
+        if pending is None:
+            timings["audio_prefetch_hit"] = False
+            return None
+
+        state.audio_prefetch = None
+        if pending.chunk_idx != chunk_idx:
+            pending.future.cancel()
+            timings["audio_prefetch_hit"] = False
+            timings["audio_prefetch_mismatch_chunk_idx"] = pending.chunk_idx
+            logger.warning(
+                "Dropping Wan S2V WS audio prefetch for chunk %s while executing "
+                "chunk %s",
+                pending.chunk_idx,
+                chunk_idx,
+            )
+            return None
+
+        wait_started = time.perf_counter()
+        try:
+            audio_feature = pending.future.result()
+        except Exception as exc:
+            logger.warning(
+                "Wan S2V WS audio feature prefetch failed for chunk %s; "
+                "falling back to synchronous audio encode: %s",
+                chunk_idx,
+                exc,
+            )
+            timings["audio_prefetch_hit"] = False
+            timings["audio_prefetch_fallback"] = "feature_prefetch_failed"
+            return None
+
+        timings["audio_prefetch_hit"] = True
+        timings["audio_prefetch_chunk_idx"] = chunk_idx
+        timings["audio_prefetch_wait_ms"] = round(
+            (time.perf_counter() - wait_started) * 1000.0,
+            3,
+        )
+        timings["audio_prefetch_age_ms"] = round(
+            (time.perf_counter() - pending.submitted_at) * 1000.0,
+            3,
+        )
+        self._copy_ws_audio_prefetch_timings(timings, pending.timings)
+        saved_cpu_ms = timings.get("audio_prefetch_feature_cpu_ms")
+        if isinstance(saved_cpu_ms, (int, float)):
+            timings["audio_prefetch_saved_cpu_ms"] = round(float(saved_cpu_ms), 3)
+        return audio_feature
+
+    def _start_ws_next_audio_prefetch(
+        self,
+        *,
+        state: _WanS2VPerChunkRealtimeState,
+        work_batch: Req,
+        audio_stage: WanS2VAudioEncodingStage,
+        audio_window_snapshot: np.ndarray,
+        current_chunk_idx: int,
+        timings: dict[str, Any],
+    ) -> None:
+        if not (
+            state.use_ws_audio_cpu_prefetch
+            and state.audio_prefetch_pool is not None
+        ):
+            timings["audio_next_prefetch_queued"] = False
+            return
+        if state.audio_prefetch is not None:
+            timings["audio_next_prefetch_queued"] = False
+            timings["audio_next_prefetch_skipped"] = "pending_prefetch_exists"
+            return
+
+        next_audio_window = work_batch.extra.get("wan_s2v_prefetch_audio_window")
+        next_audio_meta = work_batch.extra.get("wan_s2v_prefetch_audio_window_meta")
+        if next_audio_window is None or not isinstance(next_audio_meta, dict):
+            timings["audio_next_prefetch_queued"] = False
+            return
+
+        try:
+            next_chunk_idx = int(next_audio_meta.get("chunk_idx"))
+        except (TypeError, ValueError):
+            timings["audio_next_prefetch_queued"] = False
+            timings["audio_next_prefetch_skipped"] = "invalid_chunk_idx"
+            return
+        if next_chunk_idx <= current_chunk_idx:
+            timings["audio_next_prefetch_queued"] = False
+            timings["audio_next_prefetch_skipped"] = "stale_chunk_idx"
+            return
+
+        next_audio_chunk = np.asarray(next_audio_window, dtype=np.float32)
+        next_audio_snapshot = _audio_window_after_extend(
+            audio_window_snapshot,
+            next_audio_chunk,
+        )
+        prefetch_timings: dict[str, Any] = {}
+        submit_started = time.perf_counter()
+        future = state.audio_prefetch_pool.submit(
+            self._prepare_audio_feature_cpu,
+            audio_stage,
+            next_audio_snapshot,
+            ensure_loaded=False,
+            timings=prefetch_timings,
+        )
+        state.audio_prefetch = _PendingWSAudioPrefetch(
+            chunk_idx=next_chunk_idx,
+            future=future,
+            timings=prefetch_timings,
+            submitted_at=time.perf_counter(),
+        )
+        timings["audio_next_prefetch_queued"] = True
+        timings["audio_next_prefetch_chunk_idx"] = next_chunk_idx
+        timings["audio_next_prefetch_samples"] = int(len(next_audio_chunk))
+        timings["audio_next_prefetch_submit_ms"] = round(
+            (time.perf_counter() - submit_started) * 1000.0,
+            3,
         )
 
     def _prepare_wav2vec_cuda_graph(
@@ -1922,6 +2261,8 @@ class WanS2VRealtimeSessionRunner:
                 "wan_s2v_audio_window",
                 "wan_s2v_audio_window_meta",
                 "wan_s2v_audio_is_final",
+                "wan_s2v_prefetch_audio_window",
+                "wan_s2v_prefetch_audio_window_meta",
             ):
                 batch.extra.pop(key, None)
 
@@ -2047,6 +2388,24 @@ class WanS2VRealtimeSessionRunner:
             else None
         )
         state.device = get_local_torch_device()
+        audio_prefetch_env = os.environ.get("WAN_S2V_WS_AUDIO_CPU_PREFETCH")
+        if audio_prefetch_env is None:
+            state.use_ws_audio_cpu_prefetch = bool(
+                _pipeline_config_value(
+                    server_args,
+                    "wan_s2v_ws_audio_cpu_prefetch",
+                    False,
+                )
+            )
+        else:
+            state.use_ws_audio_cpu_prefetch = _env_flag(
+                "WAN_S2V_WS_AUDIO_CPU_PREFETCH"
+            )
+        if state.use_ws_audio_cpu_prefetch:
+            state.audio_prefetch_pool = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="wan-s2v-ws-audio-prefetch",
+            )
         state.dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
         state.autocast_enabled = (
             state.dit_dtype != torch.float32 and not server_args.disable_autocast
@@ -2071,13 +2430,14 @@ class WanS2VRealtimeSessionRunner:
             "Wan S2V per-chunk realtime session initialized: session=%s "
             "block_latent_frames=%d block_public_frames=%d fps=%d "
             "audio_window_samples=%d wav2vec_cuda_graph=%s "
-            "streaming_vae_cache=%s vae_cuda_graph=%s",
+            "ws_audio_cpu_prefetch=%s streaming_vae_cache=%s vae_cuda_graph=%s",
             state.session_id,
             state.num_frame_per_block,
             state.block_public_frames,
             state.fps,
             state.audio_window_samples,
             state.wav2vec_graph_runner is not None,
+            state.use_ws_audio_cpu_prefetch,
             state.use_streaming_vae_cache,
             state.use_vae_cuda_graph,
         )
@@ -2111,9 +2471,20 @@ class WanS2VRealtimeSessionRunner:
         audio_meta = dict(work_batch.extra.get("wan_s2v_audio_window_meta") or {})
 
         loop_started = time.perf_counter()
+        audio_timings: dict[str, Any] = {}
         audio_started = time.perf_counter()
+        stage_started = time.perf_counter()
         state.audio_ring.extend(audio_chunk)
+        audio_timings["audio_ring_extend_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+        stage_started = time.perf_counter()
         audio_window_snapshot = state.audio_ring.snapshot()
+        audio_timings["audio_ring_snapshot_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
         _parity_log(
             "ws.audio_window",
             session_id=state.session_id,
@@ -2136,23 +2507,49 @@ class WanS2VRealtimeSessionRunner:
         image_stage = self._get_stage(ImageVAEEncodingStage)
         decoding_stage = self._get_stage(DecodingStage)
 
-        work_batch.extra["audio_input"] = self._encode_audio_window(
-            work_batch,
-            server_args,
-            audio_stage,
-            audio_window_snapshot,
-            target_audio_frames=state.target_audio_frames,
-            audio_window_video_frames=state.audio_window_video_frames,
-            wav2vec_graph_runner=state.wav2vec_graph_runner,
-            ensure_loaded=False,
+        audio_s = 0.0
+        audio_prefetch_enabled = bool(
+            state.use_ws_audio_cpu_prefetch
+            and state.audio_prefetch_pool is not None
         )
+        audio_timings["audio_prefetch_enabled"] = audio_prefetch_enabled
+        audio_chunk_idx = int(audio_meta.get("chunk_idx", work_batch.block_idx))
+        prefetched_audio_feature = self._consume_ws_audio_prefetch(
+            state=state,
+            chunk_idx=audio_chunk_idx,
+            timings=audio_timings,
+        )
+        if prefetched_audio_feature is not None:
+            work_batch.extra["audio_input"] = self._encode_audio_feature(
+                audio_stage,
+                prefetched_audio_feature,
+                target_audio_frames=state.target_audio_frames,
+                audio_window_video_frames=state.audio_window_video_frames,
+                wav2vec_graph_runner=state.wav2vec_graph_runner,
+                timings=audio_timings,
+            )
+        else:
+            work_batch.extra["audio_input"] = self._encode_audio_window(
+                work_batch,
+                server_args,
+                audio_stage,
+                audio_window_snapshot,
+                target_audio_frames=state.target_audio_frames,
+                audio_window_video_frames=state.audio_window_video_frames,
+                wav2vec_graph_runner=state.wav2vec_graph_runner,
+                ensure_loaded=False,
+                timings=audio_timings,
+            )
         audio_s = time.perf_counter() - audio_started
-        _parity_log(
-            "ws.audio_input",
-            session_id=state.session_id,
-            block_idx=work_batch.block_idx,
-            audio_input=work_batch.extra.get("audio_input"),
-            state_generator=state.generator,
+        audio_timings["audio_measured_ms"] = round(audio_s * 1000.0, 3)
+        self._record_audio_active_compute_ms(audio_timings)
+        self._start_ws_next_audio_prefetch(
+            state=state,
+            work_batch=work_batch,
+            audio_stage=audio_stage,
+            audio_window_snapshot=audio_window_snapshot,
+            current_chunk_idx=audio_chunk_idx,
+            timings=audio_timings,
         )
 
         latent_started = time.perf_counter()
@@ -2220,7 +2617,22 @@ class WanS2VRealtimeSessionRunner:
                 True
             )
 
+        _parity_log(
+            "ws.audio_input",
+            session_id=state.session_id,
+            block_idx=work_batch.block_idx,
+            audio_input=work_batch.extra.get("audio_input"),
+            state_generator=state.generator,
+        )
+
+        condition_timings: dict[str, Any] = {}
         condition_started = time.perf_counter()
+        condition_cuda_start = condition_cuda_end = None
+        if _audio_cuda_event_profile_enabled() and torch.cuda.is_available():
+            condition_stream = torch.cuda.current_stream(state.device)
+            condition_cuda_start = torch.cuda.Event(enable_timing=True)
+            condition_cuda_end = torch.cuda.Event(enable_timing=True)
+            condition_cuda_start.record(condition_stream)
         bundle = build_wan_s2v_condition_bundle(
             work_batch,
             server_args,
@@ -2228,6 +2640,13 @@ class WanS2VRealtimeSessionRunner:
             dtype=state.dit_dtype,
             device=state.device,
         )
+        if condition_cuda_start is not None and condition_cuda_end is not None:
+            condition_cuda_end.record(torch.cuda.current_stream(state.device))
+            condition_cuda_end.synchronize()
+            condition_timings["condition_cuda_ms"] = round(
+                condition_cuda_start.elapsed_time(condition_cuda_end),
+                3,
+            )
         prompt_embeds = bundle.prompt_embeds
         if isinstance(prompt_embeds, list):
             prompt_embeds = prompt_embeds[0]
@@ -2451,6 +2870,8 @@ class WanS2VRealtimeSessionRunner:
             "model_compute_total_ms": round(model_compute_total_s * 1000, 3),
             "total_ms": round(total_s * 1000, 3),
         }
+        worker_timings.update(audio_timings)
+        worker_timings.update(condition_timings)
         worker_timings.update(clean_refresh_stage_timings)
         worker_timings.update(state.stream_vae_state.last_decode_timings or {})
         worker_timings.update(raw_frame_timings)

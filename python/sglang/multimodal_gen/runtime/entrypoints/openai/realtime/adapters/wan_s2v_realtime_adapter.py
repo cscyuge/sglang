@@ -45,12 +45,36 @@ def _resolve_float_config(
     return float(getattr(getattr(server_args, "pipeline_config", None), attr, default))
 
 
+def _resolve_bool_config(
+    server_args: ServerArgs | None,
+    *,
+    attr: str,
+    env_name: str,
+    default: bool,
+) -> bool:
+    raw_env = os.environ.get(env_name)
+    if raw_env is not None and raw_env != "":
+        return raw_env.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(getattr(getattr(server_args, "pipeline_config", None), attr, default))
+
+
+def _audio_window_meta(window: WanS2VAudioWindow) -> dict[str, Any]:
+    return {
+        "chunk_idx": window.chunk_idx,
+        "pts_start_ms": window.pts_start_ms,
+        "pts_end_ms": window.pts_end_ms,
+        "sample_count": int(len(window.samples)),
+        "is_final": window.is_final,
+    }
+
+
 class WanS2VRealtimeAdapterState:
     """Endpoint-side async wrapper around the reusable Wan S2V timeline."""
 
     def __init__(self) -> None:
         self.timeline = WanS2VAudioTimelineState()
         self.audio_ready = asyncio.Event()
+        self.reserved_prefetch_window: WanS2VAudioWindow | None = None
 
     def configure(
         self,
@@ -68,9 +92,16 @@ class WanS2VRealtimeAdapterState:
             pad_final_window=pad_final_window,
             max_buffered_audio_ms=max_buffered_audio_ms,
         )
+        self.reserved_prefetch_window = None
+
+    def has_ready_window(self) -> bool:
+        return (
+            self.reserved_prefetch_window is not None
+            or self.timeline.has_ready_window()
+        )
 
     def _wake_if_progress_possible(self) -> None:
-        if self.timeline.has_ready_window() or self.timeline.is_drained():
+        if self.has_ready_window() or self.timeline.is_drained():
             self.audio_ready.set()
 
     def receive_audio_delta(
@@ -94,24 +125,47 @@ class WanS2VRealtimeAdapterState:
         return event_log
 
     async def wait_for_ready_window(self) -> None:
-        while not self.timeline.has_ready_window():
+        while not self.has_ready_window():
             if self.timeline.is_drained():
                 raise StopAsyncIteration
             self.audio_ready.clear()
-            if self.timeline.has_ready_window() or self.timeline.is_drained():
+            if self.has_ready_window() or self.timeline.is_drained():
                 break
             await self.audio_ready.wait()
-        if self.timeline.is_drained() and not self.timeline.has_ready_window():
+        if self.timeline.is_drained() and not self.has_ready_window():
             raise StopAsyncIteration
 
     def pop_window(self) -> WanS2VAudioWindow:
-        window = self.timeline.pop_window()
-        if not self.timeline.has_ready_window():
+        if self.reserved_prefetch_window is not None:
+            window = self.reserved_prefetch_window
+            self.reserved_prefetch_window = None
+        else:
+            window = self.timeline.pop_window()
+        if not self.has_ready_window():
             self.audio_ready.clear()
         return window
 
+    def reserve_prefetch_window(self) -> WanS2VAudioWindow | None:
+        if self.reserved_prefetch_window is not None:
+            return None
+        if not self.timeline.has_ready_window():
+            return None
+        self.reserved_prefetch_window = self.timeline.pop_window()
+        self.audio_ready.set()
+        return self.reserved_prefetch_window
+
+    def debug_snapshot(self) -> dict[str, Any]:
+        snapshot = self.timeline.debug_snapshot()
+        reserved = self.reserved_prefetch_window
+        snapshot["reserved_prefetch_window"] = (
+            None if reserved is None else _audio_window_meta(reserved)
+        )
+        snapshot["ready_window"] = self.has_ready_window()
+        return snapshot
+
     def clear(self) -> None:
         self.timeline.clear()
+        self.reserved_prefetch_window = None
         self.audio_ready.set()
 
 
@@ -220,10 +274,11 @@ class WanS2VRealtimeAdapter(BaseRealtimeModelAdapter):
         event_log: str,
     ) -> dict[str, Any] | None:
         del event, event_log
-        timeline = self._state(session).timeline
+        state = self._state(session)
+        timeline = state.timeline
         return {
             "audio_event": dict(timeline.latest_event_debug or {}),
-            "audio_queue": timeline.debug_snapshot(),
+            "audio_queue": state.debug_snapshot(),
         }
 
     def build_chunk_stats_extra(
@@ -269,22 +324,47 @@ class WanS2VRealtimeAdapter(BaseRealtimeModelAdapter):
         chunk: RealtimeChunkContext,
     ):
         batch = super().prepare_next_request(session, server_args, chunk)
-        window = self._state(session).pop_window()
+        state = self._state(session)
+        window = state.pop_window()
         batch.extra["wan_s2v_realtime_per_chunk"] = True
         batch.extra["stream_r1_mode"] = True
         batch.extra["num_frame_per_block"] = self.get_chunk_size(
             session, server_args, chunk
         )
         batch.extra["wan_s2v_audio_window"] = window.samples
-        batch.extra["wan_s2v_audio_window_meta"] = {
-            "chunk_idx": window.chunk_idx,
-            "pts_start_ms": window.pts_start_ms,
-            "pts_end_ms": window.pts_end_ms,
-            "sample_count": int(len(window.samples)),
-            "is_final": window.is_final,
-        }
+        batch.extra["wan_s2v_audio_window_meta"] = _audio_window_meta(window)
         batch.extra["wan_s2v_audio_is_final"] = window.is_final
+        if self._should_prefetch_next_audio_window(session, server_args, chunk, window):
+            prefetch_window = state.reserve_prefetch_window()
+            if prefetch_window is not None:
+                batch.extra["wan_s2v_prefetch_audio_window"] = prefetch_window.samples
+                batch.extra["wan_s2v_prefetch_audio_window_meta"] = _audio_window_meta(
+                    prefetch_window
+                )
         return batch
+
+    def _should_prefetch_next_audio_window(
+        self,
+        session: GenerateSession,
+        server_args: ServerArgs,
+        chunk: RealtimeChunkContext,
+        window: WanS2VAudioWindow,
+    ) -> bool:
+        if window.is_final:
+            return False
+        request = session.request
+        if (
+            request is not None
+            and request.max_chunks is not None
+            and chunk.index + 1 >= request.max_chunks
+        ):
+            return False
+        return _resolve_bool_config(
+            server_args,
+            attr="wan_s2v_ws_audio_cpu_prefetch",
+            env_name="WAN_S2V_WS_AUDIO_CPU_PREFETCH",
+            default=False,
+        )
 
     def sample_chunk_inputs(
         self,
