@@ -1481,6 +1481,7 @@ class WanS2VDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        self._deep_gemm_m_list: tuple[int, ...] = ()
 
     def load_model(self):
         if self.server_args.dit_cpu_offload:
@@ -1490,11 +1491,75 @@ class WanS2VDenoisingStage(PipelineStage):
         if self.server_args.dit_cpu_offload:
             self.transformer.to("cpu")
 
+    def _configure_deep_gemm_for_latents(
+        self,
+        latents: torch.Tensor,
+        *,
+        patch_size: int | Sequence[int],
+        sp_size: int,
+        latent_frames: int | None = None,
+    ) -> None:
+        """Restrict DeepGEMM warmup to Wan S2V's fixed local token count."""
+        try:
+            from sglang.srt.layers.deep_gemm_wrapper import (
+                ENABLE_JIT_DEEPGEMM,
+                set_deep_gemm_m_list,
+            )
+        except ImportError:
+            return
+
+        if not ENABLE_JIT_DEEPGEMM or latents.dim() != 5:
+            return
+
+        if isinstance(patch_size, int):
+            patch = (1, patch_size, patch_size)
+        else:
+            patch = tuple(int(item) for item in patch_size)
+            if len(patch) == 2:
+                patch = (1, patch[0], patch[1])
+        if len(patch) < 3 or patch[1] <= 0 or patch[2] <= 0:
+            return
+
+        batch_size, _channels, total_frames, latent_h, latent_w = latents.shape
+        frames = int(total_frames if latent_frames is None else latent_frames)
+        if frames <= 0:
+            return
+        frame_seq_length = (int(latent_h) // patch[1]) * (int(latent_w) // patch[2])
+        if frame_seq_length <= 0:
+            return
+        sp = max(int(sp_size), 1)
+        local_seq_len = (frames * frame_seq_length + sp - 1) // sp
+        m_value = int(batch_size) * local_seq_len
+        if m_value <= 0:
+            return
+
+        m_list = tuple(sorted(set(self._deep_gemm_m_list + (m_value,))))
+        if m_list == self._deep_gemm_m_list:
+            return
+
+        gpu_id = latents.device.index if latents.device.index is not None else 0
+        set_deep_gemm_m_list(list(m_list), gpu_id=gpu_id)
+        self._deep_gemm_m_list = m_list
+        self.log_info(
+            "DeepGEMM configured for Wan S2V: M=%s "
+            "(B=%d, frames=%d, frame_seq=%d, SP=%d)",
+            list(m_list),
+            int(batch_size),
+            frames,
+            frame_seq_length,
+            sp,
+        )
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
         dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.precision]
         latents = batch.latents.to(device=device, dtype=dit_dtype)
+        self._configure_deep_gemm_for_latents(
+            latents,
+            patch_size=server_args.pipeline_config.dit_config.arch_config.patch_size,
+            sp_size=_safe_sp_world_size(),
+        )
         bundle = build_wan_s2v_condition_bundle(
             batch,
             server_args,
@@ -3337,6 +3402,12 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
         _, _, _, latent_h, latent_w = latents.shape
         frame_seq_length = (latent_h // patch_size[1]) * (latent_w // patch_size[2])
+        self._configure_deep_gemm_for_latents(
+            latents,
+            patch_size=patch_size,
+            sp_size=sp_world_size,
+            latent_frames=num_frame_per_block,
+        )
         self._configure_transformer_attention(attention_request)
         cache_state = self._prepare_cache_state(
             request=attention_request,
