@@ -51,9 +51,9 @@ from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.realtime_frame_store import (
+    attach_raw_rgb_frame_store_writer_request,
     can_use_raw_rgb_frame_store,
     create_raw_rgb_frame_store_handles,
-    start_raw_rgb_frame_store_writer,
 )
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
@@ -2150,7 +2150,8 @@ class WanS2VRealtimeSessionRunner:
             raw_frame_store_handles, raw_frame_metadata = (
                 create_raw_rgb_frame_store_handles(frames, work_batch)
             )
-            start_raw_rgb_frame_store_writer(
+            attach_raw_rgb_frame_store_writer_request(
+                output_batch,
                 output=frames,
                 handles=raw_frame_store_handles,
                 request_id=work_batch.request_id,

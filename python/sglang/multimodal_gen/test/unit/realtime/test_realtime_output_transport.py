@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import pickle
 from types import SimpleNamespace
 
 import msgspec.msgpack
@@ -16,8 +17,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.utils.realtime_frame_store import (
+    attach_raw_rgb_frame_store_writer_request,
     create_raw_rgb_frame_store_handles,
-    start_raw_rgb_frame_store_writer,
+    pop_raw_rgb_frame_store_writer_request,
+    start_raw_rgb_frame_store_writer_request,
 )
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     JPEG_FRAME_CONTENT_TYPE,
@@ -160,17 +163,22 @@ def test_raw_rgb_realtime_output_adapter_reads_frame_store_handles():
             [[[[[0.0]], [[0.25]]], [[[0.5]], [[0.75]]], [[[1.0]], [[1.0]]]]]
         )
         handles, metadata = create_raw_rgb_frame_store_handles(output, batch)
-        start_raw_rgb_frame_store_writer(
-            output=output,
-            handles=handles,
-            request_id=batch.request_id,
-            chunk_idx=batch.block_idx,
-        )
         result = OutputBatch(
             raw_frame_store_handles=handles,
             raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
             raw_frame_metadata=metadata,
         )
+        attach_raw_rgb_frame_store_writer_request(
+            result,
+            output=output,
+            handles=handles,
+            request_id=batch.request_id,
+            chunk_idx=batch.block_idx,
+        )
+        write_request = pop_raw_rgb_frame_store_writer_request(result)
+        assert write_request is not None
+        pickle.dumps(result)
+        start_raw_rgb_frame_store_writer_request(write_request)
 
         stats = await adapter.send(ws, SimpleNamespace(), result, batch)
         return ws.payloads, stats, handles

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import mmap
 import os
+import queue
 import tempfile
 import threading
 import time
@@ -36,6 +37,9 @@ FRAME_STORE_ERROR = 2
 FRAME_STORE_DIR_ENV = "SGLANG_REALTIME_FRAME_STORE_DIR"
 FRAME_STORE_TIMEOUT_ENV = "SGLANG_REALTIME_FRAME_STORE_TIMEOUT_MS"
 FRAME_STORE_DEFAULT_TIMEOUT_MS = 30000.0
+FRAME_STORE_WRITER_DEFER_ENV = "SGLANG_REALTIME_FRAME_STORE_DEFER_MS"
+FRAME_STORE_DEFAULT_WRITER_DEFER_MS = 0.0
+_RAW_RGB_FRAME_STORE_WRITE_REQUEST_ATTR = "_raw_rgb_frame_store_write_request"
 
 
 @dataclass
@@ -84,11 +88,31 @@ class RealtimeFrameStoreLoadResult:
     read_ms: float
 
 
+@dataclass
+class _FrameStoreWriteRequest:
+    samples: list[torch.Tensor]
+    handles: list[RealtimeFrameStoreHandle]
+    request_id: str
+    chunk_idx: int
+
+
+_FRAME_STORE_WRITER_QUEUE: queue.SimpleQueue | None = None
+_FRAME_STORE_WRITER_THREAD: threading.Thread | None = None
+_FRAME_STORE_WRITER_LOCK = threading.Lock()
+
+
 def get_realtime_frame_store_timeout_ms() -> float:
     raw_env = os.environ.get(FRAME_STORE_TIMEOUT_ENV)
     if raw_env is not None and raw_env != "":
         return max(0.0, float(raw_env))
     return FRAME_STORE_DEFAULT_TIMEOUT_MS
+
+
+def get_realtime_frame_store_defer_ms() -> float:
+    raw_env = os.environ.get(FRAME_STORE_WRITER_DEFER_ENV)
+    if raw_env is not None and raw_env != "":
+        return max(0.0, float(raw_env))
+    return FRAME_STORE_DEFAULT_WRITER_DEFER_MS
 
 
 def _frame_store_dir() -> str:
@@ -242,6 +266,133 @@ def _write_sample_to_store(
         os.close(fd)
 
 
+def _mark_store_handles_error(handles: list[RealtimeFrameStoreHandle]) -> None:
+    for handle in handles:
+        _mark_store_status(handle.path, FRAME_STORE_ERROR)
+
+
+def _materialize_raw_rgb_frame_store_request(
+    request: _FrameStoreWriteRequest,
+) -> None:
+    start = time.monotonic()
+    try:
+        if len(request.samples) != len(request.handles):
+            raise RuntimeError(
+                "realtime frame store request mismatch: "
+                f"samples={len(request.samples)}, handles={len(request.handles)}"
+            )
+        defer_ms = get_realtime_frame_store_defer_ms()
+        if defer_ms > 0:
+            time.sleep(defer_ms / 1000.0)
+        for sample, handle in zip(request.samples, request.handles):
+            _write_sample_to_store(sample=sample, handle=handle)
+    except Exception:
+        _mark_store_handles_error(request.handles)
+        logger.exception(
+            "failed to materialize realtime frame store request: "
+            "request_id=%s chunk_idx=%s handles=%d",
+            request.request_id,
+            request.chunk_idx,
+            len(request.handles),
+        )
+        return
+
+    logger.info(
+        "realtime raw RGB frame store materialized: request_id=%s chunk_idx=%s "
+        "handles=%d total_bytes=%d total=%.2fms",
+        request.request_id,
+        request.chunk_idx,
+        len(request.handles),
+        sum(handle.payload_size for handle in request.handles),
+        (time.monotonic() - start) * 1000.0,
+    )
+
+
+def _frame_store_writer_loop(writer_queue: queue.SimpleQueue) -> None:
+    while True:
+        try:
+            request = writer_queue.get()
+            _materialize_raw_rgb_frame_store_request(request)
+        except Exception:
+            logger.exception("unexpected realtime frame store writer failure")
+
+
+def _ensure_frame_store_writer_thread() -> tuple[queue.SimpleQueue, threading.Thread]:
+    global _FRAME_STORE_WRITER_QUEUE, _FRAME_STORE_WRITER_THREAD
+
+    with _FRAME_STORE_WRITER_LOCK:
+        if _FRAME_STORE_WRITER_QUEUE is None:
+            _FRAME_STORE_WRITER_QUEUE = queue.SimpleQueue()
+        if (
+            _FRAME_STORE_WRITER_THREAD is None
+            or not _FRAME_STORE_WRITER_THREAD.is_alive()
+        ):
+            _FRAME_STORE_WRITER_THREAD = threading.Thread(
+                target=_frame_store_writer_loop,
+                args=(_FRAME_STORE_WRITER_QUEUE,),
+                name="realtime-frame-store-writer",
+                daemon=True,
+            )
+            _FRAME_STORE_WRITER_THREAD.start()
+        return _FRAME_STORE_WRITER_QUEUE, _FRAME_STORE_WRITER_THREAD
+
+
+def create_raw_rgb_frame_store_write_request(
+    *,
+    output: torch.Tensor,
+    handles: list[RealtimeFrameStoreHandle],
+    request_id: str,
+    chunk_idx: int,
+) -> _FrameStoreWriteRequest:
+    return _FrameStoreWriteRequest(
+        samples=_iter_tensor_samples(output),
+        handles=handles,
+        request_id=request_id,
+        chunk_idx=chunk_idx,
+    )
+
+
+def attach_raw_rgb_frame_store_writer_request(
+    output_batch: Any,
+    *,
+    output: torch.Tensor,
+    handles: list[RealtimeFrameStoreHandle],
+    request_id: str,
+    chunk_idx: int,
+) -> None:
+    setattr(
+        output_batch,
+        _RAW_RGB_FRAME_STORE_WRITE_REQUEST_ATTR,
+        create_raw_rgb_frame_store_write_request(
+            output=output,
+            handles=handles,
+            request_id=request_id,
+            chunk_idx=chunk_idx,
+        ),
+    )
+
+
+def pop_raw_rgb_frame_store_writer_request(output_batch: Any) -> Any | None:
+    request = getattr(output_batch, _RAW_RGB_FRAME_STORE_WRITE_REQUEST_ATTR, None)
+    if request is not None:
+        delattr(output_batch, _RAW_RGB_FRAME_STORE_WRITE_REQUEST_ATTR)
+    return request
+
+
+def discard_raw_rgb_frame_store_writer_request(request: Any) -> None:
+    handles = getattr(request, "handles", None) or []
+    for handle in handles:
+        _cleanup_store_file(handle.path)
+
+
+def start_raw_rgb_frame_store_writer_request(
+    request: _FrameStoreWriteRequest,
+) -> threading.Thread:
+    writer_queue, thread = _ensure_frame_store_writer_thread()
+    writer_queue.put(request)
+    return thread
+
+
 def start_raw_rgb_frame_store_writer(
     *,
     output: torch.Tensor,
@@ -249,29 +400,14 @@ def start_raw_rgb_frame_store_writer(
     request_id: str,
     chunk_idx: int,
 ) -> threading.Thread:
-    samples = _iter_tensor_samples(output)
-
-    def _writer() -> None:
-        start = time.monotonic()
-        for sample, handle in zip(samples, handles):
-            _write_sample_to_store(sample=sample, handle=handle)
-        logger.info(
-            "realtime raw RGB frame store materialized: request_id=%s chunk_idx=%s "
-            "handles=%d total_bytes=%d total=%.2fms",
-            request_id,
-            chunk_idx,
-            len(handles),
-            sum(handle.payload_size for handle in handles),
-            (time.monotonic() - start) * 1000.0,
+    return start_raw_rgb_frame_store_writer_request(
+        create_raw_rgb_frame_store_write_request(
+            output=output,
+            handles=handles,
+            request_id=request_id,
+            chunk_idx=chunk_idx,
         )
-
-    thread = threading.Thread(
-        target=_writer,
-        name=f"realtime-frame-store-{chunk_idx}",
-        daemon=True,
     )
-    thread.start()
-    return thread
 
 
 def _wait_for_store_ready(

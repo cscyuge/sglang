@@ -307,10 +307,17 @@ class GPUWorker:
                 output_batch.audio = None
                 output_batch.audio_sample_rate = None
 
+            skip_cuda_cache_cleanup = bool(
+                getattr(req, "extra", None)
+                and req.extra.get("wan_s2v_realtime_per_chunk", False)
+            )
+            cuda_cache_cleanup_ms = 0.0
+            cleanup_started = time.monotonic()
+
             # Free CUDA cache on ALL ranks to prevent OOM on the next request.
-            # Guard with a timed synchronize: if CUDA doesn't quiesce within
-            # 30 s, skip empty_cache to avoid deadlocking broadcast_pyobj.
-            if torch.cuda.is_initialized():
+            # Realtime per-chunk requests keep the model/session hot and should
+            # not force a global CUDA sync on every chunk.
+            if torch.cuda.is_initialized() and not skip_cuda_cache_cleanup:
                 _sync_ok = threading.Event()
 
                 def _cuda_sync():
@@ -336,6 +343,16 @@ class GPUWorker:
                         main_process_only=False,
                         local_main_process_only=False,
                     )
+                cuda_cache_cleanup_ms = (time.monotonic() - cleanup_started) * 1000.0
+
+            realtime_timings = getattr(output_batch, "realtime_timings", None)
+            if isinstance(realtime_timings, dict):
+                realtime_timings["cuda_cache_cleanup_skipped"] = (
+                    skip_cuda_cache_cleanup
+                )
+                realtime_timings["cuda_cache_cleanup_ms"] = round(
+                    cuda_cache_cleanup_ms, 3
+                )
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:

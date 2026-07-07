@@ -319,9 +319,44 @@ class Scheduler(SchedulerDisaggMixin):
         """
         replies to client, only on rank 0
         """
+        from sglang.multimodal_gen.runtime.utils.realtime_frame_store import (
+            discard_raw_rgb_frame_store_writer_request,
+            pop_raw_rgb_frame_store_writer_request,
+            start_raw_rgb_frame_store_writer_request,
+        )
+
+        frame_store_write_request = pop_raw_rgb_frame_store_writer_request(
+            output_batch
+        )
         should_send = not is_warmup or should_return_warmup_result(req_or_group)
-        if should_send and self.receiver is not None and identity is not None:
-            self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
+        if not should_send or self.receiver is None or identity is None:
+            if frame_store_write_request is not None:
+                discard_raw_rgb_frame_store_writer_request(frame_store_write_request)
+            return
+
+        sent = False
+        try:
+            payload = pickle.dumps(output_batch)
+            self.receiver.send_multipart([identity, b"", payload])
+            sent = True
+        finally:
+            if frame_store_write_request is not None:
+                if sent:
+                    try:
+                        start_raw_rgb_frame_store_writer_request(
+                            frame_store_write_request
+                        )
+                    except Exception:
+                        logger.exception(
+                            "failed to start realtime frame store writer"
+                        )
+                        discard_raw_rgb_frame_store_writer_request(
+                            frame_store_write_request
+                        )
+                else:
+                    discard_raw_rgb_frame_store_writer_request(
+                        frame_store_write_request
+                    )
 
     def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
         """pull a req from waiting_queue"""
