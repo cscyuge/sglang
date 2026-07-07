@@ -719,10 +719,11 @@ class _WanS2VTransformerTimestepCudaGraphRunner:
         metadata_device: torch.device,
     ) -> tuple[Any, ...]:
         return (
-            "wan_s2v_transformer_timestep_v4",
+            "wan_s2v_transformer_timestep_v5",
             metadata_plan.structure_key_signature,
             bool(kwargs.get("stream_r1_audio_emb_pre_sliced", False)),
             bool(kwargs.get("stream_r1_graph_kv_update", False)),
+            bool(kwargs.get("stream_r1_refresh_only", False)),
             WanS2VTimestepStaticMetadataBuffers.signature_from_plan(
                 metadata_plan,
                 device=metadata_device,
@@ -770,6 +771,7 @@ class _WanS2VTransformerTimestepCudaGraphRunner:
             "metadata_structure",
             "audio_pre_sliced",
             "graph_kv_update",
+            "refresh_only",
             "metadata_buffers",
             "static_inputs",
             "cache_addresses",
@@ -2943,8 +2945,11 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         dtype: torch.dtype | None = None,
         autocast_enabled: bool = False,
         forward_batch: Req | None = None,
+        server_args: ServerArgs | None = None,
+        block_index: int = 0,
         crossattn_cache: list | None = None,
         audio_start_frame: int | None = None,
+        allow_timestep_cuda_graph_capture: bool = True,
     ) -> dict[str, Any]:
         timings: dict[str, Any] = {}
         if not cache_state.enabled:
@@ -2983,6 +2988,75 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             (time.perf_counter() - prepare_started) * 1000.0, 3
         )
 
+        transformer_kwargs = {
+            "hidden_states": block_latents,
+            "timestep": timestep,
+            "encoder_hidden_states": prompt_embeds,
+            "ref_latents": block_bundle.ref_latents,
+            "motion_latents": block_bundle.motion_latents,
+            "cond_states": block_bundle.cond_states,
+            "audio_input": block_bundle.audio_input,
+            "audio_emb": block_bundle.audio_emb,
+            "motion_frames": block_bundle.motion_frames,
+            "add_last_motion": block_bundle.add_last_motion,
+            "drop_motion_frames": block_bundle.drop_motion_frames,
+            "kv_cache": cache_state.kv_cache,
+            "crossattn_cache": crossattn_cache,
+            "current_start": current_start,
+            "cache_start": None,
+            "audio_start_frame": audio_start_frame,
+            "stream_r1_mode": True,
+            "stream_r1_refresh_only": True,
+        }
+        cuda_graph_status: str | None = None
+        cuda_graph_config = None
+        if server_args is not None and forward_batch is not None:
+            cuda_graph_config = self._resolve_timestep_cuda_graph_config(
+                forward_batch,
+                server_args,
+            )
+            if cuda_graph_config.enabled:
+                self._timestep_cuda_graph_runner.configure(
+                    max_graphs=cuda_graph_config.max_graphs
+                )
+
+        def _run_refresh_forward() -> None:
+            nonlocal cuda_graph_status
+            use_cuda_graph = False
+            if cuda_graph_config is not None:
+                use_cuda_graph, cuda_graph_status = self._can_use_timestep_cuda_graph(
+                    cuda_graph_config,
+                    block_index=block_index,
+                    step_index=0,
+                    device=block_latents.device,
+                    crossattn_cache=crossattn_cache,
+                )
+            if use_cuda_graph:
+                context_batch = getattr(get_forward_context(), "forward_batch", None)
+                sequence_shard_enabled = bool(
+                    context_batch is not None
+                    and getattr(context_batch, "enable_sequence_shard", False)
+                    and _safe_sp_world_size() > 1
+                )
+                try:
+                    _, cuda_graph_status = self._timestep_cuda_graph_runner.run(
+                        kwargs=transformer_kwargs,
+                        forward_fn=self.transformer,
+                        step_index=0,
+                        current_start=current_start,
+                        audio_start_frame=audio_start_frame,
+                        sequence_shard_enabled=sequence_shard_enabled,
+                        allow_capture=allow_timestep_cuda_graph_capture,
+                    )
+                except RuntimeError as exc:
+                    capture_disabled = "capture is disabled" in str(exc)
+                    if allow_timestep_cuda_graph_capture or not capture_disabled:
+                        raise
+                    cuda_graph_status = "eager_capture_disabled"
+                    self.transformer(**transformer_kwargs)
+            else:
+                self.transformer(**transformer_kwargs)
+
         forward_started = time.perf_counter()
         with set_forward_context(
             current_timestep=0,
@@ -2990,55 +3064,18 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             forward_batch=forward_batch,
         ):
             if dtype is None:
-                self.transformer(
-                    hidden_states=block_latents,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    ref_latents=block_bundle.ref_latents,
-                    motion_latents=block_bundle.motion_latents,
-                    cond_states=block_bundle.cond_states,
-                    audio_input=block_bundle.audio_input,
-                    audio_emb=block_bundle.audio_emb,
-                    motion_frames=block_bundle.motion_frames,
-                    add_last_motion=block_bundle.add_last_motion,
-                    drop_motion_frames=block_bundle.drop_motion_frames,
-                    kv_cache=cache_state.kv_cache,
-                    crossattn_cache=crossattn_cache,
-                    current_start=current_start,
-                    cache_start=None,
-                    audio_start_frame=audio_start_frame,
-                    stream_r1_mode=True,
-                    stream_r1_refresh_only=True,
-                )
+                _run_refresh_forward()
             else:
                 with torch.autocast(
                     device_type=current_platform.device_type,
                     dtype=dtype,
                     enabled=autocast_enabled,
                 ):
-                    self.transformer(
-                        hidden_states=block_latents,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
-                        ref_latents=block_bundle.ref_latents,
-                        motion_latents=block_bundle.motion_latents,
-                        cond_states=block_bundle.cond_states,
-                        audio_input=block_bundle.audio_input,
-                        audio_emb=block_bundle.audio_emb,
-                        motion_frames=block_bundle.motion_frames,
-                        add_last_motion=block_bundle.add_last_motion,
-                        drop_motion_frames=block_bundle.drop_motion_frames,
-                        kv_cache=cache_state.kv_cache,
-                        crossattn_cache=crossattn_cache,
-                        current_start=current_start,
-                        cache_start=None,
-                        audio_start_frame=audio_start_frame,
-                        stream_r1_mode=True,
-                        stream_r1_refresh_only=True,
-                    )
+                    _run_refresh_forward()
         timings["clean_refresh_forward_body_ms"] = round(
             (time.perf_counter() - forward_started) * 1000.0, 3
         )
+        timings["clean_refresh_cuda_graph"] = cuda_graph_status or "not_run"
         timings["clean_refresh_enabled"] = True
         return timings
 
@@ -3516,6 +3553,8 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                         dtype=dit_dtype,
                         autocast_enabled=autocast_enabled,
                         forward_batch=batch,
+                        server_args=server_args,
+                        block_index=block_index,
                         crossattn_cache=crossattn_cache,
                     )
         finally:

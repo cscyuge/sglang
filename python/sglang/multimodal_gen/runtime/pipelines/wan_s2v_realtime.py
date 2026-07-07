@@ -2347,6 +2347,8 @@ class WanS2VRealtimeSessionRunner:
                 dtype=state.dit_dtype,
                 autocast_enabled=state.autocast_enabled,
                 forward_batch=work_batch,
+                server_args=server_args,
+                block_index=work_batch.block_idx,
                 crossattn_cache=state.crossattn_cache,
                 audio_start_frame=0,
             )
@@ -3189,8 +3191,15 @@ class WanS2VRealtimeSessionRunner:
                         dtype=dit_dtype,
                         autocast_enabled=autocast_enabled,
                         forward_batch=batch,
+                        server_args=server_args,
+                        block_index=block_idx,
                         crossattn_cache=crossattn_cache,
                         audio_start_frame=0,
+                        allow_timestep_cuda_graph_capture=(
+                            self._should_allow_timestep_cuda_graph_capture(
+                                timestep_graph_output_started=timestep_graph_output_started
+                            )
+                        ),
                     )
                 clean_refresh_s = time.perf_counter() - clean_refresh_started
                 batch.latents = current_latents

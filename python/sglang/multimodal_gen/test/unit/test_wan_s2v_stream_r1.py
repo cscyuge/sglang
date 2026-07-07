@@ -2769,10 +2769,16 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             metadata_plan=plan_drop_motion,
             metadata_device=device,
         )
+        key_refresh_only = _WanS2VTransformerTimestepCudaGraphRunner.make_key(
+            kwargs={**kwargs, "stream_r1_refresh_only": True},
+            metadata_plan=plan_step0,
+            metadata_device=device,
+        )
 
         self.assertEqual(key_step0, key_step1)
         self.assertEqual(key_step0, key_next_block)
         self.assertNotEqual(key_step0, key_drop_motion)
+        self.assertNotEqual(key_step0, key_refresh_only)
 
     def test_timestep_graph_runner_preslices_audio_embeddings(self):
         kwargs = {
@@ -3521,6 +3527,58 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
 
         self.assertEqual(len(recorder.calls), 1)
         self.assertIs(recorder.calls[0]["crossattn_cache"], crossattn_cache)
+
+    def test_clean_context_refresh_uses_timestep_graph_when_available(self):
+        stage = self._stage()
+        stage._s2v_kv_attention_kernel_supported = True
+        recorder = self._RecordingTransformer()
+        stage.transformer = recorder
+        state = WanS2VStreamR1CacheState.allocate(self._metadata())
+        graph_calls = []
+
+        def _run_graph(**kwargs):
+            graph_calls.append(kwargs)
+            return None, "replay"
+
+        def _can_use_graph(config, **kwargs):
+            return True, "enabled"
+
+        stage._can_use_timestep_cuda_graph = _can_use_graph
+        stage._timestep_cuda_graph_runner = SimpleNamespace(
+            configure=lambda **kwargs: None,
+            run=_run_graph,
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=WanS2VPipelineConfig(
+                wan_s2v_timestep_cuda_graph=True,
+                wan_s2v_timestep_cuda_graph_indices=[0],
+                wan_s2v_timestep_cuda_graph_warmup_blocks=0,
+            )
+        )
+        forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=False)
+
+        timings = stage._clean_context_refresh(
+            block_latents=torch.ones(2, 3, 4, 2, 2),
+            prompt_embeds=torch.zeros(2, 3, 4),
+            block_bundle=self._block_bundle(),
+            current_start=15,
+            attention_request=self._attention_request(stream_r1_kv_cache=True),
+            cache_state=state,
+            forward_batch=forward_batch,
+            server_args=server_args,
+            block_index=3,
+            allow_timestep_cuda_graph_capture=False,
+        )
+
+        self.assertEqual(recorder.calls, [])
+        self.assertEqual(timings["clean_refresh_cuda_graph"], "replay")
+        self.assertEqual(len(graph_calls), 1)
+        call = graph_calls[0]
+        self.assertEqual(call["step_index"], 0)
+        self.assertEqual(call["current_start"], 15)
+        self.assertFalse(call["allow_capture"])
+        self.assertTrue(call["kwargs"]["stream_r1_refresh_only"])
+        self.assertIs(call["kwargs"]["kv_cache"], state.kv_cache)
 
     def test_clean_context_refresh_sets_forward_context(self):
         stage = self._stage()
