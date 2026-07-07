@@ -307,9 +307,21 @@ class InputValidationStage(PipelineStage):
                 condition_image_height / condition_image_width,
                 mod_value,
             )
-            batch.condition_image = batch.condition_image.resize(
-                (width, height), Image.BICUBIC
+            # Cover-resize + center-crop instead of a plain resize: a plain
+            # resize stretches the image whenever its aspect ratio doesn't
+            # match (width, height) (e.g. a landscape reference image forced
+            # into a portrait output size), visibly distorting the subject.
+            # When the aspect ratio already matches (the common auto-derived
+            # case above), the center-crop is a no-op, so this is behaviorally
+            # identical to the old resize in that case.
+            img = batch.condition_image
+            scale = max(width / img.width, height / img.height)
+            img = img.resize(
+                (round(img.width * scale), round(img.height * scale)), Image.BICUBIC
             )
+            x1 = (img.width - width) // 2
+            y1 = (img.height - height) // 2
+            batch.condition_image = img.crop((x1, y1, x1 + width, y1 + height))
             batch.height = height
             batch.width = width
 

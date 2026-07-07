@@ -10,7 +10,7 @@ import time
 from collections import OrderedDict
 from copy import copy
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Event
 from typing import Any
 
@@ -436,6 +436,7 @@ class _WanS2VStreamingVAECudaGraphRunner:
         self.cache_output_map: list[torch.Tensor] | None = None
         self._captured_shape: tuple[int, ...] | None = None
         self._disabled = False
+        self.last_timings: dict[str, float] = {}
 
     @property
     def is_captured(self) -> bool:
@@ -514,35 +515,91 @@ class _WanS2VStreamingVAECudaGraphRunner:
         torch.cuda.current_stream(sample_input.device).wait_stream(stream)
 
     def capture(self, decode_fn, sample_input: torch.Tensor, live_cache_map: list[Any]):
-        self._run_warmups(decode_fn, sample_input, live_cache_map)
-        torch.cuda.synchronize(sample_input.device)
+        timings: dict[str, float] = {}
 
+        stage_started = time.perf_counter()
+        self._run_warmups(decode_fn, sample_input, live_cache_map)
+        timings["vae_graph_warmup_enqueue_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
+
+        stage_started = time.perf_counter()
+        torch.cuda.synchronize(sample_input.device)
+        timings["vae_graph_precapture_sync_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
+
+        stage_started = time.perf_counter()
         self.static_input = sample_input.detach().clone()
         self.cache_input_map = self._clone_cache_map(live_cache_map)
         capture_cache_map = list(self.cache_input_map)
+        timings["vae_graph_static_clone_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
 
+        stage_started = time.perf_counter()
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self.static_output = decode_fn(self.static_input, capture_cache_map, False)
+        timings["vae_graph_capture_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
 
         self.cache_output_map = capture_cache_map
         # Capturing records the VAE decode but does not produce a usable result
         # for this realtime block. Replay once immediately so the capture block
         # has valid frames and the steady-state cache advances exactly once.
+        stage_started = time.perf_counter()
         self.graph.replay()
+        timings["vae_graph_initial_replay_enqueue_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
+
+        stage_started = time.perf_counter()
         self._copy_cache_map_(self.cache_input_map, self.cache_output_map)
         self._copy_cache_map_(live_cache_map, self.cache_output_map)
+        timings["vae_graph_cache_copy_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
+        self.last_timings = timings
         self._captured_shape = tuple(sample_input.shape)
         return self.static_output
 
     def replay(self, latents: torch.Tensor, live_cache_map: list[Any] | None = None):
+        timings: dict[str, float] = {}
+
+        stage_started = time.perf_counter()
         self.static_input.copy_(latents)
+        timings["vae_graph_input_copy_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
+
         if live_cache_map is not None:
+            stage_started = time.perf_counter()
             self._copy_cache_map_(self.cache_input_map, live_cache_map)
+            timings["vae_graph_cache_to_static_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
+            )
+
+        stage_started = time.perf_counter()
         self.graph.replay()
+        timings["vae_graph_replay_enqueue_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
+
         if live_cache_map is not None:
+            stage_started = time.perf_counter()
             self._copy_cache_map_(live_cache_map, self.cache_output_map)
+            timings["vae_graph_cache_to_live_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
+            )
+
+        stage_started = time.perf_counter()
         self._copy_cache_map_(self.cache_input_map, self.cache_output_map)
+        timings["vae_graph_cache_advance_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
+        self.last_timings = timings
         return self.static_output
 
 
@@ -628,6 +685,11 @@ class _WanS2VStreamingVAEState:
     initialized: bool = False
     decoded_latent_frames: int = 0
     last_decode_mode: str = "eager"
+    last_decode_timings: dict[str, Any] = field(default_factory=dict)
+    decode_latents_buffer: torch.Tensor | None = None
+    decode_scale_shift_cache_key: tuple[Any, ...] | None = None
+    decode_inverse_scaling_factor: Any = None
+    decode_shift_factor: Any = None
 
 
 class _WanS2VPerChunkRealtimeState(BaseRealtimeState):
@@ -1061,6 +1123,88 @@ class WanS2VRealtimeSessionRunner:
             output_stream=output_stream,
         )
 
+    def _realtime_scale_and_shift_latents(
+        self,
+        latents: torch.Tensor,
+        decoding_stage: DecodingStage,
+        server_args: ServerArgs,
+        stream_vae_state: _WanS2VStreamingVAEState,
+    ) -> torch.Tensor:
+        scaling_factor, shift_factor = (
+            server_args.pipeline_config.get_decode_scale_and_shift(
+                latents.device, latents.dtype, decoding_stage.vae
+            )
+        )
+        if scaling_factor is None:
+            return decoding_stage.scale_and_shift(latents, server_args)
+
+        output = stream_vae_state.decode_latents_buffer
+        if (
+            output is None
+            or output.shape != latents.shape
+            or output.dtype != latents.dtype
+            or output.device != latents.device
+        ):
+            output = torch.empty_like(latents)
+            stream_vae_state.decode_latents_buffer = output
+
+        if isinstance(scaling_factor, torch.Tensor):
+            shift_key = (
+                id(shift_factor)
+                if isinstance(shift_factor, torch.Tensor)
+                else shift_factor
+            )
+            cache_key = (
+                id(scaling_factor),
+                shift_key,
+                str(latents.device),
+                str(latents.dtype),
+            )
+            if stream_vae_state.decode_scale_shift_cache_key != cache_key:
+                scale = scaling_factor.to(device=latents.device, dtype=latents.dtype)
+                stream_vae_state.decode_inverse_scaling_factor = torch.reciprocal(
+                    scale
+                )
+                if isinstance(shift_factor, torch.Tensor):
+                    stream_vae_state.decode_shift_factor = shift_factor.to(
+                        device=latents.device, dtype=latents.dtype
+                    )
+                else:
+                    stream_vae_state.decode_shift_factor = shift_factor
+                stream_vae_state.decode_scale_shift_cache_key = cache_key
+
+            inverse_scaling = stream_vae_state.decode_inverse_scaling_factor
+            cached_shift = stream_vae_state.decode_shift_factor
+            if cached_shift is None:
+                torch.mul(latents, inverse_scaling, out=output)
+            elif isinstance(cached_shift, torch.Tensor):
+                torch.addcmul(cached_shift, latents, inverse_scaling, out=output)
+            else:
+                torch.mul(latents, inverse_scaling, out=output)
+                output.add_(cached_shift)
+            return output
+
+        inverse_scaling = 1.0 / float(scaling_factor)
+        torch.mul(latents, inverse_scaling, out=output)
+        if shift_factor is not None:
+            if isinstance(shift_factor, torch.Tensor):
+                cache_key = (
+                    "scalar_scale",
+                    float(scaling_factor),
+                    id(shift_factor),
+                    str(latents.device),
+                    str(latents.dtype),
+                )
+                if stream_vae_state.decode_scale_shift_cache_key != cache_key:
+                    stream_vae_state.decode_shift_factor = shift_factor.to(
+                        device=latents.device, dtype=latents.dtype
+                    )
+                    stream_vae_state.decode_scale_shift_cache_key = cache_key
+                output.add_(stream_vae_state.decode_shift_factor)
+            else:
+                output.add_(shift_factor)
+        return output
+
     def _decode_block_frames(
         self,
         decoding_stage: DecodingStage,
@@ -1069,9 +1213,23 @@ class WanS2VRealtimeSessionRunner:
         stream_vae_state: _WanS2VStreamingVAEState,
         vae_graph_cache: _WanS2VStreamingVAECudaGraphCache | None = None,
     ) -> torch.Tensor:
+        decode_timings: dict[str, Any] = {}
+        stream_vae_state.last_decode_timings = decode_timings
+
+        def finish_timings() -> None:
+            decode_timings["vae_decode_mode"] = stream_vae_state.last_decode_mode
+            stream_vae_state.last_decode_timings = decode_timings
+
         if not stream_vae_state.enabled:
+            stage_started = time.perf_counter()
+            image = decoding_stage.decode(latents, server_args)
             stream_vae_state.last_decode_mode = "eager"
-            return decoding_stage.decode(latents, server_args)
+            decode_timings["vae_streaming_cache_enabled"] = False
+            decode_timings["vae_decode_body_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
+            )
+            finish_timings()
+            return image
 
         original_latents = latents
         vae = decoding_stage.vae
@@ -1086,8 +1244,15 @@ class WanS2VRealtimeSessionRunner:
             getattr(vae, "use_feature_cache", False)
         ):
             stream_vae_state.enabled = False
+            stage_started = time.perf_counter()
+            image = decoding_stage.decode(original_latents, server_args)
             stream_vae_state.last_decode_mode = "eager"
-            return decoding_stage.decode(original_latents, server_args)
+            decode_timings["vae_streaming_cache_enabled"] = False
+            decode_timings["vae_decode_body_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
+            )
+            finish_timings()
+            return image
 
         try:
             from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
@@ -1121,13 +1286,50 @@ class WanS2VRealtimeSessionRunner:
                 image = image.float().clamp(-1.0, 1.0)
                 return (image / 2 + 0.5).clamp(0, 1)
 
+            prepare_started = time.perf_counter()
+
+            stage_started = time.perf_counter()
             device = get_local_torch_device()
             vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            decode_timings["vae_config_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
+            )
+
+            stage_started = time.perf_counter()
             vae = vae.to(device=device, dtype=vae_dtype)
+            decode_timings["vae_to_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
+            )
+
+            stage_started = time.perf_counter()
             latents = latents.to(device=device)
-            latents = decoding_stage.scale_and_shift(latents, server_args)
+            decode_timings["vae_latents_to_device_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
+            )
+
+            stage_started = time.perf_counter()
+            try:
+                latents = self._realtime_scale_and_shift_latents(
+                    latents, decoding_stage, server_args, stream_vae_state
+                )
+                decode_timings["vae_scale_shift_fast_path"] = True
+            except Exception as scale_shift_exc:
+                logger.warning(
+                    "Wan S2V realtime scale/shift fast path disabled: %s",
+                    scale_shift_exc,
+                )
+                latents = decoding_stage.scale_and_shift(latents, server_args)
+                decode_timings["vae_scale_shift_fast_path"] = False
+            decode_timings["vae_scale_shift_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
+            )
+
+            stage_started = time.perf_counter()
             latents = server_args.pipeline_config.preprocess_decoding(
                 latents, server_args, vae=vae
+            )
+            decode_timings["vae_preprocess_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
             )
             vae_autocast_enabled = (
                 vae_dtype != torch.float32
@@ -1138,13 +1340,28 @@ class WanS2VRealtimeSessionRunner:
                 dtype=vae_dtype,
                 enabled=vae_autocast_enabled,
             ):
+                stage_started = time.perf_counter()
                 if not vae_autocast_enabled:
                     latents = latents.to(vae_dtype)
                 else:
                     latents = latents.to(dtype=vae_dtype)
+                decode_timings["vae_latents_cast_ms"] = round(
+                    (time.perf_counter() - stage_started) * 1000.0, 3
+                )
 
                 if not stream_vae_state.initialized:
+                    stage_started = time.perf_counter()
                     vae.clear_cache()
+                    decode_timings["vae_cache_clear_ms"] = round(
+                        (time.perf_counter() - stage_started) * 1000.0, 3
+                    )
+                else:
+                    decode_timings["vae_cache_clear_ms"] = 0.0
+
+                decode_timings["vae_prepare_ms"] = round(
+                    (time.perf_counter() - prepare_started) * 1000.0, 3
+                )
+                body_started = time.perf_counter()
 
                 if (
                     vae_graph_cache is not None
@@ -1159,6 +1376,7 @@ class WanS2VRealtimeSessionRunner:
                         and vae_graph_runner.can_replay(latents)
                     ):
                         image = vae_graph_runner.replay(latents, vae._feat_map)
+                        decode_timings.update(vae_graph_runner.last_timings)
                         stream_vae_state.last_decode_mode = "graph_replay"
                     elif not _WanS2VStreamingVAECudaGraphRunner.cache_ready(
                         vae._feat_map
@@ -1177,6 +1395,7 @@ class WanS2VRealtimeSessionRunner:
                                 latents,
                                 vae._feat_map,
                             )
+                            decode_timings.update(vae_graph_runner.last_timings)
                             vae_graph_cache.put(latents, vae_graph_runner)
                             stream_vae_state.last_decode_mode = "graph_capture"
                             logger.info(
@@ -1207,8 +1426,14 @@ class WanS2VRealtimeSessionRunner:
                     )
                     stream_vae_state.last_decode_mode = "eager"
 
+                decode_timings["vae_decode_body_ms"] = round(
+                    (time.perf_counter() - body_started) * 1000.0, 3
+                )
+
             stream_vae_state.initialized = True
             stream_vae_state.decoded_latent_frames += int(latents.shape[2])
+            decode_timings["vae_streaming_cache_enabled"] = True
+            finish_timings()
             return image
         except Exception as exc:
             logger.warning(
@@ -1221,8 +1446,17 @@ class WanS2VRealtimeSessionRunner:
                 pass
             stream_vae_state.enabled = False
             stream_vae_state.initialized = False
+            stage_started = time.perf_counter()
+            image = decoding_stage.decode(original_latents, server_args)
             stream_vae_state.last_decode_mode = "eager"
-            return decoding_stage.decode(original_latents, server_args)
+            decode_timings.clear()
+            decode_timings["vae_streaming_cache_enabled"] = False
+            decode_timings["vae_streaming_cache_disabled_after_error"] = True
+            decode_timings["vae_decode_body_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000.0, 3
+            )
+            finish_timings()
+            return image
 
     def _prepare_audio_feature_cpu(
         self,
@@ -2087,15 +2321,19 @@ class WanS2VRealtimeSessionRunner:
             ),
         )
 
-        clean_refresh_started = time.perf_counter()
+        clean_refresh_select_started = time.perf_counter()
         clean_refresh_decision = denoising_stage.select_clean_context_refresh(
             batch=work_batch,
             server_args=server_args,
             block_index=work_batch.block_idx,
             config=state.clean_refresh_config,
         )
+        clean_refresh_select_s = time.perf_counter() - clean_refresh_select_started
+        clean_refresh_forward_s = 0.0
+        clean_refresh_stage_timings: dict[str, Any] = {}
         if clean_refresh_decision.refresh:
-            denoising_stage._clean_context_refresh(
+            clean_refresh_forward_started = time.perf_counter()
+            refresh_timings = denoising_stage._clean_context_refresh(
                 block_latents=current_latents,
                 prompt_embeds=prompt_embeds,
                 block_bundle=bundle,
@@ -2112,7 +2350,10 @@ class WanS2VRealtimeSessionRunner:
                 crossattn_cache=state.crossattn_cache,
                 audio_start_frame=0,
             )
-        clean_refresh_s = time.perf_counter() - clean_refresh_started
+            clean_refresh_forward_s = time.perf_counter() - clean_refresh_forward_started
+            if isinstance(refresh_timings, dict):
+                clean_refresh_stage_timings = dict(refresh_timings)
+        clean_refresh_s = clean_refresh_select_s + clean_refresh_forward_s
         work_batch.latents = current_latents
         state.previous_clean_latents = current_latents.detach()
         denoise_s = denoise_loop_s + clean_refresh_s
@@ -2125,7 +2366,15 @@ class WanS2VRealtimeSessionRunner:
             state.stream_vae_state,
             vae_graph_cache=state.vae_graph_cache,
         )
+        vae_decode_s = time.perf_counter() - decode_started
+        post_decoding_started = time.perf_counter()
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        post_decoding_s = time.perf_counter() - post_decoding_started
+        output_clone_s = 0.0
+        if state.stream_vae_state.last_decode_mode in {"graph_capture", "graph_replay"}:
+            clone_started = time.perf_counter()
+            frames = frames.detach().clone()
+            output_clone_s = time.perf_counter() - clone_started
         decode_s = time.perf_counter() - decode_started
         frame_count = int(frames.shape[2])
         _parity_log(
@@ -2190,17 +2439,27 @@ class WanS2VRealtimeSessionRunner:
             "denoise_ms": round(denoise_s * 1000, 3),
             "denoise_loop_ms": round(denoise_loop_s * 1000, 3),
             "clean_refresh_ms": round(clean_refresh_s * 1000, 3),
+            "clean_refresh_select_ms": round(clean_refresh_select_s * 1000, 3),
+            "clean_refresh_forward_ms": round(clean_refresh_forward_s * 1000, 3),
             "decode_ms": round(decode_s * 1000, 3),
+            "vae_decode_ms": round(vae_decode_s * 1000, 3),
+            "post_decoding_ms": round(post_decoding_s * 1000, 3),
+            "output_clone_ms": round(output_clone_s * 1000, 3),
+            "vae_decode_mode": state.stream_vae_state.last_decode_mode,
             "model_compute_total_ms": round(model_compute_total_s * 1000, 3),
             "total_ms": round(total_s * 1000, 3),
         }
+        worker_timings.update(clean_refresh_stage_timings)
+        worker_timings.update(state.stream_vae_state.last_decode_timings or {})
         worker_timings.update(raw_frame_timings)
         output_batch.realtime_timings = worker_timings
         logger.info(
             "Wan S2V realtime chunk %d: audio=%.3fs latent=%.3fs "
             "latent_prepare=%.3fs condition=%.3fs warm_start=%s/%.3fs "
             "steps=%d/%d denoise_loop=%.3fs refresh=%s/%s/%.3fs "
-            "decode=%.3fs active=%.3fs total=%.3fs frames=%d pts=%s-%s",
+            "clean_select=%.3fs clean_forward=%.3fs decode=%s/%.3fs "
+            "vae=%.3fs post=%.3fs clone=%.3fs active=%.3fs "
+            "total=%.3fs frames=%d pts=%s-%s",
             work_batch.block_idx,
             audio_s,
             latent_s,
@@ -2214,7 +2473,13 @@ class WanS2VRealtimeSessionRunner:
             clean_refresh_decision.refresh,
             clean_refresh_decision.reason,
             clean_refresh_s,
+            clean_refresh_select_s,
+            clean_refresh_forward_s,
+            state.stream_vae_state.last_decode_mode,
             decode_s,
+            vae_decode_s,
+            post_decoding_s,
+            output_clone_s,
             model_compute_total_s,
             total_s,
             frame_count,

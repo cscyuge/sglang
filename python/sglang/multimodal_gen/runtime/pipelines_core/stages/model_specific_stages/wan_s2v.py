@@ -147,6 +147,14 @@ class WanS2VStreamR1CacheState:
         kv_cache: list[WanS2VKVCacheBlock] = []
         kv_states: list[WanS2VStreamR1KVState] = []
         with torch.inference_mode(False):
+            # Stream-R1 updates every layer with the same noisy-token window.
+            # Sharing the read-only plan metadata avoids rewriting 40 identical
+            # plan buffers before each clean-refresh/timestep graph replay.
+            update_plan_buffer = WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer.allocate(
+                device=metadata.device,
+                cache_capacity=metadata.cache_tokens,
+                sink_tokens=metadata.sink_tokens,
+            )
             for _ in range(metadata.num_layers):
                 state = WanS2VStreamR1KVState()
                 kv_states.append(state)
@@ -181,13 +189,7 @@ class WanS2VStreamR1CacheState:
                         "global_end_index_host": 0,
                         "local_end_index_host": 0,
                         "state": state,
-                        "update_plan_buffer": (
-                            WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer.allocate(
-                                device=metadata.device,
-                                cache_capacity=metadata.cache_tokens,
-                                sink_tokens=metadata.sink_tokens,
-                            )
-                        ),
+                        "update_plan_buffer": update_plan_buffer,
                     }
                 )
         return cls(metadata=metadata, kv_cache=kv_cache, kv_states=kv_states)
@@ -198,6 +200,7 @@ class WanS2VStreamR1CacheState:
         if self.kv_states is not None:
             for state in self.kv_states:
                 state.reset()
+        cleared_plan_buffers: set[int] = set()
         for block_cache in self.kv_cache:
             block_cache["global_end_index"].zero_()
             block_cache["local_end_index"].zero_()
@@ -212,8 +215,9 @@ class WanS2VStreamR1CacheState:
             update_plan_buffer = block_cache.get("update_plan_buffer")
             if isinstance(
                 update_plan_buffer, WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer
-            ):
+            ) and id(update_plan_buffer) not in cleared_plan_buffers:
                 update_plan_buffer.clear()
+                cleared_plan_buffers.add(id(update_plan_buffer))
 
     def prepare_kv_update_plans(
         self,
@@ -221,9 +225,20 @@ class WanS2VStreamR1CacheState:
         noisy_seq_len: int,
         current_start: int,
         cache_start: int = 0,
-    ) -> None:
+    ) -> dict[str, Any]:
+        stats = {
+            "kv_plan_builds": 0,
+            "kv_plan_shared_copies": 0,
+            "kv_plan_shared_reuses": 0,
+            "kv_plan_existing_reuses": 0,
+            "kv_plan_clears": 0,
+            "kv_plan_build_ms": 0.0,
+            "kv_plan_copy_from_plan_ms": 0.0,
+            "kv_plan_shared_copy_ms": 0.0,
+            "kv_plan_clear_ms": 0.0,
+        }
         if self.metadata is None or self.kv_cache is None or self.kv_states is None:
-            return
+            return stats
         update = WanS2VStreamR1NoisyKVCacheUpdate(
             noisy_seq_len=int(noisy_seq_len),
             frame_seq_length=self.metadata.frame_seq_length,
@@ -232,22 +247,98 @@ class WanS2VStreamR1CacheState:
             current_start=int(current_start),
             cache_start=int(cache_start),
         )
+        template_buffer: WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer | None = None
+        template_plan = None
+        invalid_state_signatures: set[tuple[int, int, int]] = set()
         for block_cache, state in zip(self.kv_cache, self.kv_states):
             update_plan_buffer = block_cache.get("update_plan_buffer")
             if not isinstance(
                 update_plan_buffer, WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer
             ):
                 continue
+            state_signature = (
+                int(state.global_end_index),
+                int(state.local_end_index),
+                int(block_cache["k"].shape[1]),
+            )
+            if state_signature in invalid_state_signatures:
+                stage_started = time.perf_counter()
+                update_plan_buffer.clear()
+                stats["kv_plan_clear_ms"] += (
+                    time.perf_counter() - stage_started
+                ) * 1000.0
+                stats["kv_plan_clears"] += 1
+                continue
+            host_plan = update_plan_buffer.host_plan
+            if (
+                host_plan is not None
+                and host_plan.update == update
+                and host_plan.input_global_end == state.global_end_index
+                and host_plan.input_local_end == state.local_end_index
+            ):
+                if template_buffer is None:
+                    template_buffer = update_plan_buffer
+                    template_plan = host_plan
+                stats["kv_plan_existing_reuses"] += 1
+                continue
+            if (
+                template_buffer is not None
+                and template_plan is not None
+                and state.global_end_index == template_plan.input_global_end
+                and state.local_end_index == template_plan.input_local_end
+                and int(block_cache["k"].shape[1]) == int(template_plan.cache_capacity)
+            ):
+                if update_plan_buffer is template_buffer:
+                    stats["kv_plan_shared_reuses"] += 1
+                else:
+                    stage_started = time.perf_counter()
+                    update_plan_buffer.copy_from_buffer_(template_buffer)
+                    stats["kv_plan_shared_copy_ms"] += (
+                        time.perf_counter() - stage_started
+                    ) * 1000.0
+                    stats["kv_plan_shared_copies"] += 1
+                continue
+            if template_buffer is not None and update_plan_buffer is template_buffer:
+                raise RuntimeError(
+                    "Shared Wan S2V KV update plan buffer requires layer KV "
+                    "states to remain aligned"
+                )
             try:
+                stage_started = time.perf_counter()
                 plan = build_wan_s2v_stream_r1_noisy_kv_cache_update_plan(
                     block_cache,
                     update,
                     state=state,
                 )
+                stats["kv_plan_build_ms"] += (
+                    time.perf_counter() - stage_started
+                ) * 1000.0
             except ValueError:
+                invalid_state_signatures.add(state_signature)
+                stage_started = time.perf_counter()
                 update_plan_buffer.clear()
+                stats["kv_plan_clear_ms"] += (
+                    time.perf_counter() - stage_started
+                ) * 1000.0
+                stats["kv_plan_clears"] += 1
                 continue
+            stage_started = time.perf_counter()
             update_plan_buffer.copy_from_plan_(plan)
+            stats["kv_plan_copy_from_plan_ms"] += (
+                time.perf_counter() - stage_started
+            ) * 1000.0
+            stats["kv_plan_builds"] += 1
+            if template_buffer is None:
+                template_buffer = update_plan_buffer
+                template_plan = plan
+        for key in (
+            "kv_plan_build_ms",
+            "kv_plan_copy_from_plan_ms",
+            "kv_plan_shared_copy_ms",
+            "kv_plan_clear_ms",
+        ):
+            stats[key] = round(float(stats[key]), 3)
+        return stats
 
 
 @dataclass(frozen=True)
@@ -2789,10 +2880,13 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         forward_batch: Req | None = None,
         crossattn_cache: list | None = None,
         audio_start_frame: int | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
+        timings: dict[str, Any] = {}
         if not cache_state.enabled:
-            return None
+            timings["clean_refresh_enabled"] = False
+            return timings
 
+        prepare_started = time.perf_counter()
         self._guard_cache_runtime(cache_state)
         timestep = torch.full(
             (block_latents.shape[0],),
@@ -2800,8 +2894,14 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
             dtype=torch.long,
             device=block_latents.device,
         )
+        timings["clean_refresh_timestep_ms"] = round(
+            (time.perf_counter() - prepare_started) * 1000.0, 3
+        )
+
+        plan_started = time.perf_counter()
+        plan_stats: dict[str, Any] = {}
         if cache_state.metadata is not None:
-            cache_state.prepare_kv_update_plans(
+            plan_stats = cache_state.prepare_kv_update_plans(
                 noisy_seq_len=(
                     int(block_latents.shape[2])
                     * cache_state.metadata.frame_seq_length
@@ -2809,7 +2909,16 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                 current_start=current_start,
                 cache_start=0,
             )
+        timings["clean_refresh_plan_ms"] = round(
+            (time.perf_counter() - plan_started) * 1000.0, 3
+        )
+        for key, value in plan_stats.items():
+            timings[f"clean_refresh_{key}"] = value
+        timings["clean_refresh_prepare_ms"] = round(
+            (time.perf_counter() - prepare_started) * 1000.0, 3
+        )
 
+        forward_started = time.perf_counter()
         with set_forward_context(
             current_timestep=0,
             attn_metadata=None,
@@ -2836,34 +2945,37 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
                     stream_r1_mode=True,
                     stream_r1_refresh_only=True,
                 )
-                return None
-
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=dtype,
-                enabled=autocast_enabled,
-            ):
-                self.transformer(
-                    hidden_states=block_latents,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    ref_latents=block_bundle.ref_latents,
-                    motion_latents=block_bundle.motion_latents,
-                    cond_states=block_bundle.cond_states,
-                    audio_input=block_bundle.audio_input,
-                    audio_emb=block_bundle.audio_emb,
-                    motion_frames=block_bundle.motion_frames,
-                    add_last_motion=block_bundle.add_last_motion,
-                    drop_motion_frames=block_bundle.drop_motion_frames,
-                    kv_cache=cache_state.kv_cache,
-                    crossattn_cache=crossattn_cache,
-                    current_start=current_start,
-                    cache_start=None,
-                    audio_start_frame=audio_start_frame,
-                    stream_r1_mode=True,
-                    stream_r1_refresh_only=True,
-                )
-        return None
+            else:
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=dtype,
+                    enabled=autocast_enabled,
+                ):
+                    self.transformer(
+                        hidden_states=block_latents,
+                        timestep=timestep,
+                        encoder_hidden_states=prompt_embeds,
+                        ref_latents=block_bundle.ref_latents,
+                        motion_latents=block_bundle.motion_latents,
+                        cond_states=block_bundle.cond_states,
+                        audio_input=block_bundle.audio_input,
+                        audio_emb=block_bundle.audio_emb,
+                        motion_frames=block_bundle.motion_frames,
+                        add_last_motion=block_bundle.add_last_motion,
+                        drop_motion_frames=block_bundle.drop_motion_frames,
+                        kv_cache=cache_state.kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start=current_start,
+                        cache_start=None,
+                        audio_start_frame=audio_start_frame,
+                        stream_r1_mode=True,
+                        stream_r1_refresh_only=True,
+                    )
+        timings["clean_refresh_forward_body_ms"] = round(
+            (time.perf_counter() - forward_started) * 1000.0, 3
+        )
+        timings["clean_refresh_enabled"] = True
+        return timings
 
     def denoise_stream_r1_block(
         self,

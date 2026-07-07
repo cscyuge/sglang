@@ -185,7 +185,7 @@ class TestPreprocessConditionImageResolution(unittest.TestCase):
         self.assertEqual((batch.width, batch.height), (1280, 720))
 
     def test_wan_s2v_forces_reference_to_requested_resolution(self):
-        """Wan S2V matches the original repo's direct image.resize(width, height)."""
+        """Wan S2V preprocesses the reference image to the requested resolution."""
         img = Image.new("RGB", (1489, 2592), color="blue")
         batch = _make_batch(img, width=832, height=480)
         server_args = _make_server_args(WanS2VPipelineConfig())

@@ -3160,6 +3160,43 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(state.kv_states[1].local_end_index, 0)
         self.assertIsNone(state.kv_cache[0]["update_plan_buffer"].host_plan)
 
+    def test_kv_cache_state_reuses_prebuilt_update_plan_for_matching_layers(self):
+        metadata = WanS2VStreamR1CacheMetadata(
+            batch_size=1,
+            num_layers=3,
+            frame_seq_length=5,
+            local_num_attention_heads=1,
+            attention_head_dim=4,
+            local_attn_size=4,
+            sink_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        state = WanS2VStreamR1CacheState.allocate(metadata)
+
+        stats = state.prepare_kv_update_plans(noisy_seq_len=5, current_start=0)
+
+        self.assertEqual(stats["kv_plan_builds"], 1)
+        self.assertEqual(stats["kv_plan_shared_copies"], 0)
+        self.assertEqual(stats["kv_plan_shared_reuses"], 0)
+        self.assertEqual(stats["kv_plan_existing_reuses"], 2)
+        self.assertEqual(stats["kv_plan_clears"], 0)
+        snapshots = [
+            block_cache["update_plan_buffer"].scalar_snapshot()
+            for block_cache in state.kv_cache
+        ]
+        self.assertEqual(snapshots[0], snapshots[1])
+        self.assertEqual(snapshots[0], snapshots[2])
+        self.assertIs(
+            state.kv_cache[1]["update_plan_buffer"].host_plan,
+            state.kv_cache[0]["update_plan_buffer"].host_plan,
+        )
+
+        stats = state.prepare_kv_update_plans(noisy_seq_len=5, current_start=0)
+        self.assertEqual(stats["kv_plan_builds"], 0)
+        self.assertEqual(stats["kv_plan_existing_reuses"], 3)
+        self.assertEqual(stats["kv_plan_copy_from_plan_ms"], 0.0)
+
     def test_crossattn_cache_is_stage_owned_and_marked_for_refresh(self):
         stage = self._stage()
 

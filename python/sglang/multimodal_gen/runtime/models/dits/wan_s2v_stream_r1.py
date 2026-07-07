@@ -2356,6 +2356,36 @@ class WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer:
         self._copy_index_metadata_from_plan_(plan)
         self._host_plan = plan
 
+    def copy_from_buffer_(
+        self, other: "WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer"
+    ) -> None:
+        if self.scalar_values.shape != other.scalar_values.shape:
+            raise ValueError("KV update scalar buffer shape mismatch")
+        if self.rolling_cache_indices.shape != other.rolling_cache_indices.shape:
+            raise ValueError("KV update rolling cache index shape mismatch")
+        if self.rolling_cache_mask.shape != other.rolling_cache_mask.shape:
+            raise ValueError("KV update rolling cache mask shape mismatch")
+        if self.rolling_key_indices.shape != other.rolling_key_indices.shape:
+            raise ValueError("KV update rolling key index shape mismatch")
+        if self.rolling_key_mask.shape != other.rolling_key_mask.shape:
+            raise ValueError("KV update rolling key mask shape mismatch")
+        if self.rolling_target_mask.shape != other.rolling_target_mask.shape:
+            raise ValueError("KV update rolling target mask shape mismatch")
+        if self.sink_evict_indices.shape != other.sink_evict_indices.shape:
+            raise ValueError("KV update sink index shape mismatch")
+        if self.sink_copy_mask.shape != other.sink_copy_mask.shape:
+            raise ValueError("KV update sink mask shape mismatch")
+
+        self.scalar_values.copy_(other.scalar_values)
+        self.rolling_cache_indices.copy_(other.rolling_cache_indices)
+        self.rolling_cache_mask.copy_(other.rolling_cache_mask)
+        self.rolling_key_indices.copy_(other.rolling_key_indices)
+        self.rolling_key_mask.copy_(other.rolling_key_mask)
+        self.rolling_target_mask.copy_(other.rolling_target_mask)
+        self.sink_evict_indices.copy_(other.sink_evict_indices)
+        self.sink_copy_mask.copy_(other.sink_copy_mask)
+        self._host_plan = other.host_plan
+
     def clear(self) -> None:
         self.scalar_values.zero_()
         self.rolling_cache_indices.zero_()
@@ -2382,18 +2412,11 @@ class WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer:
             return
 
         device = self.scalar_values.device
-        rolling_cache_indices = torch.zeros(
-            (rolling_tokens,), dtype=torch.long, device=device
-        )
-        rolling_cache_mask = torch.zeros(
-            (rolling_tokens,), dtype=torch.bool, device=device
-        )
-        rolling_key_indices = torch.zeros(
-            (rolling_tokens,), dtype=torch.long, device=device
-        )
-        rolling_key_mask = torch.zeros(
-            (rolling_tokens,), dtype=torch.bool, device=device
-        )
+        self.rolling_cache_indices.zero_()
+        self.rolling_cache_mask.zero_()
+        self.rolling_key_indices.zero_()
+        self.rolling_key_mask.zero_()
+        self.rolling_target_mask.zero_()
 
         if rolling_tokens > 0:
             if plan.evict:
@@ -2404,13 +2427,14 @@ class WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer:
                 keep_len = max(0, plan.local_write_start - plan.update.sink_tokens)
             keep_len = max(0, min(int(keep_len), rolling_tokens))
             if keep_len > 0:
-                rolling_cache_indices[:keep_len] = torch.arange(
+                torch.arange(
                     keep_src_start,
                     keep_src_start + keep_len,
                     dtype=torch.long,
                     device=device,
+                    out=self.rolling_cache_indices[:keep_len],
                 )
-                rolling_cache_mask[:keep_len] = True
+                self.rolling_cache_mask[:keep_len].fill_(True)
 
             key_start = plan.local_write_start - plan.update.sink_tokens
             key_len = min(
@@ -2418,34 +2442,33 @@ class WanS2VStreamR1NoisyKVCacheUpdatePlanBuffer:
                 max(0, rolling_tokens - max(0, key_start)),
             )
             if key_start >= 0 and key_len > 0:
-                rolling_key_indices[key_start : key_start + key_len] = torch.arange(
+                torch.arange(
                     key_len,
                     dtype=torch.long,
                     device=device,
+                    out=self.rolling_key_indices[key_start : key_start + key_len],
                 )
-                rolling_key_mask[key_start : key_start + key_len] = True
+                self.rolling_key_mask[key_start : key_start + key_len].fill_(True)
+            torch.logical_or(
+                self.rolling_cache_mask,
+                self.rolling_key_mask,
+                out=self.rolling_target_mask,
+            )
 
-        self.rolling_cache_indices.copy_(rolling_cache_indices)
-        self.rolling_cache_mask.copy_(rolling_cache_mask)
-        self.rolling_key_indices.copy_(rolling_key_indices)
-        self.rolling_key_mask.copy_(rolling_key_mask)
-        self.rolling_target_mask.copy_(rolling_cache_mask | rolling_key_mask)
-
+        self.sink_evict_indices.zero_()
+        self.sink_copy_mask.zero_()
         if sink_tokens > 0:
-            sink_indices = torch.arange(
+            torch.arange(
                 plan.evicted_start,
                 plan.evicted_start + sink_tokens,
                 dtype=torch.long,
                 device=device,
-            ).clamp_(0, max(plan.cache_capacity - 1, 0))
-            sink_copy_len = max(0, min(plan.sink_copy_len, sink_tokens))
-            sink_copy_mask = torch.zeros(
-                (sink_tokens,), dtype=torch.bool, device=device
+                out=self.sink_evict_indices,
             )
+            self.sink_evict_indices.clamp_(0, max(plan.cache_capacity - 1, 0))
+            sink_copy_len = max(0, min(plan.sink_copy_len, sink_tokens))
             if sink_copy_len > 0:
-                sink_copy_mask[:sink_copy_len] = True
-            self.sink_evict_indices.copy_(sink_indices)
-            self.sink_copy_mask.copy_(sink_copy_mask)
+                self.sink_copy_mask[:sink_copy_len].fill_(True)
 
     def scalar_tensor(self, key: str) -> torch.Tensor:
         try:

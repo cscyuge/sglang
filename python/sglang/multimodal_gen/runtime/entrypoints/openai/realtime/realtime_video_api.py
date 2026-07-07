@@ -132,15 +132,22 @@ def _merge_realtime_debug_payload(
             payload[key] = value
 
 
-def _realtime_worker_timings(result) -> dict[str, int] | None:
+def _realtime_worker_timings(result) -> dict[str, Any] | None:
     timings = getattr(result, "realtime_timings", None)
     if not isinstance(timings, dict):
         return None
 
-    clean_timings: dict[str, int] = {}
+    clean_timings: dict[str, Any] = {}
     for key, value in timings.items():
+        clean_key = str(key)
+        if isinstance(value, bool):
+            clean_timings[clean_key] = value
+            continue
+        if isinstance(value, str):
+            clean_timings[clean_key] = value
+            continue
         try:
-            clean_timings[str(key)] = _transport_ms(float(value))
+            clean_timings[clean_key] = _transport_ms(float(value))
         except (TypeError, ValueError):
             continue
     return clean_timings or None
