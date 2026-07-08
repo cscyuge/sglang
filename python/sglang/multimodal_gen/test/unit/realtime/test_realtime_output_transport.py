@@ -195,6 +195,17 @@ def test_raw_rgb_realtime_output_adapter_reads_frame_store_handles():
     assert stats["num_frames"] == 2
     assert stats["frame_store_wait_ms"] >= 0
     assert stats["frame_store_read_ms"] >= 0
+    assert stats["frame_store_materialize_ms"] >= 0
+    assert stats["frame_store_producer_wait_ms"] >= 0
+    assert stats["frame_store_gpu_copy_ms"] >= 0
+    assert stats["frame_store_mmap_write_ms"] >= 0
+    assert stats["frame_store_producer_decode_ms"] >= 0
+    assert stats["frame_store_producer_post_ms"] >= 0
+    assert stats["frame_store_producer_clone_ms"] >= 0
+    assert stats["frame_store_producer_total_ms"] >= 0
+    assert stats["frame_store_producer_denoise_ms"] >= 0
+    assert stats["frame_store_producer_refresh_ms"] >= 0
+    assert stats["frame_store_producer_denoise_to_ready_ms"] >= 0
     assert all(not os.path.exists(handle.path) for handle in handles)
 
 

@@ -168,6 +168,10 @@ def _audio_cuda_event_profile_enabled() -> bool:
     return _env_flag("WAN_S2V_AUDIO_PROFILE_CUDA_EVENTS")
 
 
+def _output_cuda_event_profile_enabled() -> bool:
+    return _env_flag("WAN_S2V_OUTPUT_PROFILE_CUDA_EVENTS")
+
+
 def _parity_float(value: Any) -> float | str | None:
     try:
         result = float(value)
@@ -2705,6 +2709,24 @@ class WanS2VRealtimeSessionRunner:
             state_generator=state.generator,
         )
 
+        output_cuda_events: dict[str, Any] | None = None
+        output_cuda_device = torch.device(state.device)
+
+        def record_output_cuda_event(name: str) -> None:
+            if output_cuda_events is None:
+                return
+            event = torch.cuda.Event(enable_timing=True)
+            event.record(torch.cuda.current_stream(output_cuda_device))
+            output_cuda_events[name] = event
+
+        if (
+            _output_cuda_event_profile_enabled()
+            and torch.cuda.is_available()
+            and output_cuda_device.type == "cuda"
+        ):
+            output_cuda_events = {}
+
+        record_output_cuda_event("denoise_start")
         denoise_started = time.perf_counter()
         current_latents = denoising_stage.denoise_stream_r1_block(
             batch=work_batch,
@@ -2725,6 +2747,7 @@ class WanS2VRealtimeSessionRunner:
             block_index=work_batch.block_idx,
             allow_timestep_cuda_graph_capture=True,
         )
+        record_output_cuda_event("denoise_end")
         timestep_profile_rows = list(
             getattr(denoising_stage, "_last_timestep_profile_rows", [])
         )
@@ -2751,6 +2774,7 @@ class WanS2VRealtimeSessionRunner:
         clean_refresh_forward_s = 0.0
         clean_refresh_stage_timings: dict[str, Any] = {}
         if clean_refresh_decision.refresh:
+            record_output_cuda_event("refresh_start")
             clean_refresh_forward_started = time.perf_counter()
             refresh_timings = denoising_stage._clean_context_refresh(
                 block_latents=current_latents,
@@ -2771,6 +2795,7 @@ class WanS2VRealtimeSessionRunner:
                 crossattn_cache=state.crossattn_cache,
                 audio_start_frame=0,
             )
+            record_output_cuda_event("refresh_end")
             clean_refresh_forward_s = time.perf_counter() - clean_refresh_forward_started
             if isinstance(refresh_timings, dict):
                 clean_refresh_stage_timings = dict(refresh_timings)
@@ -2779,6 +2804,7 @@ class WanS2VRealtimeSessionRunner:
         state.previous_clean_latents = current_latents.detach()
         denoise_s = denoise_loop_s + clean_refresh_s
 
+        record_output_cuda_event("decode_start")
         decode_started = time.perf_counter()
         frames = self._decode_block_frames(
             decoding_stage,
@@ -2787,14 +2813,17 @@ class WanS2VRealtimeSessionRunner:
             state.stream_vae_state,
             vae_graph_cache=state.vae_graph_cache,
         )
+        record_output_cuda_event("decode_end")
         vae_decode_s = time.perf_counter() - decode_started
         post_decoding_started = time.perf_counter()
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        record_output_cuda_event("post_end")
         post_decoding_s = time.perf_counter() - post_decoding_started
         output_clone_s = 0.0
         if state.stream_vae_state.last_decode_mode in {"graph_capture", "graph_replay"}:
             clone_started = time.perf_counter()
             frames = frames.detach().clone()
+            record_output_cuda_event("clone_end")
             output_clone_s = time.perf_counter() - clone_started
         decode_s = time.perf_counter() - decode_started
         frame_count = int(frames.shape[2])
@@ -2826,9 +2855,12 @@ class WanS2VRealtimeSessionRunner:
                 handles=raw_frame_store_handles,
                 request_id=work_batch.request_id,
                 chunk_idx=work_batch.block_idx,
+                producer_timing_events=output_cuda_events,
             )
             raw_frame_metadata = dict(raw_frame_metadata)
             raw_frame_timings = dict(raw_frame_metadata.get("timings") or {})
+            if output_cuda_events is not None:
+                raw_frame_timings["output_cuda_profile_enabled"] = True
             raw_frame_timings["raw_frame_store_enqueue_ms"] = round(
                 (time.perf_counter() - frame_store_started) * 1000.0,
                 3,

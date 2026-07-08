@@ -28,9 +28,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 FRAME_STORE_MAGIC = b"SGLRTFR1"
-FRAME_STORE_HEADER_SIZE = 64
+FRAME_STORE_HEADER_SIZE = 128
 FRAME_STORE_STATUS_OFFSET = 8
 FRAME_STORE_SIZE_OFFSET = 16
+FRAME_STORE_MATERIALIZE_US_OFFSET = 24
+FRAME_STORE_PRODUCER_WAIT_US_OFFSET = 32
+FRAME_STORE_GPU_COPY_US_OFFSET = 40
+FRAME_STORE_MMAP_WRITE_US_OFFSET = 48
+FRAME_STORE_PRODUCER_DECODE_US_OFFSET = 56
+FRAME_STORE_PRODUCER_POST_US_OFFSET = 64
+FRAME_STORE_PRODUCER_CLONE_US_OFFSET = 72
+FRAME_STORE_PRODUCER_TOTAL_US_OFFSET = 80
+FRAME_STORE_PRODUCER_DENOISE_US_OFFSET = 88
+FRAME_STORE_PRODUCER_REFRESH_US_OFFSET = 96
+FRAME_STORE_PRODUCER_DENOISE_TO_READY_US_OFFSET = 104
 FRAME_STORE_PENDING = 0
 FRAME_STORE_READY = 1
 FRAME_STORE_ERROR = 2
@@ -39,6 +50,9 @@ FRAME_STORE_TIMEOUT_ENV = "SGLANG_REALTIME_FRAME_STORE_TIMEOUT_MS"
 FRAME_STORE_DEFAULT_TIMEOUT_MS = 30000.0
 FRAME_STORE_WRITER_DEFER_ENV = "SGLANG_REALTIME_FRAME_STORE_DEFER_MS"
 FRAME_STORE_DEFAULT_WRITER_DEFER_MS = 0.0
+FRAME_STORE_FLUSH_ENV = "SGLANG_REALTIME_FRAME_STORE_FLUSH"
+FRAME_STORE_DIRECT_TORCH_COPY_ENV = "SGLANG_REALTIME_FRAME_STORE_DIRECT_TORCH_COPY"
+FRAME_STORE_CUDA_SIDE_STREAM_ENV = "SGLANG_REALTIME_FRAME_STORE_CUDA_SIDE_STREAM"
 _RAW_RGB_FRAME_STORE_WRITE_REQUEST_ATTR = "_raw_rgb_frame_store_write_request"
 
 
@@ -86,6 +100,17 @@ class RealtimeFrameStoreLoadResult:
     frame_batches: list[RealtimeRawFrameBatch]
     wait_ms: float
     read_ms: float
+    materialize_ms: float
+    producer_wait_ms: float
+    gpu_copy_ms: float
+    mmap_write_ms: float
+    producer_decode_ms: float
+    producer_post_ms: float
+    producer_clone_ms: float
+    producer_total_ms: float
+    producer_denoise_ms: float
+    producer_refresh_ms: float
+    producer_denoise_to_ready_ms: float
 
 
 @dataclass
@@ -94,11 +119,30 @@ class _FrameStoreWriteRequest:
     handles: list[RealtimeFrameStoreHandle]
     request_id: str
     chunk_idx: int
+    ready_events: list[Any] | None = None
+    producer_timing_events: dict[str, Any] | None = None
+
+
+@dataclass
+class _FrameStoreWriteTimings:
+    producer_wait_ms: float = 0.0
+    gpu_copy_ms: float = 0.0
+    mmap_write_ms: float = 0.0
+    producer_decode_ms: float = 0.0
+    producer_post_ms: float = 0.0
+    producer_clone_ms: float = 0.0
+    producer_total_ms: float = 0.0
+    producer_denoise_ms: float = 0.0
+    producer_refresh_ms: float = 0.0
+    producer_denoise_to_ready_ms: float = 0.0
 
 
 _FRAME_STORE_WRITER_QUEUE: queue.SimpleQueue | None = None
 _FRAME_STORE_WRITER_THREAD: threading.Thread | None = None
 _FRAME_STORE_WRITER_LOCK = threading.Lock()
+_FRAME_STORE_CUDA_STREAMS: dict[int, torch.cuda.Stream] = {}
+_FRAME_STORE_PINNED_STAGING: dict[int, torch.Tensor] = {}
+_FRAME_STORE_CUDA_RESOURCE_LOCK = threading.Lock()
 
 
 def get_realtime_frame_store_timeout_ms() -> float:
@@ -113,6 +157,77 @@ def get_realtime_frame_store_defer_ms() -> float:
     if raw_env is not None and raw_env != "":
         return max(0.0, float(raw_env))
     return FRAME_STORE_DEFAULT_WRITER_DEFER_MS
+
+
+def should_flush_realtime_frame_store() -> bool:
+    raw_env = os.environ.get(FRAME_STORE_FLUSH_ENV)
+    if raw_env is None or raw_env == "":
+        return False
+    return raw_env.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def should_use_direct_torch_frame_store_copy() -> bool:
+    raw_env = os.environ.get(FRAME_STORE_DIRECT_TORCH_COPY_ENV)
+    if raw_env is None or raw_env == "":
+        return True
+    return raw_env.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def should_use_cuda_side_stream_frame_store() -> bool:
+    raw_env = os.environ.get(FRAME_STORE_CUDA_SIDE_STREAM_ENV)
+    if raw_env is None or raw_env == "":
+        return True
+    return raw_env.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ms_to_us_bytes(value_ms: float) -> bytes:
+    return max(0, int(round(value_ms * 1000.0))).to_bytes(
+        8,
+        "little",
+        signed=False,
+    )
+
+
+def _elapsed_event_ms(
+    events: dict[str, Any] | None,
+    start_name: str,
+    end_name: str,
+) -> float:
+    if not events:
+        return 0.0
+    start_event = events.get(start_name)
+    end_event = events.get(end_name)
+    if start_event is None or end_event is None:
+        return 0.0
+    try:
+        return max(0.0, float(start_event.elapsed_time(end_event)))
+    except Exception:
+        logger.exception(
+            "failed to read realtime frame store producer CUDA timing: %s -> %s",
+            start_name,
+            end_name,
+        )
+        return 0.0
+
+
+def _producer_event_timings(
+    events: dict[str, Any] | None,
+) -> _FrameStoreWriteTimings:
+    if not events:
+        return _FrameStoreWriteTimings()
+    return _FrameStoreWriteTimings(
+        producer_denoise_ms=_elapsed_event_ms(events, "denoise_start", "denoise_end"),
+        producer_refresh_ms=_elapsed_event_ms(events, "refresh_start", "refresh_end"),
+        producer_decode_ms=_elapsed_event_ms(events, "decode_start", "decode_end"),
+        producer_post_ms=_elapsed_event_ms(events, "decode_end", "post_end"),
+        producer_clone_ms=_elapsed_event_ms(events, "post_end", "ready"),
+        producer_total_ms=_elapsed_event_ms(events, "decode_start", "ready"),
+        producer_denoise_to_ready_ms=_elapsed_event_ms(
+            events,
+            "denoise_start",
+            "ready",
+        ),
+    )
 
 
 def _frame_store_dir() -> str:
@@ -238,25 +353,96 @@ def _write_sample_to_store(
     *,
     sample: torch.Tensor,
     handle: RealtimeFrameStoreHandle,
+    ready_event: Any | None = None,
+    producer_timing_events: dict[str, Any] | None = None,
 ) -> None:
+    started = time.monotonic()
     fd = os.open(handle.path, os.O_RDWR)
     try:
         total_size = handle.header_size + handle.payload_size
         with mmap.mmap(fd, total_size) as mm:
             if mm[: len(FRAME_STORE_MAGIC)] != FRAME_STORE_MAGIC:
                 raise RuntimeError("invalid realtime frame store magic")
-            frames = _tensor_sample_to_rgb24_array(sample)
-            if not frames.flags.c_contiguous:
-                frames = np.ascontiguousarray(frames)
-            payload = memoryview(frames).cast("B")
-            if len(payload) != handle.payload_size:
-                raise RuntimeError(
-                    "realtime frame store payload size mismatch: "
-                    f"expected={handle.payload_size}, got={len(payload)}"
+            if (
+                sample.is_cuda
+                and should_use_cuda_side_stream_frame_store()
+                and torch.cuda.is_available()
+            ):
+                timings = _write_sample_to_store_cuda_side_stream(
+                    sample=sample,
+                    mm=mm,
+                    handle=handle,
+                    ready_event=ready_event,
                 )
-            mm[handle.header_size : handle.header_size + handle.payload_size] = payload
+            elif should_use_direct_torch_frame_store_copy():
+                timings = _write_sample_to_store_direct_torch(
+                    sample=sample,
+                    mm=mm,
+                    handle=handle,
+                )
+            else:
+                timings = _write_sample_to_store_numpy(
+                    sample=sample,
+                    mm=mm,
+                    handle=handle,
+                )
+            producer_timings = _producer_event_timings(producer_timing_events)
+            timings.producer_decode_ms = producer_timings.producer_decode_ms
+            timings.producer_post_ms = producer_timings.producer_post_ms
+            timings.producer_clone_ms = producer_timings.producer_clone_ms
+            timings.producer_total_ms = producer_timings.producer_total_ms
+            timings.producer_denoise_ms = producer_timings.producer_denoise_ms
+            timings.producer_refresh_ms = producer_timings.producer_refresh_ms
+            timings.producer_denoise_to_ready_ms = (
+                producer_timings.producer_denoise_to_ready_ms
+            )
+            materialize_us = max(0, int(round((time.monotonic() - started) * 1e6)))
+            mm[
+                FRAME_STORE_MATERIALIZE_US_OFFSET : FRAME_STORE_MATERIALIZE_US_OFFSET
+                + 8
+            ] = materialize_us.to_bytes(8, "little", signed=False)
+            mm[
+                FRAME_STORE_PRODUCER_WAIT_US_OFFSET : FRAME_STORE_PRODUCER_WAIT_US_OFFSET
+                + 8
+            ] = _ms_to_us_bytes(timings.producer_wait_ms)
+            mm[
+                FRAME_STORE_GPU_COPY_US_OFFSET : FRAME_STORE_GPU_COPY_US_OFFSET + 8
+            ] = _ms_to_us_bytes(timings.gpu_copy_ms)
+            mm[
+                FRAME_STORE_MMAP_WRITE_US_OFFSET : FRAME_STORE_MMAP_WRITE_US_OFFSET
+                + 8
+            ] = _ms_to_us_bytes(timings.mmap_write_ms)
+            mm[
+                FRAME_STORE_PRODUCER_DECODE_US_OFFSET : FRAME_STORE_PRODUCER_DECODE_US_OFFSET
+                + 8
+            ] = _ms_to_us_bytes(timings.producer_decode_ms)
+            mm[
+                FRAME_STORE_PRODUCER_POST_US_OFFSET : FRAME_STORE_PRODUCER_POST_US_OFFSET
+                + 8
+            ] = _ms_to_us_bytes(timings.producer_post_ms)
+            mm[
+                FRAME_STORE_PRODUCER_CLONE_US_OFFSET : FRAME_STORE_PRODUCER_CLONE_US_OFFSET
+                + 8
+            ] = _ms_to_us_bytes(timings.producer_clone_ms)
+            mm[
+                FRAME_STORE_PRODUCER_TOTAL_US_OFFSET : FRAME_STORE_PRODUCER_TOTAL_US_OFFSET
+                + 8
+            ] = _ms_to_us_bytes(timings.producer_total_ms)
+            mm[
+                FRAME_STORE_PRODUCER_DENOISE_US_OFFSET : FRAME_STORE_PRODUCER_DENOISE_US_OFFSET
+                + 8
+            ] = _ms_to_us_bytes(timings.producer_denoise_ms)
+            mm[
+                FRAME_STORE_PRODUCER_REFRESH_US_OFFSET : FRAME_STORE_PRODUCER_REFRESH_US_OFFSET
+                + 8
+            ] = _ms_to_us_bytes(timings.producer_refresh_ms)
+            mm[
+                FRAME_STORE_PRODUCER_DENOISE_TO_READY_US_OFFSET : FRAME_STORE_PRODUCER_DENOISE_TO_READY_US_OFFSET
+                + 8
+            ] = _ms_to_us_bytes(timings.producer_denoise_to_ready_ms)
             mm[FRAME_STORE_STATUS_OFFSET] = FRAME_STORE_READY
-            mm.flush()
+            if should_flush_realtime_frame_store():
+                mm.flush()
     except Exception:
         _mark_store_status(handle.path, FRAME_STORE_ERROR)
         logger.exception(
@@ -264,6 +450,157 @@ def _write_sample_to_store(
         )
     finally:
         os.close(fd)
+
+
+def _rgb24_tensor(sample: torch.Tensor) -> torch.Tensor:
+    if sample.dim() == 3:
+        sample = sample.unsqueeze(1)
+    return (
+        (sample * 255)
+        .clamp(0, 255)
+        .to(torch.uint8)
+        .permute(1, 2, 3, 0)
+        .contiguous()
+    )
+
+
+def _write_sample_to_store_direct_torch(
+    *,
+    sample: torch.Tensor,
+    mm: mmap.mmap,
+    handle: RealtimeFrameStoreHandle,
+) -> _FrameStoreWriteTimings:
+    payload_array = np.ndarray(
+        (handle.payload_size,),
+        dtype=np.uint8,
+        buffer=mm,
+        offset=handle.header_size,
+    )
+    payload_tensor = torch.from_numpy(payload_array)
+    rgb_tensor = _rgb24_tensor(sample).reshape(-1)
+    try:
+        if int(rgb_tensor.numel()) != handle.payload_size:
+            raise RuntimeError(
+                "realtime frame store payload size mismatch: "
+                f"expected={handle.payload_size}, got={int(rgb_tensor.numel())}"
+            )
+        copy_started = time.monotonic()
+        payload_tensor.copy_(rgb_tensor, non_blocking=False)
+        copy_ms = (time.monotonic() - copy_started) * 1000.0
+        return _FrameStoreWriteTimings(gpu_copy_ms=copy_ms)
+    finally:
+        del rgb_tensor
+        del payload_tensor
+        del payload_array
+
+
+def _cuda_device_index(device: torch.device) -> int:
+    if device.index is not None:
+        return int(device.index)
+    return int(torch.cuda.current_device())
+
+
+def _get_frame_store_cuda_stream(device: torch.device) -> torch.cuda.Stream:
+    device_index = _cuda_device_index(device)
+    with _FRAME_STORE_CUDA_RESOURCE_LOCK:
+        stream = _FRAME_STORE_CUDA_STREAMS.get(device_index)
+        if stream is None:
+            with torch.cuda.device(device_index):
+                stream = torch.cuda.Stream(device=device_index)
+            _FRAME_STORE_CUDA_STREAMS[device_index] = stream
+        return stream
+
+
+def _get_frame_store_pinned_staging(payload_size: int) -> torch.Tensor:
+    with _FRAME_STORE_CUDA_RESOURCE_LOCK:
+        staging = _FRAME_STORE_PINNED_STAGING.get(payload_size)
+        if staging is None:
+            staging = torch.empty(
+                (payload_size,),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
+            _FRAME_STORE_PINNED_STAGING[payload_size] = staging
+        return staging
+
+
+def _write_sample_to_store_cuda_side_stream(
+    *,
+    sample: torch.Tensor,
+    mm: mmap.mmap,
+    handle: RealtimeFrameStoreHandle,
+    ready_event: Any | None = None,
+) -> _FrameStoreWriteTimings:
+    stream = _get_frame_store_cuda_stream(sample.device)
+    staging = _get_frame_store_pinned_staging(handle.payload_size)
+    wait_start_event = torch.cuda.Event(enable_timing=True)
+    body_start_event = torch.cuda.Event(enable_timing=True)
+    body_end_event = torch.cuda.Event(enable_timing=True)
+    rgb_tensor = None
+    with torch.cuda.stream(stream):
+        wait_start_event.record(stream)
+        if ready_event is not None:
+            stream.wait_event(ready_event)
+        body_start_event.record(stream)
+        rgb_tensor = _rgb24_tensor(sample).reshape(-1)
+        if int(rgb_tensor.numel()) != handle.payload_size:
+            raise RuntimeError(
+                "realtime frame store payload size mismatch: "
+                f"expected={handle.payload_size}, got={int(rgb_tensor.numel())}"
+            )
+        staging.copy_(rgb_tensor, non_blocking=True)
+        body_end_event.record(stream)
+    stream.synchronize()
+
+    payload_array = np.ndarray(
+        (handle.payload_size,),
+        dtype=np.uint8,
+        buffer=mm,
+        offset=handle.header_size,
+    )
+    try:
+        mmap_started = time.monotonic()
+        payload_array[:] = staging.numpy()
+        mmap_write_ms = (time.monotonic() - mmap_started) * 1000.0
+    finally:
+        del payload_array
+        if rgb_tensor is not None:
+            del rgb_tensor
+    return _FrameStoreWriteTimings(
+        producer_wait_ms=wait_start_event.elapsed_time(body_start_event),
+        gpu_copy_ms=body_start_event.elapsed_time(body_end_event),
+        mmap_write_ms=mmap_write_ms,
+    )
+
+
+def _write_sample_to_store_numpy(
+    *,
+    sample: torch.Tensor,
+    mm: mmap.mmap,
+    handle: RealtimeFrameStoreHandle,
+) -> _FrameStoreWriteTimings:
+    convert_started = time.monotonic()
+    frames = _tensor_sample_to_rgb24_array(sample)
+    convert_ms = (time.monotonic() - convert_started) * 1000.0
+    if not frames.flags.c_contiguous:
+        frames = np.ascontiguousarray(frames)
+    payload = memoryview(frames).cast("B")
+    try:
+        if len(payload) != handle.payload_size:
+            raise RuntimeError(
+                "realtime frame store payload size mismatch: "
+                f"expected={handle.payload_size}, got={len(payload)}"
+            )
+        mmap_started = time.monotonic()
+        mm[handle.header_size : handle.header_size + handle.payload_size] = payload
+        mmap_write_ms = (time.monotonic() - mmap_started) * 1000.0
+        return _FrameStoreWriteTimings(
+            gpu_copy_ms=convert_ms,
+            mmap_write_ms=mmap_write_ms,
+        )
+    finally:
+        payload.release()
 
 
 def _mark_store_handles_error(handles: list[RealtimeFrameStoreHandle]) -> None:
@@ -281,11 +618,28 @@ def _materialize_raw_rgb_frame_store_request(
                 "realtime frame store request mismatch: "
                 f"samples={len(request.samples)}, handles={len(request.handles)}"
             )
+        ready_events = request.ready_events
+        if ready_events is None:
+            ready_events = [None] * len(request.samples)
+        if len(ready_events) != len(request.samples):
+            raise RuntimeError(
+                "realtime frame store ready-event mismatch: "
+                f"events={len(ready_events)}, samples={len(request.samples)}"
+            )
         defer_ms = get_realtime_frame_store_defer_ms()
         if defer_ms > 0:
             time.sleep(defer_ms / 1000.0)
-        for sample, handle in zip(request.samples, request.handles):
-            _write_sample_to_store(sample=sample, handle=handle)
+        for sample, handle, ready_event in zip(
+            request.samples,
+            request.handles,
+            ready_events,
+        ):
+            _write_sample_to_store(
+                sample=sample,
+                handle=handle,
+                ready_event=ready_event,
+                producer_timing_events=request.producer_timing_events,
+            )
     except Exception:
         _mark_store_handles_error(request.handles)
         logger.exception(
@@ -343,12 +697,27 @@ def create_raw_rgb_frame_store_write_request(
     handles: list[RealtimeFrameStoreHandle],
     request_id: str,
     chunk_idx: int,
+    producer_timing_events: dict[str, Any] | None = None,
 ) -> _FrameStoreWriteRequest:
+    samples = _iter_tensor_samples(output)
+    ready_events: list[Any] = []
+    for sample in samples:
+        if sample.is_cuda and torch.cuda.is_available():
+            event = torch.cuda.Event(enable_timing=producer_timing_events is not None)
+            event.record(torch.cuda.current_stream(sample.device))
+            ready_events.append(event)
+        else:
+            ready_events.append(None)
+    if producer_timing_events is not None and ready_events:
+        producer_timing_events = dict(producer_timing_events)
+        producer_timing_events["ready"] = ready_events[0]
     return _FrameStoreWriteRequest(
-        samples=_iter_tensor_samples(output),
+        samples=samples,
         handles=handles,
         request_id=request_id,
         chunk_idx=chunk_idx,
+        ready_events=ready_events,
+        producer_timing_events=producer_timing_events,
     )
 
 
@@ -359,6 +728,7 @@ def attach_raw_rgb_frame_store_writer_request(
     handles: list[RealtimeFrameStoreHandle],
     request_id: str,
     chunk_idx: int,
+    producer_timing_events: dict[str, Any] | None = None,
 ) -> None:
     setattr(
         output_batch,
@@ -368,6 +738,7 @@ def attach_raw_rgb_frame_store_writer_request(
             handles=handles,
             request_id=request_id,
             chunk_idx=chunk_idx,
+            producer_timing_events=producer_timing_events,
         ),
     )
 
@@ -399,6 +770,7 @@ def start_raw_rgb_frame_store_writer(
     handles: list[RealtimeFrameStoreHandle],
     request_id: str,
     chunk_idx: int,
+    producer_timing_events: dict[str, Any] | None = None,
 ) -> threading.Thread:
     return start_raw_rgb_frame_store_writer_request(
         create_raw_rgb_frame_store_write_request(
@@ -406,6 +778,7 @@ def start_raw_rgb_frame_store_writer(
             handles=handles,
             request_id=request_id,
             chunk_idx=chunk_idx,
+            producer_timing_events=producer_timing_events,
         )
     )
 
@@ -414,7 +787,19 @@ def _wait_for_store_ready(
     handle: RealtimeFrameStoreHandle,
     *,
     timeout_ms: float,
-) -> None:
+) -> tuple[
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+]:
     deadline = time.monotonic() + timeout_ms / 1000.0 if timeout_ms > 0 else None
     while True:
         with open(handle.path, "rb") as fp:
@@ -424,8 +809,108 @@ def _wait_for_store_ready(
                 if mm[: len(FRAME_STORE_MAGIC)] != FRAME_STORE_MAGIC:
                     raise RuntimeError("invalid realtime frame store magic")
                 status = mm[FRAME_STORE_STATUS_OFFSET]
+                materialize_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_MATERIALIZE_US_OFFSET : FRAME_STORE_MATERIALIZE_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                producer_wait_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_PRODUCER_WAIT_US_OFFSET : FRAME_STORE_PRODUCER_WAIT_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                gpu_copy_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_GPU_COPY_US_OFFSET : FRAME_STORE_GPU_COPY_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                mmap_write_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_MMAP_WRITE_US_OFFSET : FRAME_STORE_MMAP_WRITE_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                producer_decode_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_PRODUCER_DECODE_US_OFFSET : FRAME_STORE_PRODUCER_DECODE_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                producer_post_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_PRODUCER_POST_US_OFFSET : FRAME_STORE_PRODUCER_POST_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                producer_clone_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_PRODUCER_CLONE_US_OFFSET : FRAME_STORE_PRODUCER_CLONE_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                producer_total_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_PRODUCER_TOTAL_US_OFFSET : FRAME_STORE_PRODUCER_TOTAL_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                producer_denoise_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_PRODUCER_DENOISE_US_OFFSET : FRAME_STORE_PRODUCER_DENOISE_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                producer_refresh_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_PRODUCER_REFRESH_US_OFFSET : FRAME_STORE_PRODUCER_REFRESH_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
+                producer_denoise_to_ready_us = int.from_bytes(
+                    mm[
+                        FRAME_STORE_PRODUCER_DENOISE_TO_READY_US_OFFSET : FRAME_STORE_PRODUCER_DENOISE_TO_READY_US_OFFSET
+                        + 8
+                    ],
+                    "little",
+                    signed=False,
+                )
         if status == FRAME_STORE_READY:
-            return
+            return (
+                materialize_us / 1000.0,
+                producer_wait_us / 1000.0,
+                gpu_copy_us / 1000.0,
+                mmap_write_us / 1000.0,
+                producer_decode_us / 1000.0,
+                producer_post_us / 1000.0,
+                producer_clone_us / 1000.0,
+                producer_total_us / 1000.0,
+                producer_denoise_us / 1000.0,
+                producer_refresh_us / 1000.0,
+                producer_denoise_to_ready_us / 1000.0,
+            )
         if status == FRAME_STORE_ERROR:
             raise RuntimeError("realtime frame store materialization failed")
         if deadline is not None and time.monotonic() >= deadline:
@@ -446,11 +931,45 @@ def load_raw_rgb_frame_store_handles(
     frame_batches: list[RealtimeRawFrameBatch] = []
     wait_ms = 0.0
     read_ms = 0.0
+    materialize_ms = 0.0
+    producer_wait_ms = 0.0
+    gpu_copy_ms = 0.0
+    mmap_write_ms = 0.0
+    producer_decode_ms = 0.0
+    producer_post_ms = 0.0
+    producer_clone_ms = 0.0
+    producer_total_ms = 0.0
+    producer_denoise_ms = 0.0
+    producer_refresh_ms = 0.0
+    producer_denoise_to_ready_ms = 0.0
     for handle in handles:
         wait_start = time.monotonic()
         read_start: float | None = None
         try:
-            _wait_for_store_ready(handle, timeout_ms=timeout_ms)
+            (
+                materialize_delta_ms,
+                producer_wait_delta_ms,
+                gpu_copy_delta_ms,
+                mmap_write_delta_ms,
+                producer_decode_delta_ms,
+                producer_post_delta_ms,
+                producer_clone_delta_ms,
+                producer_total_delta_ms,
+                producer_denoise_delta_ms,
+                producer_refresh_delta_ms,
+                producer_denoise_to_ready_delta_ms,
+            ) = _wait_for_store_ready(handle, timeout_ms=timeout_ms)
+            materialize_ms += materialize_delta_ms
+            producer_wait_ms += producer_wait_delta_ms
+            gpu_copy_ms += gpu_copy_delta_ms
+            mmap_write_ms += mmap_write_delta_ms
+            producer_decode_ms += producer_decode_delta_ms
+            producer_post_ms += producer_post_delta_ms
+            producer_clone_ms += producer_clone_delta_ms
+            producer_total_ms += producer_total_delta_ms
+            producer_denoise_ms += producer_denoise_delta_ms
+            producer_refresh_ms += producer_refresh_delta_ms
+            producer_denoise_to_ready_ms += producer_denoise_to_ready_delta_ms
             wait_ms += (time.monotonic() - wait_start) * 1000.0
 
             read_start = time.monotonic()
@@ -482,4 +1001,15 @@ def load_raw_rgb_frame_store_handles(
         frame_batches=frame_batches,
         wait_ms=wait_ms,
         read_ms=read_ms,
+        materialize_ms=materialize_ms,
+        producer_wait_ms=producer_wait_ms,
+        gpu_copy_ms=gpu_copy_ms,
+        mmap_write_ms=mmap_write_ms,
+        producer_decode_ms=producer_decode_ms,
+        producer_post_ms=producer_post_ms,
+        producer_clone_ms=producer_clone_ms,
+        producer_total_ms=producer_total_ms,
+        producer_denoise_ms=producer_denoise_ms,
+        producer_refresh_ms=producer_refresh_ms,
+        producer_denoise_to_ready_ms=producer_denoise_to_ready_ms,
     )

@@ -334,29 +334,28 @@ class Scheduler(SchedulerDisaggMixin):
                 discard_raw_rgb_frame_store_writer_request(frame_store_write_request)
             return
 
+        writer_started = False
+        if frame_store_write_request is not None:
+            try:
+                start_raw_rgb_frame_store_writer_request(frame_store_write_request)
+                writer_started = True
+            except Exception:
+                logger.exception("failed to start realtime frame store writer")
+                discard_raw_rgb_frame_store_writer_request(frame_store_write_request)
+                raise
+
         sent = False
         try:
             payload = pickle.dumps(output_batch)
             self.receiver.send_multipart([identity, b"", payload])
             sent = True
         finally:
-            if frame_store_write_request is not None:
-                if sent:
-                    try:
-                        start_raw_rgb_frame_store_writer_request(
-                            frame_store_write_request
-                        )
-                    except Exception:
-                        logger.exception(
-                            "failed to start realtime frame store writer"
-                        )
-                        discard_raw_rgb_frame_store_writer_request(
-                            frame_store_write_request
-                        )
-                else:
-                    discard_raw_rgb_frame_store_writer_request(
-                        frame_store_write_request
-                    )
+            if (
+                frame_store_write_request is not None
+                and writer_started
+                and not sent
+            ):
+                discard_raw_rgb_frame_store_writer_request(frame_store_write_request)
 
     def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
         """pull a req from waiting_queue"""

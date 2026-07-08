@@ -74,6 +74,17 @@ class RealtimeFrameSendStats(TypedDict):
     raw_payload_build_ms: float
     frame_store_wait_ms: float
     frame_store_read_ms: float
+    frame_store_materialize_ms: float
+    frame_store_producer_wait_ms: float
+    frame_store_gpu_copy_ms: float
+    frame_store_mmap_write_ms: float
+    frame_store_producer_decode_ms: float
+    frame_store_producer_post_ms: float
+    frame_store_producer_clone_ms: float
+    frame_store_producer_total_ms: float
+    frame_store_producer_denoise_ms: float
+    frame_store_producer_refresh_ms: float
+    frame_store_producer_denoise_to_ready_ms: float
     output_enqueue_wait_ms: float
     output_queue_delay_ms: float
     output_queue_size: int
@@ -95,6 +106,17 @@ def empty_frame_send_stats(content_type: str = "") -> RealtimeFrameSendStats:
         "raw_payload_build_ms": 0.0,
         "frame_store_wait_ms": 0.0,
         "frame_store_read_ms": 0.0,
+        "frame_store_materialize_ms": 0.0,
+        "frame_store_producer_wait_ms": 0.0,
+        "frame_store_gpu_copy_ms": 0.0,
+        "frame_store_mmap_write_ms": 0.0,
+        "frame_store_producer_decode_ms": 0.0,
+        "frame_store_producer_post_ms": 0.0,
+        "frame_store_producer_clone_ms": 0.0,
+        "frame_store_producer_total_ms": 0.0,
+        "frame_store_producer_denoise_ms": 0.0,
+        "frame_store_producer_refresh_ms": 0.0,
+        "frame_store_producer_denoise_to_ready_ms": 0.0,
         "output_enqueue_wait_ms": 0.0,
         "output_queue_delay_ms": 0.0,
         "output_queue_size": 0,
@@ -734,6 +756,33 @@ class RawRGBRealtimeOutputAdapter:
         if frame_store_load is not None:
             stats["frame_store_wait_ms"] += frame_store_load.wait_ms
             stats["frame_store_read_ms"] += frame_store_load.read_ms
+            stats["frame_store_materialize_ms"] += frame_store_load.materialize_ms
+            stats["frame_store_producer_wait_ms"] += (
+                frame_store_load.producer_wait_ms
+            )
+            stats["frame_store_gpu_copy_ms"] += frame_store_load.gpu_copy_ms
+            stats["frame_store_mmap_write_ms"] += frame_store_load.mmap_write_ms
+            stats["frame_store_producer_decode_ms"] += (
+                frame_store_load.producer_decode_ms
+            )
+            stats["frame_store_producer_post_ms"] += (
+                frame_store_load.producer_post_ms
+            )
+            stats["frame_store_producer_clone_ms"] += (
+                frame_store_load.producer_clone_ms
+            )
+            stats["frame_store_producer_total_ms"] += (
+                frame_store_load.producer_total_ms
+            )
+            stats["frame_store_producer_denoise_ms"] += (
+                frame_store_load.producer_denoise_ms
+            )
+            stats["frame_store_producer_refresh_ms"] += (
+                frame_store_load.producer_refresh_ms
+            )
+            stats["frame_store_producer_denoise_to_ready_ms"] += (
+                frame_store_load.producer_denoise_to_ready_ms
+            )
         stats["frame_shape"] = _frame_shape_from_metadata(frame_metadata)
         return stats
 

@@ -181,7 +181,15 @@ def _log_realtime_chunk_timing(
         "output_queue_size=%d "
         "output_pace=%.2fms "
         "header_pack=%.2fms "
-        "header_write=%.2fms frame_store_wait=%.2fms frame_store_read=%.2fms "
+        "header_write=%.2fms frame_store_wait=%.2fms "
+        "frame_store_read=%.2fms frame_store_materialize=%.2fms "
+        "frame_store_producer_wait=%.2fms frame_store_gpu_copy=%.2fms "
+        "frame_store_mmap_write=%.2fms "
+        "frame_store_producer_denoise=%.2fms "
+        "frame_store_producer_refresh=%.2fms "
+        "frame_store_producer_decode=%.2fms frame_store_producer_post=%.2fms "
+        "frame_store_producer_clone=%.2fms frame_store_producer_total=%.2fms "
+        "frame_store_producer_denoise_to_ready=%.2fms "
         "raw_payload_build=%.2fms raw_write=%.2fms "
         "ws_write=%.2fms chunk_total=%.2fms batches=%d frames=%d "
         "frame_shape=%s raw_bytes=%d ws_payload_bytes=%d content_type=%s",
@@ -200,6 +208,17 @@ def _log_realtime_chunk_timing(
         send_stats["header_write_ms"],
         send_stats.get("frame_store_wait_ms", 0.0),
         send_stats.get("frame_store_read_ms", 0.0),
+        send_stats.get("frame_store_materialize_ms", 0.0),
+        send_stats.get("frame_store_producer_wait_ms", 0.0),
+        send_stats.get("frame_store_gpu_copy_ms", 0.0),
+        send_stats.get("frame_store_mmap_write_ms", 0.0),
+        send_stats.get("frame_store_producer_denoise_ms", 0.0),
+        send_stats.get("frame_store_producer_refresh_ms", 0.0),
+        send_stats.get("frame_store_producer_decode_ms", 0.0),
+        send_stats.get("frame_store_producer_post_ms", 0.0),
+        send_stats.get("frame_store_producer_clone_ms", 0.0),
+        send_stats.get("frame_store_producer_total_ms", 0.0),
+        send_stats.get("frame_store_producer_denoise_to_ready_ms", 0.0),
         send_stats["raw_payload_build_ms"],
         send_stats["raw_write_ms"],
         send_stats["ws_write_ms"],
@@ -251,6 +270,39 @@ async def _send_realtime_chunk_stats(
         ),
         "frame_store_read_ms": _transport_ms(
             send_stats.get("frame_store_read_ms", 0.0)
+        ),
+        "frame_store_materialize_ms": _transport_ms(
+            send_stats.get("frame_store_materialize_ms", 0.0)
+        ),
+        "frame_store_producer_wait_ms": _transport_ms(
+            send_stats.get("frame_store_producer_wait_ms", 0.0)
+        ),
+        "frame_store_gpu_copy_ms": _transport_ms(
+            send_stats.get("frame_store_gpu_copy_ms", 0.0)
+        ),
+        "frame_store_mmap_write_ms": _transport_ms(
+            send_stats.get("frame_store_mmap_write_ms", 0.0)
+        ),
+        "frame_store_producer_denoise_ms": _transport_ms(
+            send_stats.get("frame_store_producer_denoise_ms", 0.0)
+        ),
+        "frame_store_producer_refresh_ms": _transport_ms(
+            send_stats.get("frame_store_producer_refresh_ms", 0.0)
+        ),
+        "frame_store_producer_decode_ms": _transport_ms(
+            send_stats.get("frame_store_producer_decode_ms", 0.0)
+        ),
+        "frame_store_producer_post_ms": _transport_ms(
+            send_stats.get("frame_store_producer_post_ms", 0.0)
+        ),
+        "frame_store_producer_clone_ms": _transport_ms(
+            send_stats.get("frame_store_producer_clone_ms", 0.0)
+        ),
+        "frame_store_producer_total_ms": _transport_ms(
+            send_stats.get("frame_store_producer_total_ms", 0.0)
+        ),
+        "frame_store_producer_denoise_to_ready_ms": _transport_ms(
+            send_stats.get("frame_store_producer_denoise_to_ready_ms", 0.0)
         ),
         "raw_payload_build_ms": _transport_ms(send_stats["raw_payload_build_ms"]),
         "raw_write_ms": _transport_ms(send_stats["raw_write_ms"]),
