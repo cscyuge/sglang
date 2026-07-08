@@ -22,6 +22,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
     RealtimeFrameSendStats,
     send_realtime_ws_bytes,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_sink import (
+    BaseRealtimeOutputSink,
+    WebSocketRealtimeOutputSink,
+    create_realtime_output_sink,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
@@ -191,7 +196,9 @@ def _log_realtime_chunk_timing(
         "frame_store_producer_clone=%.2fms frame_store_producer_total=%.2fms "
         "frame_store_producer_denoise_to_ready=%.2fms "
         "raw_payload_build=%.2fms raw_write=%.2fms "
-        "ws_write=%.2fms chunk_total=%.2fms batches=%d frames=%d "
+        "ws_write=%.2fms artc_enqueue_wait=%.2fms "
+        "artc_queue_delay=%.2fms artc_queue_size=%d artc_push=%.2fms "
+        "chunk_total=%.2fms batches=%d frames=%d "
         "frame_shape=%s raw_bytes=%d ws_payload_bytes=%d content_type=%s",
         session.id,
         chunk.request_id,
@@ -222,6 +229,10 @@ def _log_realtime_chunk_timing(
         send_stats["raw_payload_build_ms"],
         send_stats["raw_write_ms"],
         send_stats["ws_write_ms"],
+        send_stats.get("artc_enqueue_wait_ms", 0.0),
+        send_stats.get("artc_queue_delay_ms", 0.0),
+        send_stats.get("artc_queue_size", 0),
+        send_stats.get("artc_push_ms", 0.0),
         chunk_total_ms,
         send_stats["num_batches"],
         send_stats["num_frames"],
@@ -307,6 +318,15 @@ async def _send_realtime_chunk_stats(
         "raw_payload_build_ms": _transport_ms(send_stats["raw_payload_build_ms"]),
         "raw_write_ms": _transport_ms(send_stats["raw_write_ms"]),
         "ws_write_ms": _transport_ms(send_stats["ws_write_ms"]),
+        "artc_enqueue_wait_ms": _transport_ms(
+            send_stats.get("artc_enqueue_wait_ms", 0.0)
+        ),
+        "artc_queue_delay_ms": _transport_ms(
+            send_stats.get("artc_queue_delay_ms", 0.0)
+        ),
+        "artc_queue_size": int(send_stats.get("artc_queue_size", 0)),
+        "artc_push_ms": _transport_ms(send_stats.get("artc_push_ms", 0.0)),
+        "artc_dropped_chunks": int(send_stats.get("artc_dropped_chunks", 0)),
         "chunk_total_ms": _transport_ms(chunk_total_ms),
         "num_batches": send_stats["num_batches"],
         "num_frames": send_stats["num_frames"],
@@ -369,6 +389,10 @@ class RealtimeOutputPipeline:
         self._failed: BaseException | None = None
         self._failure_event = asyncio.Event()
         self._closed = False
+        self.output_sink = session.output_sink
+        if self.output_sink is None:
+            self.output_sink = create_realtime_output_sink(ws, session)
+            session.set_output_sink(self.output_sink)
         self._worker_task = asyncio.create_task(
             self._run(),
             name=f"realtime-output-{session.id}",
@@ -377,10 +401,28 @@ class RealtimeOutputPipeline:
     def raise_if_failed(self) -> None:
         if self._failed is not None:
             raise self._failed
+        self.output_sink.raise_if_failed()
 
     async def wait_failed(self) -> None:
-        await self._failure_event.wait()
-        self.raise_if_failed()
+        pipeline_failure_task = asyncio.create_task(self._failure_event.wait())
+        sink_failure_task = asyncio.create_task(self.output_sink.wait_failed())
+        try:
+            done, pending = await asyncio.wait(
+                {pipeline_failure_task, sink_failure_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                await _await_realtime_task(task)
+            for task in done:
+                await task
+            self.raise_if_failed()
+        finally:
+            for task in (pipeline_failure_task, sink_failure_task):
+                if not task.done():
+                    task.cancel()
+                    await _await_realtime_task(task)
 
     async def submit(
         self,
@@ -447,13 +489,17 @@ class RealtimeOutputPipeline:
     async def close(self) -> None:
         self._closed = True
         await self.drain()
-        await self.cancel()
+        await self.output_sink.close()
+        if not self._worker_task.done():
+            self._worker_task.cancel()
+        await _await_realtime_task(self._worker_task)
 
     async def cancel(self) -> None:
         self._closed = True
         if not self._worker_task.done():
             self._worker_task.cancel()
         await _await_realtime_task(self._worker_task)
+        await self.output_sink.cancel()
 
     async def _run(self) -> None:
         try:
@@ -475,6 +521,7 @@ class RealtimeOutputPipeline:
                         output_enqueue_wait_ms=item.output_enqueue_wait_ms,
                         output_queue_delay_ms=output_queue_delay_ms,
                         output_queue_size=item.output_queue_size,
+                        output_sink=self.output_sink,
                     )
                 finally:
                     self._queue.task_done()
@@ -645,16 +692,20 @@ async def _send_output_and_log(
     output_enqueue_wait_ms: float = 0.0,
     output_queue_delay_ms: float = 0.0,
     output_queue_size: int = 0,
+    output_sink: BaseRealtimeOutputSink | None = None,
 ) -> RealtimeFrameSendStats:
     if session.adapter is None:
         raise ValueError("realtime adapter is not initialized")
+    if output_sink is None:
+        output_sink = session.output_sink
+        if output_sink is None:
+            if session.request is None:
+                output_sink = WebSocketRealtimeOutputSink(ws)
+            else:
+                output_sink = create_realtime_output_sink(ws, session)
+            session.set_output_sink(output_sink)
     pace_wait_ms = await _wait_for_realtime_output_slot(session, batch, result)
-    send_stats = await session.adapter.send_output(
-        ws,
-        session,
-        result,
-        batch,
-    )
+    send_stats = await output_sink.send(session, result, batch)
     send_stats["pace_wait_ms"] = pace_wait_ms
     send_stats["output_enqueue_wait_ms"] = output_enqueue_wait_ms
     send_stats["output_queue_delay_ms"] = output_queue_delay_ms
@@ -772,6 +823,8 @@ async def _send_realtime_init_ack(
             payload,
             session.adapter.build_init_ack(session, request),
         )
+    if session.output_sink is not None:
+        _merge_realtime_debug_payload(payload, session.output_sink.build_init_ack())
     await send_realtime_ws_bytes(ws, msgspec.msgpack.encode(payload))
 
 
@@ -879,6 +932,7 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
 
             # Keep session state update atomic with validated request.
             session.set_request(realtime_req)
+            session.set_output_sink(create_realtime_output_sink(ws, session))
             await _send_realtime_init_ack(ws, session, realtime_req)
             break
         except WebSocketDisconnect:
@@ -933,6 +987,8 @@ async def _cleanup_realtime_session(
         )
     if session.input_temp_dir is not None:
         shutil.rmtree(session.input_temp_dir, ignore_errors=True)
+    if session.output_sink is not None:
+        await session.output_sink.cancel()
     session.dispose()
 
 

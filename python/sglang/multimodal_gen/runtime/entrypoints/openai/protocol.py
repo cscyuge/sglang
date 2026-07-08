@@ -147,6 +147,13 @@ class VideoRemixRequest(BaseModel):
     prompt: str
 
 
+class RealtimeArtcOutputConfig(BaseModel):
+    token: str
+    channel: str
+    userid: Optional[str] = None
+    queue_size: Optional[int] = Field(default=None, ge=1)
+
+
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     type: Literal["init"]
     # WebSocket does not support multipart/form-data image uploads.
@@ -159,6 +166,8 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     profile: Optional[bool] = False
     num_profiled_timesteps: Optional[int] = None
     profile_all_stages: Optional[bool] = False
+    output_transport: Optional[Literal["ws", "websocket", "artc"]] = "ws"
+    artc: Optional[RealtimeArtcOutputConfig] = None
     realtime_output_format: Optional[Literal["raw", "webp", "jpeg", "h264"]] = None
     realtime_preview_max_width: Optional[int] = None
     realtime_output_pacing: Optional[bool] = False

@@ -1,6 +1,6 @@
 # Wan2.2-S2V 实时生成接口接入文档
 
-日期：2026-07-06
+日期：2026-07-08
 
 适用接口：`/v1/realtime_video/generate`
 
@@ -22,7 +22,7 @@ ws://<host>:<port>/v1/realtime_video/generate
 2. 发送 `init`，创建实时生成会话。
 3. 接收 `init_ack`，读取音频窗口参数和服务端限制。
 4. 持续发送 `audio.delta`。
-5. 持续接收 `event_ack`、视频 payload 和 `chunk_stats`。
+5. 持续接收 `event_ack`、视频输出和 `chunk_stats`。
 6. 音频结束时发送 `audio.end`。
 7. 服务端生成完成后结束会话；异常时返回 `error`。
 
@@ -91,6 +91,7 @@ async with websockets.connect(
   "max_chunks": 20,
   "realtime_output_format": "h264",
   "realtime_output_pacing": false,
+  "output_transport": "ws",
   "seed": 42,
   "guidance_scale": 1.0
 }
@@ -108,8 +109,47 @@ async with websockets.connect(
 | `max_chunks` | 否 | 最多生成多少个视频 chunk；长会话可按业务策略设置。 |
 | `realtime_output_format` | 否 | `h264` / `raw` / `jpeg` / `webp`，默认 `raw`。真实接入建议用 `h264`。 |
 | `realtime_output_pacing` | 否 | 是否由服务端按输出 fps 节奏发送。低延迟接入通常设为 `false`。 |
+| `output_transport` | 否 | 视频输出通道。`ws` 表示视频 payload 从当前 WebSocket 返回，默认值；`artc` 表示视频通过 ARTC 推到指定频道，WebSocket 只返回控制消息和统计。 |
+| `artc` | 条件必填 | `output_transport="artc"` 时必填，见下文。 |
 | `seed` | 否 | 随机种子。 |
 | `guidance_scale` | 否 | 生成参数，默认按服务端配置。 |
+
+### WebSocket 输出
+
+默认 `output_transport="ws"`。视频 payload 会通过同一个 WebSocket 返回，`realtime_output_format` 决定 payload 格式。
+
+### ARTC 输出
+
+如果调用端希望使用 ARTC/RTC 播放链路，`init` 中设置：
+
+```json
+{
+  "type": "init",
+  "prompt": "A person is talking. Only the foreground person is moving, the background remains static.",
+  "first_frame": "data:image/jpeg;base64,...",
+  "fps": 16,
+  "size": "480x832",
+  "max_chunks": 20,
+  "output_transport": "artc",
+  "artc": {
+    "token": "<artc-token>",
+    "channel": "<channel-id>",
+    "userid": "sglang",
+    "queue_size": 2
+  }
+}
+```
+
+`artc` 字段：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `token` | 是 | 调用端为该频道和用户生成的 ARTC 入会 token。 |
+| `channel` | 是 | ARTC 频道 ID。服务端会作为推流端加入该频道。 |
+| `userid` | 否 | 服务端推流用户 ID，默认 `sglang`。同一频道内应避免和播放端用户 ID 冲突。 |
+| `queue_size` | 否 | 服务端 ARTC 输出队列深度，默认 2。队列满会返回 backpressure 错误并结束会话。 |
+
+使用 ARTC 时，WebSocket 仍是控制面：调用端继续通过 WebSocket 发送 `audio.delta` / `audio.end`，并接收 `init_ack`、`event_ack`、`chunk_stats` 和 `error`。视频帧不会再作为 WebSocket payload 返回，播放端应从 ARTC 频道订阅音视频流。
 
 ## 5. `init_ack`
 
@@ -122,6 +162,7 @@ async with websockets.connect(
   "type": "init_ack",
   "session_id": "68abe073d38a428599b1409a5a1a182c",
   "server_ack_ms": 12,
+  "output_transport": "ws",
   "request": {
     "fps": 16,
     "max_chunks": 20,
@@ -151,6 +192,26 @@ async with websockets.connect(
 - `steady_window_ms`：后续 chunk 需要的音频时长。
 - `first_public_frames` / `steady_public_frames`：首个和后续 chunk 的视频帧数。
 - `max_buffered_audio_ms`：服务端允许的最大未消费音频时长。
+
+如果 `output_transport="artc"`，`init_ack` 还会包含 ARTC 输出信息：
+
+```json
+{
+  "type": "init_ack",
+  "session_id": "68abe073d38a428599b1409a5a1a182c",
+  "output_transport": "artc",
+  "artc": {
+    "channel": "demo-channel",
+    "userid": "sglang",
+    "width": 480,
+    "height": 832,
+    "fps": 16,
+    "queue_size": 2
+  }
+}
+```
+
+调用端可用这些字段确认实际推流频道、分辨率和帧率。
 
 ## 6. 音频输入
 
@@ -268,7 +329,9 @@ async with websockets.connect(
 
 ## 8. 视频输出
 
-服务端可能返回两种视频 payload 形式：
+### WebSocket 视频输出
+
+当 `output_transport="ws"` 时，服务端可能返回两种视频 payload 形式：
 
 - `frame_batch_header` + 下一条二进制 payload。
 - `frame_batch`，header 和 payload 打包在同一条 msgpack 消息中。
@@ -327,6 +390,17 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 
 这两种格式只建议用于预览，不建议作为主实时视频传输。
 
+### ARTC 视频输出
+
+当 `output_transport="artc"` 时，视频和对应音频通过 ARTC 频道推送，不再通过 WebSocket 返回 `frame_batch_header` 或 `frame_batch`。WebSocket 只返回控制消息和 `chunk_stats`。
+
+调用端应：
+
+- 在发送 `init` 前准备好 `token`、`channel`、`userid`。
+- 使用播放端 SDK 订阅同一个 ARTC 频道。
+- 仍然持续读取 WebSocket，处理 `event_ack`、`chunk_stats` 和 `error`。
+- 使用 `chunk_stats.audio_window` 做业务侧时间线调试；播放时钟由 ARTC 播放端负责。
+
 ## 9. `chunk_stats`
 
 每个视频 chunk 输出后，服务端返回 `chunk_stats`。
@@ -367,6 +441,32 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 - `audio_window.is_final`：是否为最终 chunk。
 - `server_chunk_start_ms` / `server_chunk_end_ms`：服务端相对会话时间，可用于端到端调试。
 
+如果视频走 ARTC，`chunk_stats` 的 `content_type` 为 `video/artc`，`ws_payload_bytes` 为 0，并会包含 ARTC 输出队列相关字段：
+
+```json
+{
+  "type": "chunk_stats",
+  "chunk_index": 0,
+  "num_frames": 9,
+  "content_type": "video/artc",
+  "ws_payload_bytes": 0,
+  "artc_enqueue_wait_ms": 0,
+  "artc_queue_size": 1,
+  "raw_bytes": 10782720,
+  "audio_window": {
+    "pts_start_ms": 0.0,
+    "pts_end_ms": 562.5,
+    "duration_ms": 562.5
+  }
+}
+```
+
+说明：
+
+- `artc_enqueue_wait_ms`：服务端把当前 chunk 放入 ARTC 输出队列的耗时。
+- `artc_queue_size`：入队后 ARTC 输出队列深度。
+- `raw_bytes`：该 chunk 推给 ARTC 前的 RGB 原始帧字节数，仅用于带宽/调试估算；调用端不会通过 WebSocket 收到这些字节。
+
 音画对齐建议：
 
 - 以音频播放时钟为主时钟。
@@ -401,7 +501,7 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 
 ### 输出侧
 
-调用端必须持续读取输出。如果长时间不读，服务端可能返回：
+调用端必须持续读取 WebSocket 输出。如果长时间不读，服务端可能返回：
 
 ```json
 {
@@ -412,6 +512,18 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 ```
 
 收到该错误后应释放本地状态并重新建立会话。
+
+如果视频走 ARTC，服务端还会限制 ARTC 输出队列深度。队列满时可能返回：
+
+```json
+{
+  "type": "error",
+  "code": "artc_output_backpressure",
+  "content": "ARTC output queue is full"
+}
+```
+
+收到该错误后应释放本地状态并重新建立会话。调用端可以降低生成 chunk 频率、减少并发会话，或检查播放端/网络是否无法及时消费。
 
 ## 11. 错误处理
 
@@ -445,6 +557,10 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 | `audio_end_final_seq_mismatch` | `final_seq` 不匹配。 | 修正 `final_seq`。 |
 | `audio_buffer_overflow` | 输入音频队列超限。 | 降低提前发送量，稍后重发。 |
 | `output_write_timeout` | 调用端读取输出太慢。 | 持续读取输出或重连。 |
+| `missing_artc_config` | `output_transport="artc"` 但缺少 `artc` 配置。 | 补齐 `artc.token` 和 `artc.channel`。 |
+| `missing_artc_size` | ARTC 输出无法确定视频尺寸。 | 在 `init` 中提供合法 `size` 或宽高。 |
+| `artc_output_backpressure` | ARTC 输出队列已满。 | 释放会话并重连；检查播放端、网络和队列配置。 |
+| `artc_output_failed` | ARTC 推流失败。 | 释放会话并重连；检查 token、频道、网络和 ARTC SDK 日志。 |
 | `session_busy` | 服务端已有活跃会话。 | 等待后重试。 |
 
 ## 12. 推荐客户端结构
@@ -503,7 +619,8 @@ async def receiver(ws, queue_state):
 
 ## 13. 接入建议
 
-- 在线接入优先使用 `realtime_output_format="h264"`。
+- WebSocket 视频输出优先使用 `realtime_output_format="h264"`。
+- 生产 RTC 播放链路可使用 `output_transport="artc"`；此时 WebSocket 只作为控制面和统计面。
 - 音频 delta 建议 20ms 到 100ms。
 - `queue_ms` 建议维持在约 1 到 2 个 steady window。
 - 以音频播放时钟为主时钟。

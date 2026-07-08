@@ -3,19 +3,34 @@
 import asyncio
 import os
 import pickle
+import sys
 from types import SimpleNamespace
 
 import msgspec.msgpack
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    RealtimeVideoGenerationsRequest,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
     realtime_output_adapter,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
+    GenerateSession,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_sink import (
+    ARTC_CONTENT_TYPE,
+    ArtcRealtimeOutputSink,
+    WebSocketRealtimeOutputSink,
+    create_realtime_output_sink,
+    normalize_realtime_output_transport,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.realtime.errors import RealtimeProtocolError
 from sglang.multimodal_gen.runtime.utils.realtime_frame_store import (
     attach_raw_rgb_frame_store_writer_request,
     create_raw_rgb_frame_store_handles,
@@ -825,3 +840,133 @@ def test_raw_rgb_realtime_output_adapter_can_send_jpeg_preview_frames():
     assert frame_payload.startswith(b"\xff\xd8")
     assert stats["num_batches"] == 1
     assert stats["num_frames"] == 1
+
+
+def test_realtime_output_transport_defaults_to_websocket():
+    request = RealtimeVideoGenerationsRequest(type="init", prompt="p", size="1x1")
+    session = GenerateSession()
+    session.set_request(request)
+
+    sink = create_realtime_output_sink(SimpleNamespace(), session)
+
+    assert normalize_realtime_output_transport(request) == "ws"
+    assert isinstance(sink, WebSocketRealtimeOutputSink)
+    assert sink.build_init_ack() == {"output_transport": "ws"}
+
+
+def test_realtime_output_transport_requires_artc_config():
+    request = RealtimeVideoGenerationsRequest(
+        type="init",
+        prompt="p",
+        size="1x1",
+        output_transport="artc",
+    )
+    session = GenerateSession()
+    session.set_request(request)
+
+    try:
+        create_realtime_output_sink(SimpleNamespace(), session)
+    except RealtimeProtocolError as exc:
+        assert exc.code == "missing_artc_config"
+    else:
+        raise AssertionError("ARTC output transport should require artc config")
+
+
+def test_artc_realtime_output_sink_pushes_raw_rgb_chunks_asynchronously(monkeypatch):
+    class _FakeArtcPusher:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.calls = []
+            self.started = False
+            self.stopped = False
+            _FakeArtcPusher.instances.append(self)
+
+        def start_async(self):
+            self.started = True
+
+        @property
+        def failed(self):
+            return False
+
+        def push_chunk(self, frames_np, **kwargs):
+            self.calls.append((frames_np.copy(), kwargs))
+
+        def stop(self, timeout=10.0):
+            self.stop_timeout = timeout
+            self.stopped = True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.multimodal_gen.runtime.utils.artc_pusher",
+        SimpleNamespace(ArtcPusher=_FakeArtcPusher),
+    )
+
+    async def run():
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="p",
+            size="1x1",
+            fps=16,
+            output_transport="artc",
+            artc={"token": "token-1", "channel": "channel-1", "queue_size": 2},
+        )
+        session = GenerateSession()
+        session.set_request(request)
+        sink = create_realtime_output_sink(SimpleNamespace(), session)
+        batch = SimpleNamespace(
+            block_idx=3,
+            request_id="req-artc",
+            width=1,
+            height=1,
+            fps=16,
+            enable_upscaling=False,
+            realtime_event_id=5,
+            extra={
+                "wan_s2v_audio_window": np.array([0, 16384], dtype=np.int16),
+                "wan_s2v_audio_window_meta": {"sample_count": 2},
+            },
+        )
+        result = OutputBatch(
+            raw_frame_batches=[[bytes([1, 2, 3]), bytes([4, 5, 6])]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata={
+                "format": "rgb24",
+                "width": 1,
+                "height": 1,
+                "channels": 3,
+                "bytes_per_frame": 3,
+            },
+        )
+
+        stats = await sink.send(session, result, batch)
+        await sink.close()
+        return sink, stats
+
+    sink, stats = asyncio.run(run())
+
+    assert isinstance(sink, ArtcRealtimeOutputSink)
+    assert stats["content_type"] == ARTC_CONTENT_TYPE
+    assert stats["num_frames"] == 2
+    assert stats["num_batches"] == 1
+    assert stats["frame_shape"] == (1, 1, 3)
+    assert stats["raw_bytes"] == 6
+    assert stats["artc_queue_size"] == 1
+
+    [pusher] = _FakeArtcPusher.instances
+    assert pusher.started is True
+    assert pusher.stopped is True
+    assert pusher.kwargs["artc_channel"] == "channel-1"
+    assert pusher.kwargs["width"] == 1
+    assert pusher.kwargs["height"] == 1
+    assert pusher.kwargs["fps"] == 16
+    [(frames_np, push_kwargs)] = pusher.calls
+    assert frames_np.shape == (2, 1, 1, 3)
+    assert frames_np.dtype == np.uint8
+    assert frames_np.tolist() == [[[[1, 2, 3]]], [[[4, 5, 6]]]]
+    assert push_kwargs["chunk_idx"] == 3
+    assert push_kwargs["audio_chunk_idx"] == 3
+    assert push_kwargs["audio_loaded"] is True
+    assert push_kwargs["audio_chunk_meta"] == {"sample_count": 2}
+    np.testing.assert_allclose(push_kwargs["audio_16k"], np.array([0.0, 0.5]))

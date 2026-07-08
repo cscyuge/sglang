@@ -752,6 +752,10 @@ def pop_raw_rgb_frame_store_writer_request(output_batch: Any) -> Any | None:
 
 def discard_raw_rgb_frame_store_writer_request(request: Any) -> None:
     handles = getattr(request, "handles", None) or []
+    discard_raw_rgb_frame_store_handles(handles)
+
+
+def discard_raw_rgb_frame_store_handles(handles: list[RealtimeFrameStoreHandle]) -> None:
     for handle in handles:
         _cleanup_store_file(handle.path)
 

@@ -88,6 +88,11 @@ class RealtimeFrameSendStats(TypedDict):
     output_enqueue_wait_ms: float
     output_queue_delay_ms: float
     output_queue_size: int
+    artc_enqueue_wait_ms: float
+    artc_queue_delay_ms: float
+    artc_queue_size: int
+    artc_push_ms: float
+    artc_dropped_chunks: int
     raw_write_ms: float
     ws_write_ms: float
     pace_wait_ms: float
@@ -120,6 +125,11 @@ def empty_frame_send_stats(content_type: str = "") -> RealtimeFrameSendStats:
         "output_enqueue_wait_ms": 0.0,
         "output_queue_delay_ms": 0.0,
         "output_queue_size": 0,
+        "artc_enqueue_wait_ms": 0.0,
+        "artc_queue_delay_ms": 0.0,
+        "artc_queue_size": 0,
+        "artc_push_ms": 0.0,
+        "artc_dropped_chunks": 0,
         "raw_write_ms": 0.0,
         "ws_write_ms": 0.0,
         "pace_wait_ms": 0.0,

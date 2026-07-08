@@ -18,6 +18,9 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
         BaseRealtimeModelAdapter,
     )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_sink import (
+        BaseRealtimeOutputSink,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +44,7 @@ class GenerateSession:
         self.realtime_session = RealtimeSession()
         self.adapter: BaseRealtimeModelAdapter | None = None
         self.adapter_state: Any = None
+        self.output_sink: BaseRealtimeOutputSink | None = None
         self.output_pace_next_send_at: float | None = None
         self.output_pace_last_event_id: int | None = None
 
@@ -51,6 +55,9 @@ class GenerateSession:
     def set_request(self, request: RealtimeVideoGenerationsRequest):
         self.request = request
 
+    def set_output_sink(self, output_sink: BaseRealtimeOutputSink):
+        self.output_sink = output_sink
+
     def dispose(self):
         if self.adapter is not None:
             self.adapter.dispose(self)
@@ -60,6 +67,7 @@ class GenerateSession:
         self.current_chunk = None
         self.adapter = None
         self.adapter_state = None
+        self.output_sink = None
         self.output_pace_next_send_at = None
         self.output_pace_last_event_id = None
         self.realtime_session.dispose()
