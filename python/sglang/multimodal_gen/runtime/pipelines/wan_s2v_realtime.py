@@ -63,6 +63,29 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
+_WAN_S2V_TEXT_CONDITION_FIELDS = (
+    "prompt_embeds",
+    "pooled_embeds",
+    "prompt_attention_mask",
+    "prompt_embeds_mask",
+    "prompt_seq_lens",
+    "negative_prompt_embeds",
+    "neg_pooled_embeds",
+    "negative_attention_mask",
+    "negative_prompt_embeds_mask",
+    "negative_prompt_seq_lens",
+    "clip_embedding_pos",
+    "clip_embedding_neg",
+    "is_prompt_processed",
+)
+
+_WAN_S2V_TEXT_EMPTY_LIST_FIELDS = (
+    "prompt_embeds",
+    "pooled_embeds",
+    "negative_prompt_embeds",
+    "neg_pooled_embeds",
+)
+
 
 class AudioRingBuffer:
     """Fixed-size numpy ring buffer for 16 kHz session audio."""
@@ -771,6 +794,9 @@ class _WanS2VPerChunkRealtimeState(BaseRealtimeState):
         self.initialized = False
         self.session_id: str | None = None
         self.base_batch: Req | None = None
+        self.prompt_condition_key: tuple[Any, ...] | None = None
+        self.prompt_condition_revision: Any = None
+        self.prompt_condition_refresh_count = 0
         self.audio_ring: AudioRingBuffer | None = None
         self.num_frame_per_block = 0
         self.block_public_frames = 0
@@ -2270,6 +2296,133 @@ class WanS2VRealtimeSessionRunner:
             ):
                 batch.extra.pop(key, None)
 
+    @staticmethod
+    def _copy_text_condition_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return [
+                list(item) if isinstance(item, list) else item
+                for item in value
+            ]
+        return value
+
+    @classmethod
+    def _clear_text_condition_fields(cls, batch: Req) -> None:
+        for field_name in _WAN_S2V_TEXT_CONDITION_FIELDS:
+            if field_name in _WAN_S2V_TEXT_EMPTY_LIST_FIELDS:
+                setattr(batch, field_name, [])
+            elif field_name == "is_prompt_processed":
+                setattr(batch, field_name, False)
+            else:
+                setattr(batch, field_name, None)
+
+    @classmethod
+    def _copy_text_condition_fields(cls, dst: Req, src: Req) -> None:
+        for field_name in _WAN_S2V_TEXT_CONDITION_FIELDS:
+            setattr(
+                dst,
+                field_name,
+                cls._copy_text_condition_value(getattr(src, field_name, None)),
+            )
+
+    @staticmethod
+    def _prompt_condition_revision(batch: Req) -> Any:
+        prompt_meta = batch.extra.get("wan_s2v_prompt")
+        if isinstance(prompt_meta, dict) and "revision" in prompt_meta:
+            return prompt_meta.get("revision")
+        return None
+
+    @staticmethod
+    def _freeze_prompt_condition_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return tuple(
+                WanS2VRealtimeSessionRunner._freeze_prompt_condition_value(item)
+                for item in value
+            )
+        if isinstance(value, tuple):
+            return tuple(
+                WanS2VRealtimeSessionRunner._freeze_prompt_condition_value(item)
+                for item in value
+            )
+        if isinstance(value, dict):
+            return tuple(
+                (key, WanS2VRealtimeSessionRunner._freeze_prompt_condition_value(item))
+                for key, item in sorted(value.items())
+            )
+        return value
+
+    def _prompt_condition_key(self, batch: Req) -> tuple[Any, ...]:
+        revision = self._prompt_condition_revision(batch)
+        if revision is not None:
+            return ("revision", revision)
+        return (
+            "inputs",
+            self._freeze_prompt_condition_value(batch.prompt),
+            self._freeze_prompt_condition_value(batch.negative_prompt),
+            bool(batch.do_classifier_free_guidance),
+            self._freeze_prompt_condition_value(batch.prompt_template),
+            batch.max_sequence_length,
+        )
+
+    def _record_prompt_condition_key(
+        self,
+        state: _WanS2VPerChunkRealtimeState,
+        batch: Req,
+    ) -> None:
+        state.prompt_condition_key = self._prompt_condition_key(batch)
+        state.prompt_condition_revision = self._prompt_condition_revision(batch)
+
+    def _refresh_prompt_condition_if_needed(
+        self,
+        state: _WanS2VPerChunkRealtimeState,
+        work_batch: Req,
+        server_args: ServerArgs,
+    ) -> dict[str, Any]:
+        condition_key = self._prompt_condition_key(work_batch)
+        prompt_revision = self._prompt_condition_revision(work_batch)
+        timings: dict[str, Any] = {}
+        if state.prompt_condition_key == condition_key:
+            timings["prompt_condition_refresh"] = False
+            timings["prompt_condition_refresh_ms"] = 0.0
+            return timings
+
+        if state.base_batch is None:
+            timings["prompt_condition_refresh"] = False
+            timings["prompt_condition_refresh_ms"] = 0.0
+            timings["prompt_condition_refresh_skipped"] = "missing_base_batch"
+            return timings
+
+        refresh_started = time.perf_counter()
+        text_batch = copy(work_batch)
+        text_batch.extra = dict(work_batch.extra)
+        text_batch.num_frames = state.block_public_frames
+        self._clear_text_condition_fields(text_batch)
+
+        text_stage = self._get_stage(TextEncodingStage)
+        text_batch = text_stage(text_batch, server_args)
+
+        self._copy_text_condition_fields(work_batch, text_batch)
+        self._copy_text_condition_fields(state.base_batch, text_batch)
+        state.base_batch.sampling_params = text_batch.sampling_params
+        state.base_batch.prompt_template = text_batch.prompt_template
+        state.base_batch.max_sequence_length = text_batch.max_sequence_length
+        if state.base_batch.extra is None:
+            state.base_batch.extra = {}
+        prompt_meta = text_batch.extra.get("wan_s2v_prompt")
+        if isinstance(prompt_meta, dict):
+            state.base_batch.extra["wan_s2v_prompt"] = dict(prompt_meta)
+        else:
+            state.base_batch.extra.pop("wan_s2v_prompt", None)
+
+        state.prompt_condition_key = condition_key
+        state.prompt_condition_revision = prompt_revision
+        state.prompt_condition_refresh_count += 1
+        timings["prompt_condition_refresh"] = True
+        timings["prompt_condition_refresh_ms"] = round(
+            (time.perf_counter() - refresh_started) * 1000.0,
+            3,
+        )
+        return timings
+
     def _store_per_chunk_base_batch(
         self,
         state: _WanS2VPerChunkRealtimeState,
@@ -2429,6 +2582,7 @@ class WanS2VRealtimeSessionRunner:
             batch.generator[0] if isinstance(batch.generator, list) else batch.generator
         )
         self._store_per_chunk_base_batch(state, batch)
+        self._record_prompt_condition_key(state, batch)
         state.initialized = True
         logger.info(
             "Wan S2V per-chunk realtime session initialized: session=%s "
@@ -2468,13 +2622,19 @@ class WanS2VRealtimeSessionRunner:
         if state.dit_dtype is None or state.device is None:
             raise RuntimeError("Wan S2V realtime device state is not initialized")
 
+        loop_started = time.perf_counter()
+        prompt_timings = self._refresh_prompt_condition_if_needed(
+            state,
+            work_batch,
+            server_args,
+        )
+
         audio_window = work_batch.extra.get("wan_s2v_audio_window")
         if audio_window is None:
             raise RuntimeError("Wan S2V realtime chunk requires audio window samples")
         audio_chunk = np.asarray(audio_window, dtype=np.float32)
         audio_meta = dict(work_batch.extra.get("wan_s2v_audio_window_meta") or {})
 
-        loop_started = time.perf_counter()
         audio_timings: dict[str, Any] = {}
         audio_started = time.perf_counter()
         stage_started = time.perf_counter()
@@ -2903,6 +3063,7 @@ class WanS2VRealtimeSessionRunner:
             "total_ms": round(total_s * 1000, 3),
         }
         worker_timings.update(audio_timings)
+        worker_timings.update(prompt_timings)
         worker_timings.update(condition_timings)
         worker_timings.update(clean_refresh_stage_timings)
         worker_timings.update(state.stream_vae_state.last_decode_timings or {})

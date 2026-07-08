@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     WanS2VAudioEncodingStage,
     WanS2VDenoisingDispatchStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
+    RealtimeTextEncodingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.stream_r1_checkpoint import (
     load_stream_r1_generator_checkpoint,
@@ -178,9 +181,20 @@ class WanS2VPipeline(FlashTalkPipeline):
         self.add_stage(
             stage_name="input_validation_stage", stage=InputValidationStage()
         )
+        text_stage_cls = (
+            RealtimeTextEncodingStage
+            if bool(
+                getattr(
+                    getattr(server_args, "pipeline_config", None),
+                    "wan_s2v_realtime",
+                    False,
+                )
+            )
+            else TextEncodingStage
+        )
         self.add_stage(
             stage_name="prompt_encoding_stage",
-            stage=TextEncodingStage(
+            stage=text_stage_cls(
                 text_encoders=[self.get_module("text_encoder")],
                 tokenizers=[self.get_module("tokenizer")],
             ),

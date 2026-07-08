@@ -13,6 +13,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan_s2v import (
     WanS2VPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.wan_s2v import WanS2VSamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    RealtimeEvent,
+    RealtimeVideoGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
+    GenerateSession,
+    RealtimeChunkContext,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.wan_s2v_realtime_adapter import (
     WanS2VRealtimeAdapter,
     WanS2VRealtimeAdapterState,
@@ -29,11 +37,13 @@ from sglang.multimodal_gen.runtime.models.schedulers.wan_s2v_scheduler import (
 from sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime import (
     AudioRingBuffer,
     WanS2VRealtimeSessionRunner,
+    _WanS2VPerChunkRealtimeState,
     _WanS2VStreamingVAECudaGraphRunner,
     _WanS2VStreamingVAEState,
     _audio_window_after_extend,
     _wait_for_session_audio_chunk,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
     TextEncodingStage,
@@ -41,6 +51,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
+from sglang.multimodal_gen.runtime.realtime.errors import RealtimeProtocolError
 from sglang.multimodal_gen.runtime.utils.chunk_timeline import (
     write_flashtalk_audio_chunk_meta,
 )
@@ -74,6 +85,31 @@ class _RecordingStage:
                 dtype=batch.latents.dtype,
                 device=batch.latents.device,
             )
+        return batch
+
+
+class _RecordingTextEncodingStage:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, batch, server_args):
+        del server_args
+        self.calls.append(batch.prompt)
+        batch.prompt_embeds = [
+            torch.full((1, 1, 1), float(len(self.calls)), dtype=torch.float32)
+        ]
+        batch.pooled_embeds = [
+            torch.full((1, 1), float(len(self.calls)), dtype=torch.float32)
+        ]
+        batch.prompt_attention_mask = [torch.ones(1, 1, dtype=torch.int64)]
+        batch.prompt_embeds_mask = [torch.ones(1, 1, 1, dtype=torch.bool)]
+        batch.prompt_seq_lens = [[1]]
+        batch.negative_prompt_embeds = []
+        batch.neg_pooled_embeds = []
+        batch.negative_attention_mask = None
+        batch.negative_prompt_embeds_mask = None
+        batch.negative_prompt_seq_lens = None
+        batch.is_prompt_processed = True
         return batch
 
 
@@ -163,6 +199,27 @@ class _FakePipelineConfig:
 
 
 class WanS2VRealtimeHelpersTest(unittest.TestCase):
+    def _make_prompt_session(
+        self,
+        *,
+        prompt="old prompt",
+        negative_prompt=None,
+    ):
+        adapter = WanS2VRealtimeAdapter()
+        session = GenerateSession()
+        session.set_adapter(adapter)
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+        )
+        session.set_request(request)
+        state = session.adapter_state
+        assert isinstance(state, WanS2VRealtimeAdapterState)
+        state.configure(fps=16, num_frame_per_block=3)
+        state.configure_prompt(request.prompt, request.negative_prompt)
+        return adapter, session, request, state
+
     def test_ws_audio_prefetch_reservation_preserves_window_order(self):
         state = WanS2VRealtimeAdapterState()
         state.configure(fps=16, num_frame_per_block=3)
@@ -197,6 +254,201 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
         self.assertEqual(second.chunk_idx, 1)
         np.testing.assert_array_equal(second.samples, reserved.samples)
         self.assertFalse(state.has_ready_window())
+
+    def test_prompt_update_applies_to_next_unstarted_chunk(self):
+        adapter, session, request, _state = self._make_prompt_session()
+        event = RealtimeEvent(
+            type="event",
+            kind="prompt.update",
+            event_id=10,
+            payload={
+                "prompt": "new prompt",
+                "negative_prompt": "no blur",
+            },
+        )
+
+        event_log = adapter.ingest_event(session, event)
+        ack = adapter.build_event_ack(session, event, event_log)
+        chunk = RealtimeChunkContext(
+            session_id=session.id,
+            index=0,
+            request_id="request-0",
+        )
+        inputs = adapter.sample_chunk_inputs(session, SimpleNamespace(), chunk, 3)
+
+        self.assertIn("prompt_revision=1", event_log)
+        self.assertIsNotNone(ack)
+        assert ack is not None
+        self.assertEqual(ack["prompt_update"]["revision"], 1)
+        self.assertEqual(ack["prompt_update"]["effective_chunk_index"], 0)
+        self.assertEqual(inputs.prompt, "new prompt")
+        self.assertEqual(request.prompt, "new prompt")
+        self.assertEqual(request.negative_prompt, "no blur")
+
+    def test_prompt_update_waits_until_running_chunk_completes(self):
+        adapter, session, request, _state = self._make_prompt_session()
+        session.current_chunk = RealtimeChunkContext(
+            session_id=session.id,
+            index=0,
+            request_id="running-request",
+        )
+        event = RealtimeEvent(
+            type="event",
+            kind="prompt",
+            event_id=11,
+            payload="next prompt",
+        )
+
+        adapter.ingest_event(session, event)
+        chunk0_inputs = adapter.sample_chunk_inputs(
+            session,
+            SimpleNamespace(),
+            session.current_chunk,
+            3,
+        )
+        chunk1 = RealtimeChunkContext(
+            session_id=session.id,
+            index=1,
+            request_id="request-1",
+        )
+        chunk1_inputs = adapter.sample_chunk_inputs(
+            session,
+            SimpleNamespace(),
+            chunk1,
+            3,
+        )
+
+        self.assertEqual(chunk0_inputs.prompt, "old prompt")
+        self.assertEqual(chunk1_inputs.prompt, "next prompt")
+        self.assertEqual(request.prompt, "next prompt")
+
+    def test_prompt_update_rejects_expired_effective_chunk_index(self):
+        adapter, session, _request, _state = self._make_prompt_session()
+        session.current_chunk = RealtimeChunkContext(
+            session_id=session.id,
+            index=2,
+            request_id="running-request",
+        )
+        event = RealtimeEvent(
+            type="event",
+            kind="prompt.update",
+            event_id=12,
+            payload={
+                "prompt": "too late",
+                "effective_chunk_index": 2,
+            },
+        )
+
+        with self.assertRaises(RealtimeProtocolError) as cm:
+            adapter.ingest_event(session, event)
+
+        self.assertEqual(cm.exception.code, "prompt_update_too_late")
+        self.assertEqual(cm.exception.details["effective_chunk_index"], 2)
+        self.assertEqual(cm.exception.details["next_unstarted_chunk_index"], 3)
+
+    def test_prompt_update_chunk_stats_include_revision_metadata(self):
+        adapter, session, _request, state = self._make_prompt_session()
+        event = RealtimeEvent(
+            type="event",
+            kind="prompt.update",
+            event_id=13,
+            payload={"prompt": "stats prompt"},
+        )
+        adapter.ingest_event(session, event)
+        chunk = RealtimeChunkContext(
+            session_id=session.id,
+            index=0,
+            request_id="request-0",
+        )
+        adapter.sample_chunk_inputs(session, SimpleNamespace(), chunk, 3)
+        batch = SimpleNamespace(
+            realtime_event_id=7,
+            extra={
+                "wan_s2v_audio_window_meta": {
+                    "chunk_idx": 0,
+                    "pts_start_ms": 0.0,
+                    "pts_end_ms": 562.5,
+                    "sample_count": 9000,
+                    "is_final": False,
+                },
+                "wan_s2v_prompt": state.latest_prompt_chunk_debug,
+            },
+        )
+
+        stats = adapter.build_chunk_stats_extra(session, batch, result=None)
+
+        self.assertIsNotNone(stats)
+        assert stats is not None
+        self.assertEqual(stats["prompt"]["revision"], 1)
+        self.assertEqual(stats["prompt"]["event_id"], 13)
+        self.assertEqual(stats["prompt"]["effective_chunk_index"], 0)
+        self.assertEqual(stats["prompt"]["prompt_len"], len("stats prompt"))
+        self.assertEqual(stats["audio_window"]["duration_ms"], 562.5)
+
+    def test_model_side_prompt_condition_refresh_updates_cached_base_batch(self):
+        text_stage = _RecordingTextEncodingStage()
+        runner = _FakeRealtimeRunner({TextEncodingStage: text_stage})
+        state = _WanS2VPerChunkRealtimeState()
+        state.block_public_frames = 9
+        base = Req(
+            sampling_params=WanS2VSamplingParams(
+                prompt="old prompt",
+                negative_prompt=None,
+                guidance_scale=1.0,
+            ),
+            extra={"wan_s2v_prompt": {"revision": 0}},
+        )
+        base.prompt_embeds = [torch.zeros(1, 1, 1)]
+        base.pooled_embeds = [torch.zeros(1, 1)]
+        base.prompt_attention_mask = [torch.ones(1, 1, dtype=torch.int64)]
+        base.prompt_embeds_mask = [torch.ones(1, 1, 1, dtype=torch.bool)]
+        base.prompt_seq_lens = [[1]]
+        runner._store_per_chunk_base_batch(state, base)
+        runner._record_prompt_condition_key(state, base)
+
+        updated = Req(
+            sampling_params=WanS2VSamplingParams(
+                prompt="new prompt",
+                negative_prompt=None,
+                guidance_scale=1.0,
+            ),
+            extra={"wan_s2v_prompt": {"revision": 1}},
+        )
+        work_batch = runner._work_batch_for_realtime_chunk(state, updated)
+        timings = runner._refresh_prompt_condition_if_needed(
+            state,
+            work_batch,
+            SimpleNamespace(),
+        )
+
+        self.assertTrue(timings["prompt_condition_refresh"])
+        self.assertEqual(text_stage.calls, ["new prompt"])
+        self.assertEqual(state.prompt_condition_revision, 1)
+        torch.testing.assert_close(work_batch.prompt_embeds[0], torch.ones(1, 1, 1))
+        assert state.base_batch is not None
+        torch.testing.assert_close(
+            state.base_batch.prompt_embeds[0],
+            torch.ones(1, 1, 1),
+        )
+
+        same_revision = Req(
+            sampling_params=WanS2VSamplingParams(
+                prompt="new prompt",
+                negative_prompt=None,
+                guidance_scale=1.0,
+            ),
+            extra={"wan_s2v_prompt": {"revision": 1}},
+        )
+        next_work_batch = runner._work_batch_for_realtime_chunk(state, same_revision)
+        next_timings = runner._refresh_prompt_condition_if_needed(
+            state,
+            next_work_batch,
+            SimpleNamespace(),
+        )
+
+        self.assertFalse(next_timings["prompt_condition_refresh"])
+        self.assertEqual(text_stage.calls, ["new prompt"])
+        torch.testing.assert_close(next_work_batch.prompt_embeds[0], torch.ones(1, 1, 1))
 
     def test_ws_audio_prefetch_requires_explicit_experiment_flag(self):
         adapter = WanS2VRealtimeAdapter()

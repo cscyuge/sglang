@@ -103,7 +103,7 @@ async with websockets.connect(
 | --- | --- | --- |
 | `type` | 是 | 固定为 `init`。 |
 | `prompt` | 是 | 生成 prompt。 |
-| `first_frame` | 是 | 首帧图像。推荐 `data:image/jpeg;base64,...` 或 msgpack bytes。 |
+| `first_frame` | 是 | 首帧图像。推荐 `data:image/jpeg;base64,...`；也可以使用服务端可访问的图片路径或 URL。 |
 | `fps` | 否 | 默认 16。建议调用端按 `init_ack` 返回值确认实际窗口。 |
 | `size` | 否 | 例如 `480x832`。 |
 | `max_chunks` | 否 | 最多生成多少个视频 chunk；长会话可按业务策略设置。 |
@@ -286,9 +286,81 @@ async with websockets.connect(
 - 如果剩余音频不足一个完整窗口，服务端会根据 `init_ack.audio_timeline.pad_final_window` 处理最终 chunk。
 - 发送 `audio.end` 后不能再发送 `audio.delta`。
 
-## 7. `event_ack`
+## 7. 文本 prompt 更新
 
-每个被服务端接受的 `audio.delta` / `audio.end` 会返回 `event_ack`。
+会话创建后，调用端可以通过控制事件更新后续 chunk 使用的文本 prompt。
+
+推荐事件格式：
+
+```json
+{
+  "type": "event",
+  "event_id": 201,
+  "kind": "prompt.update",
+  "payload": {
+    "prompt": "A person is talking with a happier expression.",
+    "negative_prompt": "blur, distortion",
+    "effective_chunk_index": 3,
+    "context_policy": "keep"
+  }
+}
+```
+
+字段：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `kind` | 是 | 推荐使用 `prompt.update`。兼容格式 `kind="prompt"` 也可用，此时 `payload` 是非空字符串。 |
+| `payload.prompt` | 是 | 新 prompt。服务端不会在 ack 或 stats 中回传完整 prompt。 |
+| `payload.negative_prompt` | 否 | 省略表示保持当前 negative prompt 不变；传字符串表示替换；传 `null` 表示清空。 |
+| `payload.effective_chunk_index` | 否 | 指定从哪个视频 chunk 开始生效。不填时，默认从服务端下一个尚未开始生成的 chunk 生效。 |
+| `payload.context_policy` | 否 | 当前仅支持 `keep`，表示不重置会话上下文。 |
+
+生效规则：
+
+- prompt 只在 chunk 边界生效，不会修改已经开始生成的 chunk。
+- 如果服务端正在生成 chunk `N`，不指定 `effective_chunk_index` 时会从 chunk `N+1` 生效。
+- 如果服务端空闲且下一个待生成 chunk 是 `N`，不指定 `effective_chunk_index` 时会从 chunk `N` 生效。
+- 如果显式指定的 `effective_chunk_index` 已经完成或正在生成，服务端返回 `prompt_update_too_late`，不会自动顺延。
+- 同一个未来 chunk 收到多次更新时，实际生成前最后一次被接受的 revision 生效。
+- prompt 更新不会驱动生成；下一个 chunk 仍然由音频窗口 ready 触发。
+
+成功 ack 示例：
+
+```json
+{
+  "type": "event_ack",
+  "session_id": "68abe073d38a428599b1409a5a1a182c",
+  "event_id": 201,
+  "kind": "prompt.update",
+  "prompt_update": {
+    "accepted": true,
+    "revision": 1,
+    "event_id": 201,
+    "effective_chunk_index": 3,
+    "prompt_len": 49,
+    "negative_prompt_updated": true,
+    "context_policy": "keep"
+  },
+  "audio_queue": {
+    "next_seq": 8,
+    "queue_ms": 750.0,
+    "ready_window": true
+  }
+}
+```
+
+调用端建议记录 `revision`、`event_id` 和 `effective_chunk_index`。后续 `chunk_stats.prompt` 会说明该 chunk 实际使用的 prompt revision。
+
+实时性建议：
+
+- 新 prompt 首次生效时，服务端可能需要刷新模型侧文本条件；这笔耗时会体现在首次生效 chunk 的 `worker_timings.prompt_condition_refresh_ms` 中。
+- 如果业务侧能预判 prompt 变化，建议至少提前几个 chunk 发送 `prompt.update`，不要卡在必须生效的前一个瞬间发送。
+- 同一个 prompt revision 生效后的后续 chunk 会复用已刷新的文本条件，通常不会持续产生这笔刷新成本。
+
+## 8. `event_ack`
+
+每个被服务端接受的 `event` 都会返回 `event_ack`。音频事件会包含 `audio_event` 和 `audio_queue`；prompt 更新事件会包含 `prompt_update` 和 `audio_queue`。
 
 示例：
 
@@ -327,7 +399,7 @@ async with websockets.connect(
 - 当 `queue_ms` 过高时暂停或降低发送速度。
 - 收到 `audio_buffer_overflow` 时，该 delta 未被接受；调用端可等待后重发同一个 `seq`。
 
-## 8. 视频输出
+## 9. 视频输出
 
 ### WebSocket 视频输出
 
@@ -401,7 +473,7 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 - 仍然持续读取 WebSocket，处理 `event_ack`、`chunk_stats` 和 `error`。
 - 使用 `chunk_stats.audio_window` 做业务侧时间线调试；播放时钟由 ARTC 播放端负责。
 
-## 9. `chunk_stats`
+## 10. `chunk_stats`
 
 每个视频 chunk 输出后，服务端返回 `chunk_stats`。
 
@@ -427,6 +499,19 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
     "sample_count": 9000,
     "is_final": false,
     "event_id": 7
+  },
+  "prompt": {
+    "revision": 1,
+    "event_id": 201,
+    "effective_chunk_index": 0,
+    "prompt_len": 49,
+    "negative_prompt_len": 16,
+    "context_policy": "keep"
+  },
+  "worker_timings": {
+    "prompt_condition_refresh": true,
+    "prompt_condition_refresh_ms": 185,
+    "total_ms": 456
   }
 }
 ```
@@ -439,6 +524,12 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 - `audio_window.pts_start_ms` / `pts_end_ms`：该 chunk 对应的源音频时间范围。
 - `audio_window.duration_ms`：该 chunk 覆盖的音频时长。
 - `audio_window.is_final`：是否为最终 chunk。
+- `prompt.revision`：该 chunk 实际使用的 prompt revision。初始 prompt 为 0。
+- `prompt.event_id`：触发该 revision 的 prompt 更新事件 id；初始 prompt 为 `null`。
+- `prompt.effective_chunk_index`：该 revision 从哪个 chunk 开始生效。
+- `prompt.prompt_len` / `negative_prompt_len`：当前文本长度，用于调试，不包含完整文本。
+- `worker_timings.prompt_condition_refresh`：该 chunk 是否发生了模型侧文本条件刷新。通常只有 prompt revision 生效的第一个 chunk 为 `true`。
+- `worker_timings.prompt_condition_refresh_ms`：文本条件刷新的耗时。这个耗时已计入 `worker_timings.total_ms` 和 `scheduler_forward_ms`。
 - `server_chunk_start_ms` / `server_chunk_end_ms`：服务端相对会话时间，可用于端到端调试。
 
 如果视频走 ARTC，`chunk_stats` 的 `content_type` 为 `video/artc`，`ws_payload_bytes` 为 0，并会包含 ARTC 输出队列相关字段：
@@ -474,7 +565,7 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 - 不要假设 chunk 到达时间等于视频 PTS。
 - 如果实时播放落后，可由调用端按业务策略丢帧或加速追赶。
 
-## 10. Backpressure
+## 11. Backpressure
 
 ### 输入侧
 
@@ -525,7 +616,7 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 
 收到该错误后应释放本地状态并重新建立会话。调用端可以降低生成 chunk 频率、减少并发会话，或检查播放端/网络是否无法及时消费。
 
-## 11. 错误处理
+## 12. 错误处理
 
 错误统一格式：
 
@@ -556,6 +647,9 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 | `audio_delta_after_end` | `audio.end` 后继续发音频。 | 重新建立会话。 |
 | `audio_end_final_seq_mismatch` | `final_seq` 不匹配。 | 修正 `final_seq`。 |
 | `audio_buffer_overflow` | 输入音频队列超限。 | 降低提前发送量，稍后重发。 |
+| `invalid_prompt_update` | prompt 更新 payload 非法。 | 修正 prompt 更新事件。 |
+| `prompt_update_too_late` | 指定的生效 chunk 已完成或正在生成。 | 使用 `details.next_unstarted_chunk_index` 重新发送。 |
+| `unsupported_prompt_context_policy` | 指定了当前不支持的 prompt 上下文策略。 | 使用默认 `keep`。 |
 | `output_write_timeout` | 调用端读取输出太慢。 | 持续读取输出或重连。 |
 | `missing_artc_config` | `output_transport="artc"` 但缺少 `artc` 配置。 | 补齐 `artc.token` 和 `artc.channel`。 |
 | `missing_artc_size` | ARTC 输出无法确定视频尺寸。 | 在 `init` 中提供合法 `size` 或宽高。 |
@@ -563,7 +657,7 @@ raw 带宽很大，只建议在明确需要未压缩帧时使用。
 | `artc_output_failed` | ARTC 推流失败。 | 释放会话并重连；检查 token、频道、网络和 ARTC SDK 日志。 |
 | `session_busy` | 服务端已有活跃会话。 | 等待后重试。 |
 
-## 12. 推荐客户端结构
+## 13. 推荐客户端结构
 
 推荐调用端使用两个协程：
 
@@ -617,7 +711,7 @@ async def receiver(ws, queue_state):
             handle_error(msg)
 ```
 
-## 13. 接入建议
+## 14. 接入建议
 
 - WebSocket 视频输出优先使用 `realtime_output_format="h264"`。
 - 生产 RTC 播放链路可使用 `output_transport="artc"`；此时 WebSocket 只作为控制面和统计面。
