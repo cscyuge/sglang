@@ -87,6 +87,14 @@ _WAN_S2V_TEXT_EMPTY_LIST_FIELDS = (
 )
 
 
+def _mark_crossattn_cache_needs_update(crossattn_cache: list[dict] | None) -> None:
+    if crossattn_cache is None:
+        return
+    for item in crossattn_cache:
+        if isinstance(item, dict):
+            item["needs_update"] = True
+
+
 class AudioRingBuffer:
     """Fixed-size numpy ring buffer for 16 kHz session audio."""
 
@@ -2416,6 +2424,7 @@ class WanS2VRealtimeSessionRunner:
         state.prompt_condition_key = condition_key
         state.prompt_condition_revision = prompt_revision
         state.prompt_condition_refresh_count += 1
+        _mark_crossattn_cache_needs_update(state.crossattn_cache)
         timings["prompt_condition_refresh"] = True
         timings["prompt_condition_refresh_ms"] = round(
             (time.perf_counter() - refresh_started) * 1000.0,
