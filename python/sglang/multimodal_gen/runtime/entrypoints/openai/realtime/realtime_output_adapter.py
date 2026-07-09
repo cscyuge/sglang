@@ -93,6 +93,10 @@ class RealtimeFrameSendStats(TypedDict):
     artc_queue_size: int
     artc_push_ms: float
     artc_dropped_chunks: int
+    frame_processor_total_ms: float
+    frame_processor_http_ms: float
+    frame_processor_payload_build_ms: float
+    frame_processor_materialize_ms: float
     raw_write_ms: float
     ws_write_ms: float
     pace_wait_ms: float
@@ -130,6 +134,10 @@ def empty_frame_send_stats(content_type: str = "") -> RealtimeFrameSendStats:
         "artc_queue_size": 0,
         "artc_push_ms": 0.0,
         "artc_dropped_chunks": 0,
+        "frame_processor_total_ms": 0.0,
+        "frame_processor_http_ms": 0.0,
+        "frame_processor_payload_build_ms": 0.0,
+        "frame_processor_materialize_ms": 0.0,
         "raw_write_ms": 0.0,
         "ws_write_ms": 0.0,
         "pace_wait_ms": 0.0,

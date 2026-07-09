@@ -74,6 +74,18 @@ def _fallback_compact_chunk_trace_fields(**kwargs):
             "video_published",
             "dual_stream_enabled",
             "low_stream_profile",
+            "frame_processor_name",
+            "frame_processor_enabled",
+            "frame_processor_status",
+            "frame_processor_passthrough",
+            "frame_processor_total_ms",
+            "frame_processor_http_ms",
+            "frame_processor_payload_build_ms",
+            "frame_processor_materialize_ms",
+            "frame_processor_output_width",
+            "frame_processor_output_height",
+            "frame_processor_remote_timing",
+            "frame_processor_error",
         }:
             fields[key] = value
     for key, value in kwargs.items():

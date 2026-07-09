@@ -21,6 +21,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
     _raw_rgb_frame_metadata,
     empty_frame_send_stats,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_frame_processor import (
+    BaseRealtimeFrameProcessor,
+    create_realtime_frame_processor,
+)
 from sglang.multimodal_gen.runtime.realtime.errors import RealtimeProtocolError
 from sglang.multimodal_gen.runtime.utils.realtime_frame_store import (
     discard_raw_rgb_frame_store_handles,
@@ -270,6 +274,7 @@ class ArtcRealtimeOutputSink(BaseRealtimeOutputSink):
         width: int,
         height: int,
         fps: int,
+        frame_processor: BaseRealtimeFrameProcessor,
     ) -> None:
         from sglang.multimodal_gen.runtime.utils.artc_pusher import ArtcPusher
 
@@ -278,6 +283,9 @@ class ArtcRealtimeOutputSink(BaseRealtimeOutputSink):
         self.width = int(width)
         self.height = int(height)
         self.fps = int(fps) or 25
+        self.frame_processor = frame_processor
+        self.input_width = int(frame_processor.input_width)
+        self.input_height = int(frame_processor.input_height)
         self.max_queue_size = int(config.queue_size or ARTC_DEFAULT_QUEUE_SIZE)
         self._queue: asyncio.Queue[_ArtcOutputItem] = asyncio.Queue(
             maxsize=self.max_queue_size
@@ -324,16 +332,24 @@ class ArtcRealtimeOutputSink(BaseRealtimeOutputSink):
             upscaling_scale = int(request.upscaling_scale or 1)
             width *= upscaling_scale
             height *= upscaling_scale
+        fps = int(request.fps or 25)
+        frame_processor = create_realtime_frame_processor(
+            request,
+            input_width=int(width),
+            input_height=int(height),
+            fps=fps,
+        )
         return cls(
             session_id=session.id,
             config=config,
-            width=int(width),
-            height=int(height),
-            fps=int(request.fps or 25),
+            width=int(frame_processor.output_width),
+            height=int(frame_processor.output_height),
+            fps=fps,
+            frame_processor=frame_processor,
         )
 
     def build_init_ack(self) -> dict[str, Any] | None:
-        return {
+        ack = {
             "output_transport": "artc",
             "artc": {
                 "channel": self.config.channel,
@@ -344,6 +360,10 @@ class ArtcRealtimeOutputSink(BaseRealtimeOutputSink):
                 "queue_size": self.max_queue_size,
             },
         }
+        processor_ack = self.frame_processor.build_init_ack()
+        if processor_ack is not None:
+            ack["realtime_postprocess"] = processor_ack
+        return ack
 
     def raise_if_failed(self) -> None:
         if self._failed is not None:
@@ -468,6 +488,24 @@ class ArtcRealtimeOutputSink(BaseRealtimeOutputSink):
         if frames_np is None:
             return
         frame_h, frame_w = int(frames_np.shape[1]), int(frames_np.shape[2])
+        if (frame_w, frame_h) != (self.input_width, self.input_height):
+            raise RealtimeProtocolError(
+                "artc_frame_input_size_mismatch",
+                "ARTC frame input size does not match configured processor input size",
+                channel=self.config.channel,
+                frame_width=frame_w,
+                frame_height=frame_h,
+                configured_width=self.input_width,
+                configured_height=self.input_height,
+            )
+        processor_result = self.frame_processor.process(
+            frames_np,
+            session_id=item.session_id,
+            chunk_idx=getattr(item.batch, "block_idx", None),
+        )
+        frames_np = processor_result.frames
+        processor_stats = processor_result.stats
+        frame_h, frame_w = int(frames_np.shape[1]), int(frames_np.shape[2])
         if (frame_w, frame_h) != (self.width, self.height):
             raise RealtimeProtocolError(
                 "artc_frame_size_mismatch",
@@ -482,6 +520,9 @@ class ArtcRealtimeOutputSink(BaseRealtimeOutputSink):
             getattr(item.batch, "extra", {}).get("wan_s2v_audio_window")
         )
         audio_meta = getattr(item.batch, "extra", {}).get("wan_s2v_audio_window_meta")
+        push_audio_meta = dict(audio_meta) if isinstance(audio_meta, dict) else {}
+        if processor_stats:
+            push_audio_meta.update(processor_stats)
         self._pusher.push_chunk(
             frames_np,
             audio_16k=audio,
@@ -489,13 +530,15 @@ class ArtcRealtimeOutputSink(BaseRealtimeOutputSink):
             audio_chunk_idx=getattr(item.batch, "block_idx", None),
             session_id=item.session_id,
             audio_loaded=audio is not None,
-            audio_chunk_meta=audio_meta if isinstance(audio_meta, dict) else None,
+            audio_chunk_meta=push_audio_meta or None,
             is_filler=False,
         )
         self._pushed_chunks += 1
         logger.info(
             "ARTC realtime chunk enqueued: session_id=%s channel=%s chunk_idx=%s "
-            "frames=%d queue_delay=%.2fms push=%.2fms frame_store_wait=%.2fms",
+            "frames=%d queue_delay=%.2fms push=%.2fms frame_store_wait=%.2fms "
+            "frame_processor=%s processor_status=%s processor_total=%.2fms "
+            "processor_http=%.2fms processor_passthrough=%s",
             item.session_id,
             self.config.channel,
             getattr(item.batch, "block_idx", None),
@@ -503,6 +546,11 @@ class ArtcRealtimeOutputSink(BaseRealtimeOutputSink):
             (started - item.enqueued_at) * 1000.0,
             (time.perf_counter() - started) * 1000.0,
             frame_store_timings.get("frame_store_wait_ms", 0.0),
+            processor_stats.get("frame_processor_name", "none"),
+            processor_stats.get("frame_processor_status", "noop"),
+            float(processor_stats.get("frame_processor_total_ms", 0.0)),
+            float(processor_stats.get("frame_processor_http_ms", 0.0)),
+            processor_stats.get("frame_processor_passthrough", False),
         )
 
     @staticmethod

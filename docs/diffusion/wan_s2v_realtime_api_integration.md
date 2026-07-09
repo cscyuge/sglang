@@ -111,6 +111,7 @@ async with websockets.connect(
 | `realtime_output_pacing` | 否 | 是否由服务端按输出 fps 节奏发送。低延迟接入通常设为 `false`。 |
 | `output_transport` | 否 | 视频输出通道。`ws` 表示视频 payload 从当前 WebSocket 返回，默认值；`artc` 表示视频通过 ARTC 推到指定频道，WebSocket 只返回控制消息和统计。 |
 | `artc` | 条件必填 | `output_transport="artc"` 时必填，见下文。 |
+| `realtime_postprocess` | 否 | ARTC 输出前的视频后处理配置，例如 CodeFormer 超分。WebSocket 极限时延测试通常不要开启。 |
 | `seed` | 否 | 随机种子。 |
 | `guidance_scale` | 否 | 生成参数，默认按服务端配置。 |
 
@@ -150,6 +151,35 @@ async with websockets.connect(
 | `queue_size` | 否 | 服务端 ARTC 输出队列深度，默认 2。队列满会返回 backpressure 错误并结束会话。 |
 
 使用 ARTC 时，WebSocket 仍是控制面：调用端继续通过 WebSocket 发送 `audio.delta` / `audio.end`，并接收 `init_ack`、`event_ack`、`chunk_stats` 和 `error`。视频帧不会再作为 WebSocket payload 返回，播放端应从 ARTC 频道订阅音视频流。
+
+### ARTC 输出前视频后处理
+
+如果服务端部署了 CodeFormer 超分/修复服务，可以在 ARTC 推流前启用视频后处理：
+
+```json
+{
+  "output_transport": "artc",
+  "realtime_postprocess": {
+    "type": "codeformer",
+    "scale": 2,
+    "timeout_ms": 800,
+    "on_timeout": "passthrough",
+    "on_busy": "passthrough",
+    "on_error": "passthrough"
+  }
+}
+```
+
+字段说明：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `type` | 是 | 目前支持 `codeformer`；不需要后处理时不传该字段。 |
+| `scale` | 否 | 输出分辨率相对模型原始帧的倍率，CodeFormer 当前通常为 2。 |
+| `timeout_ms` | 否 | 后处理超时时间。超时后按策略处理，默认 800ms。 |
+| `on_timeout` / `on_busy` / `on_error` | 否 | 建议保持 `passthrough`，即后处理慢、忙或失败时继续推原始帧的放大版本，避免实时流中断。 |
+
+一般调用端不需要传后处理服务地址；该地址应由服务端部署配置管理。开启后请以 `init_ack.artc.width` / `height` 为准创建或校验播放端画布，因为实际 ARTC 推流分辨率会变为后处理后的分辨率。
 
 ## 5. `init_ack`
 
@@ -211,7 +241,7 @@ async with websockets.connect(
 }
 ```
 
-调用端可用这些字段确认实际推流频道、分辨率和帧率。
+调用端可用这些字段确认实际推流频道、分辨率和帧率。如果开启了 `realtime_postprocess`，这里的 `width` / `height` 是后处理后的最终推流分辨率。
 
 ## 6. 音频输入
 

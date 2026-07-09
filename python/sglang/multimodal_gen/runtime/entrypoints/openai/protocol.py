@@ -154,6 +154,18 @@ class RealtimeArtcOutputConfig(BaseModel):
     queue_size: Optional[int] = Field(default=None, ge=1)
 
 
+class RealtimePostprocessConfig(BaseModel):
+    type: Literal["none", "codeformer"] = "none"
+    endpoint: Optional[str] = None
+    scale: Optional[int] = Field(default=2, ge=1)
+    timeout_ms: Optional[float] = Field(default=800.0, ge=0.0)
+    on_timeout: Optional[Literal["passthrough", "error"]] = "passthrough"
+    on_busy: Optional[Literal["passthrough", "error"]] = "passthrough"
+    on_error: Optional[Literal["passthrough", "error"]] = "passthrough"
+    input_pix_fmt: Optional[Literal["rgb24", "bgr24"]] = "rgb24"
+    output_pix_fmt: Optional[Literal["rgb24", "bgr24"]] = "rgb24"
+
+
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     type: Literal["init"]
     # WebSocket does not support multipart/form-data image uploads.
@@ -168,6 +180,7 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     profile_all_stages: Optional[bool] = False
     output_transport: Optional[Literal["ws", "websocket", "artc"]] = "ws"
     artc: Optional[RealtimeArtcOutputConfig] = None
+    realtime_postprocess: Optional[RealtimePostprocessConfig] = None
     realtime_output_format: Optional[Literal["raw", "webp", "jpeg", "h264"]] = None
     realtime_preview_max_width: Optional[int] = None
     realtime_output_pacing: Optional[bool] = False

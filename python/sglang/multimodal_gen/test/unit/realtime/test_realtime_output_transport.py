@@ -4,6 +4,7 @@ import asyncio
 import os
 import pickle
 import sys
+import urllib.error
 from types import SimpleNamespace
 
 import msgspec.msgpack
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    RealtimePostprocessConfig,
     RealtimeVideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
@@ -21,6 +23,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_frame_processor import (
+    RemoteCodeFormerFrameProcessor,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_sink import (
     ARTC_CONTENT_TYPE,
@@ -970,3 +975,178 @@ def test_artc_realtime_output_sink_pushes_raw_rgb_chunks_asynchronously(monkeypa
     assert push_kwargs["audio_loaded"] is True
     assert push_kwargs["audio_chunk_meta"] == {"sample_count": 2}
     np.testing.assert_allclose(push_kwargs["audio_16k"], np.array([0.0, 0.5]))
+
+
+def test_artc_realtime_output_sink_applies_remote_codeformer_processor(monkeypatch):
+    class _FakeArtcPusher:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.calls = []
+            _FakeArtcPusher.instances.append(self)
+
+        def start_async(self):
+            pass
+
+        @property
+        def failed(self):
+            return False
+
+        def push_chunk(self, frames_np, **kwargs):
+            self.calls.append((frames_np.copy(), kwargs))
+
+        def stop(self, timeout=10.0):
+            self.stop_timeout = timeout
+
+    class _FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+            self.headers = {
+                "X-Width": "2",
+                "X-Height": "2",
+                "X-Num-Frames": "2",
+                "X-Pix-Fmt": "rgb24",
+                "X-Timing": "frames=2 total=11ms",
+            }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.payload
+
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        captured["body"] = request.data
+        captured["headers"] = {k.lower(): v for k, v in request.header_items()}
+        frame0 = bytes([10, 20, 30] * 4)
+        frame1 = bytes([40, 50, 60] * 4)
+        return _FakeResponse(frame0 + frame1)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.multimodal_gen.runtime.utils.artc_pusher",
+        SimpleNamespace(ArtcPusher=_FakeArtcPusher),
+    )
+    monkeypatch.setenv(
+        "SGLANG_REALTIME_CODEFORMER_ENDPOINT",
+        "http://codeformer.local/v1/realtime/sr/raw",
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_frame_processor.urllib.request.urlopen",
+        fake_urlopen,
+    )
+
+    async def run():
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="p",
+            size="1x1",
+            fps=16,
+            output_transport="artc",
+            artc={"token": "token-1", "channel": "channel-1", "queue_size": 2},
+            realtime_postprocess={
+                "type": "codeformer",
+                "scale": 2,
+                "timeout_ms": 123,
+            },
+        )
+        session = GenerateSession()
+        session.set_request(request)
+        sink = create_realtime_output_sink(SimpleNamespace(), session)
+        ack = sink.build_init_ack()
+        batch = SimpleNamespace(
+            block_idx=3,
+            request_id="req-artc",
+            width=1,
+            height=1,
+            fps=16,
+            enable_upscaling=False,
+            realtime_event_id=5,
+            extra={},
+        )
+        result = OutputBatch(
+            raw_frame_batches=[[bytes([1, 2, 3]), bytes([4, 5, 6])]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata={
+                "format": "rgb24",
+                "width": 1,
+                "height": 1,
+                "channels": 3,
+                "bytes_per_frame": 3,
+            },
+        )
+        stats = await sink.send(session, result, batch)
+        await sink.close()
+        return ack, stats
+
+    ack, stats = asyncio.run(run())
+
+    assert stats["content_type"] == ARTC_CONTENT_TYPE
+    assert stats["num_frames"] == 2
+    assert captured["url"] == "http://codeformer.local/v1/realtime/sr/raw"
+    assert captured["timeout"] == 0.123
+    assert captured["body"] == bytes([1, 2, 3, 4, 5, 6])
+    assert captured["headers"]["x-scale"] == "2"
+    assert captured["headers"]["x-output-width"] == "2"
+    assert captured["headers"]["x-output-height"] == "2"
+    assert ack["artc"]["width"] == 2
+    assert ack["artc"]["height"] == 2
+    assert ack["realtime_postprocess"]["input_width"] == 1
+    assert ack["realtime_postprocess"]["output_width"] == 2
+
+    [pusher] = _FakeArtcPusher.instances
+    assert pusher.kwargs["width"] == 2
+    assert pusher.kwargs["height"] == 2
+    [(frames_np, push_kwargs)] = pusher.calls
+    assert frames_np.shape == (2, 2, 2, 3)
+    assert frames_np.tolist()[0] == [[[10, 20, 30], [10, 20, 30]], [[10, 20, 30], [10, 20, 30]]]
+    assert frames_np.tolist()[1] == [[[40, 50, 60], [40, 50, 60]], [[40, 50, 60], [40, 50, 60]]]
+    assert push_kwargs["audio_chunk_meta"]["frame_processor_status"] == "ok"
+    assert push_kwargs["audio_chunk_meta"]["frame_processor_passthrough"] is False
+    assert push_kwargs["audio_chunk_meta"]["frame_processor_remote_timing"] == "frames=2 total=11ms"
+
+
+def test_remote_codeformer_processor_busy_passthrough_resizes(monkeypatch):
+    def fake_urlopen(_request, timeout=None):
+        raise urllib.error.HTTPError(
+            url="http://codeformer.local/v1/realtime/sr/raw",
+            code=429,
+            msg="Too Many Requests",
+            hdrs=None,
+            fp=None,
+        )
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_frame_processor.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    processor = RemoteCodeFormerFrameProcessor(
+        config=RealtimePostprocessConfig(
+            type="codeformer",
+            endpoint="http://codeformer.local/v1/realtime/sr/raw",
+            scale=2,
+            timeout_ms=50,
+            on_busy="passthrough",
+        ),
+        input_width=1,
+        input_height=1,
+        fps=16,
+    )
+    frames = np.array([[[[1, 2, 3]]]], dtype=np.uint8)
+
+    result = processor.process(frames, session_id="s", chunk_idx=0)
+
+    assert result.frames.shape == (1, 2, 2, 3)
+    assert result.frames.tolist() == [[[[1, 2, 3], [1, 2, 3]], [[1, 2, 3], [1, 2, 3]]]]
+    assert result.stats["frame_processor_status"] == "busy"
+    assert result.stats["frame_processor_passthrough"] is True
+    assert result.stats["frame_processor_output_width"] == 2
+    assert result.stats["frame_processor_output_height"] == 2
