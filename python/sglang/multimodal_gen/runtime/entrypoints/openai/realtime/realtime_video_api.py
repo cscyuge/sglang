@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_s
     BaseRealtimeOutputSink,
     WebSocketRealtimeOutputSink,
     create_realtime_output_sink,
+    create_realtime_output_sink_async,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
@@ -932,7 +933,9 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
 
             # Keep session state update atomic with validated request.
             session.set_request(realtime_req)
-            session.set_output_sink(create_realtime_output_sink(ws, session))
+            session.set_output_sink(
+                await create_realtime_output_sink_async(ws, session)
+            )
             await _send_realtime_init_ack(ws, session, realtime_req)
             break
         except WebSocketDisconnect:

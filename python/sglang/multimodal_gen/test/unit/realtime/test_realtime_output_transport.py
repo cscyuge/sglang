@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import os
 import pickle
+import struct
 import sys
 import urllib.error
 from types import SimpleNamespace
@@ -21,17 +23,19 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
     GenerateSession,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
-    RawRGBRealtimeOutputAdapter,
-)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_frame_processor import (
     RemoteCodeFormerFrameProcessor,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
+    RawRGBRealtimeOutputAdapter,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_sink import (
     ARTC_CONTENT_TYPE,
     ArtcRealtimeOutputSink,
+    RemoteCodeFormerArtcOutputSink,
     WebSocketRealtimeOutputSink,
     create_realtime_output_sink,
+    create_realtime_output_sink_async,
     normalize_realtime_output_transport,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -1107,11 +1111,20 @@ def test_artc_realtime_output_sink_applies_remote_codeformer_processor(monkeypat
     assert pusher.kwargs["height"] == 2
     [(frames_np, push_kwargs)] = pusher.calls
     assert frames_np.shape == (2, 2, 2, 3)
-    assert frames_np.tolist()[0] == [[[10, 20, 30], [10, 20, 30]], [[10, 20, 30], [10, 20, 30]]]
-    assert frames_np.tolist()[1] == [[[40, 50, 60], [40, 50, 60]], [[40, 50, 60], [40, 50, 60]]]
+    assert frames_np.tolist()[0] == [
+        [[10, 20, 30], [10, 20, 30]],
+        [[10, 20, 30], [10, 20, 30]],
+    ]
+    assert frames_np.tolist()[1] == [
+        [[40, 50, 60], [40, 50, 60]],
+        [[40, 50, 60], [40, 50, 60]],
+    ]
     assert push_kwargs["audio_chunk_meta"]["frame_processor_status"] == "ok"
     assert push_kwargs["audio_chunk_meta"]["frame_processor_passthrough"] is False
-    assert push_kwargs["audio_chunk_meta"]["frame_processor_remote_timing"] == "frames=2 total=11ms"
+    assert (
+        push_kwargs["audio_chunk_meta"]["frame_processor_remote_timing"]
+        == "frames=2 total=11ms"
+    )
 
 
 def test_remote_codeformer_processor_busy_passthrough_resizes(monkeypatch):
@@ -1150,3 +1163,177 @@ def test_remote_codeformer_processor_busy_passthrough_resizes(monkeypatch):
     assert result.stats["frame_processor_passthrough"] is True
     assert result.stats["frame_processor_output_width"] == 2
     assert result.stats["frame_processor_output_height"] == 2
+
+
+def test_remote_codeformer_artc_sink_sends_versioned_video_audio_chunk(monkeypatch):
+    captured = []
+
+    class _FakeResponse:
+        def __init__(self, payload, status=200):
+            self.payload = json.dumps(payload).encode("utf-8")
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.payload
+
+    def fake_urlopen(request, timeout=None):
+        captured.append(
+            {
+                "url": request.full_url,
+                "method": request.get_method(),
+                "body": request.data,
+                "timeout": timeout,
+            }
+        )
+        if request.get_method() == "POST" and request.full_url.endswith("/sessions"):
+            return _FakeResponse({"state": "ready"}, status=201)
+        if request.get_method() == "POST" and request.full_url.endswith("/chunks"):
+            return _FakeResponse(
+                {
+                    "status": "enqueued",
+                    "timing": {"end_to_end_ms": 12.5},
+                    "queue": {},
+                }
+            )
+        if request.get_method() == "DELETE":
+            return _FakeResponse({"status": "closed"})
+        return _FakeResponse({"state": "ready"})
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_codeformer_artc.urllib.request.urlopen",
+        fake_urlopen,
+    )
+
+    async def run():
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="p",
+            size="1x1",
+            fps=16,
+            output_transport="artc",
+            artc={"token": "secret-token", "channel": "channel-1", "queue_size": 2},
+            realtime_postprocess={
+                "type": "codeformer",
+                "delivery": "artc",
+                "endpoint": "http://codeformer.local/v1/realtime/sessions",
+                "scale": 2,
+                "timeout_ms": 123,
+            },
+        )
+        session = GenerateSession()
+        session.set_request(request)
+        sink = await create_realtime_output_sink_async(SimpleNamespace(), session)
+        batch = SimpleNamespace(
+            block_idx=0,
+            request_id="req-remote-artc",
+            width=1,
+            height=1,
+            fps=16,
+            enable_upscaling=False,
+            realtime_event_id=5,
+            extra={
+                "wan_s2v_audio_window": np.array([0, 16384], dtype=np.int16),
+                "wan_s2v_audio_window_meta": {"sample_count": 2},
+            },
+        )
+        result = OutputBatch(
+            raw_frame_batches=[[bytes([1, 2, 3]), bytes([4, 5, 6])]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata={
+                "format": "rgb24",
+                "width": 1,
+                "height": 1,
+                "channels": 3,
+                "bytes_per_frame": 3,
+            },
+        )
+        stats = await sink.send(session, result, batch)
+        ack = sink.build_init_ack()
+        await sink.close()
+        return sink, stats, ack
+
+    sink, stats, ack = asyncio.run(run())
+
+    assert isinstance(sink, RemoteCodeFormerArtcOutputSink)
+    assert stats["content_type"] == ARTC_CONTENT_TYPE
+    assert ack["artc"]["publisher"] == "codeformer"
+    assert ack["artc"]["width"] == 2
+    assert ack["artc"]["height"] == 2
+    assert [item["method"] for item in captured] == ["POST", "POST", "DELETE"]
+    create_payload = json.loads(captured[0]["body"])
+    assert create_payload["artc"]["token"] == "secret-token"
+    assert create_payload["video"]["output_width"] == 2
+    envelope = captured[1]["body"]
+    magic, header_size = struct.unpack("!4sI", envelope[:8])
+    assert magic == b"CFA1"
+    header = json.loads(envelope[8 : 8 + header_size])
+    assert header["chunk_idx"] == 0
+    assert header["num_frames"] == 2
+    assert header["frame_bytes"] == 6
+    assert header["audio_samples"] == 2
+    assert header["audio_meta"] == {"sample_count": 2}
+    assert envelope[8 + header_size : 8 + header_size + 6] == bytes([1, 2, 3, 4, 5, 6])
+    assert captured[-1]["url"].endswith("?mode=drain")
+
+
+def test_remote_codeformer_artc_sink_propagates_publisher_failure(monkeypatch):
+    class _FakeResponse:
+        def __init__(self, payload):
+            self.payload = json.dumps(payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.payload
+
+    def fake_urlopen(request, timeout=None):
+        if request.get_method() == "GET":
+            return _FakeResponse(
+                {"state": "failed", "last_error": "publisher disconnected"}
+            )
+        if request.get_method() == "DELETE":
+            return _FakeResponse({"status": "closed"})
+        return _FakeResponse({"state": "ready"})
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_codeformer_artc.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    monkeypatch.setenv("SGLANG_REALTIME_CODEFORMER_STATUS_POLL_S", "0.1")
+
+    async def run():
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="p",
+            size="1x1",
+            fps=16,
+            output_transport="artc",
+            artc={"token": "token", "channel": "channel"},
+            realtime_postprocess={
+                "type": "codeformer",
+                "delivery": "artc",
+                "endpoint": "http://codeformer.local/v1/realtime/sessions",
+            },
+        )
+        session = GenerateSession()
+        session.set_request(request)
+        sink = await create_realtime_output_sink_async(SimpleNamespace(), session)
+        try:
+            await asyncio.wait_for(sink.wait_failed(), timeout=1.0)
+        except RealtimeProtocolError as exc:
+            assert exc.code == "codeformer_artc_output_failed"
+        else:
+            raise AssertionError("remote publisher failure was not propagated")
+        await sink.cancel()
+
+    asyncio.run(run())

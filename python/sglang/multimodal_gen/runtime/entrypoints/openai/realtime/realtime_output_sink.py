@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -14,16 +15,19 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeArtcOutputConfig,
     RealtimeVideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_codeformer_artc import (
+    CodeFormerArtcClient,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_frame_processor import (
+    BaseRealtimeFrameProcessor,
+    create_realtime_frame_processor,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RealtimeFrameSendStats,
     RealtimeRawFrameBatch,
     _frame_shape_from_metadata,
     _raw_rgb_frame_metadata,
     empty_frame_send_stats,
-)
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_frame_processor import (
-    BaseRealtimeFrameProcessor,
-    create_realtime_frame_processor,
 )
 from sglang.multimodal_gen.runtime.realtime.errors import RealtimeProtocolError
 from sglang.multimodal_gen.runtime.utils.realtime_frame_store import (
@@ -126,7 +130,9 @@ def _result_raw_bytes(result: "OutputBatch") -> int:
     return 0
 
 
-def _result_frame_shape(result: "OutputBatch", batch: "Req") -> tuple[int, int, int] | None:
+def _result_frame_shape(
+    result: "OutputBatch", batch: "Req"
+) -> tuple[int, int, int] | None:
     metadata = getattr(result, "raw_frame_metadata", None) or _raw_rgb_frame_metadata(
         batch
     )
@@ -560,6 +566,395 @@ class ArtcRealtimeOutputSink(BaseRealtimeOutputSink):
             discard_raw_rgb_frame_store_handles(handles)
 
 
+class RemoteCodeFormerArtcOutputSink(BaseRealtimeOutputSink):
+    """Send low-resolution chunks to CodeFormer, which owns the ARTC publisher."""
+
+    transport = "artc"
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        config: RealtimeArtcOutputConfig,
+        endpoint: str,
+        input_width: int,
+        input_height: int,
+        output_width: int,
+        output_height: int,
+        fps: int,
+        timeout_ms: float,
+    ) -> None:
+        self.session_id = session_id
+        self.config = config
+        self.endpoint = endpoint
+        self.input_width = int(input_width)
+        self.input_height = int(input_height)
+        self.width = int(output_width)
+        self.height = int(output_height)
+        self.fps = int(fps) or 25
+        self.max_queue_size = int(config.queue_size or ARTC_DEFAULT_QUEUE_SIZE)
+        self._queue: asyncio.Queue[_ArtcOutputItem] = asyncio.Queue(
+            maxsize=self.max_queue_size
+        )
+        self._failed: BaseException | None = None
+        self._failure_event = asyncio.Event()
+        self._closed = False
+        self._remote_closed = False
+        self._pushed_chunks = 0
+        self._worker_task: asyncio.Task | None = None
+        self._client = CodeFormerArtcClient(
+            endpoint=endpoint,
+            session_id=session_id,
+            timeout_ms=timeout_ms,
+        )
+
+    def _session_payload(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "video": {
+                "input_width": self.input_width,
+                "input_height": self.input_height,
+                "output_width": self.width,
+                "output_height": self.height,
+                "fps": self.fps,
+                "pix_fmt": "rgb24",
+            },
+            "artc": {
+                "token": self.config.token,
+                "channel": self.config.channel,
+                "userid": self.config.userid or "codeformer",
+                "queue_size": self.max_queue_size,
+            },
+        }
+
+    def _start_worker(self) -> None:
+        self._worker_task = asyncio.create_task(
+            self._run(),
+            name=f"realtime-codeformer-artc-output-{self.session_id}",
+        )
+
+    def _start_remote_sync(self) -> None:
+        try:
+            self._remote_status = self._client.create(self._session_payload())
+        except Exception as exc:
+            try:
+                self._client.close(drain=False)
+            except Exception:
+                pass
+            raise RealtimeProtocolError(
+                "codeformer_artc_session_create_failed",
+                f"CodeFormer ARTC session creation failed: {exc}",
+                endpoint=self.endpoint,
+                channel=self.config.channel,
+            ) from exc
+        self._start_worker()
+
+    async def _start_remote_async(self) -> None:
+        try:
+            self._remote_status = await asyncio.to_thread(
+                self._client.create,
+                self._session_payload(),
+            )
+        except Exception as exc:
+            try:
+                await asyncio.to_thread(self._client.close, drain=False)
+            except Exception:
+                pass
+            raise RealtimeProtocolError(
+                "codeformer_artc_session_create_failed",
+                f"CodeFormer ARTC session creation failed: {exc}",
+                endpoint=self.endpoint,
+                channel=self.config.channel,
+            ) from exc
+        self._start_worker()
+
+    @classmethod
+    def _from_request_unstarted(
+        cls,
+        session: "GenerateSession",
+        request: RealtimeVideoGenerationsRequest,
+    ) -> "RemoteCodeFormerArtcOutputSink":
+        artc_config = _coerce_artc_config(request)
+        postprocess = request.realtime_postprocess
+        if postprocess is None or postprocess.type != "codeformer":
+            raise RealtimeProtocolError(
+                "missing_remote_artc_postprocess",
+                "remote ARTC delivery requires realtime_postprocess type='codeformer'",
+            )
+        endpoint = str(
+            postprocess.endpoint
+            or os.environ.get("SGLANG_REALTIME_CODEFORMER_ARTC_ENDPOINT", "")
+        ).strip()
+        if not endpoint:
+            raise RealtimeProtocolError(
+                "missing_codeformer_artc_endpoint",
+                "remote ARTC delivery requires a CodeFormer session endpoint",
+            )
+        size = _parse_size(request.size)
+        width = size[0] if size is not None else request.width
+        height = size[1] if size is not None else request.height
+        if not width or not height:
+            raise RealtimeProtocolError(
+                "missing_artc_size",
+                "output_transport='artc' requires request size or width/height",
+                size=request.size,
+                width=request.width,
+                height=request.height,
+            )
+        if request.enable_upscaling:
+            scale = int(request.upscaling_scale or 1)
+            width *= scale
+            height *= scale
+        postprocess_scale = int(postprocess.scale or 2)
+        sink = cls(
+            session_id=session.id,
+            config=artc_config,
+            endpoint=endpoint,
+            input_width=int(width),
+            input_height=int(height),
+            output_width=int(width) * postprocess_scale,
+            output_height=int(height) * postprocess_scale,
+            fps=int(request.fps or 25),
+            timeout_ms=float(postprocess.timeout_ms or 0.0),
+        )
+        return sink
+
+    @classmethod
+    def from_request(
+        cls,
+        session: "GenerateSession",
+        request: RealtimeVideoGenerationsRequest,
+    ) -> "RemoteCodeFormerArtcOutputSink":
+        sink = cls._from_request_unstarted(session, request)
+        sink._start_remote_sync()
+        return sink
+
+    @classmethod
+    async def from_request_async(
+        cls,
+        session: "GenerateSession",
+        request: RealtimeVideoGenerationsRequest,
+    ) -> "RemoteCodeFormerArtcOutputSink":
+        sink = cls._from_request_unstarted(session, request)
+        await sink._start_remote_async()
+        return sink
+
+    def build_init_ack(self) -> dict[str, Any] | None:
+        return {
+            "output_transport": "artc",
+            "artc": {
+                "channel": self.config.channel,
+                "userid": self.config.userid or "codeformer",
+                "width": self.width,
+                "height": self.height,
+                "fps": self.fps,
+                "queue_size": self.max_queue_size,
+                "publisher": "codeformer",
+            },
+            "realtime_postprocess": {
+                "type": "codeformer",
+                "delivery": "artc",
+                "endpoint": self.endpoint,
+                "input_width": self.input_width,
+                "input_height": self.input_height,
+                "output_width": self.width,
+                "output_height": self.height,
+            },
+        }
+
+    def raise_if_failed(self) -> None:
+        if self._failed is not None:
+            raise self._failed
+
+    async def wait_failed(self) -> None:
+        await self._failure_event.wait()
+        self.raise_if_failed()
+
+    async def send(
+        self,
+        session: "GenerateSession",
+        result: "OutputBatch",
+        batch: "Req",
+    ) -> RealtimeFrameSendStats:
+        del session
+        self.raise_if_failed()
+        if self._closed:
+            raise RealtimeProtocolError(
+                "codeformer_artc_output_closed",
+                "CodeFormer ARTC output sink is closed",
+                channel=self.config.channel,
+            )
+        started = time.perf_counter()
+        item = _ArtcOutputItem(
+            session_id=self.session_id,
+            result=result,
+            batch=batch,
+            enqueued_at=started,
+            queue_size=self._queue.qsize() + 1,
+        )
+        try:
+            self._queue.put_nowait(item)
+        except asyncio.QueueFull as exc:
+            self._discard_result_handles(result)
+            raise RealtimeProtocolError(
+                "codeformer_artc_output_backpressure",
+                "CodeFormer ARTC output queue is full",
+                channel=self.config.channel,
+                chunk_index=getattr(batch, "block_idx", None),
+                queue_size=self._queue.qsize(),
+                max_queue_size=self.max_queue_size,
+            ) from exc
+        stats = empty_frame_send_stats(ARTC_CONTENT_TYPE)
+        stats["num_frames"] = _result_num_frames(result)
+        stats["num_batches"] = 1 if stats["num_frames"] > 0 else 0
+        stats["frame_shape"] = _result_frame_shape(result, batch)
+        stats["raw_bytes"] = _result_raw_bytes(result)
+        stats["artc_enqueue_wait_ms"] = (time.perf_counter() - started) * 1000.0
+        stats["artc_queue_size"] = item.queue_size
+        return stats
+
+    async def close(self) -> None:
+        self._closed = True
+        if self._failed is None:
+            await self._queue.join()
+        if self._worker_task is not None and not self._worker_task.done():
+            self._worker_task.cancel()
+        await self._await_worker()
+        await self._close_remote(drain=True)
+        self.raise_if_failed()
+
+    async def cancel(self) -> None:
+        self._closed = True
+        self._discard_pending_items()
+        if self._worker_task is not None and not self._worker_task.done():
+            self._worker_task.cancel()
+        await self._await_worker()
+        try:
+            await self._close_remote(drain=False)
+        except Exception:
+            logger.exception(
+                "CodeFormer ARTC cancel failed, session_id=%s", self.session_id
+            )
+
+    async def _await_worker(self) -> None:
+        if self._worker_task is None:
+            return
+        try:
+            await self._worker_task
+        except asyncio.CancelledError:
+            pass
+
+    async def _close_remote(self, *, drain: bool) -> None:
+        if self._remote_closed:
+            return
+        self._remote_closed = True
+        await asyncio.to_thread(self._client.close, drain=drain)
+
+    def _discard_pending_items(self) -> None:
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._discard_result_handles(item.result)
+            self._queue.task_done()
+
+    async def _run(self) -> None:
+        poll_interval = max(
+            0.1,
+            float(os.environ.get("SGLANG_REALTIME_CODEFORMER_STATUS_POLL_S", "1")),
+        )
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(
+                        self._queue.get(), timeout=poll_interval
+                    )
+                except asyncio.TimeoutError:
+                    status = await asyncio.to_thread(self._client.status)
+                    self._remote_status = status
+                    if status.get("state") == "failed":
+                        raise RealtimeProtocolError(
+                            "codeformer_artc_output_failed",
+                            "CodeFormer ARTC publisher failed",
+                            channel=self.config.channel,
+                            remote_error=status.get("last_error"),
+                        )
+                    continue
+                try:
+                    await asyncio.to_thread(self._push_item, item)
+                finally:
+                    self._queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._failed = exc
+            self._failure_event.set()
+            logger.exception(
+                "CodeFormer ARTC output sink failed, session_id=%s channel=%s",
+                self.session_id,
+                self.config.channel,
+            )
+            self._discard_pending_items()
+
+    def _push_item(self, item: _ArtcOutputItem) -> None:
+        started = time.perf_counter()
+        frames_np, frame_store_timings = _frames_from_result(item.result, item.batch)
+        if frames_np is None:
+            return
+        frame_h, frame_w = int(frames_np.shape[1]), int(frames_np.shape[2])
+        if (frame_w, frame_h) != (self.input_width, self.input_height):
+            raise RealtimeProtocolError(
+                "codeformer_artc_frame_input_size_mismatch",
+                "CodeFormer ARTC input size does not match configured size",
+                frame_width=frame_w,
+                frame_height=frame_h,
+                configured_width=self.input_width,
+                configured_height=self.input_height,
+            )
+        audio = _audio_window_to_float32(
+            getattr(item.batch, "extra", {}).get("wan_s2v_audio_window")
+        )
+        audio_meta = getattr(item.batch, "extra", {}).get("wan_s2v_audio_window_meta")
+        response = self._client.send_chunk(
+            frames=frames_np,
+            audio=audio,
+            chunk_idx=int(getattr(item.batch, "block_idx", 0)),
+            width=self.input_width,
+            height=self.input_height,
+            fps=self.fps,
+            audio_meta=audio_meta if isinstance(audio_meta, dict) else {},
+        )
+        if response.get("status") != "enqueued":
+            raise RealtimeProtocolError(
+                "codeformer_artc_chunk_failed",
+                "CodeFormer did not enqueue the ARTC chunk",
+                response_status=response.get("status"),
+            )
+        self._remote_status = response
+        self._pushed_chunks += 1
+        remote_timing = response.get("timing") or {}
+        logger.info(
+            "CodeFormer ARTC chunk enqueued: session_id=%s channel=%s chunk_idx=%s "
+            "frames=%d queue_delay=%.2fms request=%.2fms remote_total=%.2fms "
+            "frame_store_wait=%.2fms",
+            item.session_id,
+            self.config.channel,
+            getattr(item.batch, "block_idx", None),
+            int(frames_np.shape[0]),
+            (started - item.enqueued_at) * 1000.0,
+            (time.perf_counter() - started) * 1000.0,
+            float(remote_timing.get("end_to_end_ms", 0.0)),
+            frame_store_timings.get("frame_store_wait_ms", 0.0),
+        )
+
+    @staticmethod
+    def _discard_result_handles(result: "OutputBatch") -> None:
+        handles = getattr(result, "raw_frame_store_handles", None)
+        if handles is not None:
+            discard_raw_rgb_frame_store_handles(handles)
+
+
 def create_realtime_output_sink(
     ws: "WebSocket",
     session: "GenerateSession",
@@ -569,4 +964,30 @@ def create_realtime_output_sink(
     transport = normalize_realtime_output_transport(session.request)
     if transport == "ws":
         return WebSocketRealtimeOutputSink(ws)
+    postprocess = session.request.realtime_postprocess
+    if (
+        postprocess is not None
+        and postprocess.type == "codeformer"
+        and postprocess.delivery == "artc"
+    ):
+        return RemoteCodeFormerArtcOutputSink.from_request(session, session.request)
     return ArtcRealtimeOutputSink.from_request(session, session.request)
+
+
+async def create_realtime_output_sink_async(
+    ws: "WebSocket",
+    session: "GenerateSession",
+) -> BaseRealtimeOutputSink:
+    if session.request is None:
+        raise ValueError("realtime request is not initialized")
+    postprocess = session.request.realtime_postprocess
+    if (
+        normalize_realtime_output_transport(session.request) == "artc"
+        and postprocess is not None
+        and postprocess.type == "codeformer"
+        and postprocess.delivery == "artc"
+    ):
+        return await RemoteCodeFormerArtcOutputSink.from_request_async(
+            session, session.request
+        )
+    return create_realtime_output_sink(ws, session)

@@ -156,6 +156,7 @@ class RealtimeArtcOutputConfig(BaseModel):
 
 class RealtimePostprocessConfig(BaseModel):
     type: Literal["none", "codeformer"] = "none"
+    delivery: Literal["frames", "artc"] = "frames"
     endpoint: Optional[str] = None
     scale: Optional[int] = Field(default=2, ge=1)
     timeout_ms: Optional[float] = Field(default=800.0, ge=0.0)

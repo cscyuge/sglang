@@ -161,6 +161,7 @@ async with websockets.connect(
   "output_transport": "artc",
   "realtime_postprocess": {
     "type": "codeformer",
+    "delivery": "frames",
     "scale": 2,
     "timeout_ms": 800,
     "on_timeout": "passthrough",
@@ -175,11 +176,28 @@ async with websockets.connect(
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `type` | 是 | 目前支持 `codeformer`；不需要后处理时不传该字段。 |
+| `delivery` | 否 | `frames` 表示增强帧回传 SGLang 后由其推 ARTC，默认值；`artc` 表示 CodeFormer 直接推 ARTC。 |
 | `scale` | 否 | 输出分辨率相对模型原始帧的倍率，CodeFormer 当前通常为 2。 |
 | `timeout_ms` | 否 | 后处理超时时间。超时后按策略处理，默认 800ms。 |
 | `on_timeout` / `on_busy` / `on_error` | 否 | 建议保持 `passthrough`，即后处理慢、忙或失败时继续推原始帧的放大版本，避免实时流中断。 |
 
 一般调用端不需要传后处理服务地址；该地址应由服务端部署配置管理。开启后请以 `init_ack.artc.width` / `height` 为准创建或校验播放端画布，因为实际 ARTC 推流分辨率会变为后处理后的分辨率。
+
+如果部署启用了 CodeFormer 后侧直推 ARTC，配置为：
+
+```json
+{
+  "output_transport": "artc",
+  "realtime_postprocess": {
+    "type": "codeformer",
+    "delivery": "artc",
+    "scale": 2,
+    "timeout_ms": 1500
+  }
+}
+```
+
+该模式保持客户端控制协议不变，但 SGLang 只发送低分辨率视频、16 kHz 音频窗口和时间线元数据；CodeFormer 完成增强后直接推 ARTC，不再把 `960x1664` raw frame 回传 SGLang。`init_ack.artc.publisher` 为 `codeformer`，会话创建失败或运行中 publisher 失败时控制面返回错误并停止当前输出，不做会中双推切换。部署可通过恢复 `delivery="frames"` 回滚到原路径。
 
 ## 5. `init_ack`
 
