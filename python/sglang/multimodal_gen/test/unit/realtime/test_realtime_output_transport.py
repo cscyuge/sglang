@@ -11,9 +11,11 @@ from types import SimpleNamespace
 
 import msgspec.msgpack
 import numpy as np
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    RealtimeArtcOutputConfig,
     RealtimePostprocessConfig,
     RealtimeVideoGenerationsRequest,
 )
@@ -1335,5 +1337,100 @@ def test_remote_codeformer_artc_sink_propagates_publisher_failure(monkeypatch):
         else:
             raise AssertionError("remote publisher failure was not propagated")
         await sink.cancel()
+
+    asyncio.run(run())
+
+
+def test_remote_codeformer_artc_sink_waits_for_bounded_queue(monkeypatch):
+    monkeypatch.setenv("SGLANG_REALTIME_OUTPUT_ENQUEUE_TIMEOUT_MS", "1000")
+
+    async def run():
+        sink = RemoteCodeFormerArtcOutputSink(
+            session_id="session-backpressure",
+            config=RealtimeArtcOutputConfig(
+                token="token",
+                channel="channel",
+                queue_size=1,
+            ),
+            endpoint="http://codeformer.local/v1/realtime/sessions",
+            input_width=1,
+            input_height=1,
+            output_width=2,
+            output_height=2,
+            fps=16,
+            timeout_ms=1000,
+        )
+        session = GenerateSession()
+        result = OutputBatch(
+            raw_frame_batches=[[bytes([1, 2, 3])]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata={
+                "format": "rgb24",
+                "width": 1,
+                "height": 1,
+                "channels": 3,
+                "bytes_per_frame": 3,
+            },
+        )
+        first_batch = SimpleNamespace(block_idx=0)
+        second_batch = SimpleNamespace(block_idx=1)
+
+        await sink.send(session, result, first_batch)
+        waiting_send = asyncio.create_task(sink.send(session, result, second_batch))
+        await asyncio.sleep(0)
+        assert not waiting_send.done()
+
+        first_item = sink._queue.get_nowait()
+        sink._queue.task_done()
+        stats = await asyncio.wait_for(waiting_send, timeout=1.0)
+        second_item = sink._queue.get_nowait()
+        sink._queue.task_done()
+
+        assert first_item.batch.block_idx == 0
+        assert second_item.batch.block_idx == 1
+        assert stats["artc_queue_size"] == 1
+
+    asyncio.run(run())
+
+
+def test_remote_codeformer_artc_sink_times_out_on_full_queue(monkeypatch):
+    monkeypatch.setenv("SGLANG_REALTIME_OUTPUT_ENQUEUE_TIMEOUT_MS", "1")
+
+    async def run():
+        sink = RemoteCodeFormerArtcOutputSink(
+            session_id="session-timeout",
+            config=RealtimeArtcOutputConfig(
+                token="token",
+                channel="channel",
+                queue_size=1,
+            ),
+            endpoint="http://codeformer.local/v1/realtime/sessions",
+            input_width=1,
+            input_height=1,
+            output_width=2,
+            output_height=2,
+            fps=16,
+            timeout_ms=1000,
+        )
+        session = GenerateSession()
+        result = OutputBatch(
+            raw_frame_batches=[[bytes([1, 2, 3])]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata={
+                "format": "rgb24",
+                "width": 1,
+                "height": 1,
+                "channels": 3,
+                "bytes_per_frame": 3,
+            },
+        )
+        await sink.send(session, result, SimpleNamespace(block_idx=0))
+        with pytest.raises(RealtimeProtocolError) as exc_info:
+            await sink.send(session, result, SimpleNamespace(block_idx=1))
+        assert exc_info.value.code == "codeformer_artc_output_backpressure"
+        assert exc_info.value.details["timeout_ms"] == 1.0
+
+        sink._queue.get_nowait()
+        sink._queue.task_done()
 
     asyncio.run(run())

@@ -50,6 +50,15 @@ logger = logging.getLogger(__name__)
 RealtimeOutputTransport = Literal["ws", "artc"]
 ARTC_CONTENT_TYPE = "video/artc"
 ARTC_DEFAULT_QUEUE_SIZE = 2
+ARTC_ENQUEUE_TIMEOUT_ENV = "SGLANG_REALTIME_OUTPUT_ENQUEUE_TIMEOUT_MS"
+ARTC_ENQUEUE_TIMEOUT_DEFAULT_MS = 10000.0
+
+
+def _artc_enqueue_timeout_ms() -> float:
+    raw = os.environ.get(
+        ARTC_ENQUEUE_TIMEOUT_ENV, str(ARTC_ENQUEUE_TIMEOUT_DEFAULT_MS)
+    )
+    return max(0.0, float(raw))
 
 
 def normalize_realtime_output_transport(
@@ -593,6 +602,7 @@ class RemoteCodeFormerArtcOutputSink(BaseRealtimeOutputSink):
         self.height = int(output_height)
         self.fps = int(fps) or 25
         self.max_queue_size = int(config.queue_size or ARTC_DEFAULT_QUEUE_SIZE)
+        self.enqueue_timeout_ms = _artc_enqueue_timeout_ms()
         self._queue: asyncio.Queue[_ArtcOutputItem] = asyncio.Queue(
             maxsize=self.max_queue_size
         )
@@ -790,19 +800,27 @@ class RemoteCodeFormerArtcOutputSink(BaseRealtimeOutputSink):
             result=result,
             batch=batch,
             enqueued_at=started,
-            queue_size=self._queue.qsize() + 1,
+            queue_size=0,
         )
         try:
-            self._queue.put_nowait(item)
-        except asyncio.QueueFull as exc:
+            if self.enqueue_timeout_ms <= 0:
+                await self._queue.put(item)
+            else:
+                await asyncio.wait_for(
+                    self._queue.put(item),
+                    timeout=self.enqueue_timeout_ms / 1000.0,
+                )
+            item.queue_size = self._queue.qsize()
+        except asyncio.TimeoutError as exc:
             self._discard_result_handles(result)
             raise RealtimeProtocolError(
                 "codeformer_artc_output_backpressure",
-                "CodeFormer ARTC output queue is full",
+                "Timed out waiting for CodeFormer ARTC output queue slot",
                 channel=self.config.channel,
                 chunk_index=getattr(batch, "block_idx", None),
                 queue_size=self._queue.qsize(),
                 max_queue_size=self.max_queue_size,
+                timeout_ms=round(self.enqueue_timeout_ms, 3),
             ) from exc
         stats = empty_frame_send_stats(ARTC_CONTENT_TYPE)
         stats["num_frames"] = _result_num_frames(result)
