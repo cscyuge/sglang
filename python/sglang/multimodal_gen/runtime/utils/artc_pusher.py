@@ -130,6 +130,60 @@ logger = logging.getLogger(__name__)
 
 _SDK_DIR = os.path.join(os.path.dirname(__file__), "alirtc")
 _CHUNK = "chunk"
+_SHARED_FRAMES_KEY = "__sglang_shared_frames__"
+
+
+def _is_shared_frames(value) -> bool:
+    return isinstance(value, dict) and bool(value.get(_SHARED_FRAMES_KEY))
+
+
+def _shared_frame_count(value) -> int:
+    if _is_shared_frames(value):
+        return int(value["shape"][0])
+    return int(value.shape[0])
+
+
+def _release_shared_frames(value) -> None:
+    if not _is_shared_frames(value):
+        return
+    path = str(value.get("path") or "")
+    cleanup_dir = str(value.get("cleanup_dir") or "")
+    if path:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Failed to release shared frame path: %s", path)
+    if cleanup_dir:
+        try:
+            os.rmdir(cleanup_dir)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _open_shared_frames(value):
+    if not _is_shared_frames(value):
+        return value
+    frames = np.memmap(
+        value["path"],
+        dtype=np.dtype(value.get("dtype") or "uint8"),
+        mode="r",
+        shape=tuple(int(item) for item in value["shape"]),
+    )
+    # The mapping remains valid after unlink; this transfers ownership to the
+    # ARTC worker and guarantees cleanup even if the worker later fails.
+    _release_shared_frames(value)
+    return frames
+
+
+def _release_chunk_item(item) -> None:
+    if isinstance(item, tuple) and len(item) > 1 and item[0] == _CHUNK:
+        _release_shared_frames(item[1])
+
+
 _CLEAR_BUFFER = "clear_buffer"
 _STOP = "stop"
 
@@ -597,7 +651,7 @@ def _drain_worker_queue(
         if item[0] != _CHUNK:
             continue
 
-        frames_np, audio_int16 = item[1], item[2]
+        frames_np, audio_int16 = _open_shared_frames(item[1]), item[2]
         meta = item[3] if len(item) > 3 and isinstance(item[3], dict) else {}
         chunk_idx = meta.get("chunk_idx")
         audio_chunk_idx = meta.get("audio_chunk_idx")
@@ -1095,6 +1149,7 @@ class ArtcPusher:
         self._status_read_fd: Optional[int] = None
         self._process: Optional[subprocess.Popen] = None
         self._sender_thread: Optional[threading.Thread] = None
+        self._shared_frame_descriptors: list[dict] = []
 
         self._started = False
         self._failed = False
@@ -1251,9 +1306,27 @@ class ArtcPusher:
             )
             self._start_thread.start()
 
+    @staticmethod
+    def release_frames(frames) -> None:
+        _release_shared_frames(frames)
+
+    def _track_shared_frames(self, frames) -> None:
+        self._shared_frame_descriptors = [
+            descriptor
+            for descriptor in self._shared_frame_descriptors
+            if os.path.exists(str(descriptor.get("path") or ""))
+        ]
+        if _is_shared_frames(frames):
+            self._shared_frame_descriptors.append(dict(frames))
+
+    def _release_tracked_shared_frames(self) -> None:
+        for descriptor in self._shared_frame_descriptors:
+            _release_shared_frames(descriptor)
+        self._shared_frame_descriptors.clear()
+
     def push_chunk(
         self,
-        frames_np: np.ndarray,
+        frames_np: np.ndarray | dict,
         audio_16k: Optional[np.ndarray] = None,
         chunk_idx: Optional[int] = None,
         audio_chunk_idx: Optional[int] = None,
@@ -1268,8 +1341,10 @@ class ArtcPusher:
     ) -> None:
         """Enqueue a chunk of RGB video frames and optional 16 kHz mono audio."""
         if self.failed:
+            _release_shared_frames(frames_np)
             return
         if not self._started and not self._start_requested:
+            _release_shared_frames(frames_np)
             return
 
         audio_int16 = None
@@ -1277,7 +1352,7 @@ class ArtcPusher:
             audio_int16 = np.clip(audio_16k * 32767, -32768, 32767).astype(np.int16)
 
         self._ensure_queues()
-        frame_count = int(frames_np.shape[0])
+        frame_count = _shared_frame_count(frames_np)
         duration_s = frame_count / max(self._fps, 1)
         meta = dict(audio_chunk_meta or {})
         meta.update({
@@ -1297,6 +1372,7 @@ class ArtcPusher:
             "enqueue_monotonic_s": time.monotonic(),
         })
         item = (_CHUNK, frames_np, audio_int16, meta)
+        self._track_shared_frames(frames_np)
 
         meta_is_filler = self._meta_is_filler(meta)
         effective_turn_id = meta.get("turn_id")
@@ -1348,6 +1424,8 @@ class ArtcPusher:
                 except queue.Full:
                     pass
                 logger.warning("ARTC pusher queue full, dropped oldest chunk")
+        if not enqueued:
+            _release_shared_frames(frames_np)
         if meta_is_filler:
             self._last_enqueued_was_filler = True
         elif enqueued:
@@ -1542,6 +1620,7 @@ class ArtcPusher:
             except queue.Empty:
                 break
             if dropped == 0 and isinstance(item, tuple) and item and item[0] == _CHUNK:
+                _release_chunk_item(item)
                 dropped = 1
                 continue
             kept.append(item)
@@ -1583,6 +1662,7 @@ class ArtcPusher:
             except queue.Empty:
                 break
             if self._item_is_filler(item):
+                _release_chunk_item(item)
                 meta = self._item_meta(item)
                 stats["dropped_filler_chunks"] += 1
                 duration_ms = float(meta.get("duration_s") or 0.0) * 1000.0
@@ -1664,6 +1744,7 @@ class ArtcPusher:
                 meta = self._item_meta(item)
                 item_turn_id = meta.get("turn_id")
                 if self._meta_is_filler(meta):
+                    _release_chunk_item(item)
                     dropped += 1
                     continue
                 if item_turn_id and item_turn_id != active_turn_id:
@@ -1736,6 +1817,7 @@ class ArtcPusher:
                 self._terminate_worker(timeout=2.0)
 
         self._poll_status()
+        self._release_tracked_shared_frames()
         self._started = False
         self._start_requested = False
         self._start_done.set()
@@ -1829,7 +1911,8 @@ class ArtcPusher:
             self._command_queue.put_nowait((_STOP,))
         except queue.Full:
             try:
-                self._command_queue.get_nowait()
+                dropped = self._command_queue.get_nowait()
+                _release_chunk_item(dropped)
             except queue.Empty:
                 pass
             try:
