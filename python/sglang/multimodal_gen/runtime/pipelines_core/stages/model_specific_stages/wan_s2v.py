@@ -629,6 +629,13 @@ class _WanS2VTransformerTimestepCudaGraphRunner:
     def clear(self) -> None:
         self.graphs.clear()
 
+    def _evict_lru_graph(self, *, device: torch.device) -> None:
+        if device.type == "cuda":
+            # A graph replay is asynchronous. Ensure its executable is no longer
+            # in flight before dropping the final references held by the entry.
+            torch.cuda.synchronize(device)
+        self.graphs.popitem(last=False)
+
     @staticmethod
     def crossattn_cache_ready(crossattn_cache: list[dict] | None) -> bool:
         if crossattn_cache is None:
@@ -1006,16 +1013,13 @@ class _WanS2VTransformerTimestepCudaGraphRunner:
             self.graphs.move_to_end(key)
             return output, "replay"
 
-        if len(self.graphs) >= self.max_graphs:
-            return (
-                forward_fn(**self._disable_graph_kv_update(graph_kwargs)),
-                "eager_graph_limit",
-            )
-
         if not allow_capture:
             raise RuntimeError(
                 "Wan S2V timestep CUDA graph attempted capture while capture is disabled."
             )
+
+        if len(self.graphs) >= self.max_graphs:
+            self._evict_lru_graph(device=metadata_device)
 
         self._log_key_miss_debug(key)
 

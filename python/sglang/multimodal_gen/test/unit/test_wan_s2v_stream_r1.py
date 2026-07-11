@@ -2901,6 +2901,55 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
             kwargs["hidden_states"] + 3,
         )
 
+    def test_timestep_graph_runner_evicts_lru_across_session_addresses(self):
+        runner = _WanS2VTransformerTimestepCudaGraphRunner()
+        runner.configure(max_graphs=16)
+        captured_keys = []
+
+        def _capture_one(*, forward_fn, static_kwargs):
+            captured_keys.append(runner._test_key)
+            return object(), forward_fn(**static_kwargs)
+
+        runner.backend = SimpleNamespace(
+            capture_one=_capture_one,
+            replay=lambda entry: entry.output,
+        )
+        runner.make_key = lambda **_: runner._test_key
+
+        class _Forward:
+            def __call__(self, **call_kwargs):
+                return call_kwargs["hidden_states"]
+
+        for session_index in range(20):
+            runner._test_key = ("session", session_index)
+            _, status = runner.run(
+                kwargs=self._graph_kwargs(),
+                forward_fn=_Forward(),
+                step_index=0,
+                current_start=0,
+                audio_start_frame=0,
+                sequence_shard_enabled=False,
+                allow_capture=True,
+            )
+            self.assertEqual(status, "capture")
+
+        self.assertEqual(runner.cached_graph_count, 16)
+        self.assertEqual(list(runner.graphs), [("session", i) for i in range(4, 20)])
+        self.assertEqual(captured_keys, [("session", i) for i in range(20)])
+
+        runner._test_key = ("session", 19)
+        _, status = runner.run(
+            kwargs=self._graph_kwargs(),
+            forward_fn=_Forward(),
+            step_index=0,
+            current_start=0,
+            audio_start_frame=0,
+            sequence_shard_enabled=False,
+            allow_capture=True,
+        )
+        self.assertEqual(status, "replay")
+        self.assertEqual(captured_keys, [("session", i) for i in range(20)])
+
     def test_timestep_graph_runner_rejects_key_miss_when_capture_disabled(self):
         kwargs = self._graph_kwargs()
         runner = _WanS2VTransformerTimestepCudaGraphRunner()
