@@ -157,6 +157,7 @@ class WanS2VPipeline(FlashTalkPipeline):
                 model_path=audio_encoder_path,
                 num_hidden_layers=25,
                 include_embedding_layer=True,
+                wan_s2v_post_encoder_resample=True,
             )
             audio_encoder = audio_encoder.to(device)
             audio_encoder.eval()

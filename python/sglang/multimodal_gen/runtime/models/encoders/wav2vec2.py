@@ -20,6 +20,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def resample_wan_s2v_hidden_states(
+    hidden_states: torch.Tensor,
+    *,
+    audio_num_samples: int,
+    sample_rate: int,
+    num_video_frames: int,
+    native_fps: float = 50.0,
+    intermediate_fps: float = 30.0,
+) -> torch.Tensor:
+    """Match Wan S2V's post-Wav2Vec 50 Hz -> 30 Hz -> video FPS path."""
+    if hidden_states.ndim != 4:
+        raise ValueError(
+            "hidden_states must have shape [B, T, L, D], got "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if audio_num_samples <= 0 or sample_rate <= 0 or num_video_frames <= 0:
+        raise ValueError("audio length, sample rate, and video frames must be positive")
+
+    batch, native_frames, layers, dim = hidden_states.shape
+    intermediate_frames = max(
+        1, int(native_frames / float(native_fps) * float(intermediate_fps))
+    )
+    features = hidden_states.permute(0, 2, 3, 1).reshape(
+        batch, layers * dim, native_frames
+    )
+    features = F.interpolate(
+        features,
+        size=intermediate_frames,
+        mode="linear",
+        align_corners=True,
+    )
+    features = features.reshape(
+        batch, layers, dim, intermediate_frames
+    ).permute(0, 3, 1, 2)
+
+    duration = audio_num_samples / float(sample_rate)
+    video_fps = num_video_frames / duration
+    indices = torch.round(
+        torch.arange(num_video_frames, device=features.device, dtype=torch.float32)
+        * (float(intermediate_fps) / video_fps)
+    ).to(dtype=torch.long)
+    valid = indices < intermediate_frames
+    gathered = features.index_select(1, indices.clamp(max=intermediate_frames - 1))
+    return gathered * valid.view(1, -1, 1, 1).to(dtype=gathered.dtype)
+
+
 class Wav2Vec2AudioEncoder(nn.Module):
     """Wav2Vec2-based audio encoder that extracts all hidden layer features.
 
@@ -35,6 +81,7 @@ class Wav2Vec2AudioEncoder(nn.Module):
         sample_rate: int = 16000,
         freeze_feature_extractor: bool = True,
         include_embedding_layer: bool = False,
+        wan_s2v_post_encoder_resample: bool = False,
     ):
         super().__init__()
         from transformers import Wav2Vec2Model
@@ -45,6 +92,7 @@ class Wav2Vec2AudioEncoder(nn.Module):
         self.target_fps = target_fps
         self.sample_rate = sample_rate
         self.include_embedding_layer = include_embedding_layer
+        self.wan_s2v_post_encoder_resample = wan_s2v_post_encoder_resample
 
         if freeze_feature_extractor:
             self.wav2vec2.feature_extractor._freeze_parameters()
@@ -92,6 +140,26 @@ class Wav2Vec2AudioEncoder(nn.Module):
             (B, seq_len, num_layers, hidden_size) audio features
         """
         wav2vec = self.wav2vec2
+
+        if self.wan_s2v_post_encoder_resample:
+            outputs = wav2vec(
+                audio_waveform,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            if self.include_embedding_layer:
+                selected = outputs.hidden_states[: self.num_hidden_layers]
+            else:
+                selected = outputs.hidden_states[1 : self.num_hidden_layers + 1]
+            all_layer_features = torch.stack(selected, dim=2)
+            if num_video_frames is None:
+                return all_layer_features
+            return resample_wan_s2v_hidden_states(
+                all_layer_features,
+                audio_num_samples=int(audio_waveform.shape[-1]),
+                sample_rate=self.sample_rate,
+                num_video_frames=num_video_frames,
+            )
 
         # Step 1: CNN feature extraction at native audio framerate
         extract_features = wav2vec.feature_extractor(audio_waveform)
