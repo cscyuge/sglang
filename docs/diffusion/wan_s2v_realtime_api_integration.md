@@ -177,22 +177,55 @@ async with websockets.connect(
 | --- | --- | --- |
 | `type` | 是 | 目前支持 `codeformer`；不需要后处理时不传该字段。 |
 | `delivery` | 否 | `frames` 表示增强帧回传 SGLang 后由其推 ARTC，默认值；`artc` 表示 CodeFormer 直接推 ARTC。 |
+| `endpoint` | 否 | 请求级服务地址覆盖。通常由服务端环境变量配置；该值必须与 `delivery` 对应。 |
 | `scale` | 否 | 输出分辨率相对模型原始帧的倍率，CodeFormer 当前通常为 2。 |
 | `timeout_ms` | 否 | 后处理超时时间。超时后按策略处理，默认 800ms。 |
 | `on_timeout` / `on_busy` / `on_error` | 否 | 建议保持 `passthrough`，即后处理慢、忙或失败时继续推原始帧的放大版本，避免实时流中断。 |
 
-一般调用端不需要传后处理服务地址；该地址应由服务端部署配置管理。开启后请以 `init_ack.artc.width` / `height` 为准创建或校验播放端画布，因为实际 ARTC 推流分辨率会变为后处理后的分辨率。
+一般调用端不需要传后处理服务地址；该地址应由服务端部署配置管理。地址解析顺序为：
 
-如果部署启用了 CodeFormer 后侧直推 ARTC，配置为：
+1. `realtime_postprocess.endpoint`，用于请求级覆盖。
+2. `delivery="artc"` 时使用服务端环境变量 `SGLANG_REALTIME_CODEFORMER_ARTC_ENDPOINT`，地址应指向 `/v1/realtime/sessions`。
+3. `delivery="frames"` 时使用服务端环境变量 `SGLANG_REALTIME_CODEFORMER_ENDPOINT`，地址应指向 `/v1/realtime/sr/raw`。
+
+请求级 `endpoint` 必须与 `delivery` 对应，不能把 raw-frame 地址用于 `delivery="artc"`。开启后请以 `init_ack.artc.width` / `height` 为准创建或校验播放端画布，因为实际 ARTC 推流分辨率会变为后处理后的分辨率。
+
+如果部署启用了 CodeFormer 后侧直推 ARTC，完整的 `init` 请求为：
 
 ```json
 {
+  "type": "init",
+  "prompt": "A person is talking. Only the foreground person is moving, the background remains static.",
+  "first_frame": "data:image/jpeg;base64,...",
+  "fps": 16,
+  "size": "480x832",
+  "max_chunks": 20,
   "output_transport": "artc",
+  "artc": {
+    "token": "<artc-token>",
+    "channel": "<channel-id>",
+    "userid": "sglang",
+    "queue_size": 2
+  },
   "realtime_postprocess": {
     "type": "codeformer",
     "delivery": "artc",
     "scale": 2,
-    "timeout_ms": 1500
+    "timeout_ms": 3000
+  }
+}
+```
+
+如果服务端没有配置环境变量，或需要临时覆盖地址，在 `realtime_postprocess` 中增加：
+
+```json
+{
+  "realtime_postprocess": {
+    "type": "codeformer",
+    "delivery": "artc",
+    "endpoint": "http://<codeformer-host>:8761/v1/realtime/sessions",
+    "scale": 2,
+    "timeout_ms": 3000
   }
 }
 ```
