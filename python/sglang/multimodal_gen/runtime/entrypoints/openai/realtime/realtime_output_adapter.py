@@ -768,7 +768,11 @@ class RawRGBRealtimeOutputAdapter:
             event_id=getattr(batch, "realtime_event_id", None),
             frame_metadata=frame_metadata,
             output_format=output_format,
-            transport_quality=getattr(batch, "output_compression", None),
+            transport_quality=getattr(
+                batch,
+                "realtime_output_compression",
+                getattr(batch, "output_compression", None),
+            ),
             preview_max_width=preview_max_width,
         )
         if frame_store_load is not None:

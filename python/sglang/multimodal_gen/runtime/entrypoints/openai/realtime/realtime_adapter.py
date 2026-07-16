@@ -265,6 +265,7 @@ class BaseRealtimeModelAdapter:
         if session.request is None:
             return
         batch.realtime_output_format = session.request.realtime_output_format
+        batch.realtime_output_compression = session.request.output_compression
         batch.realtime_preview_max_width = session.request.realtime_preview_max_width
         batch.realtime_output_pacing = bool(session.request.realtime_output_pacing)
         batch.realtime_causal_sink_size = session.request.realtime_causal_sink_size

@@ -436,13 +436,25 @@ def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
     assert stats["ws_payload_bytes"] == sum(len(payload) for payload in payloads)
 
 
-def test_raw_rgb_realtime_output_adapter_can_send_h264_annexb_chunks(monkeypatch):
+@pytest.mark.parametrize(
+    ("realtime_compression", "sampling_compression", "expected_crf"),
+    [
+        (27, 50, 27),
+        (None, 50, realtime_output_adapter.H264_DEFAULT_CRF),
+    ],
+)
+def test_raw_rgb_realtime_output_adapter_can_send_h264_annexb_chunks(
+    monkeypatch,
+    realtime_compression,
+    sampling_compression,
+    expected_crf,
+):
     def fake_h264_encoder(transport_frames, *, width, height, fps, crf):
         assert len(transport_frames) == 2
         assert width == 2
         assert height == 2
         assert fps == 16
-        assert crf == 27
+        assert crf == expected_crf
         return b"\x00\x00\x00\x01fake-h264"
 
     monkeypatch.setattr(
@@ -472,7 +484,8 @@ def test_raw_rgb_realtime_output_adapter_can_send_h264_annexb_chunks(monkeypatch
             enable_upscaling=False,
             realtime_event_id=3,
             realtime_output_format="h264",
-            output_compression=27,
+            realtime_output_compression=realtime_compression,
+            output_compression=sampling_compression,
         )
         result = OutputBatch(
             raw_frame_batches=[[frame0, frame1]],
