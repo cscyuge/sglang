@@ -72,6 +72,8 @@ class WanS2VStreamR1KVState:
 class WanS2VKVCacheBlock(TypedDict):
     k: torch.Tensor
     v: torch.Tensor
+    packed_key_storage: NotRequired[torch.Tensor]
+    packed_value_storage: NotRequired[torch.Tensor]
     global_end_index: torch.Tensor
     local_end_index: torch.Tensor
     global_end_index_host: NotRequired[int]
@@ -342,6 +344,11 @@ def _stream_r1_reuse_packed_buffers_enabled() -> bool:
 
 def _stream_r1_fused_segmented_pack_enabled() -> bool:
     value = os.getenv("SGLANG_STREAM_R1_FUSED_SEGMENTED_PACK", "1")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _stream_r1_contiguous_segmented_kv_enabled() -> bool:
+    value = os.getenv("SGLANG_STREAM_R1_CONTIGUOUS_SEGMENTED_KV", "0")
     return value.lower() not in ("", "0", "false", "no", "off")
 
 
@@ -1366,6 +1373,74 @@ def _try_fused_pack_segmented_kv_ranges(
     )
 
 
+def _try_update_contiguous_segmented_kv_ranges(
+    segmented_view: "WanS2VStreamR1SegmentedMixedKVView",
+    metadata: WanS2VStreamR1PackedAttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not _stream_r1_contiguous_segmented_kv_enabled():
+        return None
+    packed_key_storage = segmented_view.packed_key_storage
+    packed_value_storage = segmented_view.packed_value_storage
+    copy_ranges = metadata.kv_copy_ranges
+    if (
+        packed_key_storage is None
+        or packed_value_storage is None
+        or copy_ranges is None
+        or len(copy_ranges) != 2
+        or segmented_view.noisy_key.shape[0] != 1
+        or segmented_view.noisy_key.device.type != "cuda"
+        or segmented_view.condition_seq_len <= 0
+        or packed_key_storage.ndim != 4
+        or packed_value_storage.ndim != 4
+        or metadata.total_kv_tokens > packed_key_storage.shape[1]
+        or metadata.total_kv_tokens > packed_value_storage.shape[1]
+    ):
+        return None
+
+    cached_noisy = segmented_view.cached_noisy_seq_len
+    condition = segmented_view.condition_seq_len
+    first, second = copy_ranges
+    expected_first_end = cached_noisy + condition
+    if (
+        first.batch_index != 0
+        or first.packed_start != 0
+        or first.source_start != 0
+        or first.packed_end != expected_first_end
+        or first.source_end != expected_first_end
+        or second.batch_index != 0
+        or second.packed_start != expected_first_end
+        or second.source_end != expected_first_end
+        or second.source_start < 0
+        or second.source_start >= cached_noisy
+    ):
+        return None
+    current_noisy = cached_noisy - second.source_start
+    if (
+        second.length != current_noisy + condition
+        or metadata.total_kv_tokens != cached_noisy + condition * 2 + current_noisy
+    ):
+        return None
+    if (
+        segmented_view.noisy_key.data_ptr() != packed_key_storage.data_ptr()
+        or segmented_view.noisy_value.data_ptr() != packed_value_storage.data_ptr()
+    ):
+        return None
+
+    from sglang.jit_kernel.diffusion.triton.stream_r1_segmented_pack import (
+        update_contiguous_segmented_kv_tail,
+    )
+
+    return update_contiguous_segmented_kv_tail(
+        segmented_view.noisy_key,
+        segmented_view.noisy_value,
+        segmented_view.condition_key,
+        segmented_view.condition_value,
+        packed_key_storage,
+        packed_value_storage,
+        current_noisy_seq_len=current_noisy,
+    )
+
+
 def _build_wan_s2v_stream_r1_packed_attention_workspace_from_packed_kv(
     query: torch.Tensor,
     metadata: WanS2VStreamR1PackedAttentionMetadata,
@@ -1560,6 +1635,23 @@ def build_wan_s2v_stream_r1_segmented_packed_attention_workspace(
 
     metadata = _get_wan_s2v_stream_r1_packed_attention_metadata(query, plan)
     if metadata.kv_copy_ranges is not None:
+        with _stream_r1_comm_nvtx_range(
+            "stream_r1_segmented_packed_workspace.contiguous_kv_tail "
+            f"ranges={len(metadata.kv_copy_ranges)} kv_seq_len={plan.kv_seq_len}"
+        ):
+            contiguous_packed_kv = _try_update_contiguous_segmented_kv_ranges(
+                segmented_view,
+                metadata,
+            )
+        if contiguous_packed_kv is not None:
+            packed_key, packed_value = contiguous_packed_kv
+            return _build_wan_s2v_stream_r1_packed_attention_workspace_from_packed_kv(
+                query,
+                metadata,
+                packed_key=packed_key,
+                packed_value=packed_value,
+            )
+
         with _stream_r1_comm_nvtx_range(
             "stream_r1_segmented_packed_workspace.fused_kv_pack "
             f"ranges={len(metadata.kv_copy_ranges)} kv_seq_len={plan.kv_seq_len} "
@@ -2653,6 +2745,8 @@ class WanS2VStreamR1NoisyKVCacheView:
     local_end_index: int
     local_start: int
     local_end: int
+    packed_key_storage: torch.Tensor | None = None
+    packed_value_storage: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -2702,6 +2796,8 @@ class WanS2VStreamR1SegmentedMixedKVView:
     local_end_index: int
     local_start: int
     local_end: int
+    packed_key_storage: torch.Tensor | None = None
+    packed_value_storage: torch.Tensor | None = None
 
     @property
     def cached_noisy_seq_len(self) -> int:
@@ -2824,6 +2920,8 @@ def update_wan_s2v_stream_r1_noisy_kv_cache(
         local_end_index=local_end_index,
         local_start=plan.local_start,
         local_end=update.current_end,
+        packed_key_storage=kv_cache.get("packed_key_storage"),
+        packed_value_storage=kv_cache.get("packed_value_storage"),
     )
 
 
@@ -2974,6 +3072,8 @@ def update_wan_s2v_stream_r1_noisy_kv_cache_with_plan_buffer(
         local_end_index=plan.new_local_end_index,
         local_start=plan.local_start,
         local_end=update.current_end,
+        packed_key_storage=kv_cache.get("packed_key_storage"),
+        packed_value_storage=kv_cache.get("packed_value_storage"),
     )
 
 
@@ -3075,6 +3175,8 @@ def compose_wan_s2v_stream_r1_segmented_mixed_kv_view(
         local_end_index=noisy_view.local_end_index,
         local_start=noisy_view.local_start,
         local_end=noisy_view.local_end,
+        packed_key_storage=noisy_view.packed_key_storage,
+        packed_value_storage=noisy_view.packed_value_storage,
     )
 
 
@@ -3262,6 +3364,7 @@ def _prepare_wan_s2v_stream_r1_cached_attention_inputs(
     sp_pad_tokens: int,
     profile: _StreamR1Profile,
     graph_kv_update: bool = False,
+    rope_freqs: torch.Tensor | None = None,
 ) -> _WanS2VCachedAttentionInputs:
     if kv_cache is None:
         raise ValueError("Stream-R1 S2V cached attention requires kv_cache")
@@ -3307,6 +3410,7 @@ def _prepare_wan_s2v_stream_r1_cached_attention_inputs(
                     query,
                     key,
                     value,
+                    rope_freqs=rope_freqs,
                 )
             query_for_attention = query_for_attention[
                 :, : layout.total_seq_len
@@ -3316,6 +3420,13 @@ def _prepare_wan_s2v_stream_r1_cached_attention_inputs(
         else:
             if attention_backend == "packed_varlen":
                 selected_backend = "dense_sdpa_sp_fallback"
+            if rope_freqs is not None:
+                from sglang.jit_kernel.diffusion.triton.wan_s2v_rope import (
+                    apply_wan_s2v_rope,
+                )
+
+                query = apply_wan_s2v_rope(query, rope_freqs).to(query.dtype)
+                key = apply_wan_s2v_rope(key, rope_freqs).to(key.dtype)
             query_for_attention = query
             with profile.span("kv_all_gather"):
                 key = sequence_model_parallel_all_gather(key.contiguous(), dim=1)
@@ -3323,6 +3434,13 @@ def _prepare_wan_s2v_stream_r1_cached_attention_inputs(
             key = key[:, : layout.total_seq_len].contiguous()
             value = value[:, : layout.total_seq_len].contiguous()
     else:
+        if rope_freqs is not None:
+            from sglang.jit_kernel.diffusion.triton.wan_s2v_rope import (
+                apply_wan_s2v_rope,
+            )
+
+            query = apply_wan_s2v_rope(query, rope_freqs).to(query.dtype)
+            key = apply_wan_s2v_rope(key, rope_freqs).to(key.dtype)
         if query.shape[1] != layout.total_seq_len:
             raise ValueError(
                 "query sequence length must match the Stream-R1 attention layout"
@@ -3446,6 +3564,7 @@ def run_wan_s2v_stream_r1_cached_self_attention(
     sequence_shard_enabled: bool = False,
     sp_pad_tokens: int = 0,
     graph_kv_update: bool = False,
+    rope_freqs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one guarded Stream-R1 S2V cached self-attention step."""
 
@@ -3464,6 +3583,7 @@ def run_wan_s2v_stream_r1_cached_self_attention(
         sp_pad_tokens=sp_pad_tokens,
         profile=profile,
         graph_kv_update=graph_kv_update,
+        rope_freqs=rope_freqs,
     )
     query_for_attention = prepared.query_for_attention
     current_kv = prepared.current_kv

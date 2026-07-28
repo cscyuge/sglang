@@ -45,6 +45,11 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
+def _stream_r1_contiguous_segmented_kv_enabled() -> bool:
+    value = os.getenv("SGLANG_STREAM_R1_CONTIGUOUS_SEGMENTED_KV", "0")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
 @dataclass(frozen=True)
 class WanS2VStreamR1AttentionRequest:
     stream_r1_kv_cache: bool
@@ -105,6 +110,11 @@ class WanS2VStreamR1CacheMetadata:
     @property
     def bytes_per_kv_cache(self) -> int:
         itemsize = torch.empty((), dtype=self.dtype).element_size()
+        storage_multiplier = (
+            2
+            if self.batch_size == 1 and _stream_r1_contiguous_segmented_kv_enabled()
+            else 1
+        )
         return (
             self.num_layers
             * self.batch_size
@@ -113,6 +123,7 @@ class WanS2VStreamR1CacheMetadata:
             * self.attention_head_dim
             * 2
             * itemsize
+            * storage_multiplier
         )
 
 
@@ -158,28 +169,51 @@ class WanS2VStreamR1CacheState:
             for _ in range(metadata.num_layers):
                 state = WanS2VStreamR1KVState()
                 kv_states.append(state)
+                cache_shape = (
+                    metadata.batch_size,
+                    metadata.cache_tokens,
+                    metadata.local_num_attention_heads,
+                    metadata.attention_head_dim,
+                )
+                packed_key_storage = None
+                packed_value_storage = None
+                if (
+                    metadata.batch_size == 1
+                    and _stream_r1_contiguous_segmented_kv_enabled()
+                ):
+                    packed_shape = (
+                        metadata.batch_size,
+                        metadata.cache_tokens * 2,
+                        metadata.local_num_attention_heads,
+                        metadata.attention_head_dim,
+                    )
+                    packed_key_storage = torch.zeros(
+                        packed_shape,
+                        dtype=metadata.dtype,
+                        device=metadata.device,
+                    )
+                    packed_value_storage = torch.zeros(
+                        packed_shape,
+                        dtype=metadata.dtype,
+                        device=metadata.device,
+                    )
+                    cache_key = packed_key_storage[:, : metadata.cache_tokens]
+                    cache_value = packed_value_storage[:, : metadata.cache_tokens]
+                else:
+                    cache_key = torch.zeros(
+                        cache_shape,
+                        dtype=metadata.dtype,
+                        device=metadata.device,
+                    )
+                    cache_value = torch.zeros(
+                        cache_shape,
+                        dtype=metadata.dtype,
+                        device=metadata.device,
+                    )
                 kv_cache.append(
                     {
-                        "k": torch.zeros(
-                            (
-                                metadata.batch_size,
-                                metadata.cache_tokens,
-                                metadata.local_num_attention_heads,
-                                metadata.attention_head_dim,
-                            ),
-                            dtype=metadata.dtype,
-                            device=metadata.device,
-                        ),
-                        "v": torch.zeros(
-                            (
-                                metadata.batch_size,
-                                metadata.cache_tokens,
-                                metadata.local_num_attention_heads,
-                                metadata.attention_head_dim,
-                            ),
-                            dtype=metadata.dtype,
-                            device=metadata.device,
-                        ),
+                        "k": cache_key,
+                        "v": cache_value,
                         "global_end_index": torch.zeros(
                             (1,), dtype=torch.long, device=metadata.device
                         ),
@@ -190,6 +224,15 @@ class WanS2VStreamR1CacheState:
                         "local_end_index_host": 0,
                         "state": state,
                         "update_plan_buffer": update_plan_buffer,
+                        **(
+                            {
+                                "packed_key_storage": packed_key_storage,
+                                "packed_value_storage": packed_value_storage,
+                            }
+                            if packed_key_storage is not None
+                            and packed_value_storage is not None
+                            else {}
+                        ),
                     }
                 )
         return cls(metadata=metadata, kv_cache=kv_cache, kv_states=kv_states)

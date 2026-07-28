@@ -86,6 +86,13 @@ def _usp_fp8_comm_fused_rowpack_enabled() -> bool:
     return _env_enabled("SGLANG_STREAM_R1_SP_COMM_FP8_FUSED_ROWPACK", "0")
 
 
+def usp_fp8_comm_fused_qk_prepack_enabled() -> bool:
+    return _env_enabled(
+        "SGLANG_STREAM_R1_SP_COMM_FP8_FUSED_QK_PREPACK",
+        "0",
+    )
+
+
 def _usp_device_cache_key(device: torch.device) -> tuple[str, int]:
     index = device.index
     if device.type == "cuda" and index is None and torch.cuda.is_available():
@@ -507,6 +514,8 @@ def _usp_input_all_to_all_qkv(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    rope_freqs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched Ulysses input all-to-all for QKV (head_dim=2 layout).
 
@@ -517,18 +526,34 @@ def _usp_input_all_to_all_qkv(
     Only supports the head_dim=2 layout: q, k, v are [B, S_local, H, D].
     Falls back to 3 separate calls for GQA (num_kv_heads < num_heads).
     """
+
+    def apply_rope() -> None:
+        nonlocal q, k, rope_freqs
+        if rope_freqs is None:
+            return
+        from sglang.jit_kernel.diffusion.triton.wan_s2v_rope import (
+            apply_wan_s2v_rope,
+        )
+
+        q = apply_wan_s2v_rope(q, rope_freqs).to(q.dtype)
+        k = apply_wan_s2v_rope(k, rope_freqs).to(k.dtype)
+        rope_freqs = None
+
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
+        apply_rope()
         return q, k, v
 
     # GQA guard: q and k/v must have the same number of heads
     if q.shape != k.shape or q.shape != v.shape:
+        apply_rope()
         q = _usp_input_all_to_all(q, head_dim=2)
         k = _usp_input_all_to_all(k, head_dim=2)
         v = _usp_input_all_to_all(v, head_dim=2)
         return q, k, v
 
     if _usp_fp8_comm_enabled("v_only"):
+        apply_rope()
         q = _usp_input_all_to_all(q, head_dim=2)
         k = _usp_input_all_to_all(k, head_dim=2)
         v = _usp_input_all_to_all(v, head_dim=2, fp8_comm=True)
@@ -548,6 +573,7 @@ def _usp_input_all_to_all_qkv(
         from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
             aligned_rowpack_shape,
             blockwise_quant_qkv_fp8_rowpack,
+            blockwise_quant_rope_qkv_fp8_rowpack,
             fused_dequant_unpack_qkv_fp8_rowpack,
         )
 
@@ -558,9 +584,18 @@ def _usp_input_all_to_all_qkv(
             scale_cols=D // group_size,
             world_size=world_size,
         )
+        fuse_rope = (
+            rope_freqs is not None
+            and usp_fp8_comm_fused_qk_prepack_enabled()
+            and q.dtype == torch.bfloat16
+        )
         with _comm_nvtx_range(
-            "sgl_mm_usp_qkv_fused_quant_pack_rowpack "
-            f"world_size={world_size} group_size={group_size} "
+            (
+                "sgl_mm_usp_qkv_fused_rope_quant_pack_rowpack "
+                if fuse_rope
+                else "sgl_mm_usp_qkv_fused_quant_pack_rowpack "
+            )
+            + f"world_size={world_size} group_size={group_size} "
             f"q={tuple(q.shape)} rowpack={rowpack_shape}"
         ):
             packed_rowpack = _usp_get_buffer(
@@ -569,14 +604,27 @@ def _usp_input_all_to_all_qkv(
                 rowpack_shape,
                 dtype=torch.uint8,
             )
-            packed_rowpack = blockwise_quant_qkv_fp8_rowpack(
-                q,
-                k,
-                v,
-                group_size=group_size,
-                world_size=world_size,
-                out=packed_rowpack,
-            )
+            if fuse_rope:
+                packed_rowpack = blockwise_quant_rope_qkv_fp8_rowpack(
+                    q,
+                    k,
+                    v,
+                    rope_freqs,
+                    group_size=group_size,
+                    world_size=world_size,
+                    out=packed_rowpack,
+                )
+                rope_freqs = None
+            else:
+                apply_rope()
+                packed_rowpack = blockwise_quant_qkv_fp8_rowpack(
+                    q,
+                    k,
+                    v,
+                    group_size=group_size,
+                    world_size=world_size,
+                    out=packed_rowpack,
+                )
         packed_rowpack = _usp_all_to_all_single(
             packed_rowpack,
             cache_name="usp_qkv_fp8_rowpack.fp8_rowpack",
@@ -605,6 +653,7 @@ def _usp_input_all_to_all_qkv(
             out=qkv_out,
         )
 
+    apply_rope()
     from sglang.jit_kernel.diffusion.triton.usp_permute import (
         fused_pack_qkv_for_all_to_all,
         fused_unpack_qkv_from_all_to_all,

@@ -331,6 +331,126 @@ def _blockwise_quant_qkv_fp8_rowpack_kernel(
 
 
 @triton.jit
+def _blockwise_quant_rope_qkv_fp8_rowpack_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    freqs_ptr,
+    q_out_ptr,
+    scale_out_ptr,
+    M: tl.constexpr,
+    S: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    CHUNK_ROWS: tl.constexpr,
+    MERGED_ROWS_PER_PEER: tl.constexpr,
+    stride_q_b,
+    stride_q_s,
+    stride_q_h,
+    stride_q_d,
+    stride_k_b,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_v_b,
+    stride_v_s,
+    stride_v_h,
+    stride_v_d,
+    stride_f_b,
+    stride_f_s,
+    stride_f_h,
+    stride_f_p,
+    stride_f_c,
+    BLOCK_M: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+):
+    packed_rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = packed_rows < M
+    qkv_id = packed_rows % 3
+    tmp = packed_rows // 3
+    h = tmp % H
+    tmp = tmp // H
+    s = tmp % S
+    b = tmp // S
+
+    group_id = tl.program_id(1)
+    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    pair_cols = (col_offsets // 2) * 2
+    q_base = (
+        b[:, None] * stride_q_b
+        + s[:, None] * stride_q_s
+        + h[:, None] * stride_q_h
+        + pair_cols[None, :] * stride_q_d
+    )
+    k_base = (
+        b[:, None] * stride_k_b
+        + s[:, None] * stride_k_s
+        + h[:, None] * stride_k_h
+        + pair_cols[None, :] * stride_k_d
+    )
+    q_mask = row_mask[:, None] & (qkv_id[:, None] == 0)
+    k_mask = row_mask[:, None] & (qkv_id[:, None] == 1)
+    rope_mask = q_mask | k_mask
+    x0 = tl.load(q_ptr + q_base, mask=q_mask, other=0.0).to(tl.float32)
+    x0 += tl.load(k_ptr + k_base, mask=k_mask, other=0.0).to(tl.float32)
+    x1 = tl.load(q_ptr + q_base + stride_q_d, mask=q_mask, other=0.0).to(tl.float32)
+    x1 += tl.load(k_ptr + k_base + stride_k_d, mask=k_mask, other=0.0).to(tl.float32)
+    freq_base = (
+        b[:, None] * stride_f_b
+        + s[:, None] * stride_f_s
+        + h[:, None] * stride_f_h
+        + (col_offsets[None, :] // 2) * stride_f_p
+    )
+    freq_r = tl.load(freqs_ptr + freq_base, mask=rope_mask, other=1.0).to(tl.float32)
+    freq_i = tl.load(freqs_ptr + freq_base + stride_f_c, mask=rope_mask, other=0.0).to(
+        tl.float32
+    )
+    rope_even = x0 * freq_r - x1 * freq_i
+    rope_odd = x1 * freq_r + x0 * freq_i
+    rope = tl.where((col_offsets[None, :] % 2) == 0, rope_even, rope_odd)
+    # Preserve the materialized RoPE kernel's BF16 store/reload boundary before
+    # the FP8 absmax and quantization so the fused path remains byte-identical.
+    rope = rope.to(tl.bfloat16).to(tl.float32)
+
+    v_offsets = (
+        b[:, None] * stride_v_b
+        + s[:, None] * stride_v_s
+        + h[:, None] * stride_v_h
+        + col_offsets[None, :] * stride_v_d
+    )
+    v_values = tl.load(
+        v_ptr + v_offsets,
+        mask=row_mask[:, None] & (qkv_id[:, None] == 2),
+        other=0.0,
+    ).to(tl.float32)
+    x = tl.where(rope_mask, rope, v_values)
+
+    absmax = tl.max(tl.abs(x), axis=1)
+    scale = tl.maximum(absmax / FP8_MAX, 1.0e-10)
+    q = tl.clamp(x / scale[:, None], FP8_MIN, FP8_MAX).to(tl.float8e4nv)
+
+    first_row = 3 * h + qkv_id
+    rest_idx = b * S + s
+    rest = M // (3 * H)
+    peer = first_row // CHUNK_ROWS
+    inner = first_row - peer * CHUNK_ROWS
+    payload_row = peer * MERGED_ROWS_PER_PEER + inner
+    payload_offsets = (
+        payload_row[:, None] * rest * D + rest_idx[:, None] * D + col_offsets[None, :]
+    )
+    tl.store(q_out_ptr + payload_offsets, q, mask=row_mask[:, None])
+
+    scale_cols = D // GROUP_SIZE
+    scale_byte_linear = (inner * scale_cols + group_id) * 4
+    scale_row = peer * MERGED_ROWS_PER_PEER + CHUNK_ROWS + scale_byte_linear // D
+    scale_col = scale_byte_linear % D
+    scale_byte_offset = (scale_row * rest + rest_idx) * D + scale_col
+    tl.store(scale_out_ptr + scale_byte_offset // 4, scale, mask=row_mask)
+
+
+@triton.jit
 def _pack_fp8_payload_scale_aligned_kernel(
     payload_ptr,
     scale_u8_ptr,
@@ -577,6 +697,131 @@ def blockwise_quant_qkv_fp8_rowpack(
         v.stride(1),
         v.stride(2),
         v.stride(3),
+        block_m,
+        _FP8_MAX,
+        _FP8_MIN,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+def blockwise_quant_rope_qkv_fp8_rowpack(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    freqs: torch.Tensor,
+    *,
+    group_size: int,
+    world_size: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply Q/K RoPE and directly produce the QKV FP8 SP row-pack.
+
+    The RoPE result is explicitly rounded to BF16 before quantization, matching
+    the unfused ``apply_wan_s2v_rope`` plus
+    ``blockwise_quant_qkv_fp8_rowpack`` chain.
+    """
+
+    if q.shape != k.shape or q.shape != v.shape or q.ndim != 4:
+        raise ValueError(
+            "q, k, and v must have the same [B, S, H, D] shape, got "
+            f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        )
+    batch, seq_len, heads, d = q.shape
+    if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError(
+            "fused RoPE FP8 rowpack requires q, k, and v to use bfloat16, "
+            f"got q={q.dtype} k={k.dtype} v={v.dtype}"
+        )
+    if k.device != q.device or v.device != q.device or freqs.device != q.device:
+        raise ValueError(
+            "q, k, v, and freqs must be on the same device, "
+            f"got q={q.device} k={k.device} v={v.device} freqs={freqs.device}"
+        )
+    if freqs.ndim != 4 or not freqs.is_complex():
+        raise ValueError(
+            "freqs must be complex [B, S, H, D/2], "
+            f"got shape={tuple(freqs.shape)} dtype={freqs.dtype}"
+        )
+    if (
+        freqs.shape[0] != batch
+        or freqs.shape[1] < seq_len
+        or freqs.shape[2] != heads
+        or freqs.shape[3] != d // 2
+    ):
+        raise ValueError(
+            "freqs must cover the Q/K batch, sequence, head, and half-head "
+            f"dimensions, got q={tuple(q.shape)} freqs={tuple(freqs.shape)}"
+        )
+    if d % group_size != 0 or d % 4 != 0 or d % 2 != 0:
+        raise ValueError(
+            f"d={d} must be divisible by group_size={group_size}, 4, and 2"
+        )
+
+    payload_shape = (3 * heads, batch, seq_len, d)
+    rows = payload_shape[0]
+    if rows % world_size != 0:
+        raise ValueError(f"rows={rows} must be divisible by world_size={world_size}")
+    combined_shape = aligned_rowpack_shape(
+        payload_shape,
+        scale_cols=d // group_size,
+        world_size=world_size,
+    )
+    if out is None:
+        out = torch.empty(combined_shape, dtype=torch.uint8, device=q.device)
+    elif (
+        out.shape != combined_shape
+        or out.dtype != torch.uint8
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must match aligned row-pack shape/device, be contiguous, and use uint8"
+        )
+
+    chunk_rows = rows // world_size
+    scale_rows = _rowpack_scale_rows(
+        chunk_rows=chunk_rows,
+        d=d,
+        scale_cols=d // group_size,
+    )
+    merged_rows_per_peer = chunk_rows + scale_rows
+    packed_input_rows = batch * seq_len * heads * 3
+    block_m = _block_m_for_rows(packed_input_rows)
+    freqs_real = torch.view_as_real(freqs[:, :seq_len])
+    grid = (triton.cdiv(packed_input_rows, block_m), d // group_size)
+    _blockwise_quant_rope_qkv_fp8_rowpack_kernel[grid](
+        q,
+        k,
+        v,
+        freqs_real,
+        out.view(torch.float8_e4m3fn),
+        out.view(torch.float32),
+        packed_input_rows,
+        seq_len,
+        heads,
+        d,
+        group_size,
+        chunk_rows,
+        merged_rows_per_peer,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        freqs_real.stride(0),
+        freqs_real.stride(1),
+        freqs_real.stride(2),
+        freqs_real.stride(3),
+        freqs_real.stride(4),
         block_m,
         _FP8_MAX,
         _FP8_MIN,

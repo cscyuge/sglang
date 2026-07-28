@@ -238,6 +238,62 @@ class TestWanS2VStreamR1Fp8CommKernels(unittest.TestCase):
             )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_fused_rope_quant_qkv_rowpack_is_byte_identical(self):
+        from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+            aligned_rowpack_shape,
+            blockwise_quant_qkv_fp8_rowpack,
+            blockwise_quant_rope_qkv_fp8_rowpack,
+        )
+        from sglang.jit_kernel.diffusion.triton.wan_s2v_rope import (
+            apply_wan_s2v_rope,
+        )
+
+        torch.manual_seed(13)
+        base_shape = (1, 12, 4, 128)
+        q = torch.randn(base_shape, device="cuda", dtype=torch.bfloat16)[:, ::2]
+        k = torch.randn(base_shape, device="cuda", dtype=torch.bfloat16)[:, ::2]
+        v = torch.randn(base_shape, device="cuda", dtype=torch.bfloat16)[:, ::2]
+        phase = torch.randn(
+            (1, 6, 4, 64),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        freqs = torch.polar(torch.ones_like(phase), phase)
+        out_shape = aligned_rowpack_shape(
+            (12, 1, 6, 128),
+            scale_cols=1,
+            world_size=2,
+        )
+        expected = torch.zeros(out_shape, dtype=torch.uint8, device="cuda")
+        blockwise_quant_qkv_fp8_rowpack(
+            apply_wan_s2v_rope(q, freqs),
+            apply_wan_s2v_rope(k, freqs),
+            v,
+            group_size=128,
+            world_size=2,
+            out=expected,
+        )
+        # Both fused rowpack kernels intentionally leave unused scale-row
+        # alignment bytes untouched. Start from the same padding contents so
+        # the full-buffer equality checks every semantically transmitted byte.
+        out = torch.zeros(out_shape, dtype=torch.uint8, device="cuda")
+        actual = blockwise_quant_rope_qkv_fp8_rowpack(
+            q,
+            k,
+            v,
+            freqs,
+            group_size=128,
+            world_size=2,
+            out=out,
+        )
+        self.assertIs(actual, out)
+        self.assertTrue(
+            torch.equal(actual, expected),
+            f"fused rowpack differs in "
+            f"{torch.count_nonzero(actual != expected).item()} bytes",
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_fused_fp8_qkv_dequant_unpack_matches_reference(self):
         from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
             blockwise_dequant_fp8,
@@ -522,6 +578,134 @@ class TestWanS2VStreamR1SegmentKernels(unittest.TestCase):
         self.assertEqual(actual.dtype, torch.bfloat16)
         self.assertEqual(actual.shape, x.shape)
         torch.testing.assert_close(actual, expected)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_segment_modulate_prequant_is_byte_identical(self):
+        from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
+            segment_modulate,
+            segment_modulate_quant_fp8,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        torch.manual_seed(14)
+        x = torch.randn(
+            (1, 11, 5120),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        shift = torch.randn(
+            (1, 2, 5120),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        scale = torch.randn_like(shift)
+        modulated = segment_modulate(
+            x,
+            shift,
+            scale,
+            7,
+            out_dtype=torch.bfloat16,
+        )
+        expected_q, expected_scale = sglang_per_token_group_quant_fp8(
+            modulated.view(-1, modulated.shape[-1]),
+            128,
+            column_major_scales=True,
+        )
+        expected_q = expected_q.view_as(modulated)
+        expected_scale = expected_scale.transpose(-1, -2).contiguous()
+        actual_q, actual_scale = segment_modulate_quant_fp8(
+            x,
+            shift,
+            scale,
+            7,
+        )
+
+        self.assertTrue(
+            torch.equal(actual_q, expected_q),
+            f"fused prequant differs in "
+            f"{torch.count_nonzero(actual_q != expected_q).item()} FP8 bytes",
+        )
+        torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_flashinfer_block_fp8_prequant_matches_internal_quant(self):
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+        from sglang.srt.layers.quantization.fp8_utils import (
+            flashinfer_gemm_w8a8_block_fp8_linear_with_fallback,
+        )
+
+        if torch.cuda.get_device_capability()[0] < 12:
+            self.skipTest("FlashInfer CUTLASS groupwise FP8 requires Blackwell")
+        torch.manual_seed(15)
+        x = torch.randn((11, 256), device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(
+            (256, 256),
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).to(torch.float8_e4m3fn)
+        weight_scale = torch.ones(
+            (2, 2),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        q, q_scale = sglang_per_token_group_quant_fp8(
+            x,
+            128,
+            column_major_scales=True,
+        )
+        q_scale = q_scale.transpose(-1, -2).contiguous()
+        expected = flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
+            x,
+            weight,
+            [128, 128],
+            weight_scale,
+        )
+        actual = flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
+            q,
+            weight,
+            [128, 128],
+            weight_scale,
+            input_scale=q_scale,
+        )
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_gelu_tanh_prequant_is_byte_identical(self):
+        from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
+            gelu_tanh_quant_fp8,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        torch.manual_seed(16)
+        x = torch.randn(
+            (1, 11, 13824),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        activated = F.gelu(x, approximate="tanh")
+        expected_q, expected_scale = sglang_per_token_group_quant_fp8(
+            activated.view(-1, activated.shape[-1]),
+            128,
+            column_major_scales=True,
+        )
+        expected_q = expected_q.view_as(activated)
+        expected_scale = expected_scale.transpose(-1, -2).contiguous()
+        actual_q, actual_scale = gelu_tanh_quant_fp8(x)
+
+        self.assertTrue(
+            torch.equal(actual_q, expected_q),
+            f"fused GELU prequant differs in "
+            f"{torch.count_nonzero(actual_q != expected_q).item()} FP8 bytes",
+        )
+        torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
 
     def test_legacy_grid_has_zero_start_and_current_values(self):
         grid_sizes = torch.tensor([[2, 3, 4], [5, 6, 7]], dtype=torch.long)
@@ -1608,6 +1792,101 @@ class TestWanS2VStreamR1ProjectedKVAdapters(unittest.TestCase):
         torch.testing.assert_close(workspace.key, expected_key)
         torch.testing.assert_close(workspace.value, expected_value)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_contiguous_segmented_kv_tail_matches_workspace(self):
+        from sglang.jit_kernel.diffusion.triton.stream_r1_segmented_pack import (
+            update_contiguous_segmented_kv_tail,
+        )
+
+        update = WanS2VStreamR1NoisyKVCacheUpdate(
+            noisy_seq_len=4,
+            frame_seq_length=1,
+            local_attn_size=5,
+            sink_size=1,
+            current_start=4,
+        )
+        cached_key, cached_value = self._indexed_kv([0, 4, 5, 6, 7])
+        packed_key_storage = torch.empty(
+            (1, 16, 2, 4), dtype=torch.float32, device="cuda"
+        )
+        packed_value_storage = torch.empty_like(packed_key_storage)
+        packed_key_storage[:, :5].copy_(
+            cached_key.expand(1, -1, 2, 4).contiguous().cuda()
+        )
+        packed_value_storage[:, :5].copy_(
+            cached_value.expand(1, -1, 2, 4).contiguous().cuda()
+        )
+        noisy_view = WanS2VStreamR1NoisyKVCacheView(
+            key=packed_key_storage[:, :5],
+            value=packed_value_storage[:, :5],
+            global_end_index=8,
+            local_end_index=5,
+            local_start=4,
+            local_end=8,
+            packed_key_storage=packed_key_storage,
+            packed_value_storage=packed_value_storage,
+        )
+        condition_key = torch.arange(16, dtype=torch.float32, device="cuda").view(
+            1, 2, 2, 4
+        )
+        condition_value = condition_key + 100
+        split = split_wan_s2v_stream_r1_projected_kv(
+            torch.cat([noisy_view.key[:, -4:], condition_key], dim=1),
+            torch.cat([noisy_view.value[:, -4:], condition_value], dim=1),
+            noisy_seq_len=4,
+        )
+        segmented = compose_wan_s2v_stream_r1_segmented_mixed_kv_view(
+            noisy_view,
+            split,
+        )
+        plan = build_wan_s2v_stream_r1_segmented_mixed_kv_attention_plan(
+            noisy_view,
+            segmented,
+            update,
+        )
+        query = torch.randn(1, 6, 2, 4, device="cuda")
+        expected_key = torch.cat(
+            [
+                segmented.noisy_key[0],
+                segmented.condition_key[0],
+                segmented.noisy_key[0, 1:],
+                segmented.condition_key[0],
+            ],
+            dim=0,
+        )
+        expected_value = torch.cat(
+            [
+                segmented.noisy_value[0],
+                segmented.condition_value[0],
+                segmented.noisy_value[0, 1:],
+                segmented.condition_value[0],
+            ],
+            dim=0,
+        )
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"SGLANG_STREAM_R1_CONTIGUOUS_SEGMENTED_KV": "1"},
+            ),
+            patch(
+                "sglang.jit_kernel.diffusion.triton.stream_r1_segmented_pack."
+                "update_contiguous_segmented_kv_tail",
+                wraps=update_contiguous_segmented_kv_tail,
+            ) as update_tail_mock,
+        ):
+            workspace = build_wan_s2v_stream_r1_segmented_packed_attention_workspace(
+                query,
+                segmented,
+                plan,
+            )
+
+        self.assertGreater(update_tail_mock.call_count, 0)
+        self.assertEqual(workspace.key.data_ptr(), packed_key_storage.data_ptr())
+        self.assertEqual(workspace.value.data_ptr(), packed_value_storage.data_ptr())
+        torch.testing.assert_close(workspace.key, expected_key, rtol=0, atol=0)
+        torch.testing.assert_close(workspace.value, expected_value, rtol=0, atol=0)
+
 
 class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
     def _cache(self, tokens: int):
@@ -1774,14 +2053,17 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
             current_start=0,
         )
 
-        with patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "get_sp_world_size",
-            return_value=2,
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "sequence_model_parallel_all_gather",
-            side_effect=fake_all_gather,
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "get_sp_world_size",
+                return_value=2,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "sequence_model_parallel_all_gather",
+                side_effect=fake_all_gather,
+            ),
         ):
             output = run_wan_s2v_stream_r1_cached_self_attention(
                 recording_attention,
@@ -1833,13 +2115,16 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
             current_start=0,
         )
 
-        with patch.dict(
-            "os.environ",
-            {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "compose_wan_s2v_stream_r1_mixed_kv_view",
-            side_effect=AssertionError("packed backend should use segmented K/V"),
+        with (
+            patch.dict(
+                "os.environ",
+                {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "compose_wan_s2v_stream_r1_mixed_kv_view",
+                side_effect=AssertionError("packed backend should use segmented K/V"),
+            ),
         ):
             output = run_wan_s2v_stream_r1_cached_self_attention(
                 FailingAttention(),
@@ -1889,17 +2174,21 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
             current_start=0,
         )
 
-        with patch.dict(
-            "os.environ",
-            {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "get_sp_world_size",
-            return_value=2,
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "sequence_model_parallel_all_gather",
-            side_effect=fake_all_gather,
+        with (
+            patch.dict(
+                "os.environ",
+                {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "get_sp_world_size",
+                return_value=2,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "sequence_model_parallel_all_gather",
+                side_effect=fake_all_gather,
+            ),
         ):
             output = run_wan_s2v_stream_r1_cached_self_attention(
                 recording_attention,
@@ -1940,7 +2229,8 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
         output_local = torch.randn(1, 2, 2, 2)
         output_all_to_all_inputs = []
 
-        def fake_qkv_all_to_all(query, key, value):
+        def fake_qkv_all_to_all(query, key, value, *, rope_freqs=None):
+            self.assertIsNone(rope_freqs)
             torch.testing.assert_close(query, query_local)
             torch.testing.assert_close(key, key_local)
             torch.testing.assert_close(value, value_local)
@@ -1964,29 +2254,38 @@ class TestWanS2VStreamR1CachedSelfAttentionBranch(unittest.TestCase):
             current_start=0,
         )
 
-        with patch.dict(
-            "os.environ",
-            {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "get_sp_world_size",
-            return_value=2,
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "_usp_input_all_to_all_qkv",
-            side_effect=fake_qkv_all_to_all,
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "_usp_output_all_to_all",
-            side_effect=fake_output_all_to_all,
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "sequence_model_parallel_all_gather",
-            side_effect=fail_all_gather,
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "compose_wan_s2v_stream_r1_mixed_kv_view",
-            side_effect=AssertionError("SP packed backend should use segmented K/V"),
+        with (
+            patch.dict(
+                "os.environ",
+                {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "get_sp_world_size",
+                return_value=2,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "_usp_input_all_to_all_qkv",
+                side_effect=fake_qkv_all_to_all,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "_usp_output_all_to_all",
+                side_effect=fake_output_all_to_all,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "sequence_model_parallel_all_gather",
+                side_effect=fail_all_gather,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "compose_wan_s2v_stream_r1_mixed_kv_view",
+                side_effect=AssertionError(
+                    "SP packed backend should use segmented K/V"
+                ),
+            ),
         ):
             output = run_wan_s2v_stream_r1_cached_self_attention(
                 FailingAttention(),
@@ -3334,6 +3633,47 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         self.assertEqual(state.kv_states[1].local_end_index, 0)
         self.assertIsNone(state.kv_cache[0]["update_plan_buffer"].host_plan)
 
+    def test_kv_cache_state_allocates_contiguous_segmented_storage(self):
+        metadata = WanS2VStreamR1CacheMetadata(
+            batch_size=1,
+            num_layers=2,
+            frame_seq_length=5,
+            local_num_attention_heads=3,
+            attention_head_dim=8,
+            local_attn_size=4,
+            sink_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"SGLANG_STREAM_R1_CONTIGUOUS_SEGMENTED_KV": "1"},
+        ):
+            state = WanS2VStreamR1CacheState.allocate(metadata)
+            expected_bytes = metadata.bytes_per_kv_cache
+
+        block = state.kv_cache[0]
+        packed_key_storage = block["packed_key_storage"]
+        packed_value_storage = block["packed_value_storage"]
+        self.assertEqual(packed_key_storage.shape, (1, 40, 3, 8))
+        self.assertEqual(packed_value_storage.shape, (1, 40, 3, 8))
+        self.assertEqual(block["k"].shape, (1, 20, 3, 8))
+        self.assertEqual(block["v"].shape, (1, 20, 3, 8))
+        self.assertEqual(block["k"].data_ptr(), packed_key_storage.data_ptr())
+        self.assertEqual(block["v"].data_ptr(), packed_value_storage.data_ptr())
+        self.assertEqual(
+            expected_bytes,
+            sum(
+                tensor.numel() * tensor.element_size()
+                for cache in state.kv_cache
+                for tensor in (
+                    cache["packed_key_storage"],
+                    cache["packed_value_storage"],
+                )
+            ),
+        )
+
     def test_kv_cache_state_reuses_prebuilt_update_plan_for_matching_layers(self):
         metadata = WanS2VStreamR1CacheMetadata(
             batch_size=1,
@@ -3516,17 +3856,21 @@ class TestWanS2VStreamR1DenoisingStage(unittest.TestCase):
         stage._s2v_kv_attention_kernel_supported = True
         request = self._attention_request(stream_r1_kv_cache=True)
 
-        with patch.dict(
-            "os.environ",
-            {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
-        ), patch(
-            "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
-            "get_sp_world_size",
-            return_value=3,
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages."
-            "model_specific_stages.wan_s2v.get_sp_world_size",
-            return_value=3,
+        with (
+            patch.dict(
+                "os.environ",
+                {"SGLANG_STREAM_R1_ATTENTION_BACKEND": "packed_varlen"},
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1."
+                "get_sp_world_size",
+                return_value=3,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.wan_s2v.get_sp_world_size",
+                return_value=3,
+            ),
         ):
             state = stage._prepare_cache_state(
                 request=request,

@@ -56,10 +56,14 @@ def main() -> None:
         blockwise_quant_fp8,
         blockwise_quant_fp8_rowpack,
         blockwise_quant_qkv_fp8_rowpack,
+        blockwise_quant_rope_qkv_fp8_rowpack,
         pack_fp8_payload_scale_aligned,
     )
     from sglang.jit_kernel.diffusion.triton.usp_permute import (
         fused_pack_qkv_for_all_to_all,
+    )
+    from sglang.jit_kernel.diffusion.triton.wan_s2v_rope import (
+        apply_wan_s2v_rope,
     )
 
     group_size = 128
@@ -68,6 +72,12 @@ def main() -> None:
     q = torch.randn(qkv_shape, device=device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
+    phase = torch.randn(
+        (qkv_shape[0], qkv_shape[1], qkv_shape[2], qkv_shape[3] // 2),
+        device=device,
+        dtype=torch.float32,
+    )
+    freqs = torch.polar(torch.ones_like(phase), phase)
     qkv_payload_shape = (120, 1, 2717, 128)
     qkv_scale_shape = (120, 1, 2717, 1)
     qkv_rowpack_shape = aligned_rowpack_shape(
@@ -112,6 +122,41 @@ def main() -> None:
             group_size=group_size,
             world_size=world_size,
             out=qkv_fused_out,
+        )
+
+    def rope_qkv_reference() -> None:
+        q_rope = apply_wan_s2v_rope(q, freqs)
+        k_rope = apply_wan_s2v_rope(k, freqs)
+        blockwise_quant_qkv_fp8_rowpack(
+            q_rope,
+            k_rope,
+            v,
+            group_size=group_size,
+            world_size=world_size,
+            out=qkv_reference_out,
+        )
+
+    def rope_qkv_fused() -> None:
+        blockwise_quant_rope_qkv_fp8_rowpack(
+            q,
+            k,
+            v,
+            freqs,
+            group_size=group_size,
+            world_size=world_size,
+            out=qkv_fused_out,
+        )
+
+    # Aligned scale rows contain padding bytes that neither kernel consumes.
+    # Give both outputs identical padding before the full-buffer quality gate.
+    qkv_reference_out.zero_()
+    qkv_fused_out.zero_()
+    rope_qkv_reference()
+    rope_qkv_fused()
+    if not torch.equal(qkv_reference_out, qkv_fused_out):
+        differing_bytes = torch.count_nonzero(qkv_reference_out != qkv_fused_out).item()
+        raise AssertionError(
+            f"fused RoPE QKV rowpack differs in {differing_bytes} bytes"
         )
 
     output_shape = (5434, 1, 20, 128)
@@ -177,6 +222,27 @@ def main() -> None:
                 )
             ),
         },
+        "rope_qkv": {
+            "input_shape": list(qkv_shape),
+            "rowpack_shape": list(qkv_rowpack_shape),
+            "byte_identical": True,
+            "reference": _summary(
+                _time(
+                    rope_qkv_reference,
+                    warmup=args.warmup,
+                    repeats=args.repeats,
+                    trials=args.trials,
+                )
+            ),
+            "fused": _summary(
+                _time(
+                    rope_qkv_fused,
+                    warmup=args.warmup,
+                    repeats=args.repeats,
+                    trials=args.trials,
+                )
+            ),
+        },
         "output": {
             "input_shape": list(output_shape),
             "rowpack_shape": list(output_rowpack_shape),
@@ -198,10 +264,9 @@ def main() -> None:
             ),
         },
     }
-    for record in (results["qkv"], results["output"]):
-        record["speedup"] = (
-            float(record["reference"]["p50_ms"])
-            / float(record["fused"]["p50_ms"])
+    for record in (results["qkv"], results["rope_qkv"], results["output"]):
+        record["speedup"] = float(record["reference"]["p50_ms"]) / float(
+            record["fused"]["p50_ms"]
         )
         record["saved_ms"] = (
             float(record["reference"]["p50_ms"])
@@ -212,6 +277,9 @@ def main() -> None:
     )
     results["projected_saved_ms_per_timestep_40_layers"] = (
         float(results["saved_ms_per_layer"]) * 40
+    )
+    results["rope_qkv_projected_saved_ms_per_timestep_40_layers"] = (
+        float(results["rope_qkv"]["saved_ms"]) * 40
     )
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.json_out.write_text(json.dumps(results, indent=2) + "\n")

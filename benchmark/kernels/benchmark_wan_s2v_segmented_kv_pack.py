@@ -13,6 +13,7 @@ import torch
 
 from sglang.jit_kernel.diffusion.triton.stream_r1_segmented_pack import (
     fused_pack_segmented_kv,
+    update_contiguous_segmented_kv_tail,
 )
 
 
@@ -37,6 +38,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--noisy-seq-len", type=int, default=14040)
     parser.add_argument("--condition-seq-len", type=int, default=3874)
+    parser.add_argument("--current-noisy-seq-len", type=int, default=1560)
     parser.add_argument("--heads", type=int, default=20)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--block-rows", nargs="+", type=int, default=[1, 2, 4, 8])
@@ -58,16 +60,28 @@ def main() -> None:
     noisy_value = torch.randn_like(noisy_key)
     condition_key = torch.randn(condition_shape, device=device, dtype=dtype)
     condition_value = torch.randn_like(condition_key)
+    if args.current_noisy_seq_len > args.noisy_seq_len:
+        raise ValueError("current noisy sequence length exceeds noisy cache length")
     plan = [
         torch.tensor(values, device=device, dtype=torch.int32)
         for values in (
             [0, 0],
-            [0, args.noisy_seq_len],
-            [0, args.noisy_seq_len],
-            [args.noisy_seq_len, args.condition_seq_len],
+            [0, args.noisy_seq_len + args.condition_seq_len],
+            [0, args.noisy_seq_len - args.current_noisy_seq_len],
+            [
+                args.noisy_seq_len + args.condition_seq_len,
+                args.current_noisy_seq_len + args.condition_seq_len,
+            ],
         )
     ]
-    total_tokens = args.noisy_seq_len + args.condition_seq_len
+    total_tokens = (
+        args.noisy_seq_len + 2 * args.condition_seq_len + args.current_noisy_seq_len
+    )
+    if total_tokens > 2 * args.noisy_seq_len:
+        raise ValueError(
+            "production persistent storage is too small for this shape: "
+            f"required={total_tokens} capacity={2 * args.noisy_seq_len}"
+        )
     out = (
         torch.empty(
             (total_tokens, args.heads, args.head_dim), device=device, dtype=dtype
@@ -77,23 +91,79 @@ def main() -> None:
         ),
     )
     expected_key = torch.cat((noisy_key[0], condition_key[0]), dim=0)
-    expected_value = torch.cat((noisy_value[0], condition_value[0]), dim=0)
+    expected_key = torch.cat(
+        (
+            expected_key,
+            noisy_key[0, -args.current_noisy_seq_len :],
+            condition_key[0],
+        ),
+        dim=0,
+    )
+    expected_value = torch.cat(
+        (
+            noisy_value[0],
+            condition_value[0],
+            noisy_value[0, -args.current_noisy_seq_len :],
+            condition_value[0],
+        ),
+        dim=0,
+    )
+    packed_storage_shape = (
+        1,
+        2 * args.noisy_seq_len,
+        args.heads,
+        args.head_dim,
+    )
+    packed_storage = (
+        torch.empty(packed_storage_shape, device=device, dtype=dtype),
+        torch.empty(packed_storage_shape, device=device, dtype=dtype),
+    )
+    packed_storage[0][:, : args.noisy_seq_len].copy_(noisy_key)
+    packed_storage[1][:, : args.noisy_seq_len].copy_(noisy_value)
+    persistent_noisy_key = packed_storage[0][:, : args.noisy_seq_len]
+    persistent_noisy_value = packed_storage[1][:, : args.noisy_seq_len]
+
+    def run_full_pack():
+        return fused_pack_segmented_kv(
+            noisy_key,
+            noisy_value,
+            condition_key,
+            condition_value,
+            *plan,
+            total_tokens=total_tokens,
+            noisy_seq_len=args.noisy_seq_len,
+            max_length=args.noisy_seq_len + args.condition_seq_len,
+            out=out,
+            block_rows=2,
+            block_hd=4096,
+            num_warps=4,
+        )
+
+    run_full_pack()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[0], expected_key, rtol=0, atol=0)
+    torch.testing.assert_close(out[1], expected_value, rtol=0, atol=0)
+    full_pack_samples = _samples(
+        run_full_pack,
+        warmup=args.warmup,
+        repeats=args.repeats,
+        trials=args.trials,
+    )
+    full_pack_median = statistics.median(full_pack_samples)
     results = []
 
     for block_rows, block_hd, num_warps in itertools.product(
         args.block_rows, args.block_hd, args.num_warps
     ):
         def run():
-            return fused_pack_segmented_kv(
-                noisy_key,
-                noisy_value,
+            return update_contiguous_segmented_kv_tail(
+                persistent_noisy_key,
+                persistent_noisy_value,
                 condition_key,
                 condition_value,
-                *plan,
-                total_tokens=total_tokens,
-                noisy_seq_len=args.noisy_seq_len,
-                max_length=args.noisy_seq_len,
-                out=out,
+                packed_storage[0],
+                packed_storage[1],
+                current_noisy_seq_len=args.current_noisy_seq_len,
                 block_rows=block_rows,
                 block_hd=block_hd,
                 num_warps=num_warps,
@@ -102,8 +172,10 @@ def main() -> None:
         try:
             run()
             torch.cuda.synchronize()
-            torch.testing.assert_close(out[0], expected_key, rtol=0, atol=0)
-            torch.testing.assert_close(out[1], expected_value, rtol=0, atol=0)
+            packed_key, packed_value = run()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(packed_key, expected_key, rtol=0, atol=0)
+            torch.testing.assert_close(packed_value, expected_value, rtol=0, atol=0)
             samples = _samples(
                 run,
                 warmup=args.warmup,
@@ -119,6 +191,8 @@ def main() -> None:
                 "min_ms": min(samples),
                 "max_ms": max(samples),
                 "exact": True,
+                "saving_vs_full_ms": full_pack_median - statistics.median(samples),
+                "speedup_vs_full": full_pack_median / statistics.median(samples),
             }
             print(
                 f"rows={block_rows} hd={block_hd} warps={num_warps}: "
@@ -146,7 +220,15 @@ def main() -> None:
         "shape": {
             "noisy": noisy_shape,
             "condition": condition_shape,
+            "current_noisy_seq_len": args.current_noisy_seq_len,
             "total_tokens": total_tokens,
+        },
+        "full_pack": {
+            "block_rows": 2,
+            "block_hd": 4096,
+            "num_warps": 4,
+            "samples_ms": full_pack_samples,
+            "median_ms": full_pack_median,
         },
         "best": valid[0] if valid else None,
         "results": results,

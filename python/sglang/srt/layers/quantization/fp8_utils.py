@@ -773,14 +773,23 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
-
     input_2d = input.view(-1, input.shape[-1])
+    prequantized_input = input_scale is not None
+    if prequantized_input and input_2d.dtype not in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
+        raise ValueError(
+            "prequantized FlashInfer groupwise FP8 input must use an FP8 dtype, "
+            f"got {input_2d.dtype}"
+        )
     backend = _get_flashinfer_groupwise_backend()
     # Fall back to triton for non-supported formats.
     # TODO: Check if flashinfer supports other output dtypes besides bf16.
-    if backend == "trtllm" and (
-        input_2d.shape[1] < 256 or input_2d.dtype != torch.bfloat16
+    if (
+        not prequantized_input
+        and backend == "trtllm"
+        and (input_2d.shape[1] < 256 or input_2d.dtype != torch.bfloat16)
     ):
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
@@ -799,11 +808,21 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     # scale_major_mode="MN" expects (k//block_k, m), so generate activation
     # scales in column-major storage and transpose to the target shape as a
     # contiguous view.
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d,
-        block_size[1],
-        column_major_scales=(backend in ("cutlass", "trtllm")),
-    )
+    if prequantized_input:
+        q_input = input_2d
+        x_scale = input_scale
+        if x_scale.dtype != torch.float32:
+            raise ValueError(
+                "prequantized FlashInfer groupwise FP8 scales must use float32, "
+                f"got {x_scale.dtype}"
+            )
+        quant_ms = 0.0
+    else:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            block_size[1],
+            column_major_scales=(backend in ("cutlass", "trtllm")),
+        )
     if profile_segments:
         quant_ms = _fp8_gemm_profile_time_stop(timer)
         timer = _fp8_gemm_profile_time_start(input.device)
@@ -846,12 +865,13 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     # TRTLLM path continues using the original quantized scale layout.
     if profile_segments:
         timer = _fp8_gemm_profile_time_start(input.device)
+    output_dtype = torch.bfloat16 if prequantized_input else input_2d.dtype
     output = gemm_fp8_nt_groupwise(
         q_input,
         weight,
         x_scale,
         weight_scale,
-        out_dtype=input_2d.dtype,
+        out_dtype=output_dtype,
     )
     if profile_segments:
         gemm_ms = _fp8_gemm_profile_time_stop(timer)
@@ -883,7 +903,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             bias_ms=bias_ms,
         )
 
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(

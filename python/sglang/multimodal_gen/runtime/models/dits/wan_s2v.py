@@ -8,6 +8,7 @@ FSDP/quantization loader.
 """
 
 import math
+import os
 from copy import deepcopy
 from typing import Any
 
@@ -29,6 +30,9 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.usp import (
+    usp_fp8_comm_fused_qk_prepack_enabled,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -393,6 +397,39 @@ def _segment_modulate(
     return out
 
 
+def _fp8_prequant_fusion_enabled() -> bool:
+    value = os.getenv("SGLANG_STREAM_R1_FP8_PREQUANT_FUSION", "0")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _linear_accepts_block_fp8_prequant(linear: nn.Module) -> bool:
+    quant_method = getattr(linear, "quant_method", None)
+    return bool(getattr(quant_method, "block_quant", False))
+
+
+def _segment_modulate_prequant(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    seg_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
+        segment_modulate_quant_fp8,
+    )
+
+    return segment_modulate_quant_fp8(x, shift, scale, seg_idx)
+
+
+def _gelu_tanh_prequant(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
+        gelu_tanh_quant_fp8,
+    )
+
+    return gelu_tanh_quant_fp8(x)
+
+
 def _segment_gate(x: torch.Tensor, gate: torch.Tensor, seg_idx: int) -> torch.Tensor:
     seg_idx = min(max(0, seg_idx), x.size(1))
     return torch.cat(
@@ -709,13 +746,27 @@ class WanS2VTransformerBlock(WanTransformerBlock):
             x.squeeze(1) for x in e.chunk(6, dim=1)
         )
 
-        norm_hidden_states = _segment_modulate(
-            self.norm1.norm(hidden_states),
-            shift_msa,
-            scale_msa,
-            seg_idx,
-            out_dtype=orig_dtype,
+        norm1_hidden_states = self.norm1.norm(hidden_states)
+        use_qkv_prequant = (
+            _fp8_prequant_fusion_enabled()
+            and orig_dtype == torch.bfloat16
+            and _linear_accepts_block_fp8_prequant(self.to_qkv)
         )
+        if use_qkv_prequant:
+            norm_hidden_states = _segment_modulate_prequant(
+                norm1_hidden_states,
+                shift_msa,
+                scale_msa,
+                seg_idx,
+            )
+        else:
+            norm_hidden_states = _segment_modulate(
+                norm1_hidden_states,
+                shift_msa,
+                scale_msa,
+                seg_idx,
+                out_dtype=orig_dtype,
+            )
         query, key, value = self._project_self_attn_qkv(norm_hidden_states)
         if self.norm_q is not None:
             query = (
@@ -732,8 +783,17 @@ class WanS2VTransformerBlock(WanTransformerBlock):
         query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        query = _rope_apply_precomputed(query, freqs_cis).to(orig_dtype)
-        key = _rope_apply_precomputed(key, freqs_cis).to(orig_dtype)
+        defer_rope_to_sp_prepack = (
+            not stream_r1_cache_update_only
+            and (
+                stream_r1_kv_cache is not None or stream_r1_attention_layout is not None
+            )
+            and usp_fp8_comm_fused_qk_prepack_enabled()
+        )
+        rope_freqs = freqs_cis if defer_rope_to_sp_prepack else None
+        if not defer_rope_to_sp_prepack:
+            query = _rope_apply_precomputed(query, freqs_cis).to(orig_dtype)
+            key = _rope_apply_precomputed(key, freqs_cis).to(orig_dtype)
         if stream_r1_cache_update_only:
             if stream_r1_kv_cache is None or stream_r1_attention_layout is None:
                 raise ValueError(
@@ -763,6 +823,7 @@ class WanS2VTransformerBlock(WanTransformerBlock):
                 sequence_shard_enabled=stream_r1_sequence_shard_enabled,
                 sp_pad_tokens=stream_r1_sp_pad_tokens,
                 graph_kv_update=stream_r1_graph_kv_update,
+                rope_freqs=rope_freqs,
             ).flatten(2)
         else:
             attn_output = self.attn1(query, key, value, attn_mask=attn_mask).flatten(2)
@@ -827,14 +888,34 @@ class WanS2VTransformerBlock(WanTransformerBlock):
             cached_kv=crossattn_kv_cache,
         )
         hidden_states = hidden_states + attn_output
-        norm_hidden_states = _segment_modulate(
-            self.cross_attn_residual_norm.norm(hidden_states),
-            c_shift_msa,
-            c_scale_msa,
-            seg_idx,
-            out_dtype=orig_dtype,
+        cross_norm_hidden_states = self.cross_attn_residual_norm.norm(hidden_states)
+        use_ffn_prequant = (
+            _fp8_prequant_fusion_enabled()
+            and orig_dtype == torch.bfloat16
+            and _linear_accepts_block_fp8_prequant(self.ffn.fc_in)
+            and _linear_accepts_block_fp8_prequant(self.ffn.fc_out)
         )
-        ff_output = self.ffn(norm_hidden_states)
+        if use_ffn_prequant:
+            norm_hidden_states = _segment_modulate_prequant(
+                cross_norm_hidden_states,
+                c_shift_msa,
+                c_scale_msa,
+                seg_idx,
+            )
+        else:
+            norm_hidden_states = _segment_modulate(
+                cross_norm_hidden_states,
+                c_shift_msa,
+                c_scale_msa,
+                seg_idx,
+                out_dtype=orig_dtype,
+            )
+        if use_ffn_prequant:
+            ff_hidden_states, _ = self.ffn.fc_in(norm_hidden_states)
+            ff_hidden_states = _gelu_tanh_prequant(ff_hidden_states)
+            ff_output, _ = self.ffn.fc_out(ff_hidden_states)
+        else:
+            ff_output = self.ffn(norm_hidden_states)
         hidden_states = _segment_gate_add(hidden_states, ff_output, c_gate_msa, seg_idx)
         return hidden_states.to(orig_dtype)
 
