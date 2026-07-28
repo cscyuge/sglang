@@ -56,6 +56,7 @@ def main() -> None:
 
     from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
         gelu_tanh_quant_fp8,
+        segment_gate_add,
         segment_modulate,
         segment_modulate_quant_fp8,
     )
@@ -166,6 +167,112 @@ def main() -> None:
     gelu_reference_p50 = float(gelu_reference_summary["p50_ms"])
     gelu_fused_p50 = float(gelu_fused_summary["p50_ms"])
     gelu_saved_ms = gelu_reference_p50 - gelu_fused_p50
+
+    gelu_bias = torch.randn(
+        (gelu_shape[-1],),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    def gelu_bias_reference():
+        biased = (gelu_input + gelu_bias).to(torch.bfloat16)
+        activated = torch.nn.functional.gelu(biased, approximate="tanh")
+        q, q_scale = sglang_per_token_group_quant_fp8(
+            activated.view(-1, activated.shape[-1]),
+            128,
+            column_major_scales=True,
+        )
+        return q.view_as(activated), q_scale.transpose(-1, -2)
+
+    def gelu_bias_fused():
+        return gelu_tanh_quant_fp8(gelu_input, bias=gelu_bias)
+
+    expected_q, expected_scale = gelu_bias_reference()
+    actual_q, actual_scale = gelu_bias_fused()
+    if not torch.equal(actual_q, expected_q):
+        differing_values = torch.count_nonzero(actual_q != expected_q).item()
+        raise AssertionError(
+            f"fused bias+GELU prequant differs in {differing_values} FP8 bytes"
+        )
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+    gelu_bias_reference_summary = _summary(
+        _time(
+            gelu_bias_reference,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            trials=args.trials,
+        )
+    )
+    gelu_bias_fused_summary = _summary(
+        _time(
+            gelu_bias_fused,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            trials=args.trials,
+        )
+    )
+    gelu_bias_reference_p50 = float(gelu_bias_reference_summary["p50_ms"])
+    gelu_bias_fused_p50 = float(gelu_bias_fused_summary["p50_ms"])
+    gelu_bias_saved_ms = gelu_bias_reference_p50 - gelu_bias_fused_p50
+
+    gate_shape = (1, args.seq_len, args.hidden_dim)
+    residual = torch.randn(gate_shape, device=device, dtype=torch.bfloat16)
+    update = torch.randn_like(residual)
+    gate = torch.randn(
+        (1, 2, args.hidden_dim),
+        device=device,
+        dtype=torch.float32,
+    )
+    gate_bias = torch.randn(
+        (args.hidden_dim,),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    def gate_bias_reference():
+        biased_update = (update + gate_bias).to(torch.bfloat16)
+        return segment_gate_add(
+            residual,
+            biased_update,
+            gate,
+            args.seg_idx,
+        )
+
+    def gate_bias_fused():
+        return segment_gate_add(
+            residual,
+            update,
+            gate,
+            args.seg_idx,
+            bias=gate_bias,
+        )
+
+    expected_gate = gate_bias_reference()
+    actual_gate = gate_bias_fused()
+    if not torch.equal(actual_gate, expected_gate):
+        differing_values = torch.count_nonzero(actual_gate != expected_gate).item()
+        raise AssertionError(
+            f"fused bias+gate add differs in {differing_values} BF16 values"
+        )
+    gate_bias_reference_summary = _summary(
+        _time(
+            gate_bias_reference,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            trials=args.trials,
+        )
+    )
+    gate_bias_fused_summary = _summary(
+        _time(
+            gate_bias_fused,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            trials=args.trials,
+        )
+    )
+    gate_bias_reference_p50 = float(gate_bias_reference_summary["p50_ms"])
+    gate_bias_fused_p50 = float(gate_bias_fused_summary["p50_ms"])
+    gate_bias_saved_ms = gate_bias_reference_p50 - gate_bias_fused_p50
     result = {
         "device": torch.cuda.get_device_name(device),
         "group_size": 128,
@@ -185,7 +292,25 @@ def main() -> None:
             "speedup": gelu_reference_p50 / gelu_fused_p50,
             "saved_ms_per_call": gelu_saved_ms,
         },
+        "gelu_tanh_with_linear_bias": {
+            "input_shape": list(gelu_shape),
+            "reference": gelu_bias_reference_summary,
+            "fused": gelu_bias_fused_summary,
+            "speedup": gelu_bias_reference_p50 / gelu_bias_fused_p50,
+            "saved_ms_per_call": gelu_bias_saved_ms,
+        },
+        "segment_gate_add_with_linear_bias": {
+            "input_shape": list(gate_shape),
+            "reference": gate_bias_reference_summary,
+            "fused": gate_bias_fused_summary,
+            "speedup": gate_bias_reference_p50 / gate_bias_fused_p50,
+            "saved_ms_per_call": gate_bias_saved_ms,
+        },
         "projected_saved_ms_per_block_40_layers": (segment_saved_ms * 2 + gelu_saved_ms)
+        * 40,
+        "projected_bias_saved_ms_per_block_40_layers": (
+            gelu_bias_saved_ms + 2 * gate_bias_saved_ms
+        )
         * 40,
     }
     args.json_out.parent.mkdir(parents=True, exist_ok=True)

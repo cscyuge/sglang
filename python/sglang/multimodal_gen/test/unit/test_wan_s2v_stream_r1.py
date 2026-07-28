@@ -512,7 +512,6 @@ class TestWanS2VStreamR1Fp8CommKernels(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-
 class TestWanS2VStreamR1SegmentKernels(unittest.TestCase):
     def test_segment_gate_add_matches_reference(self):
         torch.manual_seed(1)
@@ -541,6 +540,67 @@ class TestWanS2VStreamR1SegmentKernels(unittest.TestCase):
 
         self.assertEqual(actual.dtype, torch.bfloat16)
         self.assertEqual(actual.shape, residual.shape)
+
+    def test_segment_gate_add_with_bias_matches_materialized_reference(self):
+        torch.manual_seed(17)
+        residual = torch.randn(1, 5, 4, dtype=torch.bfloat16)
+        update = torch.randn(1, 5, 4, dtype=torch.bfloat16)
+        bias = torch.randn(4, dtype=torch.bfloat16)
+        gate = torch.randn(1, 2, 4, dtype=torch.float32)
+        seg_idx = 2
+        biased_update = (update + bias).to(torch.bfloat16)
+        expected = (
+            residual
+            + torch.cat(
+                [
+                    biased_update[:, :seg_idx] * gate[:, 0:1],
+                    biased_update[:, seg_idx:] * gate[:, 1:2],
+                ],
+                dim=1,
+            )
+        ).to(torch.bfloat16)
+
+        actual = _segment_gate_add(
+            residual,
+            update,
+            gate,
+            seg_idx,
+            bias=bias,
+        )
+
+        self.assertTrue(torch.equal(actual, expected))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_segment_gate_add_cuda_bias_is_byte_identical(self):
+        from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
+            segment_gate_add,
+        )
+
+        torch.manual_seed(18)
+        residual = torch.randn(
+            (1, 11, 5120), device="cuda", dtype=torch.bfloat16
+        )
+        update = torch.randn_like(residual)
+        bias = torch.randn((5120,), device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(
+            (1, 2, 5120), device="cuda", dtype=torch.float32
+        )
+        biased_update = (update + bias).to(torch.bfloat16)
+        expected = segment_gate_add(
+            residual,
+            biased_update,
+            gate,
+            7,
+        )
+        actual = segment_gate_add(
+            residual,
+            update,
+            gate,
+            7,
+            bias=bias,
+        )
+
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_segment_modulate_matches_reference(self):
         torch.manual_seed(2)
@@ -703,6 +763,44 @@ class TestWanS2VStreamR1SegmentKernels(unittest.TestCase):
         self.assertTrue(
             torch.equal(actual_q, expected_q),
             f"fused GELU prequant differs in "
+            f"{torch.count_nonzero(actual_q != expected_q).item()} FP8 bytes",
+        )
+        torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_gelu_tanh_prequant_bias_is_byte_identical(self):
+        from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
+            gelu_tanh_quant_fp8,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        torch.manual_seed(19)
+        x = torch.randn(
+            (1, 11, 13824),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        bias = torch.randn(
+            (13824,),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        biased = (x + bias).to(torch.bfloat16)
+        activated = F.gelu(biased, approximate="tanh")
+        expected_q, expected_scale = sglang_per_token_group_quant_fp8(
+            activated.view(-1, activated.shape[-1]),
+            128,
+            column_major_scales=True,
+        )
+        expected_q = expected_q.view_as(activated)
+        expected_scale = expected_scale.transpose(-1, -2).contiguous()
+        actual_q, actual_scale = gelu_tanh_quant_fp8(x, bias=bias)
+
+        self.assertTrue(
+            torch.equal(actual_q, expected_q),
+            f"fused bias+GELU prequant differs in "
             f"{torch.count_nonzero(actual_q != expected_q).item()} FP8 bytes",
         )
         torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)

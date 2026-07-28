@@ -145,6 +145,7 @@ def _segment_modulate_quant_fp8_kernel(
 @triton.jit
 def _gelu_tanh_quant_fp8_kernel(
     x_ptr,
+    bias_ptr,
     q_ptr,
     q_scale_ptr,
     rows: tl.constexpr,
@@ -156,6 +157,7 @@ def _gelu_tanh_quant_fp8_kernel(
     FP8_MAX: tl.constexpr,
     FP8_MIN: tl.constexpr,
     EPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     group_block = tl.program_id(0)
     row = group_block // GROUP_BLOCKS_PER_ROW
@@ -166,6 +168,11 @@ def _gelu_tanh_quant_fp8_kernel(
     offsets = row * hidden_dim + col
 
     x = tl.load(x_ptr + offsets, mask=group_mask[:, None]).to(tl.float32)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + col, mask=group_mask[:, None]).to(tl.float32)
+        # The unfused FP8 linear materializes ``output += bias`` in BF16
+        # before GELU consumes it. Preserve that intermediate rounding.
+        x = (x + bias).to(tl.bfloat16).to(tl.float32)
     x_cubed = x * x * x
     inner = 0.7978845608028654 * (x + 0.044715 * x_cubed)
     activated = 0.5 * x * (1.0 + libdevice.tanh(inner))
@@ -193,6 +200,7 @@ def _segment_gate_add_kernel(
     residual_ptr,
     update_ptr,
     gate_ptr,
+    bias_ptr,
     out_ptr,
     total: tl.constexpr,
     seq_len: tl.constexpr,
@@ -211,6 +219,7 @@ def _segment_gate_add_kernel(
     stride_out_s: tl.constexpr,
     stride_out_c: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < total
@@ -233,6 +242,10 @@ def _segment_gate_add_kernel(
         tl.float32
     )
     update = tl.load(update_ptr + update_offsets, mask=mask, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + col, mask=mask, other=0.0).to(tl.float32)
+        # Match the separate BF16 linear-bias kernel before applying the gate.
+        update = (update + bias).to(tl.bfloat16).to(tl.float32)
     gate = tl.load(gate_ptr + gate_offsets, mask=mask, other=0.0).to(tl.float32)
     out = residual + update * gate
     tl.store(out_ptr + out_offsets, out, mask=mask)
@@ -243,6 +256,8 @@ def segment_gate_add(
     update: torch.Tensor,
     gate: torch.Tensor,
     seg_idx: int,
+    *,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute ``residual + update * gate[:, segment]`` for Wan S2V segments."""
 
@@ -275,6 +290,20 @@ def segment_gate_add(
         raise ValueError("Wan S2V segment gate add tensors must share a device")
     if residual.stride(-1) != 1 or update.stride(-1) != 1 or gate.stride(-1) != 1:
         raise ValueError("Wan S2V segment gate add expects contiguous hidden dimension")
+    if bias is not None:
+        if (
+            bias.dim() != 1
+            or bias.shape[0] != residual.shape[2]
+            or bias.dtype != update.dtype
+            or bias.device != update.device
+        ):
+            raise ValueError(
+                "Wan S2V segment gate add bias must match update hidden dimension, "
+                f"dtype, and device: update={tuple(update.shape)}/{update.dtype}/"
+                f"{update.device} bias={tuple(bias.shape)}/{bias.dtype}/{bias.device}"
+            )
+        if bias.stride(0) != 1:
+            raise ValueError("Wan S2V segment gate add expects contiguous bias")
 
     batch, seq_len, hidden_dim = residual.shape
     out = torch.empty_like(residual)
@@ -285,6 +314,7 @@ def segment_gate_add(
         residual,
         update,
         gate,
+        bias if bias is not None else update,
         out,
         total,
         seq_len,
@@ -303,6 +333,7 @@ def segment_gate_add(
         out.stride(1),
         out.stride(2),
         BLOCK_SIZE=256,
+        HAS_BIAS=bias is not None,
         num_warps=4,
     )
     return out
@@ -468,6 +499,7 @@ def segment_modulate_quant_fp8(
 def gelu_tanh_quant_fp8(
     x: torch.Tensor,
     *,
+    bias: torch.Tensor | None = None,
     group_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse BF16 tanh-GELU with CUTLASS-layout FP8 prequantization."""
@@ -479,6 +511,20 @@ def gelu_tanh_quant_fp8(
     if not x.is_contiguous():
         raise ValueError("Wan S2V GELU prequant expects contiguous input")
     hidden_dim = x.shape[-1]
+    if bias is not None:
+        if (
+            bias.dim() != 1
+            or bias.shape[0] != hidden_dim
+            or bias.dtype != x.dtype
+            or bias.device != x.device
+            or bias.stride(0) != 1
+        ):
+            raise ValueError(
+                "Wan S2V GELU prequant bias must be contiguous and match the "
+                f"input hidden dimension, dtype, and device: x={tuple(x.shape)}/"
+                f"{x.dtype}/{x.device} bias={tuple(bias.shape)}/{bias.dtype}/"
+                f"{bias.device}"
+            )
     if hidden_dim % group_size != 0:
         raise ValueError(
             f"hidden_dim={hidden_dim} must be divisible by group_size={group_size}"
@@ -495,6 +541,7 @@ def gelu_tanh_quant_fp8(
     )
     _gelu_tanh_quant_fp8_kernel[(rows * group_blocks_per_row,)](
         x,
+        bias if bias is not None else x,
         q,
         q_scale,
         rows,
@@ -506,6 +553,7 @@ def gelu_tanh_quant_fp8(
         FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
         FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
         EPS=1.0e-10,
+        HAS_BIAS=bias is not None,
         num_warps=8,
         num_stages=1,
     )

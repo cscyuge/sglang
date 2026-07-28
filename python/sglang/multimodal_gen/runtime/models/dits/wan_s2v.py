@@ -402,6 +402,11 @@ def _fp8_prequant_fusion_enabled() -> bool:
     return value.lower() not in ("", "0", "false", "no", "off")
 
 
+def _fp8_bias_fusion_enabled() -> bool:
+    value = os.getenv("SGLANG_STREAM_R1_FP8_BIAS_FUSION", "0")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
 def _linear_accepts_block_fp8_prequant(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
     return bool(getattr(quant_method, "block_quant", False))
@@ -422,12 +427,13 @@ def _segment_modulate_prequant(
 
 def _gelu_tanh_prequant(
     x: torch.Tensor,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
         gelu_tanh_quant_fp8,
     )
 
-    return gelu_tanh_quant_fp8(x)
+    return gelu_tanh_quant_fp8(x, bias=bias)
 
 
 def _segment_gate(x: torch.Tensor, gate: torch.Tensor, seg_idx: int) -> torch.Tensor:
@@ -442,17 +448,23 @@ def _segment_gate_add(
     update: torch.Tensor,
     gate: torch.Tensor,
     seg_idx: int,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if bias is not None and update.dtype != torch.bfloat16:
+        update = (update + bias).to(update.dtype)
+        bias = None
     if residual.device.type == "cuda":
         try:
             from sglang.jit_kernel.diffusion.triton.wan_s2v_segment import (
                 segment_gate_add,
             )
 
-            return segment_gate_add(residual, update, gate, seg_idx)
+            return segment_gate_add(residual, update, gate, seg_idx, bias=bias)
         except Exception:
             pass
 
+    if bias is not None:
+        update = (update + bias).to(update.dtype)
     return (residual + _segment_gate(update, gate, seg_idx)).to(residual.dtype)
 
 
@@ -720,6 +732,14 @@ class WanS2VTransformerBlock(WanTransformerBlock):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("fused_qkv", True)
         super().__init__(*args, **kwargs)
+        self.stream_r1_fp8_bias_fusion = bool(
+            _fp8_bias_fusion_enabled()
+            and _fp8_prequant_fusion_enabled()
+        )
+        if self.stream_r1_fp8_bias_fusion:
+            self.to_out.skip_bias_add = True
+            self.ffn.fc_in.skip_bias_add = True
+            self.ffn.fc_out.skip_bias_add = True
 
     def forward(
         self,
@@ -827,9 +847,13 @@ class WanS2VTransformerBlock(WanTransformerBlock):
             ).flatten(2)
         else:
             attn_output = self.attn1(query, key, value, attn_mask=attn_mask).flatten(2)
-        attn_output, _ = self.to_out(attn_output)
+        attn_output, attn_output_bias = self.to_out(attn_output)
         hidden_states = _segment_gate_add(
-            hidden_states, attn_output.squeeze(1), gate_msa, seg_idx
+            hidden_states,
+            attn_output.squeeze(1),
+            gate_msa,
+            seg_idx,
+            bias=attn_output_bias,
         )
         hidden_states = hidden_states.to(orig_dtype)
 
@@ -911,12 +935,31 @@ class WanS2VTransformerBlock(WanTransformerBlock):
                 out_dtype=orig_dtype,
             )
         if use_ffn_prequant:
-            ff_hidden_states, _ = self.ffn.fc_in(norm_hidden_states)
-            ff_hidden_states = _gelu_tanh_prequant(ff_hidden_states)
-            ff_output, _ = self.ffn.fc_out(ff_hidden_states)
+            ff_hidden_states, fc_in_bias = self.ffn.fc_in(norm_hidden_states)
+            ff_hidden_states = _gelu_tanh_prequant(
+                ff_hidden_states,
+                bias=fc_in_bias,
+            )
+            ff_output, fc_out_bias = self.ffn.fc_out(ff_hidden_states)
         else:
-            ff_output = self.ffn(norm_hidden_states)
-        hidden_states = _segment_gate_add(hidden_states, ff_output, c_gate_msa, seg_idx)
+            if self.stream_r1_fp8_bias_fusion:
+                ff_hidden_states, fc_in_bias = self.ffn.fc_in(norm_hidden_states)
+                if fc_in_bias is not None:
+                    ff_hidden_states = (ff_hidden_states + fc_in_bias).to(
+                        ff_hidden_states.dtype
+                    )
+                ff_hidden_states = self.ffn.act(ff_hidden_states)
+                ff_output, fc_out_bias = self.ffn.fc_out(ff_hidden_states)
+            else:
+                ff_output = self.ffn(norm_hidden_states)
+                fc_out_bias = None
+        hidden_states = _segment_gate_add(
+            hidden_states,
+            ff_output,
+            c_gate_msa,
+            seg_idx,
+            bias=fc_out_bias,
+        )
         return hidden_states.to(orig_dtype)
 
 
