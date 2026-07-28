@@ -8,9 +8,22 @@ single launch.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+
+
+_SEGMENTED_KV_PACK_BLOCK_ROWS = int(
+    os.environ.get("SGLANG_STREAM_R1_SEGMENTED_KV_PACK_BLOCK_ROWS", "4")
+)
+_SEGMENTED_KV_PACK_BLOCK_HD = int(
+    os.environ.get("SGLANG_STREAM_R1_SEGMENTED_KV_PACK_BLOCK_HD", "0")
+)
+_SEGMENTED_KV_PACK_NUM_WARPS = int(
+    os.environ.get("SGLANG_STREAM_R1_SEGMENTED_KV_PACK_NUM_WARPS", "4")
+)
 
 
 @triton.jit
@@ -57,7 +70,7 @@ def _fused_pack_segmented_kv_kernel(
     row_block = tl.program_id(1)
 
     rows = row_block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    cols = tl.arange(0, BLOCK_HD)
+    cols = tl.program_id(2) * BLOCK_HD + tl.arange(0, BLOCK_HD)
     col_mask = cols < HD
 
     length = tl.load(lengths_ptr + range_id)
@@ -146,7 +159,9 @@ def fused_pack_segmented_kv(
     noisy_seq_len: int,
     max_length: int,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
-    block_rows: int = 4,
+    block_rows: int | None = None,
+    block_hd: int | None = None,
+    num_warps: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack segmented K/V ranges into FA varlen layout in one Triton launch."""
 
@@ -184,9 +199,23 @@ def fused_pack_segmented_kv(
 
     _, _, num_heads, head_dim = noisy_key.shape
     hd = num_heads * head_dim
-    block_hd = triton.next_power_of_2(hd)
+    block_rows = (
+        _SEGMENTED_KV_PACK_BLOCK_ROWS if block_rows is None else block_rows
+    )
+    block_hd = _SEGMENTED_KV_PACK_BLOCK_HD if block_hd is None else block_hd
+    num_warps = (
+        _SEGMENTED_KV_PACK_NUM_WARPS if num_warps is None else num_warps
+    )
+    if block_rows <= 0:
+        raise ValueError("block_rows must be positive")
+    if block_hd == 0:
+        block_hd = triton.next_power_of_2(hd)
+    if block_hd <= 0 or block_hd & (block_hd - 1):
+        raise ValueError("block_hd must be zero or a positive power of two")
     if block_hd > 131072:
         raise ValueError(f"unsupported segmented KV feature size: {hd}")
+    if num_warps not in (1, 2, 4, 8, 16, 32):
+        raise ValueError("num_warps must be a supported Triton warp count")
 
     output_shape = (total_tokens, num_heads, head_dim)
     if out is None:
@@ -204,7 +233,11 @@ def fused_pack_segmented_kv(
             if not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous")
 
-    grid = (batch_indices.numel(), triton.cdiv(max_length, block_rows))
+    grid = (
+        batch_indices.numel(),
+        triton.cdiv(max_length, block_rows),
+        triton.cdiv(hd, block_hd),
+    )
     with torch.get_device_module().device(device):
         _fused_pack_segmented_kv_kernel[grid](
             noisy_key,
@@ -244,6 +277,6 @@ def fused_pack_segmented_kv(
             packed_value.stride(2),
             BLOCK_ROWS=block_rows,
             BLOCK_HD=block_hd,
-            num_warps=4,
+            num_warps=num_warps,
         )
     return packed_key, packed_value

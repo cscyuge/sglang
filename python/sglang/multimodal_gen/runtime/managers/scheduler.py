@@ -614,6 +614,14 @@ class Scheduler(SchedulerDisaggMixin):
                 src=self.worker.tp_group.ranks[0],
             )
 
+        if self.worker.pp_group.world_size > 1:
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                self.worker.pp_group.rank,
+                self.worker.pp_cpu_group,
+                src=self.worker.pp_group.ranks[0],
+            )
+
         assert recv_reqs is not None
 
         return recv_reqs

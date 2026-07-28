@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_s2v_stream_r1 import (
     stream_r1_segmented_packed_varlen_attention,
     stream_r1_packed_varlen_attention,
     _pad_stream_r1_sp_packed_attention_output,
+    _stream_r1_fa4_sm120_tile_mn,
     _StreamR1ProfileSpan,
     update_wan_s2v_stream_r1_cached_self_attention_kv_cache,
     update_wan_s2v_stream_r1_noisy_kv_cache,
@@ -87,6 +88,33 @@ class TestWanS2VStreamR1Profile(unittest.TestCase):
         self.assertEqual(profile.timings[0][0], "capture")
 
 
+class TestWanS2VStreamR1Fa4Config(unittest.TestCase):
+    def test_sm120_tile_defaults_to_none(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertIsNone(_stream_r1_fa4_sm120_tile_mn())
+
+    def test_sm120_tile_accepts_x_or_comma_syntax(self):
+        for value in ("64x64", "64,64", "64 64"):
+            with self.subTest(value=value):
+                with patch.dict(
+                    "os.environ",
+                    {"SGLANG_STREAM_R1_FA4_SM120_TILE_MN": value},
+                    clear=True,
+                ):
+                    self.assertEqual(_stream_r1_fa4_sm120_tile_mn(), (64, 64))
+
+    def test_sm120_tile_rejects_invalid_dimensions(self):
+        for value in ("64", "abc", "64x0", "63x64"):
+            with self.subTest(value=value):
+                with patch.dict(
+                    "os.environ",
+                    {"SGLANG_STREAM_R1_FA4_SM120_TILE_MN": value},
+                    clear=True,
+                ):
+                    with self.assertRaises(ValueError):
+                        _stream_r1_fa4_sm120_tile_mn()
+
+
 class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
     def test_rope_params_uses_complex64(self):
         self.assertEqual(rope_params(8, 4).dtype, torch.complex64)
@@ -118,6 +146,97 @@ class TestWanS2VNoisyRopeGridSizes(unittest.TestCase):
 
 
 class TestWanS2VStreamR1Fp8CommKernels(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_fused_quant_rowpack_matches_reference(self):
+        from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+            blockwise_quant_fp8,
+            blockwise_quant_fp8_rowpack,
+            fused_dequant_unpack_output_fp8_rowpack,
+            pack_fp8_payload_scale_aligned,
+        )
+
+        torch.manual_seed(11)
+        x = torch.randn(8, 1, 5, 128, device="cuda", dtype=torch.bfloat16)
+        payload, scale = blockwise_quant_fp8(x, group_size=128)
+        expected = pack_fp8_payload_scale_aligned(
+            payload, scale, world_size=2
+        )
+        actual = blockwise_quant_fp8_rowpack(
+            x, group_size=128, world_size=2
+        )
+        self.assertEqual(actual.shape, expected.shape)
+        expected_out = fused_dequant_unpack_output_fp8_rowpack(
+            expected,
+            batch_size=1,
+            seq_len=8,
+            world_size=2,
+            group_size=128,
+            dtype=x.dtype,
+        )
+        actual_out = fused_dequant_unpack_output_fp8_rowpack(
+            actual,
+            batch_size=1,
+            seq_len=8,
+            world_size=2,
+            group_size=128,
+            dtype=x.dtype,
+        )
+        torch.testing.assert_close(actual_out, expected_out, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_fused_quant_qkv_rowpack_matches_reference(self):
+        from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+            blockwise_quant_fp8,
+            blockwise_quant_qkv_fp8_rowpack,
+            fused_dequant_unpack_qkv_fp8_rowpack,
+            pack_fp8_payload_scale_aligned,
+        )
+        from sglang.jit_kernel.diffusion.triton.usp_permute import (
+            fused_pack_qkv_for_all_to_all,
+        )
+
+        torch.manual_seed(12)
+        base_shape = (1, 10, 4, 128)
+        q = torch.randn(base_shape, device="cuda", dtype=torch.bfloat16)[:, ::2]
+        k = torch.randn(base_shape, device="cuda", dtype=torch.bfloat16)[:, ::2]
+        v = torch.randn(base_shape, device="cuda", dtype=torch.bfloat16)[:, ::2]
+        self.assertFalse(q.is_contiguous())
+        self.assertEqual(q.shape, (1, 5, 4, 128))
+        packed = fused_pack_qkv_for_all_to_all(q, k, v)
+        payload, scale = blockwise_quant_fp8(packed, group_size=128)
+        expected = pack_fp8_payload_scale_aligned(
+            payload, scale, world_size=2
+        )
+        actual = blockwise_quant_qkv_fp8_rowpack(
+            q, k, v, group_size=128, world_size=2
+        )
+        expected_out = fused_dequant_unpack_qkv_fp8_rowpack(
+            expected,
+            1,
+            5,
+            2,
+            128,
+            2,
+            group_size=128,
+            dtype=q.dtype,
+        )
+        actual_out = fused_dequant_unpack_qkv_fp8_rowpack(
+            actual,
+            1,
+            5,
+            2,
+            128,
+            2,
+            group_size=128,
+            dtype=q.dtype,
+        )
+        for actual_tensor, expected_tensor in zip(
+            actual_out, expected_out, strict=True
+        ):
+            torch.testing.assert_close(
+                actual_tensor, expected_tensor, rtol=0, atol=0
+            )
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_fused_fp8_qkv_dequant_unpack_matches_reference(self):
         from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (

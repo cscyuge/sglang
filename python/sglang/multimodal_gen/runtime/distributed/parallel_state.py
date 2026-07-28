@@ -520,6 +520,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     dp_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
+    pipeline_parallel_degree: int = 1,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -560,6 +561,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
+        pipeline_parallel_degree=pipeline_parallel_degree,
     )
 
     # Only set CUDA device if we're on a CUDA platform

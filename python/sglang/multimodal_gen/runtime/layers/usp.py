@@ -82,6 +82,10 @@ def _usp_fp8_comm_rowpack_enabled() -> bool:
     return _env_enabled("SGLANG_STREAM_R1_SP_COMM_FP8_ROWPACK", "1")
 
 
+def _usp_fp8_comm_fused_rowpack_enabled() -> bool:
+    return _env_enabled("SGLANG_STREAM_R1_SP_COMM_FP8_FUSED_ROWPACK", "0")
+
+
 def _usp_device_cache_key(device: torch.device) -> tuple[str, int]:
     index = device.index
     if device.type == "cuda" and index is None and torch.cuda.is_available():
@@ -319,11 +323,46 @@ def _usp_blockwise_fp8_all_to_all_rowpack_payload_scale(
 
     from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
         aligned_rowpack_shape,
+        blockwise_quant_fp8_rowpack,
         blockwise_quant_fp8,
         pack_fp8_payload_scale_aligned,
     )
 
     scale_shape = tuple(x.shape[:-1]) + (x.shape[-1] // group_size,)
+    rowpack_shape = aligned_rowpack_shape(
+        tuple(x.shape),
+        scale_cols=scale_shape[-1],
+        world_size=world_size,
+    )
+    if _usp_fp8_comm_fused_rowpack_enabled():
+        with _comm_nvtx_range(
+            "sgl_mm_usp_fp8_comm_fused_quant_pack_rowpack "
+            f"group_size={group_size} payload_shape={tuple(x.shape)} "
+            f"rowpack_shape={rowpack_shape}"
+        ):
+            rowpack = _usp_get_buffer(
+                f"{cache_name}.fp8_rowpack_pack",
+                x,
+                rowpack_shape,
+                dtype=torch.uint8,
+            )
+            rowpack = blockwise_quant_fp8_rowpack(
+                x,
+                group_size=group_size,
+                world_size=world_size,
+                out=rowpack,
+            )
+        with _comm_nvtx_range(
+            "sgl_mm_usp_fp8_comm_all_to_all_rowpack "
+            f"group_size={group_size} shape={tuple(rowpack.shape)} "
+            f"{_comm_nvtx_caller()}"
+        ):
+            rowpack = _usp_all_to_all_single(
+                rowpack,
+                cache_name=f"{cache_name}.fp8_rowpack",
+            )
+        return rowpack, group_size
+
     with _comm_nvtx_range(
         "sgl_mm_usp_fp8_comm_quant "
         f"group_size={group_size} {_tensor_desc('x', x)} {_comm_nvtx_caller()}"
@@ -347,11 +386,6 @@ def _usp_blockwise_fp8_all_to_all_rowpack_payload_scale(
             out_scale=scale_out,
         )
 
-    rowpack_shape = aligned_rowpack_shape(
-        tuple(x_q.shape),
-        scale_cols=x_scale.shape[-1],
-        world_size=world_size,
-    )
     with _comm_nvtx_range(
         "sgl_mm_usp_fp8_comm_pack_payload_scale_rowpack "
         f"group_size={group_size} payload_shape={tuple(x_q.shape)} "
@@ -505,6 +539,71 @@ def _usp_input_all_to_all_qkv(
         H_global % world_size == 0
     ), f"H_global ({H_global}) must be divisible by world_size ({world_size})"
     H_local = H_global // world_size
+
+    if (
+        _usp_fp8_comm_enabled("qkv")
+        and _usp_fp8_comm_rowpack_enabled()
+        and _usp_fp8_comm_fused_rowpack_enabled()
+    ):
+        from sglang.jit_kernel.diffusion.triton.usp_fp8_comm import (
+            aligned_rowpack_shape,
+            blockwise_quant_qkv_fp8_rowpack,
+            fused_dequant_unpack_qkv_fp8_rowpack,
+        )
+
+        group_size = _usp_fp8_comm_block_size()
+        payload_shape = (3 * H_global, B, S_local, D)
+        rowpack_shape = aligned_rowpack_shape(
+            payload_shape,
+            scale_cols=D // group_size,
+            world_size=world_size,
+        )
+        with _comm_nvtx_range(
+            "sgl_mm_usp_qkv_fused_quant_pack_rowpack "
+            f"world_size={world_size} group_size={group_size} "
+            f"q={tuple(q.shape)} rowpack={rowpack_shape}"
+        ):
+            packed_rowpack = _usp_get_buffer(
+                "usp_qkv_fp8_rowpack.fp8_rowpack_pack",
+                q,
+                rowpack_shape,
+                dtype=torch.uint8,
+            )
+            packed_rowpack = blockwise_quant_qkv_fp8_rowpack(
+                q,
+                k,
+                v,
+                group_size=group_size,
+                world_size=world_size,
+                out=packed_rowpack,
+            )
+        packed_rowpack = _usp_all_to_all_single(
+            packed_rowpack,
+            cache_name="usp_qkv_fp8_rowpack.fp8_rowpack",
+        )
+        qkv_out_buffer = _usp_get_buffer(
+            "usp_qkv_unpack",
+            q,
+            (3, B, S_local * world_size, H_local, D),
+        )
+        qkv_out = None
+        if qkv_out_buffer is not None:
+            qkv_out = (
+                qkv_out_buffer[0],
+                qkv_out_buffer[1],
+                qkv_out_buffer[2],
+            )
+        return fused_dequant_unpack_qkv_fp8_rowpack(
+            packed_rowpack,
+            B,
+            S_local,
+            H_local,
+            D,
+            world_size,
+            group_size=group_size,
+            dtype=q.dtype,
+            out=qkv_out,
+        )
 
     from sglang.jit_kernel.diffusion.triton.usp_permute import (
         fused_pack_qkv_for_all_to_all,

@@ -678,6 +678,658 @@ class WanS2VRealtimeHelpersTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "wan_s2v_idle_policy"):
             WanS2VPipelineConfig(wan_s2v_idle_policy="busy_loop")
 
+    def test_tpp_config_accepts_three_fixed_steps_and_cancels_flush(self):
+        cfg = WanS2VPipelineConfig(
+            stream_r1_mode=True,
+            stream_r1_kv_cache=True,
+            num_frame_per_block=1,
+            denoising_step_list=[1000, 666, 333],
+            wan_s2v_clean_context_refresh_mode="never",
+            wan_s2v_timestep_ablation_mode="off",
+            wan_s2v_tpp=True,
+            wan_s2v_tpp_dit_ranks=[1, 2, 3],
+            wan_s2v_tpp_decode_rank=0,
+        )
+
+        self.assertTrue(cfg.wan_s2v_tpp)
+        self.assertEqual(cfg.wan_s2v_tpp_dit_ranks, [1, 2, 3])
+        self.assertEqual(cfg.wan_s2v_tpp_decode_rank, 0)
+        self.assertEqual(cfg.wan_s2v_tpp_transport, "host_staged_gloo")
+        self.assertEqual(cfg.wan_s2v_clean_context_refresh_mode, "never")
+
+        nccl_cfg = WanS2VPipelineConfig(
+            stream_r1_mode=True,
+            stream_r1_kv_cache=True,
+            num_frame_per_block=1,
+            denoising_step_list=[1000, 666, 333],
+            wan_s2v_clean_context_refresh_mode="never",
+            wan_s2v_timestep_ablation_mode="off",
+            wan_s2v_tpp=True,
+            wan_s2v_tpp_dit_ranks=[1, 2, 3],
+            wan_s2v_tpp_decode_rank=0,
+            wan_s2v_tpp_transport="official_blocking_nccl",
+        )
+        self.assertEqual(
+            nccl_cfg.wan_s2v_tpp_transport,
+            "official_blocking_nccl",
+        )
+
+        with self.assertRaisesRegex(ValueError, "wan_s2v_tpp_transport"):
+            WanS2VPipelineConfig(wan_s2v_tpp_transport="unknown")
+
+    def test_tpp_config_accepts_uniform_sp2_stage_groups(self):
+        cfg = WanS2VPipelineConfig(
+            stream_r1_mode=True,
+            stream_r1_kv_cache=True,
+            num_frame_per_block=1,
+            denoising_step_list=[1000, 666, 333],
+            wan_s2v_clean_context_refresh_mode="never",
+            wan_s2v_timestep_ablation_mode="off",
+            wan_s2v_tpp=True,
+            wan_s2v_tpp_dit_ranks=[2, 4, 6],
+            wan_s2v_tpp_decode_rank=0,
+            wan_s2v_tpp_stage_parallel_size=2,
+        )
+
+        self.assertEqual(cfg.wan_s2v_tpp_stage_parallel_size, 2)
+        self.assertEqual(cfg.wan_s2v_tpp_dit_ranks, [2, 4, 6])
+        self.assertFalse(cfg.vae_config.use_parallel_decode)
+
+        with self.assertRaisesRegex(ValueError, "stage leaders must align"):
+            WanS2VPipelineConfig(
+                stream_r1_mode=True,
+                stream_r1_kv_cache=True,
+                num_frame_per_block=1,
+                denoising_step_list=[1000, 666, 333],
+                wan_s2v_clean_context_refresh_mode="never",
+                wan_s2v_timestep_ablation_mode="off",
+                wan_s2v_tpp=True,
+                wan_s2v_tpp_dit_ranks=[1, 4, 6],
+                wan_s2v_tpp_decode_rank=0,
+                wan_s2v_tpp_stage_parallel_size=2,
+            )
+
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            WanS2VPipelineConfig(wan_s2v_tpp_stage_parallel_size=0)
+
+    def test_tpp_flat_server_config_reapplies_sp2_derived_settings(self):
+        cfg = WanS2VPipelineConfig()
+        flat_config = {
+            "stream_r1_mode": True,
+            "stream_r1_kv_cache": True,
+            "num_frame_per_block": 1,
+            "denoising_step_list": [1000, 666, 333],
+            "wan_s2v_clean_context_refresh_mode": "never",
+            "wan_s2v_timestep_ablation_mode": "off",
+            "wan_s2v_tpp": True,
+            "wan_s2v_tpp_dit_ranks": [2, 4, 6],
+            "wan_s2v_tpp_decode_rank": 0,
+            "wan_s2v_tpp_stage_parallel_size": 2,
+        }
+
+        cfg.update_config_from_dict(flat_config)
+
+        self.assertFalse(cfg.vae_config.use_parallel_decode)
+        self.assertEqual(cfg.wan_s2v_tpp_dit_ranks, [2, 4, 6])
+
+    def test_tpp_config_rejects_flush_and_incompatible_features(self):
+        common = {
+            "num_frame_per_block": 1,
+            "denoising_step_list": [1000, 666, 333],
+            "wan_s2v_timestep_ablation_mode": "off",
+            "wan_s2v_tpp": True,
+            "wan_s2v_tpp_dit_ranks": [1, 2, 3],
+            "wan_s2v_tpp_decode_rank": 0,
+        }
+
+        with self.assertRaisesRegex(ValueError, "cancels the flush step"):
+            WanS2VPipelineConfig(
+                **common,
+                wan_s2v_clean_context_refresh_mode="always",
+            )
+
+        with self.assertRaisesRegex(ValueError, "latent warm start"):
+            WanS2VPipelineConfig(
+                **common,
+                wan_s2v_clean_context_refresh_mode="never",
+                wan_s2v_latent_warm_start=True,
+            )
+
+    def test_tpp_config_requires_one_rank_per_timestep(self):
+        with self.assertRaisesRegex(ValueError, "one denoising_step_list entry"):
+            WanS2VPipelineConfig(
+                num_frame_per_block=1,
+                denoising_step_list=[1000, 666, 333],
+                wan_s2v_clean_context_refresh_mode="never",
+                wan_s2v_timestep_ablation_mode="off",
+                wan_s2v_tpp=True,
+                wan_s2v_tpp_dit_ranks=[1, 2],
+                wan_s2v_tpp_decode_rank=0,
+            )
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_world_rank",
+        return_value=1,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_pp_group"
+    )
+    @patch("torch.distributed.recv")
+    @patch("torch.distributed.send")
+    def test_tpp_dit_rank_runs_only_its_fixed_timestep(
+        self,
+        distributed_send,
+        distributed_recv,
+        get_pp_group,
+        _get_world_rank,
+    ):
+        class _DenoisingStage:
+            def __init__(self):
+                self.calls = []
+
+            def denoise_stream_r1_block(self, **kwargs):
+                self.calls.append(kwargs)
+                return kwargs["block_latents"] + 1
+
+        cpu_group = object()
+        get_pp_group.return_value = SimpleNamespace(cpu_group=cpu_group)
+
+        def recv_ack(tensor, **_kwargs):
+            tensor.fill_(0)
+
+        distributed_recv.side_effect = recv_ack
+        runner = _FakeRealtimeRunner({})
+        denoising_stage = _DenoisingStage()
+        latents = torch.zeros(1, 1, 1, 1, 1)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                wan_s2v_tpp=True,
+                wan_s2v_tpp_dit_ranks=[1, 2, 3],
+                wan_s2v_tpp_decode_rank=0,
+            )
+        )
+
+        output, timing = runner._denoise_tpp_block(
+            denoising_stage=denoising_stage,
+            batch=SimpleNamespace(),
+            server_args=server_args,
+            block_latents=latents,
+            block_bundle=SimpleNamespace(),
+            block_start=0,
+            frame_seq_length=1,
+            timesteps=torch.tensor([1000.0, 666.0, 333.0]),
+            prompt_embeds=torch.zeros(1),
+            cache_state=SimpleNamespace(),
+            crossattn_cache=None,
+            generator=None,
+            dit_dtype=torch.float32,
+            autocast_enabled=False,
+            step_noises_btchw=(torch.zeros_like(latents),) * 2,
+            block_index=0,
+            allow_timestep_cuda_graph_capture=False,
+            timestep_values=(1000.0, 666.0, 333.0),
+        )
+
+        self.assertEqual(denoising_stage.calls[0]["only_step_index"], 0)
+        self.assertEqual(distributed_send.call_count, 2)
+        self.assertEqual(distributed_send.call_args_list[0].kwargs["dst"], 2)
+        self.assertIs(
+            distributed_send.call_args_list[0].kwargs["group"], cpu_group
+        )
+        self.assertEqual(distributed_send.call_args_list[0].args[0].item(), 0)
+        torch.testing.assert_close(
+            distributed_send.call_args_list[1].args[0],
+            torch.ones_like(latents),
+        )
+        self.assertEqual(distributed_send.call_args_list[1].kwargs["dst"], 2)
+        self.assertIs(
+            distributed_send.call_args_list[1].kwargs["group"], cpu_group
+        )
+        distributed_recv.assert_called_once()
+        self.assertEqual(distributed_recv.call_args.kwargs["src"], 2)
+        self.assertIs(distributed_recv.call_args.kwargs["group"], cpu_group)
+        get_pp_group.assert_called_once_with()
+        torch.testing.assert_close(output, torch.ones_like(latents))
+        self.assertEqual(timing["tpp_role"], "dit")
+        self.assertEqual(timing["tpp_stage_index"], 0)
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_world_rank",
+        return_value=0,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_pp_group"
+    )
+    @patch("torch.distributed.send")
+    @patch("torch.distributed.recv")
+    def test_tpp_decode_rank_receives_last_stage_without_dit_forward(
+        self,
+        distributed_recv,
+        distributed_send,
+        get_pp_group,
+        _get_world_rank,
+    ):
+        class _DenoisingStage:
+            def denoise_stream_r1_block(self, **kwargs):
+                raise AssertionError("decode rank must not run a DiT timestep")
+
+        recv_call_index = 0
+
+        def recv_into(tensor, **_kwargs):
+            nonlocal recv_call_index
+            tensor.fill_(0 if recv_call_index == 0 else 7)
+            recv_call_index += 1
+
+        distributed_recv.side_effect = recv_into
+        cpu_group = object()
+        get_pp_group.return_value = SimpleNamespace(cpu_group=cpu_group)
+        runner = _FakeRealtimeRunner({})
+        latents = torch.zeros(1, 1, 1, 1, 1)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                wan_s2v_tpp=True,
+                wan_s2v_tpp_dit_ranks=[1, 2, 3],
+                wan_s2v_tpp_decode_rank=0,
+            )
+        )
+
+        output, timing = runner._denoise_tpp_block(
+            denoising_stage=_DenoisingStage(),
+            batch=SimpleNamespace(),
+            server_args=server_args,
+            block_latents=latents,
+            block_bundle=SimpleNamespace(),
+            block_start=0,
+            frame_seq_length=1,
+            timesteps=torch.tensor([1000.0, 666.0, 333.0]),
+            prompt_embeds=torch.zeros(1),
+            cache_state=SimpleNamespace(),
+            crossattn_cache=None,
+            generator=None,
+            dit_dtype=torch.float32,
+            autocast_enabled=False,
+            step_noises_btchw=(torch.zeros_like(latents),) * 2,
+            block_index=0,
+            allow_timestep_cuda_graph_capture=False,
+            timestep_values=(1000.0, 666.0, 333.0),
+        )
+
+        self.assertEqual(distributed_recv.call_count, 2)
+        self.assertEqual(distributed_recv.call_args_list[0].kwargs["src"], 3)
+        self.assertIs(
+            distributed_recv.call_args_list[0].kwargs["group"], cpu_group
+        )
+        self.assertEqual(distributed_recv.call_args_list[1].kwargs["src"], 3)
+        self.assertIs(
+            distributed_recv.call_args_list[1].kwargs["group"], cpu_group
+        )
+        distributed_send.assert_called_once()
+        self.assertEqual(distributed_send.call_args.kwargs["dst"], 3)
+        self.assertIs(distributed_send.call_args.kwargs["group"], cpu_group)
+        self.assertEqual(distributed_send.call_args.args[0].item(), 0)
+        get_pp_group.assert_called_once_with()
+        torch.testing.assert_close(output, torch.full_like(latents, 7))
+        self.assertEqual(timing["tpp_role"], "decode")
+        self.assertIsNone(timing["tpp_stage_index"])
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_world_rank",
+        return_value=1,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_pp_group"
+    )
+    @patch("torch.distributed.recv")
+    @patch("torch.distributed.send")
+    def test_tpp_official_nccl_dit_uses_default_group_without_header_or_ack(
+        self,
+        distributed_send,
+        distributed_recv,
+        get_pp_group,
+        _get_world_rank,
+    ):
+        class _DenoisingStage:
+            def denoise_stream_r1_block(self, **kwargs):
+                return kwargs["block_latents"] + 1
+
+        runner = _FakeRealtimeRunner({})
+        latents = torch.zeros(1, 1, 1, 1, 1)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                wan_s2v_tpp=True,
+                wan_s2v_tpp_dit_ranks=[1, 2, 3],
+                wan_s2v_tpp_decode_rank=0,
+                wan_s2v_tpp_transport="official_blocking_nccl",
+            )
+        )
+
+        output, timing = runner._denoise_tpp_block(
+            denoising_stage=_DenoisingStage(),
+            batch=SimpleNamespace(),
+            server_args=server_args,
+            block_latents=latents,
+            block_bundle=SimpleNamespace(),
+            block_start=0,
+            frame_seq_length=1,
+            timesteps=torch.tensor([1000.0, 666.0, 333.0]),
+            prompt_embeds=torch.zeros(1),
+            cache_state=SimpleNamespace(),
+            crossattn_cache=None,
+            generator=None,
+            dit_dtype=torch.float32,
+            autocast_enabled=False,
+            step_noises_btchw=(torch.zeros_like(latents),) * 2,
+            block_index=0,
+            allow_timestep_cuda_graph_capture=False,
+            timestep_values=(1000.0, 666.0, 333.0),
+        )
+
+        distributed_send.assert_called_once()
+        self.assertEqual(distributed_send.call_args.kwargs["dst"], 2)
+        self.assertNotIn("group", distributed_send.call_args.kwargs)
+        torch.testing.assert_close(
+            distributed_send.call_args.args[0],
+            torch.ones_like(latents),
+        )
+        distributed_recv.assert_not_called()
+        get_pp_group.assert_not_called()
+        torch.testing.assert_close(output, torch.ones_like(latents))
+        self.assertEqual(timing["tpp_transport"], "official_blocking_nccl")
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_world_rank",
+        return_value=0,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_pp_group"
+    )
+    @patch("torch.distributed.send")
+    @patch("torch.distributed.recv")
+    def test_tpp_official_nccl_decode_receives_gpu_payload_only(
+        self,
+        distributed_recv,
+        distributed_send,
+        get_pp_group,
+        _get_world_rank,
+    ):
+        class _DenoisingStage:
+            def denoise_stream_r1_block(self, **_kwargs):
+                raise AssertionError("decode rank must not run a DiT timestep")
+
+        def recv_into(tensor, **_kwargs):
+            tensor.fill_(7)
+
+        distributed_recv.side_effect = recv_into
+        runner = _FakeRealtimeRunner({})
+        latents = torch.zeros(1, 1, 1, 1, 1)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                wan_s2v_tpp=True,
+                wan_s2v_tpp_dit_ranks=[1, 2, 3],
+                wan_s2v_tpp_decode_rank=0,
+                wan_s2v_tpp_transport="official_blocking_nccl",
+            )
+        )
+
+        output, timing = runner._denoise_tpp_block(
+            denoising_stage=_DenoisingStage(),
+            batch=SimpleNamespace(),
+            server_args=server_args,
+            block_latents=latents,
+            block_bundle=SimpleNamespace(),
+            block_start=0,
+            frame_seq_length=1,
+            timesteps=torch.tensor([1000.0, 666.0, 333.0]),
+            prompt_embeds=torch.zeros(1),
+            cache_state=SimpleNamespace(),
+            crossattn_cache=None,
+            generator=None,
+            dit_dtype=torch.float32,
+            autocast_enabled=False,
+            step_noises_btchw=(torch.zeros_like(latents),) * 2,
+            block_index=0,
+            allow_timestep_cuda_graph_capture=False,
+            timestep_values=(1000.0, 666.0, 333.0),
+        )
+
+        distributed_recv.assert_called_once()
+        self.assertEqual(distributed_recv.call_args.kwargs["src"], 3)
+        self.assertNotIn("group", distributed_recv.call_args.kwargs)
+        distributed_send.assert_not_called()
+        get_pp_group.assert_not_called()
+        torch.testing.assert_close(output, torch.full_like(latents, 7))
+        self.assertEqual(timing["tpp_transport"], "official_blocking_nccl")
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_world_rank",
+        return_value=3,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_sp_group"
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_pp_group"
+    )
+    @patch("torch.distributed.recv")
+    @patch("torch.distributed.send")
+    def test_tpp_sp2_lane_one_runs_first_step_and_sends_to_next_group(
+        self,
+        distributed_send,
+        distributed_recv,
+        get_pp_group,
+        get_sp_group,
+        _get_world_rank,
+    ):
+        class _DenoisingStage:
+            def __init__(self):
+                self.calls = []
+
+            def denoise_stream_r1_block(self, **kwargs):
+                self.calls.append(kwargs)
+                return kwargs["block_latents"] + 1
+
+        get_sp_group.return_value = SimpleNamespace(
+            world_size=2,
+            ranks=[2, 3],
+            first_rank=2,
+            rank_in_group=1,
+        )
+        runner = _FakeRealtimeRunner({})
+        denoising_stage = _DenoisingStage()
+        latents = torch.zeros(1, 1, 1, 1, 1)
+        batch = SimpleNamespace(enable_sequence_shard=False)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                wan_s2v_tpp=True,
+                wan_s2v_tpp_dit_ranks=[2, 4, 6],
+                wan_s2v_tpp_decode_rank=0,
+                wan_s2v_tpp_stage_parallel_size=2,
+                wan_s2v_tpp_transport="official_blocking_nccl",
+            )
+        )
+
+        output, timing = runner._denoise_tpp_block(
+            denoising_stage=denoising_stage,
+            batch=batch,
+            server_args=server_args,
+            block_latents=latents,
+            block_bundle=SimpleNamespace(),
+            block_start=0,
+            frame_seq_length=1,
+            timesteps=torch.tensor([1000.0, 666.0, 333.0]),
+            prompt_embeds=torch.zeros(1),
+            cache_state=SimpleNamespace(),
+            crossattn_cache=None,
+            generator=None,
+            dit_dtype=torch.float32,
+            autocast_enabled=False,
+            step_noises_btchw=(torch.zeros_like(latents),) * 2,
+            block_index=0,
+            allow_timestep_cuda_graph_capture=False,
+            timestep_values=(1000.0, 666.0, 333.0),
+        )
+
+        self.assertTrue(batch.enable_sequence_shard)
+        self.assertEqual(denoising_stage.calls[0]["only_step_index"], 0)
+        distributed_recv.assert_not_called()
+        distributed_send.assert_called_once()
+        self.assertEqual(distributed_send.call_args.kwargs["dst"], 5)
+        self.assertNotIn("group", distributed_send.call_args.kwargs)
+        get_pp_group.assert_not_called()
+        torch.testing.assert_close(output, torch.ones_like(latents))
+        self.assertEqual(timing["tpp_stage_parallel_size"], 2)
+        self.assertEqual(timing["tpp_stage_leader"], 2)
+        self.assertEqual(timing["tpp_stage_ranks"], [2, 3])
+        self.assertEqual(timing["tpp_lane_index"], 1)
+        self.assertFalse(timing["tpp_is_stage_leader"])
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_world_rank",
+        return_value=5,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_sp_group"
+    )
+    @patch("torch.distributed.recv")
+    @patch("torch.distributed.send")
+    def test_tpp_sp2_middle_stage_receives_and_sends_on_same_lane(
+        self,
+        distributed_send,
+        distributed_recv,
+        get_sp_group,
+        _get_world_rank,
+    ):
+        class _DenoisingStage:
+            def __init__(self):
+                self.calls = []
+
+            def denoise_stream_r1_block(self, **kwargs):
+                self.calls.append(kwargs)
+                return kwargs["block_latents"] + 1
+
+        def recv_into(tensor, **_kwargs):
+            tensor.fill_(4)
+
+        distributed_recv.side_effect = recv_into
+        get_sp_group.return_value = SimpleNamespace(
+            world_size=2,
+            ranks=[4, 5],
+            first_rank=4,
+            rank_in_group=1,
+        )
+        runner = _FakeRealtimeRunner({})
+        denoising_stage = _DenoisingStage()
+        latents = torch.zeros(1, 1, 1, 1, 1)
+        batch = SimpleNamespace(enable_sequence_shard=False)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                wan_s2v_tpp=True,
+                wan_s2v_tpp_dit_ranks=[2, 4, 6],
+                wan_s2v_tpp_decode_rank=0,
+                wan_s2v_tpp_stage_parallel_size=2,
+                wan_s2v_tpp_transport="official_blocking_nccl",
+            )
+        )
+
+        output, timing = runner._denoise_tpp_block(
+            denoising_stage=denoising_stage,
+            batch=batch,
+            server_args=server_args,
+            block_latents=latents,
+            block_bundle=SimpleNamespace(),
+            block_start=0,
+            frame_seq_length=1,
+            timesteps=torch.tensor([1000.0, 666.0, 333.0]),
+            prompt_embeds=torch.zeros(1),
+            cache_state=SimpleNamespace(),
+            crossattn_cache=None,
+            generator=None,
+            dit_dtype=torch.float32,
+            autocast_enabled=False,
+            step_noises_btchw=(torch.zeros_like(latents),) * 2,
+            block_index=0,
+            allow_timestep_cuda_graph_capture=False,
+            timestep_values=(1000.0, 666.0, 333.0),
+        )
+
+        distributed_recv.assert_called_once()
+        self.assertEqual(distributed_recv.call_args.kwargs["src"], 3)
+        distributed_send.assert_called_once()
+        self.assertEqual(distributed_send.call_args.kwargs["dst"], 7)
+        self.assertEqual(denoising_stage.calls[0]["only_step_index"], 1)
+        torch.testing.assert_close(output, torch.full_like(latents, 5))
+        self.assertEqual(timing["tpp_lane_index"], 1)
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_world_rank",
+        return_value=1,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.wan_s2v_realtime.get_sp_group"
+    )
+    @patch("torch.distributed.send")
+    @patch("torch.distributed.recv")
+    def test_tpp_sp2_decode_follower_receives_last_lane_without_dit(
+        self,
+        distributed_recv,
+        distributed_send,
+        get_sp_group,
+        _get_world_rank,
+    ):
+        class _DenoisingStage:
+            def denoise_stream_r1_block(self, **_kwargs):
+                raise AssertionError("decode follower must not run DiT")
+
+        def recv_into(tensor, **_kwargs):
+            tensor.fill_(7)
+
+        distributed_recv.side_effect = recv_into
+        get_sp_group.return_value = SimpleNamespace(
+            world_size=2,
+            ranks=[0, 1],
+            first_rank=0,
+            rank_in_group=1,
+        )
+        runner = _FakeRealtimeRunner({})
+        latents = torch.zeros(1, 1, 1, 1, 1)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                wan_s2v_tpp=True,
+                wan_s2v_tpp_dit_ranks=[2, 4, 6],
+                wan_s2v_tpp_decode_rank=0,
+                wan_s2v_tpp_stage_parallel_size=2,
+                wan_s2v_tpp_transport="official_blocking_nccl",
+            )
+        )
+
+        output, timing = runner._denoise_tpp_block(
+            denoising_stage=_DenoisingStage(),
+            batch=SimpleNamespace(),
+            server_args=server_args,
+            block_latents=latents,
+            block_bundle=SimpleNamespace(),
+            block_start=0,
+            frame_seq_length=1,
+            timesteps=torch.tensor([1000.0, 666.0, 333.0]),
+            prompt_embeds=torch.zeros(1),
+            cache_state=SimpleNamespace(),
+            crossattn_cache=None,
+            generator=None,
+            dit_dtype=torch.float32,
+            autocast_enabled=False,
+            step_noises_btchw=(torch.zeros_like(latents),) * 2,
+            block_index=0,
+            allow_timestep_cuda_graph_capture=False,
+            timestep_values=(1000.0, 666.0, 333.0),
+        )
+
+        distributed_recv.assert_called_once()
+        self.assertEqual(distributed_recv.call_args.kwargs["src"], 7)
+        distributed_send.assert_not_called()
+        torch.testing.assert_close(output, torch.full_like(latents, 7))
+        self.assertEqual(timing["tpp_role"], "decode")
+        self.assertFalse(timing["tpp_is_stage_leader"])
+
     def test_first_frame_controls_are_configurable(self):
         cfg = WanS2VPipelineConfig(
             s2v_init_first_frame=True,

@@ -222,5 +222,76 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
         self.assertEqual(server_args.pipeline_config.resolution, 768)
 
 
+class TestWanS2VTPPParallelism(unittest.TestCase):
+    @staticmethod
+    def _config(stage_parallel_size=2):
+        return WanS2VPipelineConfig(
+            stream_r1_mode=True,
+            stream_r1_kv_cache=True,
+            num_frame_per_block=1,
+            denoising_step_list=[1000, 666, 333],
+            wan_s2v_clean_context_refresh_mode="never",
+            wan_s2v_timestep_ablation_mode="off",
+            wan_s2v_tpp=True,
+            wan_s2v_tpp_dit_ranks=(
+                [2, 4, 6] if stage_parallel_size == 2 else [1, 2, 3]
+            ),
+            wan_s2v_tpp_decode_rank=0,
+            wan_s2v_tpp_stage_parallel_size=stage_parallel_size,
+        )
+
+    def test_sp2_is_derived_from_tpp_stage_parallel_size(self):
+        with patch.object(
+            PipelineConfig,
+            "from_kwargs",
+            return_value=self._config(),
+        ):
+            args = ServerArgs.from_dict(
+                {
+                    "model_path": "/fake",
+                    "num_gpus": 8,
+                }
+            )
+
+        self.assertEqual(args.tp_size, 1)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.ulysses_degree, 2)
+        self.assertEqual(args.ring_degree, 1)
+        self.assertFalse(args.enable_cfg_parallel)
+
+    def test_sp2_rejects_mismatched_explicit_parallelism(self):
+        with (
+            patch.object(
+                PipelineConfig,
+                "from_kwargs",
+                return_value=self._config(),
+            ),
+            self.assertRaisesRegex(ValueError, "requires sp_degree=2"),
+        ):
+            ServerArgs.from_dict(
+                {
+                    "model_path": "/fake",
+                    "num_gpus": 8,
+                    "sp_degree": 1,
+                }
+            )
+
+    def test_sp2_requires_all_stage_groups_to_cover_world(self):
+        with (
+            patch.object(
+                PipelineConfig,
+                "from_kwargs",
+                return_value=self._config(),
+            ),
+            self.assertRaisesRegex(ValueError, "stage groups must cover"),
+        ):
+            ServerArgs.from_dict(
+                {
+                    "model_path": "/fake",
+                    "num_gpus": 7,
+                }
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

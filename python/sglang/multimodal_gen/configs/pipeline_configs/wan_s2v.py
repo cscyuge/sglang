@@ -96,6 +96,15 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
     wan_s2v_timestep_cuda_graph_warmup_blocks: int = 2
     wan_s2v_timestep_cuda_graph_max_graphs: int = 16
     wan_s2v_timestep_cuda_graph_log: bool = False
+    # Timestep-forcing Pipeline Parallelism (TPP). Each DiT stage owns one
+    # fixed denoising timestep and one persistent noisy KV cache. A stage can
+    # span multiple contiguous ranks using Ulysses sequence parallelism; the
+    # configured DiT/decode ranks are the first ranks of those groups.
+    wan_s2v_tpp: bool = False
+    wan_s2v_tpp_dit_ranks: list[int] | None = None
+    wan_s2v_tpp_decode_rank: int = 0
+    wan_s2v_tpp_stage_parallel_size: int = 1
+    wan_s2v_tpp_transport: str = "host_staged_gloo"
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -239,6 +248,88 @@ class WanS2VPipelineConfig(WanI2V720PConfig):
             values = getattr(self, field_name)
             if values is not None and any(int(value) < 0 for value in values):
                 raise ValueError(f"{field_name} values must be non-negative")
+        self.wan_s2v_tpp_transport = str(self.wan_s2v_tpp_transport).strip().lower()
+        if self.wan_s2v_tpp_transport not in (
+            "host_staged_gloo",
+            "official_blocking_nccl",
+        ):
+            raise ValueError(
+                "wan_s2v_tpp_transport must be one of "
+                "{'host_staged_gloo', 'official_blocking_nccl'}"
+            )
+        self.wan_s2v_tpp_stage_parallel_size = int(
+            self.wan_s2v_tpp_stage_parallel_size
+        )
+        if self.wan_s2v_tpp_stage_parallel_size <= 0:
+            raise ValueError("wan_s2v_tpp_stage_parallel_size must be positive")
+        if self.wan_s2v_tpp:
+            if self.wan_s2v_tpp_dit_ranks is None:
+                raise ValueError(
+                    "wan_s2v_tpp_dit_ranks is required when wan_s2v_tpp=true"
+                )
+            ranks = [int(rank) for rank in self.wan_s2v_tpp_dit_ranks]
+            if not ranks:
+                raise ValueError("wan_s2v_tpp_dit_ranks must not be empty")
+            if len(set(ranks)) != len(ranks) or any(rank < 0 for rank in ranks):
+                raise ValueError(
+                    "wan_s2v_tpp_dit_ranks must contain unique non-negative ranks"
+                )
+            if int(self.wan_s2v_tpp_decode_rank) < 0:
+                raise ValueError("wan_s2v_tpp_decode_rank must be non-negative")
+            if int(self.wan_s2v_tpp_decode_rank) in ranks:
+                raise ValueError(
+                    "wan_s2v_tpp_decode_rank must not also be a DiT rank"
+                )
+            stage_parallel_size = self.wan_s2v_tpp_stage_parallel_size
+            group_leaders = [int(self.wan_s2v_tpp_decode_rank), *ranks]
+            if any(leader % stage_parallel_size != 0 for leader in group_leaders):
+                raise ValueError(
+                    "Wan S2V TPP stage leaders must align to "
+                    "wan_s2v_tpp_stage_parallel_size"
+                )
+            expanded_ranks = [
+                rank
+                for leader in group_leaders
+                for rank in range(leader, leader + stage_parallel_size)
+            ]
+            if len(set(expanded_ranks)) != len(expanded_ranks):
+                raise ValueError("Wan S2V TPP stage rank groups must not overlap")
+            if self.denoising_step_list is None or len(
+                self.denoising_step_list
+            ) != len(ranks):
+                raise ValueError(
+                    "TPP requires one denoising_step_list entry per DiT rank"
+                )
+            if self.num_frame_per_block != 1:
+                raise ValueError("Wan S2V TPP currently requires num_frame_per_block=1")
+            if self.wan_s2v_clean_context_refresh_mode != "never":
+                raise ValueError(
+                    "Wan S2V TPP cancels the flush step and requires "
+                    "wan_s2v_clean_context_refresh_mode='never'"
+                )
+            if self.wan_s2v_adaptive_steps:
+                raise ValueError("Wan S2V TPP does not support adaptive timesteps")
+            if self.wan_s2v_latent_warm_start:
+                raise ValueError("Wan S2V TPP does not support latent warm start")
+            if self.wan_s2v_timestep_ablation_mode != "off":
+                raise ValueError("Wan S2V TPP requires timestep ablation mode 'off'")
+            self.wan_s2v_tpp_dit_ranks = ranks
+            # The first multi-rank TPP version keeps streaming VAE decode on
+            # the public decode leader. This avoids mixing VAE collectives
+            # with the two blocking TPP lanes.
+            if stage_parallel_size > 1:
+                self.vae_config.use_parallel_decode = False
+
+    def update_config_from_dict(self, args: dict, prefix: str = "") -> None:
+        """Re-run Wan validation after ServerArgs applies flat config values.
+
+        ``PipelineConfig.from_kwargs`` first constructs the dataclass and only
+        then applies values from the serve JSON. Without this second
+        ``__post_init__`` pass, derived TPP settings such as leader-only VAE
+        decode would retain their pre-update defaults.
+        """
+        super().update_config_from_dict(args, prefix)
+        self.__post_init__()
 
     def postprocess_image_latent(self, latent_condition, batch):
         return latent_condition

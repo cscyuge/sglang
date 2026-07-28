@@ -3103,6 +3103,7 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         step_noises_btchw: Sequence[torch.Tensor] | None = None,
         block_index: int | None = None,
         allow_timestep_cuda_graph_capture: bool = True,
+        only_step_index: int | None = None,
     ) -> torch.Tensor:
         """Denoise one Stream-R1 S2V latent block.
 
@@ -3152,12 +3153,15 @@ class WanS2VStreamR1DenoisingStage(WanS2VDenoisingStage):
         previous_noise_pred_btchw: torch.Tensor | None = None
         for i, t_cur in enumerate(timesteps):
             timestep_value = timestep_values[i]
-            action = self._select_timestep_ablation_action(
-                ablation_config,
-                block_index=block_index,
-                step_index=i,
-                timestep_value=timestep_value,
-            )
+            if only_step_index is not None and i != only_step_index:
+                action = "skip_update"
+            else:
+                action = self._select_timestep_ablation_action(
+                    ablation_config,
+                    block_index=block_index,
+                    step_index=i,
+                    timestep_value=timestep_value,
+                )
             effective_action = action
             t_expand = t_cur.reshape(1).repeat(current_latents.shape[0])
             step_marker = (

@@ -175,6 +175,162 @@ def blockwise_dequant_fp8(
 
 
 @triton.jit
+def _blockwise_quant_fp8_rowpack_kernel(
+    x_ptr,
+    q_out_ptr,
+    scale_out_ptr,
+    M: tl.constexpr,
+    REST: tl.constexpr,
+    D: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    CHUNK_ROWS: tl.constexpr,
+    MERGED_ROWS_PER_PEER: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+):
+    flat_rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = flat_rows < M
+    group_id = tl.program_id(1)
+    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+
+    x_offsets = flat_rows[:, None] * D + col_offsets[None, :]
+    x = tl.load(x_ptr + x_offsets, mask=row_mask[:, None], other=0.0).to(
+        tl.float32
+    )
+    absmax = tl.max(tl.abs(x), axis=1)
+    scale = tl.maximum(absmax / FP8_MAX, 1.0e-10)
+    q = tl.clamp(x / scale[:, None], FP8_MIN, FP8_MAX).to(tl.float8e4nv)
+
+    first_row = flat_rows // REST
+    rest_idx = flat_rows - first_row * REST
+    peer = first_row // CHUNK_ROWS
+    inner = first_row - peer * CHUNK_ROWS
+    payload_row = peer * MERGED_ROWS_PER_PEER + inner
+    payload_offsets = (
+        payload_row[:, None] * REST * D
+        + rest_idx[:, None] * D
+        + col_offsets[None, :]
+    )
+    tl.store(q_out_ptr + payload_offsets, q, mask=row_mask[:, None])
+
+    scale_cols = D // GROUP_SIZE
+    scale_byte_linear = (inner * scale_cols + group_id) * 4
+    scale_row = (
+        peer * MERGED_ROWS_PER_PEER
+        + CHUNK_ROWS
+        + scale_byte_linear // D
+    )
+    scale_col = scale_byte_linear % D
+    scale_byte_offset = (scale_row * REST + rest_idx) * D + scale_col
+    tl.store(scale_out_ptr + scale_byte_offset // 4, scale, mask=row_mask)
+
+
+@triton.jit
+def _blockwise_quant_qkv_fp8_rowpack_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    q_out_ptr,
+    scale_out_ptr,
+    M: tl.constexpr,
+    S: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    CHUNK_ROWS: tl.constexpr,
+    MERGED_ROWS_PER_PEER: tl.constexpr,
+    stride_q_b,
+    stride_q_s,
+    stride_q_h,
+    stride_q_d,
+    stride_k_b,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_v_b,
+    stride_v_s,
+    stride_v_h,
+    stride_v_d,
+    BLOCK_M: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+):
+    packed_rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = packed_rows < M
+    qkv_id = packed_rows % 3
+    tmp = packed_rows // 3
+    h = tmp % H
+    tmp = tmp // H
+    s = tmp % S
+    b = tmp // S
+
+    group_id = tl.program_id(1)
+    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    q_offsets = (
+        b[:, None] * stride_q_b
+        + s[:, None] * stride_q_s
+        + h[:, None] * stride_q_h
+        + col_offsets[None, :] * stride_q_d
+    )
+    k_offsets = (
+        b[:, None] * stride_k_b
+        + s[:, None] * stride_k_s
+        + h[:, None] * stride_k_h
+        + col_offsets[None, :] * stride_k_d
+    )
+    v_offsets = (
+        b[:, None] * stride_v_b
+        + s[:, None] * stride_v_s
+        + h[:, None] * stride_v_h
+        + col_offsets[None, :] * stride_v_d
+    )
+    x = tl.load(
+        q_ptr + q_offsets,
+        mask=row_mask[:, None] & (qkv_id[:, None] == 0),
+        other=0.0,
+    ).to(tl.float32)
+    x += tl.load(
+        k_ptr + k_offsets,
+        mask=row_mask[:, None] & (qkv_id[:, None] == 1),
+        other=0.0,
+    ).to(tl.float32)
+    x += tl.load(
+        v_ptr + v_offsets,
+        mask=row_mask[:, None] & (qkv_id[:, None] == 2),
+        other=0.0,
+    ).to(tl.float32)
+
+    absmax = tl.max(tl.abs(x), axis=1)
+    scale = tl.maximum(absmax / FP8_MAX, 1.0e-10)
+    q = tl.clamp(x / scale[:, None], FP8_MIN, FP8_MAX).to(tl.float8e4nv)
+
+    first_row = 3 * h + qkv_id
+    rest_idx = b * S + s
+    rest = M // (3 * H)
+    peer = first_row // CHUNK_ROWS
+    inner = first_row - peer * CHUNK_ROWS
+    payload_row = peer * MERGED_ROWS_PER_PEER + inner
+    payload_offsets = (
+        payload_row[:, None] * rest * D
+        + rest_idx[:, None] * D
+        + col_offsets[None, :]
+    )
+    tl.store(q_out_ptr + payload_offsets, q, mask=row_mask[:, None])
+
+    scale_cols = D // GROUP_SIZE
+    scale_byte_linear = (inner * scale_cols + group_id) * 4
+    scale_row = (
+        peer * MERGED_ROWS_PER_PEER
+        + CHUNK_ROWS
+        + scale_byte_linear // D
+    )
+    scale_col = scale_byte_linear % D
+    scale_byte_offset = (scale_row * rest + rest_idx) * D + scale_col
+    tl.store(scale_out_ptr + scale_byte_offset // 4, scale, mask=row_mask)
+
+
+@triton.jit
 def _pack_fp8_payload_scale_aligned_kernel(
     payload_ptr,
     scale_u8_ptr,
@@ -251,6 +407,183 @@ def aligned_rowpack_shape(
         scale_cols=scale_cols,
     )
     return (world_size * (chunk_rows + scale_rows),) + payload_shape[1:]
+
+
+def _validate_quant_rowpack_output(
+    x: torch.Tensor,
+    *,
+    group_size: int,
+    world_size: int,
+    payload_shape: tuple[int, ...],
+    out: torch.Tensor | None,
+) -> tuple[torch.Tensor, int, int, int, int]:
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"FP8 rowpack quant expects bf16/fp16 input, got {x.dtype}")
+    if not x.is_contiguous():
+        raise ValueError(f"expected contiguous input, got stride={tuple(x.stride())}")
+    rows, rest, d = _flatten_rowpack_shape(x)
+    if d % group_size != 0 or d % 4 != 0:
+        raise ValueError(
+            f"last dimension d={d} must be divisible by group_size={group_size} and 4"
+        )
+    if rows % world_size != 0:
+        raise ValueError(f"rows={rows} must be divisible by world_size={world_size}")
+    combined_shape = aligned_rowpack_shape(
+        payload_shape,
+        scale_cols=d // group_size,
+        world_size=world_size,
+    )
+    if out is None:
+        out = torch.empty(combined_shape, dtype=torch.uint8, device=x.device)
+    elif (
+        out.shape != combined_shape
+        or out.dtype != torch.uint8
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must match aligned row-pack shape/device, be contiguous, and use uint8"
+        )
+    chunk_rows = rows // world_size
+    scale_rows = _rowpack_scale_rows(
+        chunk_rows=chunk_rows,
+        d=d,
+        scale_cols=d // group_size,
+    )
+    return out, rows, rest, d, chunk_rows + scale_rows
+
+
+def blockwise_quant_fp8_rowpack(
+    x: torch.Tensor,
+    *,
+    group_size: int,
+    world_size: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    out, rows, rest, d, merged_rows_per_peer = _validate_quant_rowpack_output(
+        x,
+        group_size=group_size,
+        world_size=world_size,
+        payload_shape=tuple(x.shape),
+        out=out,
+    )
+    flat_rows = rows * rest
+    block_m = _block_m_for_rows(flat_rows)
+    grid = (triton.cdiv(flat_rows, block_m), d // group_size)
+    _blockwise_quant_fp8_rowpack_kernel[grid](
+        x,
+        out.view(torch.float8_e4m3fn),
+        out.view(torch.float32),
+        flat_rows,
+        rest,
+        d,
+        group_size,
+        rows // world_size,
+        merged_rows_per_peer,
+        block_m,
+        _FP8_MAX,
+        _FP8_MIN,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+def blockwise_quant_qkv_fp8_rowpack(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    group_size: int,
+    world_size: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if q.shape != k.shape or q.shape != v.shape or q.ndim != 4:
+        raise ValueError(
+            "q, k, and v must have the same [B, S, H, D] shape, got "
+            f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        )
+    batch, seq_len, heads, d = q.shape
+    if (
+        q.dtype not in (torch.bfloat16, torch.float16)
+        or k.dtype != q.dtype
+        or v.dtype != q.dtype
+    ):
+        raise ValueError(
+            "FP8 rowpack quant expects q, k, and v to share bf16/fp16 dtype, "
+            f"got q={q.dtype} k={k.dtype} v={v.dtype}"
+        )
+    if k.device != q.device or v.device != q.device:
+        raise ValueError(
+            "q, k, and v must be on the same device, "
+            f"got q={q.device} k={k.device} v={v.device}"
+        )
+    if d % group_size != 0 or d % 4 != 0:
+        raise ValueError(
+            f"last dimension d={d} must be divisible by group_size={group_size} and 4"
+        )
+    payload_shape = (3 * heads, batch, seq_len, d)
+    rows = payload_shape[0]
+    if rows % world_size != 0:
+        raise ValueError(f"rows={rows} must be divisible by world_size={world_size}")
+    combined_shape = aligned_rowpack_shape(
+        payload_shape,
+        scale_cols=d // group_size,
+        world_size=world_size,
+    )
+    if out is None:
+        out = torch.empty(combined_shape, dtype=torch.uint8, device=q.device)
+    elif (
+        out.shape != combined_shape
+        or out.dtype != torch.uint8
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must match aligned row-pack shape/device, be contiguous, and use uint8"
+        )
+    chunk_rows = rows // world_size
+    scale_rows = _rowpack_scale_rows(
+        chunk_rows=chunk_rows,
+        d=d,
+        scale_cols=d // group_size,
+    )
+    merged_rows_per_peer = chunk_rows + scale_rows
+    packed_input_rows = batch * seq_len * heads * 3
+    block_m = _block_m_for_rows(packed_input_rows)
+    grid = (triton.cdiv(packed_input_rows, block_m), d // group_size)
+    _blockwise_quant_qkv_fp8_rowpack_kernel[grid](
+        q,
+        k,
+        v,
+        out.view(torch.float8_e4m3fn),
+        out.view(torch.float32),
+        packed_input_rows,
+        seq_len,
+        heads,
+        d,
+        group_size,
+        chunk_rows,
+        merged_rows_per_peer,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        block_m,
+        _FP8_MAX,
+        _FP8_MIN,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
 
 
 def pack_fp8_payload_scale_aligned(

@@ -19,6 +19,8 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
+    get_pp_group,
+    get_sp_group,
     get_world_rank,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -771,6 +773,25 @@ class _BufferedWanS2VFrameBlock:
     audio_prefetched: bool
 
 
+@dataclass(frozen=True)
+class _WanS2VTPPRole:
+    role: str
+    stage_index: int | None
+    dit_stage_leaders: tuple[int, ...]
+    decode_stage_leader: int
+    stage_parallel_size: int
+    stage_leader: int
+    stage_ranks: tuple[int, ...]
+    lane_index: int
+
+    @property
+    def is_stage_leader(self) -> bool:
+        return self.lane_index == 0
+
+    def peer_for_stage(self, stage_leader: int) -> int:
+        return int(stage_leader) + self.lane_index
+
+
 @dataclass
 class _WanS2VStreamingVAEState:
     enabled: bool
@@ -826,6 +847,7 @@ class _WanS2VPerChunkRealtimeState(BaseRealtimeState):
         self.cache_state = None
         self.frame_seq_length = None
         self.timesteps: torch.Tensor | None = None
+        self.timestep_values: tuple[float, ...] | None = None
         self.reference_latents_ready = False
         self.previous_clean_latents: torch.Tensor | None = None
         self.frame_start_idx = 0
@@ -979,6 +1001,376 @@ class WanS2VRealtimeSessionRunner:
             )
             for _ in range(num_noises)
         )
+
+    @staticmethod
+    def _tpp_enabled(server_args: ServerArgs) -> bool:
+        return bool(
+            _pipeline_config_value(server_args, "wan_s2v_tpp", False)
+        )
+
+    @staticmethod
+    def _tpp_transport(server_args: ServerArgs) -> str:
+        return str(
+            _pipeline_config_value(
+                server_args,
+                "wan_s2v_tpp_transport",
+                "host_staged_gloo",
+            )
+        )
+
+    @staticmethod
+    def _tpp_role(
+        server_args: ServerArgs,
+    ) -> _WanS2VTPPRole:
+        dit_stage_leaders = tuple(
+            int(rank)
+            for rank in (
+                _pipeline_config_value(
+                    server_args, "wan_s2v_tpp_dit_ranks", None
+                )
+                or ()
+            )
+        )
+        decode_stage_leader = int(
+            _pipeline_config_value(
+                server_args, "wan_s2v_tpp_decode_rank", 0
+            )
+        )
+        stage_parallel_size = int(
+            _pipeline_config_value(
+                server_args,
+                "wan_s2v_tpp_stage_parallel_size",
+                1,
+            )
+        )
+        rank = int(get_world_rank())
+        if stage_parallel_size == 1:
+            stage_ranks = (rank,)
+            stage_leader = rank
+            lane_index = 0
+        else:
+            sp_group = get_sp_group()
+            if int(sp_group.world_size) != stage_parallel_size:
+                raise RuntimeError(
+                    "Wan S2V TPP SP group size mismatch: "
+                    f"expected={stage_parallel_size}, actual={sp_group.world_size}"
+                )
+            stage_ranks = tuple(int(group_rank) for group_rank in sp_group.ranks)
+            stage_leader = int(sp_group.first_rank)
+            lane_index = int(sp_group.rank_in_group)
+            expected_stage_ranks = tuple(
+                range(stage_leader, stage_leader + stage_parallel_size)
+            )
+            if stage_ranks != expected_stage_ranks:
+                raise RuntimeError(
+                    "Wan S2V TPP requires contiguous SP stage groups: "
+                    f"expected={expected_stage_ranks}, actual={stage_ranks}"
+                )
+        if stage_leader == decode_stage_leader:
+            role = "decode"
+            stage_index = None
+        elif stage_leader in dit_stage_leaders:
+            role = "dit"
+            stage_index = dit_stage_leaders.index(stage_leader)
+        else:
+            raise RuntimeError(
+                f"Wan S2V TPP rank {rank} has no role; "
+                f"stage_leader={stage_leader}, "
+                f"dit_stage_leaders={dit_stage_leaders}, "
+                f"decode_stage_leader={decode_stage_leader}"
+            )
+        return _WanS2VTPPRole(
+            role=role,
+            stage_index=stage_index,
+            dit_stage_leaders=dit_stage_leaders,
+            decode_stage_leader=decode_stage_leader,
+            stage_parallel_size=stage_parallel_size,
+            stage_leader=stage_leader,
+            stage_ranks=stage_ranks,
+            lane_index=lane_index,
+        )
+
+    def _denoise_tpp_block(
+        self,
+        *,
+        denoising_stage: Any,
+        batch: Req,
+        server_args: ServerArgs,
+        block_latents: torch.Tensor,
+        block_bundle: WanS2VConditionBundle,
+        block_start: int,
+        frame_seq_length: int,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        cache_state: Any,
+        crossattn_cache: list[dict] | None,
+        generator: torch.Generator | None,
+        dit_dtype: torch.dtype,
+        autocast_enabled: bool,
+        step_noises_btchw: tuple[torch.Tensor, ...],
+        block_index: int,
+        allow_timestep_cuda_graph_capture: bool,
+        timestep_values: tuple[float, ...],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Execute one fixed-timestep TPP stage or receive the clean latent.
+
+        All ranks prepare identical block shapes and RNG streams. Only the
+        configured DiT ranks mutate KV state. The decode rank receives the
+        final clean latent and owns all public output work.
+        """
+
+        role_info = self._tpp_role(server_args)
+        role = role_info.role
+        stage_index = role_info.stage_index
+        dit_stage_leaders = role_info.dit_stage_leaders
+        if len(dit_stage_leaders) != int(timesteps.numel()):
+            raise RuntimeError(
+                "Wan S2V TPP timestep/rank count changed after startup: "
+                f"timesteps={int(timesteps.numel())}, "
+                f"dit_stage_leaders={dit_stage_leaders}"
+            )
+        if len(timestep_values) != len(dit_stage_leaders):
+            raise RuntimeError(
+                "Wan S2V TPP cached timestep/rank count changed after startup: "
+                f"timestep_values={timestep_values}, "
+                f"dit_stage_leaders={dit_stage_leaders}"
+            )
+        started = time.perf_counter()
+        recv_ms = 0.0
+        send_ms = 0.0
+        stage_ms = 0.0
+        transport = self._tpp_transport(server_args)
+        use_official_nccl = transport == "official_blocking_nccl"
+        control_group = None if use_official_nccl else get_pp_group().cpu_group
+        trace_p2p = os.environ.get(
+            "SGLANG_WAN_S2V_TPP_P2P_TRACE", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        def trace(phase: str) -> None:
+            if trace_p2p:
+                logger.info(
+                    "Wan S2V TPP P2P trace block=%d rank=%d phase=%s",
+                    block_index,
+                    get_world_rank(),
+                    phase,
+                    main_process_only=False,
+                    local_main_process_only=False,
+                )
+
+        trace("enter")
+
+        def recv_latents(src: int) -> torch.Tensor:
+            if use_official_nccl:
+                received_latents = torch.empty(
+                    block_latents.shape,
+                    dtype=torch.float32,
+                    device=block_latents.device,
+                )
+                trace("recv_latent_start")
+                torch.distributed.recv(received_latents, src=src)
+                trace("recv_latent_done")
+                return received_latents
+
+            assert control_group is not None
+            received_block_index_tensor = torch.empty(
+                1,
+                dtype=torch.int64,
+                device="cpu",
+            )
+            trace("recv_header_start")
+            torch.distributed.recv(
+                received_block_index_tensor,
+                src=src,
+                group=control_group,
+            )
+            trace("recv_header_done")
+            received_block_index = int(received_block_index_tensor.item())
+            if received_block_index != int(block_index):
+                raise RuntimeError(
+                    f"Wan S2V TPP block order mismatch on {role} rank: "
+                    f"rank={get_world_rank()}, expected={block_index}, "
+                    f"received={received_block_index}"
+                )
+            received_latents = torch.empty(
+                block_latents.shape,
+                dtype=torch.float32,
+                device="cpu",
+            )
+            trace("recv_latent_start")
+            torch.distributed.recv(
+                received_latents,
+                src=src,
+                group=control_group,
+            )
+            trace("recv_latent_done")
+            current_latents = received_latents.to(
+                device=block_latents.device,
+            )
+            ack = torch.tensor(
+                [block_index],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            trace("send_ack_start")
+            torch.distributed.send(ack, dst=src, group=control_group)
+            trace("send_ack_done")
+            return current_latents
+
+        def send_latents(current_latents: torch.Tensor, dst: int) -> None:
+            if use_official_nccl:
+                # Scheduler outputs are FP32. Send the native GPU payload
+                # directly on the default WORLD NCCL group, matching the
+                # blocking LiveAvatar order without a header or ACK.
+                sent_latents = current_latents.detach().to(
+                    dtype=torch.float32,
+                ).contiguous()
+                trace("send_latent_start")
+                torch.distributed.send(sent_latents, dst=dst)
+                trace("send_latent_done")
+                return
+
+            assert control_group is not None
+            sent_block_index = torch.tensor(
+                [block_index],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            trace("send_header_start")
+            torch.distributed.send(
+                sent_block_index,
+                dst=dst,
+                group=control_group,
+            )
+            trace("send_header_done")
+            # Scheduler outputs are FP32 even when DiT weights/inputs use
+            # BF16. Keep a fixed wire dtype so every TPP stage allocates the
+            # exact payload size expected by Gloo.
+            sent_latents = current_latents.detach().to(
+                device="cpu",
+                dtype=torch.float32,
+            )
+            trace("send_latent_start")
+            torch.distributed.send(
+                sent_latents,
+                dst=dst,
+                group=control_group,
+            )
+            trace("send_latent_done")
+            ack = torch.empty(
+                1,
+                dtype=torch.int64,
+                device="cpu",
+            )
+            trace("recv_ack_start")
+            torch.distributed.recv(ack, src=dst, group=control_group)
+            trace("recv_ack_done")
+            if int(ack.item()) != int(block_index):
+                raise RuntimeError(
+                    "Wan S2V TPP acknowledgment mismatch: "
+                    f"rank={get_world_rank()}, expected={block_index}, "
+                    f"received={int(ack.item())}"
+                )
+
+        if role == "decode":
+            recv_started = time.perf_counter()
+            src = role_info.peer_for_stage(dit_stage_leaders[-1])
+            current_latents = recv_latents(src)
+            recv_ms = (time.perf_counter() - recv_started) * 1000.0
+        else:
+            assert stage_index is not None
+            if stage_index == 0:
+                current_latents = block_latents
+            else:
+                recv_started = time.perf_counter()
+                src = role_info.peer_for_stage(
+                    dit_stage_leaders[stage_index - 1]
+                )
+                current_latents = recv_latents(src)
+                recv_ms = (time.perf_counter() - recv_started) * 1000.0
+
+            trace("stage_start")
+            stage_started = time.perf_counter()
+            if role_info.stage_parallel_size > 1:
+                batch.enable_sequence_shard = True
+            current_latents = denoising_stage.denoise_stream_r1_block(
+                batch=batch,
+                server_args=server_args,
+                block_latents=current_latents,
+                block_bundle=block_bundle,
+                block_start=block_start,
+                frame_seq_length=frame_seq_length,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                cache_state=cache_state,
+                crossattn_cache=crossattn_cache,
+                generator=generator,
+                dit_dtype=dit_dtype,
+                autocast_enabled=autocast_enabled,
+                audio_start_frame=0,
+                step_noises_btchw=step_noises_btchw,
+                block_index=block_index,
+                allow_timestep_cuda_graph_capture=(
+                    allow_timestep_cuda_graph_capture
+                ),
+                only_step_index=stage_index,
+            )
+            stage_ms = (time.perf_counter() - stage_started) * 1000.0
+            trace("stage_done")
+
+            dst = (
+                role_info.peer_for_stage(role_info.decode_stage_leader)
+                if stage_index == len(dit_stage_leaders) - 1
+                else role_info.peer_for_stage(
+                    dit_stage_leaders[stage_index + 1]
+                )
+            )
+            send_started = time.perf_counter()
+            current_latents = current_latents.contiguous()
+            send_latents(current_latents, dst)
+            send_ms = (time.perf_counter() - send_started) * 1000.0
+
+        timing = {
+            "tpp_enabled": True,
+            "tpp_transport": transport,
+            "tpp_role": role,
+            "tpp_rank": int(get_world_rank()),
+            "tpp_stage_index": stage_index,
+            "tpp_stage_parallel_size": role_info.stage_parallel_size,
+            "tpp_stage_leader": role_info.stage_leader,
+            "tpp_stage_ranks": list(role_info.stage_ranks),
+            "tpp_lane_index": role_info.lane_index,
+            "tpp_is_stage_leader": role_info.is_stage_leader,
+            "tpp_timestep": (
+                None
+                if stage_index is None
+                else timestep_values[stage_index]
+            ),
+            "tpp_recv_ms": round(recv_ms, 3),
+            "tpp_stage_ms": round(stage_ms, 3),
+            "tpp_send_ms": round(send_ms, 3),
+            "tpp_total_ms": round(
+                (time.perf_counter() - started) * 1000.0, 3
+            ),
+        }
+        logger.info(
+            "Wan S2V TPP block=%d rank=%d role=%s stage=%s timestep=%s "
+            "recv_ms=%.3f stage_ms=%.3f send_ms=%.3f "
+            "stage_parallel_size=%d stage_leader=%d lane=%d",
+            block_index,
+            timing["tpp_rank"],
+            role,
+            stage_index,
+            timing["tpp_timestep"],
+            recv_ms,
+            stage_ms,
+            send_ms,
+            role_info.stage_parallel_size,
+            role_info.stage_leader,
+            role_info.lane_index,
+            main_process_only=False,
+            local_main_process_only=False,
+        )
+        return current_latents, timing
 
     def _prepare_block_inputs(
         self,
@@ -2772,6 +3164,9 @@ class WanS2VRealtimeSessionRunner:
                 raise ValueError(
                     "Wan S2V realtime chunk requires at least one timestep"
                 )
+            state.timestep_values = tuple(
+                float(value) for value in state.timesteps.detach().cpu().tolist()
+            )
             patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
             _, _, _, latent_h, latent_w = block_latents.shape
             state.frame_seq_length = (latent_h // patch_size[1]) * (
@@ -2897,25 +3292,48 @@ class WanS2VRealtimeSessionRunner:
 
         record_output_cuda_event("denoise_start")
         denoise_started = time.perf_counter()
-        current_latents = denoising_stage.denoise_stream_r1_block(
-            batch=work_batch,
-            server_args=server_args,
-            block_latents=block_latents,
-            block_bundle=bundle,
-            block_start=work_batch.block_idx * state.num_frame_per_block,
-            frame_seq_length=state.frame_seq_length,
-            timesteps=block_timesteps,
-            prompt_embeds=prompt_embeds,
-            cache_state=state.cache_state,
-            crossattn_cache=state.crossattn_cache,
-            generator=state.generator,
-            dit_dtype=state.dit_dtype,
-            autocast_enabled=state.autocast_enabled,
-            audio_start_frame=0,
-            step_noises_btchw=block_step_noises,
-            block_index=work_batch.block_idx,
-            allow_timestep_cuda_graph_capture=True,
-        )
+        tpp_timing: dict[str, Any] = {}
+        if self._tpp_enabled(server_args):
+            current_latents, tpp_timing = self._denoise_tpp_block(
+                denoising_stage=denoising_stage,
+                batch=work_batch,
+                server_args=server_args,
+                block_latents=block_latents,
+                block_bundle=bundle,
+                block_start=work_batch.block_idx * state.num_frame_per_block,
+                frame_seq_length=state.frame_seq_length,
+                timesteps=block_timesteps,
+                prompt_embeds=prompt_embeds,
+                cache_state=state.cache_state,
+                crossattn_cache=state.crossattn_cache,
+                generator=state.generator,
+                dit_dtype=state.dit_dtype,
+                autocast_enabled=state.autocast_enabled,
+                step_noises_btchw=block_step_noises,
+                block_index=work_batch.block_idx,
+                allow_timestep_cuda_graph_capture=True,
+                timestep_values=state.timestep_values,
+            )
+        else:
+            current_latents = denoising_stage.denoise_stream_r1_block(
+                batch=work_batch,
+                server_args=server_args,
+                block_latents=block_latents,
+                block_bundle=bundle,
+                block_start=work_batch.block_idx * state.num_frame_per_block,
+                frame_seq_length=state.frame_seq_length,
+                timesteps=block_timesteps,
+                prompt_embeds=prompt_embeds,
+                cache_state=state.cache_state,
+                crossattn_cache=state.crossattn_cache,
+                generator=state.generator,
+                dit_dtype=state.dit_dtype,
+                autocast_enabled=state.autocast_enabled,
+                audio_start_frame=0,
+                step_noises_btchw=block_step_noises,
+                block_index=work_batch.block_idx,
+                allow_timestep_cuda_graph_capture=True,
+            )
         record_output_cuda_event("denoise_end")
         timestep_profile_rows = list(
             getattr(denoising_stage, "_last_timestep_profile_rows", [])
@@ -2943,6 +3361,8 @@ class WanS2VRealtimeSessionRunner:
         clean_refresh_forward_s = 0.0
         clean_refresh_stage_timings: dict[str, Any] = {}
         if clean_refresh_decision.refresh:
+            if self._tpp_enabled(server_args):
+                raise RuntimeError("Wan S2V TPP must never execute a flush step")
             record_output_cuda_event("refresh_start")
             clean_refresh_forward_started = time.perf_counter()
             refresh_timings = denoising_stage._clean_context_refresh(
@@ -2972,6 +3392,25 @@ class WanS2VRealtimeSessionRunner:
         work_batch.latents = current_latents
         state.previous_clean_latents = current_latents.detach()
         denoise_s = denoise_loop_s + clean_refresh_s
+
+        if self._tpp_enabled(server_args):
+            role_info = self._tpp_role(server_args)
+            if role_info.role != "decode" or not role_info.is_stage_leader:
+                timings = {
+                    "audio_ms": round(audio_s * 1000, 3),
+                    "latent_ms": round(latent_s * 1000, 3),
+                    "condition_ms": round(condition_s * 1000, 3),
+                    "step_noise_ms": round(step_noise_s * 1000, 3),
+                    "denoise_ms": round(denoise_s * 1000, 3),
+                    "clean_refresh_ms": 0.0,
+                    **tpp_timing,
+                }
+                return OutputBatch(
+                    output=None,
+                    output_file_paths=[],
+                    metrics=work_batch.metrics,
+                    realtime_timings=timings,
+                )
 
         record_output_cuda_event("decode_start")
         decode_started = time.perf_counter()
@@ -3075,6 +3514,7 @@ class WanS2VRealtimeSessionRunner:
         worker_timings.update(prompt_timings)
         worker_timings.update(condition_timings)
         worker_timings.update(clean_refresh_stage_timings)
+        worker_timings.update(tpp_timing)
         worker_timings.update(state.stream_vae_state.last_decode_timings or {})
         worker_timings.update(raw_frame_timings)
         output_batch.realtime_timings = worker_timings
@@ -3371,6 +3811,7 @@ class WanS2VRealtimeSessionRunner:
         crossattn_cache: list[dict] | None = None
         frame_seq_length = None
         timesteps = None
+        timestep_values: tuple[float, ...] | None = None
         prompt_embeds = None
         reference_latents_ready = False
         stream_vae_state = _WanS2VStreamingVAEState(enabled=use_streaming_vae_cache)
@@ -3600,6 +4041,9 @@ class WanS2VRealtimeSessionRunner:
                         raise ValueError(
                             "Wan S2V realtime session requires at least one timestep"
                         )
+                    timestep_values = tuple(
+                        float(value) for value in timesteps.detach().cpu().tolist()
+                    )
                     patch_size = (
                         server_args.pipeline_config.dit_config.arch_config.patch_size
                     )
@@ -3757,29 +4201,60 @@ class WanS2VRealtimeSessionRunner:
                     )
 
                 denoise_started = time.perf_counter()
-                current_latents = denoising_stage.denoise_stream_r1_block(
-                    batch=batch,
-                    server_args=server_args,
-                    block_latents=block_latents,
-                    block_bundle=bundle,
-                    block_start=block_idx * num_frame_per_block,
-                    frame_seq_length=frame_seq_length,
-                    timesteps=block_timesteps,
-                    prompt_embeds=prompt_embeds,
-                    cache_state=cache_state,
-                    crossattn_cache=crossattn_cache,
-                    generator=generator,
-                    dit_dtype=dit_dtype,
-                    autocast_enabled=autocast_enabled,
-                    audio_start_frame=0,
-                    step_noises_btchw=block_step_noises,
-                    block_index=block_idx,
-                    allow_timestep_cuda_graph_capture=(
-                        self._should_allow_timestep_cuda_graph_capture(
-                            timestep_graph_output_started=timestep_graph_output_started
-                        )
-                    ),
-                )
+                tpp_timing: dict[str, Any] = {}
+                if self._tpp_enabled(server_args):
+                    current_latents, tpp_timing = self._denoise_tpp_block(
+                        denoising_stage=denoising_stage,
+                        batch=batch,
+                        server_args=server_args,
+                        block_latents=block_latents,
+                        block_bundle=bundle,
+                        block_start=block_idx * num_frame_per_block,
+                        frame_seq_length=frame_seq_length,
+                        timesteps=block_timesteps,
+                        prompt_embeds=prompt_embeds,
+                        cache_state=cache_state,
+                        crossattn_cache=crossattn_cache,
+                        generator=generator,
+                        dit_dtype=dit_dtype,
+                        autocast_enabled=autocast_enabled,
+                        step_noises_btchw=block_step_noises,
+                        block_index=block_idx,
+                        allow_timestep_cuda_graph_capture=(
+                            self._should_allow_timestep_cuda_graph_capture(
+                                timestep_graph_output_started=(
+                                    timestep_graph_output_started
+                                )
+                            )
+                        ),
+                        timestep_values=timestep_values,
+                    )
+                else:
+                    current_latents = denoising_stage.denoise_stream_r1_block(
+                        batch=batch,
+                        server_args=server_args,
+                        block_latents=block_latents,
+                        block_bundle=bundle,
+                        block_start=block_idx * num_frame_per_block,
+                        frame_seq_length=frame_seq_length,
+                        timesteps=block_timesteps,
+                        prompt_embeds=prompt_embeds,
+                        cache_state=cache_state,
+                        crossattn_cache=crossattn_cache,
+                        generator=generator,
+                        dit_dtype=dit_dtype,
+                        autocast_enabled=autocast_enabled,
+                        audio_start_frame=0,
+                        step_noises_btchw=block_step_noises,
+                        block_index=block_idx,
+                        allow_timestep_cuda_graph_capture=(
+                            self._should_allow_timestep_cuda_graph_capture(
+                                timestep_graph_output_started=(
+                                    timestep_graph_output_started
+                                )
+                            )
+                        ),
+                    )
                 timestep_profile_rows = list(
                     getattr(denoising_stage, "_last_timestep_profile_rows", [])
                 )
@@ -3802,6 +4277,10 @@ class WanS2VRealtimeSessionRunner:
                     config=clean_refresh_config,
                 )
                 if clean_refresh_decision.refresh:
+                    if self._tpp_enabled(server_args):
+                        raise RuntimeError(
+                            "Wan S2V TPP must never execute a flush step"
+                        )
                     denoising_stage._clean_context_refresh(
                         block_latents=current_latents,
                         prompt_embeds=prompt_embeds,
@@ -3837,6 +4316,23 @@ class WanS2VRealtimeSessionRunner:
                         prefetch_gpu_start_event.set()
                     prefetch_after_denoise_event = None
                     prefetch_gpu_start_event = None
+
+                if self._tpp_enabled(server_args):
+                    role_info = self._tpp_role(server_args)
+                    if (
+                        role_info.role != "decode"
+                        or not role_info.is_stage_leader
+                    ):
+                        emit_chunk_timeline(
+                            timeline_path,
+                            "wan_s2v_tpp_stage_done",
+                            session_id=session_id,
+                            block_idx=block_idx,
+                            timings=tpp_timing,
+                            refresh=False,
+                        )
+                        block_idx += 1
+                        continue
 
                 decode_started = time.perf_counter()
                 frames = self._decode_block_frames(
@@ -4036,6 +4532,7 @@ class WanS2VRealtimeSessionRunner:
                         ),
                         "block_wall_ms": round(total_s * 1000, 3),
                         "total_ms": round(total_s * 1000, 3),
+                        **tpp_timing,
                     },
                     audio_prefetched=audio_prefetched,
                     latent_prefetched=latent_prefetched,

@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_pp_group,
     get_ring_parallel_rank,
     get_ring_parallel_world_size,
     get_tp_group,
@@ -92,6 +93,8 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+        self.pp_group = get_pp_group()
+        self.pp_cpu_group = self.pp_group.cpu_group
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -114,6 +117,24 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
+            pipeline_parallel_degree=(
+                self.server_args.num_gpus
+                // int(
+                    getattr(
+                        self.server_args.pipeline_config,
+                        "wan_s2v_tpp_stage_parallel_size",
+                        1,
+                    )
+                )
+                if bool(
+                    getattr(
+                        self.server_args.pipeline_config,
+                        "wan_s2v_tpp",
+                        False,
+                    )
+                )
+                else 1
+            ),
             distributed_init_method=NetworkAddress(
                 "127.0.0.1", self.master_port
             ).to_tcp(),

@@ -429,6 +429,32 @@ def _stream_r1_flash_attention_version() -> str:
     )
 
 
+def _stream_r1_fa4_sm120_tile_mn() -> tuple[int, int] | None:
+    value = os.getenv("SGLANG_STREAM_R1_FA4_SM120_TILE_MN", "").strip().lower()
+    if not value:
+        return None
+    normalized = value.replace("x", ",").replace(" ", ",")
+    parts = [item for item in normalized.split(",") if item]
+    if len(parts) != 2:
+        raise ValueError(
+            "SGLANG_STREAM_R1_FA4_SM120_TILE_MN must use MxN syntax, "
+            f"got {value!r}"
+        )
+    try:
+        tile_m, tile_n = (int(item) for item in parts)
+    except ValueError as exc:
+        raise ValueError(
+            "SGLANG_STREAM_R1_FA4_SM120_TILE_MN must contain integers, "
+            f"got {value!r}"
+        ) from exc
+    if tile_m <= 0 or tile_n <= 0 or tile_m % 16 or tile_n % 16:
+        raise ValueError(
+            "SGLANG_STREAM_R1_FA4_SM120_TILE_MN dimensions must be positive "
+            f"multiples of 16, got {(tile_m, tile_n)}"
+        )
+    return tile_m, tile_n
+
+
 def wan_s2v_stream_r1_attention_backend() -> str:
     return _stream_r1_attention_backend()
 
@@ -1709,21 +1735,39 @@ def _run_stream_r1_packed_varlen_attention_workspace(
                 "flash_attn_4_sm120 on PYTHONPATH"
             ) from exc
 
+        tile_mn = _stream_r1_fa4_sm120_tile_mn()
         with _stream_r1_comm_nvtx_range(
             "stream_r1_packed_attention.fa4_sm120 "
-            f"max_q={workspace.max_seqlen_q} max_k={workspace.max_seqlen_k}"
+            f"max_q={workspace.max_seqlen_q} max_k={workspace.max_seqlen_k} "
+            f"tile_mn={tile_mn or 'default'}"
         ):
-            result = flash_attn_varlen_func(
-                workspace.query,
-                workspace.key,
-                workspace.value,
-                cu_seqlens_q=workspace.cu_seqlens_q,
-                cu_seqlens_k=workspace.cu_seqlens_k,
-                max_seqlen_q=workspace.max_seqlen_q,
-                max_seqlen_k=workspace.max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=False,
-            )
+            if tile_mn is None:
+                result = flash_attn_varlen_func(
+                    workspace.query,
+                    workspace.key,
+                    workspace.value,
+                    cu_seqlens_q=workspace.cu_seqlens_q,
+                    cu_seqlens_k=workspace.cu_seqlens_k,
+                    max_seqlen_q=workspace.max_seqlen_q,
+                    max_seqlen_k=workspace.max_seqlen_k,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                )
+            else:
+                from flash_attn_4_sm120.interface import _flash_attn_fwd
+
+                result = _flash_attn_fwd(
+                    workspace.query,
+                    workspace.key,
+                    workspace.value,
+                    cu_seqlens_q=workspace.cu_seqlens_q,
+                    cu_seqlens_k=workspace.cu_seqlens_k,
+                    max_seqlen_q=workspace.max_seqlen_q,
+                    max_seqlen_k=workspace.max_seqlen_k,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                    tile_mn=tile_mn,
+                )
     else:
         try:
             from sglang.jit_kernel.flash_attention import flash_attn_varlen_func

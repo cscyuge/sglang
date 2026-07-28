@@ -624,6 +624,40 @@ class ServerArgs(DisaggArgsMixin):
         ulysses_unspecified = self.ulysses_degree is None
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
+        tpp_enabled = bool(getattr(self.pipeline_config, "wan_s2v_tpp", False))
+
+        if tpp_enabled:
+            stage_parallel_size = int(
+                getattr(
+                    self.pipeline_config,
+                    "wan_s2v_tpp_stage_parallel_size",
+                    1,
+                )
+            )
+            if self.tp_size not in (None, 1):
+                raise ValueError("Wan S2V TPP requires tp_size=1")
+            if self.sp_degree not in (None, stage_parallel_size):
+                raise ValueError(
+                    f"Wan S2V TPP requires sp_degree={stage_parallel_size} "
+                    "(wan_s2v_tpp_stage_parallel_size)"
+                )
+            if self.ulysses_degree not in (None, stage_parallel_size):
+                raise ValueError(
+                    f"Wan S2V TPP requires ulysses_degree={stage_parallel_size} "
+                    "(wan_s2v_tpp_stage_parallel_size)"
+                )
+            if self.ring_degree not in (None, 1):
+                raise ValueError("Wan S2V TPP requires ring_degree=1")
+            if self.enable_cfg_parallel not in (None, False):
+                raise ValueError("Wan S2V TPP requires CFG parallelism disabled")
+            self.tp_size = 1
+            self.sp_degree = stage_parallel_size
+            self.ulysses_degree = stage_parallel_size
+            self.ring_degree = 1
+            self.enable_cfg_parallel = False
+            tp_unspecified = sp_unspecified = False
+            ulysses_unspecified = ring_unspecified = False
+            cfg_unspecified = False
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
@@ -1519,6 +1553,29 @@ class ServerArgs(DisaggArgsMixin):
             )
 
     def _validate_parallelism(self):
+        if bool(getattr(self.pipeline_config, "wan_s2v_tpp", False)):
+            dit_ranks = list(self.pipeline_config.wan_s2v_tpp_dit_ranks or ())
+            decode_rank = int(self.pipeline_config.wan_s2v_tpp_decode_rank)
+            stage_parallel_size = int(
+                getattr(
+                    self.pipeline_config,
+                    "wan_s2v_tpp_stage_parallel_size",
+                    1,
+                )
+            )
+            stage_leaders = [decode_rank, *dit_ranks]
+            expected_ranks = {
+                rank
+                for leader in stage_leaders
+                for rank in range(leader, leader + stage_parallel_size)
+            }
+            if expected_ranks != set(range(self.num_gpus)):
+                raise ValueError(
+                    "Wan S2V TPP stage groups must cover every process exactly "
+                    f"once: got dit_ranks={dit_ranks}, decode_rank={decode_rank}, "
+                    f"stage_parallel_size={stage_parallel_size}, "
+                    f"num_gpus={self.num_gpus}"
+                )
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be >= and divisible by sp_degree ({self.sp_degree})"
