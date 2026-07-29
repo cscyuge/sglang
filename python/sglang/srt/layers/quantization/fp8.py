@@ -371,7 +371,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def _uses_flashinfer_cutlass_block_fp8(self) -> bool:
         backend = get_fp8_gemm_runner_backend()
-        if backend.is_flashinfer_cutlass():
+        if backend.is_flashinfer_cutlass() or backend.is_cutlass_sm120_exact():
             return True
         return (
             backend.is_auto()

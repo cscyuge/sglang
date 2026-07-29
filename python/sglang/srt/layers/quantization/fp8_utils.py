@@ -416,6 +416,7 @@ class Fp8GemmRunnerBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
+    CUTLASS_SM120_EXACT = "cutlass_sm120_exact"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
@@ -433,6 +434,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_flashinfer_deepgemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
+
+    def is_cutlass_sm120_exact(self) -> bool:
+        return self == Fp8GemmRunnerBackend.CUTLASS_SM120_EXACT
 
     def is_cutlass(self) -> bool:
         return self == Fp8GemmRunnerBackend.CUTLASS
@@ -656,6 +660,15 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
                 "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_cutlass, "
                 "but FlashInfer is not available or not supported on this hardware. "
                 "FlashInfer CUTLASS FP8 GEMM requires Blackwell GPUs and FlashInfer."
+            )
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+
+    elif backend.is_cutlass_sm120_exact():
+        if not (is_sm120_supported() and is_flashinfer_available()):
+            raise RuntimeError(
+                "Exact SM120 FP8 GEMM requested via "
+                "--fp8-gemm-backend=cutlass_sm120_exact, but this backend "
+                "requires an SM120/SM121 GPU and FlashInfer."
             )
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 

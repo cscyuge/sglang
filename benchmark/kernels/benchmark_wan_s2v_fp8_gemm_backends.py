@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -70,11 +71,16 @@ def _capture_samples(
 
 
 def _stats(samples: list[float]) -> dict[str, object]:
+    mean = statistics.mean(samples)
+    stddev = statistics.stdev(samples) if len(samples) > 1 else 0.0
     return {
         "samples_ms": samples,
+        "mean_ms": mean,
         "median_ms": statistics.median(samples),
         "min_ms": min(samples),
         "max_ms": max(samples),
+        "stddev_ms": stddev,
+        "cv": stddev / mean if mean else math.inf,
     }
 
 
@@ -91,7 +97,12 @@ def main() -> None:
     torch.cuda.set_device(args.device)
     device = torch.device(f"cuda:{args.device}")
     backends = {
-        "flashinfer_cutlass": flashinfer_gemm_w8a8_block_fp8_linear_with_fallback,
+        "flashinfer_cutlass_uncached": (
+            flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+        ),
+        "flashinfer_cutlass_cached": (
+            flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+        ),
         "sgl_cutlass": cutlass_w8a8_block_fp8_linear_with_fallback,
         "triton": triton_w8a8_block_fp8_linear,
     }
@@ -115,12 +126,23 @@ def main() -> None:
             device=device,
             dtype=torch.float32,
         )
+        weight_scale_cutlass = weight_scale.T.contiguous()
         op = {**asdict(spec), "backends": {}}
         reference = None
         for name, fn in backends.items():
             try:
+                backend_weight_scale = (
+                    weight_scale_cutlass
+                    if name == "flashinfer_cutlass_cached"
+                    else weight_scale
+                )
                 eager_output = fn(
-                    x, weight, BLOCK_SIZE, weight_scale, input_scale=None, bias=None
+                    x,
+                    weight,
+                    BLOCK_SIZE,
+                    backend_weight_scale,
+                    input_scale=None,
+                    bias=None,
                 )
                 torch.cuda.synchronize()
                 if reference is None:
@@ -138,7 +160,7 @@ def main() -> None:
                         x,
                         weight,
                         BLOCK_SIZE,
-                        weight_scale,
+                        backend_weight_scale,
                         input_scale=None,
                         bias=None,
                     ),
@@ -149,6 +171,9 @@ def main() -> None:
                 op["backends"][name] = {
                     **_stats(samples),
                     "error_vs_flashinfer_cutlass": error,
+                    "bit_exact_vs_flashinfer_cutlass": bool(
+                        torch.equal(eager_output, reference)
+                    ),
                 }
                 print(
                     f"  {name}: {statistics.median(samples):.6f} ms",
@@ -160,7 +185,7 @@ def main() -> None:
                 }
                 print(f"  {name}: ERROR {type(exc).__name__}: {exc}", flush=True)
         result["ops"].append(op)
-        del x, weight, weight_scale, reference
+        del x, weight, weight_scale, weight_scale_cutlass, reference
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -174,7 +199,7 @@ def main() -> None:
                 break
             values.append(measurement["median_ms"] * op["count"])
         totals[backend] = sum(values) if values else None
-    baseline = totals["flashinfer_cutlass"]
+    baseline = totals["flashinfer_cutlass_uncached"]
     result["weighted_layer_ms"] = {
         backend: {
             "ms": value,

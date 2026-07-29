@@ -39,10 +39,13 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
+    get_fp8_gemm_runner_backend,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
 )
+from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.utils import is_blackwell_supported, is_flashinfer_available
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
@@ -199,6 +202,34 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = self.quant_config.weight_block_size is not None
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+
+    def _uses_flashinfer_cutlass_block_fp8(self) -> bool:
+        backend = get_fp8_gemm_runner_backend()
+        if backend.is_flashinfer_cutlass() or backend.is_cutlass_sm120_exact():
+            return True
+        return (
+            backend.is_auto()
+            and is_blackwell_supported()
+            and is_flashinfer_available()
+        )
+
+    def _process_block_fp8_linear_weight_scale(self, layer: Module) -> None:
+        if not self.block_quant or not self._uses_flashinfer_cutlass_block_fp8():
+            return
+        block_n, block_k = self.quant_config.weight_block_size
+        n, k = layer.weight.shape
+        expected_shape = (k // block_k, n // block_n)
+        weight_scale = layer.weight_scale_inv.data
+        if tuple(weight_scale.shape) == expected_shape and weight_scale.is_contiguous():
+            prepared = weight_scale
+        else:
+            prepared = weight_scale.transpose(-1, -2).contiguous()
+        if tuple(prepared.shape) != expected_shape:
+            raise ValueError(
+                "FlashInfer CUTLASS block FP8 scale layout expected "
+                f"{expected_shape}, got {tuple(prepared.shape)}."
+            )
+        copy_or_rebind_param(layer, "weight_scale_inv_cutlass", prepared)
 
     def create_weights(
         self,
@@ -360,6 +391,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
             layer.weight.data = weight.data
             layer.weight_scale_inv.data = weight_scale.data
+            self._process_block_fp8_linear_weight_scale(layer)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -479,20 +511,26 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
             if isinstance(x, tuple):
+                weight_scale = getattr(
+                    layer, "weight_scale_inv_cutlass", layer.weight_scale_inv
+                )
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
                     weight=layer.weight,
                     block_size=self.quant_config.weight_block_size,
-                    weight_scale=layer.weight_scale_inv,
+                    weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
                 )
 
+            weight_scale = getattr(
+                layer, "weight_scale_inv_cutlass", layer.weight_scale_inv
+            )
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
                 block_size=self.quant_config.weight_block_size,
-                weight_scale=layer.weight_scale_inv,
+                weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
             )
